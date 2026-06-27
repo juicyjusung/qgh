@@ -1,7 +1,12 @@
 # qgh PRD
 
+문서 역할: canonical full PRD.
+관련 문서: `qgh-product-brief.md`는 제품 포지셔닝/brief, `.scratch/qgh-mvp/PRD.md`는 local issue tracker에서 `/to-issues`가 읽는 working PRD다.
+업데이트 규칙: MVP 요구사항, acceptance criteria, release gate, source model, CLI/MCP contract가 바뀌면 이 파일을 먼저 수정하고 `.scratch/qgh-mvp/PRD.md`의 working copy를 동기화한다.
+
 작성일: 2026-06-27 KST
 개정: 2026-06-27 KST (리뷰 반영 — positioning 정정, search-quality gate 수치화, 삭제 감지 전략, vector post-MVP 연기, GHES 결정, privacy hardening)
+개정: 2026-06-28 KST (문서 역할 정리 — canonical PRD와 tracker working PRD 관계 명시)
 제품명: qgh
 문서 목적: GitHub Issues/Wiki용 local-first read-only CLI/MCP 검색 도구의 MVP 요구사항을 정의한다.
 
@@ -135,7 +140,7 @@ MVP에 포함한다.
 
 ### 6.1 Post-MVP로 명시적으로 연기 (release gate 아님)
 
-다음은 설계상 자리를 잡되 MVP acceptance(AC-01~AC-27, 단 AC-13/AC-20 제외)의 전제가 아니다. M6에서 prototype 또는 연기를 결정한다.
+다음은 설계상 자리를 잡되 MVP acceptance(AC-01~AC-27, 단 AC-13/AC-20 제외)의 전제가 아니다. M6에서 prototype 또는 연기를 결정한다. M6의 first candidate는 local ONNX embedding runtime + SQLite vector index이며, hosted embedding/rerank는 별도 privacy policy와 explicit opt-in 전에는 후보가 아니다.
 
 - optional local vector/hybrid search
 - embedding fingerprint(provider/model/dimension/chunker/schema)와 partial coverage gating
@@ -177,21 +182,21 @@ MVP에서 제외한다.
 
 | ID | Requirement | 왜 필요한가 | Acceptance |
 |---|---|---|---|
-| FR-01 | qgh는 profile마다 GitHub host, token source, local DB path, repo allowlist를 명시적으로 고정해야 한다. | wrong repo/private corpus 검색과 CLI/MCP profile drift를 막는다. | AC-01, AC-12 |
+| FR-01 | qgh는 profile마다 GitHub host, token source reference, local DB path, repo allowlist를 명시적으로 고정해야 한다. `qgh init`의 추천 token source는 `github_cli`지만 runtime이 GitHub CLI -> environment -> OS credential store로 자동 fallback하면 안 된다. | wrong repo/private corpus 검색과 CLI/MCP profile drift를 막고 wrong-account fallback을 방지한다. | AC-01, AC-12 |
 | FR-02 | qgh는 allowlisted repo의 Issues title/body와 metadata(state, labels, milestone, assignees, author, created_at/updated_at/closed_at, canonical URL)를 backfill 및 `since` incremental sync해야 한다. | issue body와 명시된 metadata는 source lookup과 filter의 기본 corpus다. | AC-02, AC-03 |
 | FR-03 | qgh는 allowlisted repo의 issue comments(body, author, timestamps, canonical URL)를 backfill 및 `since` incremental sync해야 한다. | comments에는 결정 배경과 장애 대응 맥락이 많고 GitHub native semantic issue search와의 핵심 차별점이다. | AC-02, AC-03 |
 | FR-04 | qgh는 allowlisted repo의 Wiki latest branch content를 `{repo}.wiki.git` git clone으로 sync해야 하며, wiki clone에 필요한 token capability를 검증하고 disabled/empty Wiki와 auth/permission 실패를 구분해야 한다. | Wiki는 runbook/architecture 문서의 source이며 Issues API corpus와 다르다. fine-grained token의 wiki 접근 가능 여부가 불확실하다. | AC-02, AC-04 |
-| FR-05 | qgh는 supported lifecycle fixture에서 edit, delete, rename, transfer 후 stale ghost result가 active search에 남지 않게 해야 한다. `since` listing이 삭제를 반환하지 않으므로, (a) issue `comments` count/`updated_at` 변화 시 해당 issue comment 재나열·diff, (b) `get` 시 404/410/301 → tombstone, (c) bounded-cadence full reconciliation(기본 manual/configurable)으로 삭제·transfer를 감지한다. | 삭제되거나 이동된 private content가 검색/citation되면 제품 신뢰와 privacy가 깨진다. incremental sync만으로는 삭제를 감지할 수 없다. | AC-03, AC-05 |
+| FR-05 | qgh는 supported lifecycle fixture에서 edit, delete, rename, transfer 후 stale ghost result가 active search에 남지 않게 해야 한다. `since` listing이 삭제를 반환하지 않으므로, (a) issue `comments` count/`updated_at` 변화 시 해당 issue comment 재나열·diff, (b) wiki git tree diff, (c) `get` 시 404/410/301 → tombstone, (d) explicit full reconciliation command(기본 manual, optional `reconcile_after_days`는 status warning 우선)로 삭제·transfer를 감지한다. | 삭제되거나 이동된 private content가 검색/citation되면 제품 신뢰와 privacy가 깨진다. incremental sync만으로는 삭제를 감지할 수 없다. | AC-03, AC-05 |
 | FR-06 | qgh는 BM25-only path로 query, get, status를 완전히 지원해야 한다. | vector extension, model download, GPU/runtime 실패가 core adoption을 막지 않아야 한다. | AC-06 |
 | FR-07 | qgh는 exact lookup과 structured filter를 지원하고 filter는 query expansion 또는 semantic rewrite의 영향을 받지 않아야 한다. | repo/label/state/author/issue/wiki path scope가 넓어지는 agent misuse를 막는다. | AC-07 |
 | FR-08 | 모든 query result는 stable `source_id`, `entity_type`, canonical URL, snippet, `get_args`, parent context, `indexed_at`/source version을 포함해야 한다. | 검색 결과가 원문 조회와 citation으로 round-trip되어야 하고 agent가 staleness를 인지해야 한다. | AC-08 |
 | FR-09 | `get`은 issue body, comment body, wiki page/section 원문과 canonical GitHub URL, source version(body hash, updated_at/commit, `indexed_at`)을 반환해야 한다. | final answer의 근거는 search snippet이 아니라 authoritative source여야 하며 신선도를 판단할 수 있어야 한다. | AC-08, AC-09 |
-| FR-10 | `status`는 last sync, source count, stale/tombstone count, DB/schema version, profile id, Wiki commit을 표시하고, vector mode 활성 시 missing embedding count를 추가 표시해야 한다. | 검색 실패의 원인이 stale index인지, wrong profile인지, partial vector coverage인지 진단해야 한다. | AC-10 |
+| FR-10 | `status`는 last sync, source count, stale/tombstone count, DB/schema version, profile id, Wiki commit, reconciliation age를 표시하고, vector mode 활성 시 missing embedding count를 추가 표시해야 한다. | 검색 실패의 원인이 stale index인지, wrong profile인지, stale reconciliation인지, partial vector coverage인지 진단해야 한다. | AC-10 |
 | FR-11 | CLI/config/MCP는 strict schema validation을 적용하고 unknown key/parameter를 structured error로 실패시켜야 한다. | typo가 broad search, wrong profile, silent no-op으로 바뀌면 private repo 검색에서 위험하다. | AC-11 |
 | FR-12 | MCP v1은 read-only `query`, `get`, `status`만 제공해야 한다. | agent가 sync, write-back, embedding job, external egress를 임의로 유발하지 않게 한다. | AC-12 |
 | FR-13 | (post-MVP) optional vector/hybrid path는 fingerprint와 partial coverage 상태를 추적해야 하며 BM25 path를 깨뜨리면 안 된다. MVP release gate 아님. | semantic quality 개선은 필요하지만 mixed model/vector state는 잘못된 ranking을 만든다. | AC-13 |
 | FR-14 | qgh는 no result, validation error, auth error, rate-limit/backoff state, stale index warning을 JSON schema상 구분해야 한다. | agent와 shell automation이 실패를 성공 결과로 오인하지 않아야 한다. | AC-11, AC-14 |
-| FR-15 | qgh는 GitHub config에 token 평문을 저장하지 않고 source reference(GitHub CLI, env, OS credential store, GitHub App token)로만 다뤄야 한다. | local config leak가 private repo access leak로 이어지지 않아야 한다. | AC-26 |
+| FR-15 | qgh는 GitHub config에 token 평문을 저장하지 않고 source reference(`github_cli`, `env`, `credential_store`; GitHub App token은 post-MVP/server capability)로만 다뤄야 한다. Runtime source fallback은 금지한다. | local config leak가 private repo access leak로 이어지지 않고 wrong-account fallback이 생기지 않아야 한다. | AC-26 |
 
 ## 9. Non-Functional Requirements
 
@@ -234,7 +239,7 @@ MVP에서 제외한다.
 | PSR-01 | Default configuration은 hosted embedding, hosted rerank, telemetry upload, shared server를 비활성화해야 한다. | private repo content와 derived data의 third-party egress를 기본적으로 막는다. | AC-15 |
 | PSR-02 | Hosted provider는 future option으로만 남기고 repo/profile policy와 explicit opt-in 없이는 사용할 수 없어야 한다. opt-in 없이는 코드 경로가 활성화되지 않아야 한다. | 보안 검토 없이 “품질 개선”이 private data transfer로 바뀌는 것을 막는다. | AC-15 |
 | PSR-03 | Local DB, snippets, embeddings, logs는 sensitive derivative data로 취급해야 한다. | vector/snippet도 원문 재구성이 어렵더라도 private content를 반영한다. | AC-15, AC-23 |
-| PSR-04 | Token은 qgh config에 평문 저장하지 않고 GitHub CLI, environment, OS credential store, GitHub App token 같은 source reference로 다뤄야 한다. | local config leak가 private repo access leak로 이어지지 않아야 한다. | AC-24, AC-26 |
+| PSR-04 | Token은 qgh config에 평문 저장하지 않고 `github_cli`, `env`, `credential_store` 같은 explicit source reference로 다뤄야 한다. GitHub App token은 post-MVP/server capability다. | local config leak와 wrong-account fallback이 private repo access leak로 이어지지 않아야 한다. | AC-24, AC-26 |
 | PSR-05 | MCP v1은 read-only이고 GitHub write permission 없이 사용할 수 있어야 한다. | 최소 권한으로 agent integration을 가능하게 한다. | AC-12, AC-24 |
 
 ## 13. Search Quality Requirements
@@ -271,7 +276,7 @@ MVP에서 제외한다.
 | AC-07 | issue number, full URL, repo/label/state/author/wiki path filters는 exact/hard filter로 동작하고 semantic rewrite 또는 query expansion이 filter를 넓히지 않는다. | FR-07, IR-06, SQR-01 |
 | AC-08 | top-k query results는 모두 `source_id`, `entity_type`, canonical URL, snippet, `get_args`, parent context, `indexed_at`/source version을 포함하고 `get` round-trip에 성공한다. | FR-08, FR-09, DSR-01, DSR-02, DSR-03, DSR-05, SQR-05 |
 | AC-09 | `get`은 issue body, comment, wiki page/section 각각에서 authoritative body, canonical GitHub URL, source version(body hash, updated_at/commit, indexed_at)을 반환한다. | FR-09, DSR-02, DSR-03 |
-| AC-10 | `status`는 last sync, source count, stale/tombstone count, DB/schema version, profile id, Wiki commit을 network/model load 없이 표시하고, vector mode 활성 시 missing embedding count를 추가 표시한다. | FR-10, DSR-03 |
+| AC-10 | `status`는 last sync, source count, stale/tombstone count, DB/schema version, profile id, Wiki commit, reconciliation age를 network/model load 없이 표시하고, vector mode 활성 시 missing embedding count를 추가 표시한다. | FR-10, DSR-03 |
 | AC-11 | config/CLI/MCP unknown keys, typoed params, malformed JSON, invalid enum은 silent fallback 없이 structured validation error를 낸다. | FR-11, FR-14, NFR-05, IR-02, IR-04 |
 | AC-12 | MCP tool 목록은 read-only `query`, `get`, `status`로 제한되고 각 tool은 `readOnlyHint: true`, `inputSchema`, `outputSchema`를 노출하며 mutation/sync/embed/write tool이 없다. | FR-01, FR-12, IR-03, PSR-05 |
 | AC-13 | (post-MVP) optional vector mode는 fingerprint mismatch와 partial embedding coverage를 detect하고 BM25-only search를 중단시키지 않는다. MVP release gate 아님. | FR-13, DSR-05, DSR-06 |
@@ -288,7 +293,7 @@ MVP에서 제외한다.
 | AC-24 | 최소 권한 read token으로 sync/query/get/status가 작동하고 write permission 없이 MCP workflow가 통과한다. | PSR-04, PSR-05 |
 | AC-25 | 20~30개 curated query set에서 issue body, comment-only answer, wiki page/section, exact lookup, CJK/mixed, negative query class별로 §13.1 numeric target을 충족하고, gold source set과 라벨링 규칙이 문서화되며 모든 top-k가 `get` round-trip을 통과한다. | SQR-01, SQR-02, SQR-03, SQR-05, SQR-06 |
 | AC-26 | qgh config 파일/저장소 어디에도 literal token 문자열이 기록되지 않고 source reference만 저장됨이 검증된다. | FR-15, PSR-04 |
-| AC-27 | reconciliation job(FR-05)이 bounded rate-limit 예산 안에서 deleted comment/issue/wiki를 tombstone하고, cadence와 비용이 `status`/문서에 표시된다. | FR-05, NFR-03 |
+| AC-27 | reconciliation job(FR-05)이 bounded rate-limit 예산 안에서 deleted comment/issue/wiki를 tombstone하고, manual/configured cadence, last run age, estimated cost class가 `status`/문서에 표시된다. | FR-05, NFR-03 |
 
 ## 15. Validation and Research Plan
 
@@ -321,18 +326,18 @@ MVP에서 제외한다.
 | Scope creep | shared server, Web UI, PR/Discussions, vector를 MVP로 끌어와 지연한다. | Non-Goals와 §6.1 deferral을 release gate로 사용하고 MVP acceptance 전 확장 설계를 금지한다. |
 | GHES variance | endpoint, rate limit, Wiki policy가 github.com과 다를 수 있다. | GHES를 best-effort profile capability로 표현하고 release gate에서 제외한다(§17 Q1). |
 
-## 17. Open Questions
+## 17. Resolved Planning Decisions
 
-해결된 항목은 결정 내용을 함께 표기한다.
+이 PRD는 MVP planning에 필요한 제품 결정을 닫은 상태다. 남은 것은 구현 중 검증할 empirical uncertainty다.
 
-1. **(결정)** MVP first-class target은 GitHub.com. GHES는 best-effort profile capability이며 release gate(AC-20)에서 제외한다.
-2. token source 우선순위 default는 GitHub CLI → environment → OS credential store → GitHub App token 중 무엇인가? (제안: GitHub CLI default, 나머지 fallback. M1에서 확정.)
-3. 초기 curated eval corpus는 실제 private repo 익명화 vs synthetic fixture repo 중 무엇으로 시작하고, gold source set 라벨러는 누구인가? (SQR-06와 연결.)
-4. CJK baseline은 FTS5 trigram으로 §13.1 target을 충족하는가? 미달 시 형태소 tokenizer를 언제 optional tier로 올리는가? (AC-25 eval 결과로 결정.)
-5. 삭제 감지 full reconciliation의 default cadence는? (manual vs N일 주기. rate-limit 예산과 trade-off, AC-27.)
-6. Wiki가 disabled/private/empty/large file count일 때 사용자-facing status wording 표준은?
-7. (post-MVP) optional vector path의 first supported local embedding runtime을 언제 결정할 것인가? (M6.)
-8. MVP 후 서버형 제품화 판단 기준은 team adoption, search quality, ACL 요구, sync volume 중 무엇을 gate로 삼을 것인가?
+1. MVP first-class target은 GitHub.com이다. GHES는 best-effort profile capability이며 release gate(AC-20)에서 제외한다.
+2. Token source default는 `github_cli`다. 단, profile에는 explicit source reference가 저장되어야 하며 runtime fallback은 금지한다. `env`와 `credential_store`는 profile에서 명시할 때만 사용한다. GitHub App token은 post-MVP/server capability다.
+3. 초기 curated eval corpus는 synthetic fixture repo로 시작한다. 실제 private repo 익명화 corpus는 user validation 보조 자료이며 release gate가 아니다. Gold source set은 fixture source ids로 라벨링하고 ambiguous query는 제외 규칙을 문서화한다.
+4. CJK baseline은 FTS5 trigram + 1~2자 LIKE fallback이다. 형태소 tokenizer는 CJK/mixed target 미달 또는 false-positive 분석에서 trigram 한계가 확인될 때 optional tier로 올린다.
+5. Full reconciliation은 hidden background work가 아니다. 일반 `sync`는 cheap lifecycle checks를 수행하고, full reconciliation은 explicit `qgh sync --reconcile full`로 시작한다. Optional `reconcile_after_days`는 자동 실행보다 status warning을 우선한다.
+6. Wiki status vocabulary는 `ok`, `disabled`, `empty`, `auth_error`, `not_found`, `clone_error`, `too_large_warning`으로 고정한다. `disabled`는 repo metadata로 wiki off를 확인한 경우에만 사용한다.
+7. Optional vector path는 M6에서 local ONNX embedding runtime + SQLite vector index를 first candidate로 검토한다. Hosted embedding/rerank는 explicit policy/opt-in 전에는 검토하지 않는다.
+8. 서버형 제품화 gate는 local MVP quality gate 통과, 3~5명 user validation에서 repeated workflow 가치 확인, shared index/ACL 요구가 local duplicate-index 비용보다 크다는 evidence, GitHub App/token 운영 모델 정의다.
 
 ## 18. Milestones / Next Steps
 
@@ -340,13 +345,13 @@ MVP release gate = AC-01~AC-27, 단 AC-13(vector)·AC-20(GHES)은 제외.
 
 | Milestone | Deliverable | Exit criteria |
 |---|---|---|
-| M0 PRD lock | 이 PRD, §13.1 numeric target, acceptance criteria 확정 | Non-Goals, §6.1 deferral, numeric target, GHES 결정에 이해관계자 동의 |
-| M1 Contract design | profile, source model, CLI/MCP schema, JSON output contract, token source default | FR/DSR/IR requirements가 schema tests로 전환 가능 |
+| M0 PRD lock | 이 PRD, §13.1 numeric target, acceptance criteria, §17 decisions 확정 | Non-Goals, §6.1 deferral, numeric target, GHES/token/eval/reconciliation decisions가 implementation-ready |
+| M1 Contract design | profile, source model, CLI/MCP schema, JSON output contract, token source policy | FR/DSR/IR requirements가 schema tests로 전환 가능 |
 | M2 Sync vertical slice | REST Issues/comments + Wiki git fixture sync + 삭제 감지 reconciliation | AC-02~AC-05, AC-27 fixture 통과 |
 | M3 BM25 retrieval slice | BM25-only `query -> get -> cite -> status` | AC-06~AC-11 통과 |
 | M4 MCP read-only slice | MCP `query`, `get`, `status` | AC-12, AC-21, agent workflow fixture 통과 |
 | M5 Search quality gate | gold-labeled curated 20~30 query eval | §13.1 numeric target, AC-22, AC-25 통과 및 top failure 분석 |
-| M6 Optional vector decision | local vector/hybrid prototype or deferral | AC-13 충족 또는 vector MVP 제외 확정 (release gate 아님) |
+| M6 Optional vector decision | local ONNX + SQLite vector prototype or deferral | AC-13 충족 또는 vector MVP 제외 확정 (release gate 아님) |
 | M7 MVP release candidate | docs, schema, privacy(NFR-07), status, packaging check | release-gate AC 검증 결과와 residual risks 문서화 |
 
 ## Sources and References
@@ -366,6 +371,7 @@ Primary/current references checked for this PRD:
 - GitHub REST best practices: https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api
 - GitHub pagination: https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
 - GitHub Wikis: https://docs.github.com/en/communities/documenting-your-project-with-wikis/about-wikis
+- GitHub Wiki git workflow: https://docs.github.com/en/communities/documenting-your-project-with-wikis/adding-or-editing-wiki-pages
 - GitHub issue semantic/hybrid search GA changelog: https://github.blog/changelog/2026-04-02-improved-search-for-github-issues-is-now-generally-available/
 - GitHub MCP server: https://github.com/github/github-mcp-server
 - MCP 2025-11-25 tools specification: https://modelcontextprotocol.io/specification/2025-11-25/server/tools

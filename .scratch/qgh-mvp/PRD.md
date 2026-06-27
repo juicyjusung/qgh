@@ -2,6 +2,12 @@
 
 Status: ready-for-agent
 Created: 2026-06-27 KST
+Updated: 2026-06-28 KST
+
+Document role: local issue-tracker working PRD for `/to-issues`.
+Canonical source: `qgh-prd.md`.
+Related brief: `qgh-product-brief.md`.
+Update rule: keep this file implementation-ready for agent issue generation. If MVP requirements or acceptance criteria change, update `qgh-prd.md` first, then sync this working PRD.
 
 ## Problem Statement
 
@@ -76,16 +82,16 @@ MVP의 기본 검색 경로는 BM25-only로 완성한다. Vector/hybrid search, 
 - Scope는 Issues title/body/metadata, issue comments, Wiki latest branch content로 제한한다.
 - Repo selection은 explicit allowlist만 지원한다. Organization-wide discovery, implicit fallback, current-directory inference는 제외한다.
 - Profile은 GitHub host, token source, local DB path, repo allowlist, schema/profile id를 고정한다.
-- Token은 config에 literal value로 저장하지 않고 GitHub CLI, environment, OS credential store, GitHub App token 같은 source reference로만 다룬다.
+- Token은 config에 literal value로 저장하지 않고 source reference로만 다룬다. MVP profile은 `token_source`를 명시해야 하며, `qgh init`의 추천값은 `github_cli`다. Runtime fallback으로 GitHub CLI -> environment -> OS credential store를 자동 순회하지 않는다. 다른 source를 쓰려면 profile에 `env` 또는 `credential_store`를 명시한다. GitHub App installation token은 서버형/post-MVP capability로 둔다.
 - Sync는 CLI explicit command로만 제공한다. MCP는 sync, embed, delete, update, write-back tool을 제공하지 않는다.
 - Issues/comments sync는 REST 기반 backfill과 `since` incremental sync를 기본으로 한다.
 - Wiki sync는 `{repo}.wiki.git` clone/fetch 기반 latest branch content를 기본으로 한다.
 - Source identity는 URL, title, issue number, wiki path와 분리한다. Mutable locator는 alias/version/lifecycle state로 다룬다.
 - Source model은 issue, comment, wiki page/section의 parent-child 관계를 표현한다.
 - Source version은 body hash, updated timestamp 또는 wiki commit, indexed timestamp를 포함한다.
-- Deletion and transfer handling은 tombstone, last-seen tracking, `get` 404/410/redirect handling, bounded reconciliation으로 처리한다.
+- Deletion and transfer handling은 tombstone, last-seen tracking, `get` 404/410/redirect handling, bounded reconciliation으로 처리한다. 일반 `sync`는 cheap lifecycle check(issue `updated_at`/comment count diff, wiki git tree diff)를 수행하고, full reconciliation은 기본 manual command(`qgh sync --reconcile full`)로 둔다. Profile은 optional `reconcile_after_days`를 가질 수 있으며, 기본값은 자동 실행이 아니라 stale warning이다.
 - BM25-only path는 `sync`, `query`, `get`, `status` 전체 workflow를 완성해야 한다.
-- Vector/hybrid search는 post-MVP capability다. Fingerprint, partial coverage, local runtime 선택은 later decision으로 둔다.
+- Vector/hybrid search는 post-MVP capability다. M6에서만 prototype 여부를 결정하며, first candidate는 local ONNX embedding runtime + SQLite vector index다. Hosted embedding/rerank는 explicit policy/opt-in 전에는 후보가 아니다. Fingerprint와 partial coverage schema는 BM25 path를 깨뜨리지 않는 범위에서만 설계한다.
 - Query response는 `source_id`, `entity_type`, canonical URL, snippet, `get_args`, parent context, ranking evidence, source version/staleness metadata를 포함한다.
 - `get` response는 issue body, comment body, wiki page/section content와 canonical URL, parent context, source version을 반환한다.
 - Snippet은 preview이며 citation 근거가 아니다. Citation contract는 `query -> get -> cite`다.
@@ -96,12 +102,25 @@ MVP의 기본 검색 경로는 BM25-only로 완성한다. Vector/hybrid search, 
 - MCP v1은 read-only `query`, `get`, `status` tools만 expose하고 strict input/output schemas와 `readOnlyHint`를 제공한다.
 - Config, CLI, MCP schemas는 strict validation을 적용한다. Unknown keys, typoed params, malformed JSON, invalid enum은 structured error로 실패한다.
 - MCP stdout은 protocol messages only로 유지하고 diagnostics는 stderr/log channel로 보낸다.
-- `status`는 last sync, source count, stale/tombstone count, DB/schema version, profile id, Wiki commit을 표시한다.
+- `status`는 last sync, source count, stale/tombstone count, DB/schema version, profile id, Wiki commit, reconciliation age를 표시한다.
 - `status`는 network probe, model load, expensive doctor check를 수행하지 않는다.
 - Local DB, logs, cache files는 single-user permission으로 생성하고 sensitive derivative data로 문서화한다.
 - Default mode는 GitHub host 외 outbound call을 하지 않는다. Hosted provider는 explicit opt-in 없이는 코드 경로가 활성화되지 않는다.
 - SQLite local storage는 concurrent read와 explicit sync write를 안전하게 처리하도록 WAL, busy timeout, single-writer queue, migration lock, shadow publish 같은 운영 규칙을 갖는다.
 - Search quality gate는 exact lookup, keyword/body/comment/wiki query, CJK/mixed query, negative query, `get` round-trip을 class별로 평가한다.
+
+## Grilled Lock Decisions
+
+이 섹션은 더 물어볼 필요 없이 implementation planning에서 그대로 쓰는 결정이다.
+
+1. Token source default는 `github_cli`다. 단, profile에는 source reference가 명시되어야 하며 runtime fallback은 금지한다. Silent fallback은 wrong-account/wrong-repo indexing 위험이 크다.
+2. Initial eval corpus는 synthetic fixture repo로 시작한다. 실제 private repo 익명화 corpus는 user validation용 보조 자료이며 release gate가 아니다. Synthetic fixture는 issue body, comment-only answer, wiki page/section, exact lookup, CJK/mixed, negative query를 모두 포함하고 gold `source_id`를 repo 안에 둔다.
+3. CJK baseline은 FTS5 trigram + 1~2자 LIKE fallback이다. 형태소 tokenizer(예: Korean analyzer)는 CJK/mixed top-5 target 미달 또는 false-positive 분석에서 trigram 한계가 확인될 때 optional tier로 올린다.
+4. Full reconciliation은 hidden background work가 아니다. MVP는 explicit CLI sync product이므로 full reconciliation도 explicit/manual command로 시작한다. `status`는 마지막 full reconciliation 시각, stale warning, estimated API cost class를 보여준다.
+5. Wiki status vocabulary는 `ok`, `disabled`, `empty`, `auth_error`, `not_found`, `clone_error`, `too_large_warning`으로 고정한다. `disabled`는 repo metadata가 wiki off임을 확인한 경우에만 쓰고, clone 401/403은 `auth_error`, clone 404/ambiguous failure는 `not_found` 또는 `clone_error`로 구분한다.
+6. Server productization은 MVP 후 gate다. 최소 조건은 local MVP에서 search quality gate 통과, 3~5명 user validation에서 repeated workflow 가치 확인, shared index/ACL 요구가 local duplicate-index 비용보다 큰 evidence 확보, GitHub App/token 운영 모델 정의다.
+7. GitHub native search 대비 positioning은 privacy가 아니라 coverage/comments/Wiki, local repeat query, offline/local operation, deterministic `query -> get -> cite`다. Privacy는 third-party hosted RAG/embedding 대비 차별점으로만 주장한다.
+8. Snippet-only 억제는 protocol hard guarantee가 아니다. Schema, docs, eval, MCP prompt contract로 유도하되 final citation correctness gate는 `get` round-trip이다.
 
 ## Testing Decisions
 
@@ -121,6 +140,7 @@ MVP의 기본 검색 경로는 BM25-only로 완성한다. Vector/hybrid search, 
 - BM25 fallback tests는 vector extension, local model cache, GPU/runtime이 없는 환경에서도 `sync`, BM25 `query`, `get`, `status`가 통과하는지 검증한다.
 - Performance tests는 warm local DB에서 10k sources 또는 50k chunks 기준 BM25 p95 query latency를 측정하고 cold-start latency를 별도로 기록한다.
 - Prior art는 기존 source truth의 qmd evidence에서 온다: source identity vs locator 분리, query-result round-trip, strict schema, BM25-first graceful degradation, MCP stdout cleanliness, local DB migration safety, privacy no-egress.
+- External contract tests should pin assumptions from primary docs: GitHub issue/comment REST pagination and `since`, GitHub REST rate-limit/retry behavior, GitHub Wiki git clone behavior, MCP tool schemas/annotations, and SQLite FTS5 trigram behavior.
 
 ## Out of Scope
 
@@ -145,4 +165,16 @@ MVP의 기본 검색 경로는 BM25-only로 완성한다. Vector/hybrid search, 
 - Search result success means `get` round-trip success. A result that cannot retrieve authoritative source content is not successful.
 - Privacy positioning must stay precise: local-first privacy is a differentiator against third-party hosted RAG/embedding tools, not against GitHub native search where content already lives in GitHub.
 - GitHub native semantic/hybrid issue search changes the positioning. qgh should emphasize comments/Wiki coverage, rate-limit-free local query, offline/local behavior, deterministic citation, and read-only MCP workflow.
-- Open decisions for implementation planning: token source priority, curated eval corpus and label owner, CJK tokenizer fallback threshold, full reconciliation default cadence, Wiki disabled/empty/auth status wording, post-MVP vector runtime, and server-product gate after MVP.
+- No open product decisions remain for MVP planning. Remaining uncertainty is validation work: real token/wiki behavior, actual CJK quality on fixture/eval corpus, and post-MVP vector/server gates.
+
+## Validated External References
+
+Checked 2026-06-27 while grilling this PRD. These are product-contract inputs, not implementation shortcuts.
+
+- GitHub issue search GA positioning: https://github.blog/changelog/2026-04-02-improved-search-for-github-issues-is-now-generally-available/
+- GitHub REST issues: https://docs.github.com/en/rest/issues/issues
+- GitHub REST issue comments: https://docs.github.com/en/rest/issues/comments
+- GitHub REST search/rate limits/best practices: https://docs.github.com/en/rest/search/search, https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api, https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api
+- GitHub Wiki git workflow: https://docs.github.com/en/communities/documenting-your-project-with-wikis/adding-or-editing-wiki-pages
+- MCP tools/schema: https://modelcontextprotocol.io/specification/2025-11-25/server/tools, https://modelcontextprotocol.io/specification/2025-11-25/schema
+- SQLite FTS5 trigram/unicode tokenizers: https://www.sqlite.org/fts5.html
