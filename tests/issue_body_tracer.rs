@@ -93,6 +93,50 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
         "pull_request items from the Issues endpoint must not be indexed"
     );
 
+    let issue_url_lookup =
+        fixture.qgh(["query", "https://github.com/owner/repo/issues/42", "--json"]);
+    assert_success(&issue_url_lookup);
+    assert_eq!(
+        stdout_json(&issue_url_lookup)["data"]["results"][0]["source_id"],
+        source_id
+    );
+
+    let number_lookup = fixture.qgh(["query", "#42", "--repo", "owner/repo", "--json"]);
+    assert_success(&number_lookup);
+    assert_eq!(
+        stdout_json(&number_lookup)["data"]["results"][0]["source_id"],
+        source_id
+    );
+
+    let filtered_issue = fixture.qgh([
+        "query",
+        "BM25 tracer",
+        "--repo",
+        "owner/repo",
+        "--label",
+        "bug",
+        "--state",
+        "open",
+        "--author",
+        "bob",
+        "--json",
+    ]);
+    assert_success(&filtered_issue);
+    assert_eq!(
+        stdout_json(&filtered_issue)["data"]["results"][0]["source_id"],
+        source_id
+    );
+
+    let narrowed_out = fixture.qgh(["query", "BM25 tracer", "--label", "missing", "--json"]);
+    assert_success(&narrowed_out);
+    assert_eq!(
+        stdout_json(&narrowed_out)["data"]["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
     let get = fixture.qgh(["get", source_id, "--json"]);
     assert_success(&get);
     let get_json = stdout_json(&get);
@@ -147,6 +191,32 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
         .unwrap()
         .contains("comment-only mitigation"));
 
+    let comment_url_lookup = fixture.qgh([
+        "query",
+        "https://github.com/owner/repo/issues/42#issuecomment-5001",
+        "--json",
+    ]);
+    assert_success(&comment_url_lookup);
+    assert_eq!(
+        stdout_json(&comment_url_lookup)["data"]["results"][0]["source_id"],
+        comment_source_id
+    );
+
+    let filtered_comment = fixture.qgh([
+        "query",
+        "comment-only mitigation",
+        "--repo",
+        "owner/repo",
+        "--author",
+        "carol",
+        "--json",
+    ]);
+    assert_success(&filtered_comment);
+    assert_eq!(
+        stdout_json(&filtered_comment)["data"]["results"][0]["source_id"],
+        comment_source_id
+    );
+
     let comment_get = fixture.qgh(["get", comment_source_id, "--json"]);
     assert_success(&comment_get);
     let comment_get_json = stdout_json(&comment_get);
@@ -175,6 +245,40 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     let second_sync = fixture.qgh(["sync", "--json"]);
     assert_success(&second_sync);
     fixture.assert_sqlite_comment_metadata(1);
+}
+
+#[test]
+fn query_filter_errors_are_versioned_json_envelopes() {
+    let fixture = TestFixture::new("filter-errors");
+    fixture.write_config("http://127.0.0.1:1");
+
+    let invalid_state = fixture.qgh(["query", "anything", "--state", "merged", "--json"]);
+    assert_eq!(invalid_state.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&invalid_state)["error"]["code"],
+        "validation.invalid_state"
+    );
+
+    let malformed_repo = fixture.qgh(["query", "anything", "--repo", "owner", "--json"]);
+    assert_eq!(malformed_repo.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&malformed_repo)["error"]["code"],
+        "validation.invalid_repo"
+    );
+
+    let wiki_filter = fixture.qgh(["query", "anything", "--wiki", "Home", "--json"]);
+    assert_eq!(wiki_filter.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&wiki_filter)["error"]["code"],
+        "validation.unsupported_filter"
+    );
+
+    let unknown_flag = fixture.qgh(["query", "anything", "--bogus", "--json"]);
+    assert_eq!(unknown_flag.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&unknown_flag)["error"]["code"],
+        "validation.cli"
+    );
 }
 
 #[test]

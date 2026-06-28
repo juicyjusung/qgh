@@ -5,7 +5,14 @@ use crate::output::{print_error, print_success};
 use clap::Parser;
 
 pub async fn run_from_env() -> i32 {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let qgh_error = QghError::validation("validation.cli", error.to_string());
+            print_error(&qgh_error, std::env::args().any(|arg| arg == "--json"));
+            return qgh_error.exit_code;
+        }
+    };
     let wants_json = cli.wants_json();
     match run(cli).await {
         Ok(data) => {
@@ -27,9 +34,8 @@ async fn run(cli: Cli) -> Result<serde_json::Value, QghError> {
 
     match cli.command {
         crate::cli::Command::Sync { .. } => commands::sync(&profile_id).await,
-        crate::cli::Command::Query { query, limit, .. }
-        | crate::cli::Command::Search { query, limit, .. } => {
-            commands::query(&profile_id, &query, limit)
+        crate::cli::Command::Query(args) | crate::cli::Command::Search(args) => {
+            commands::query(&profile_id, args)
         }
         crate::cli::Command::Get { source_id, .. } => commands::get(&profile_id, &source_id),
         crate::cli::Command::Status { .. } => commands::status(&profile_id),

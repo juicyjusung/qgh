@@ -355,6 +355,83 @@ impl Store {
         Ok(None)
     }
 
+    pub fn find_issue_by_canonical_url(
+        &self,
+        canonical_url: &str,
+    ) -> Result<Option<StoredIssue>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT im.source_id, im.repo, im.issue_number, im.title, im.body, im.state,
+                        im.labels_json, im.author, im.canonical_url,
+                        sv.body_hash, sv.github_updated_at, sv.indexed_at, sv.sync_run_id, sv.lifecycle_state
+                 FROM issue_metadata im
+                 JOIN source_entities se ON se.source_id = im.source_id
+                 JOIN source_versions sv ON sv.id = im.latest_version_id
+                 WHERE im.canonical_url = ?1 AND se.lifecycle_state = 'active'",
+                params![canonical_url],
+                stored_issue_from_row,
+            )
+            .optional()
+            .map_err(QghError::from)
+    }
+
+    pub fn find_comment_by_canonical_url(
+        &self,
+        canonical_url: &str,
+    ) -> Result<Option<StoredComment>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT cm.source_id, cm.repo, cm.issue_number, cm.body, cm.author,
+                        cm.canonical_url, cm.parent_issue_source_id, cm.parent_issue_title,
+                        cm.parent_issue_canonical_url, sv.body_hash, sv.github_updated_at, sv.indexed_at,
+                        sv.sync_run_id, sv.lifecycle_state
+                 FROM comment_metadata cm
+                 JOIN source_entities se ON se.source_id = cm.source_id
+                 JOIN source_versions sv ON sv.id = cm.latest_version_id
+                 WHERE cm.canonical_url = ?1 AND se.lifecycle_state = 'active'",
+                params![canonical_url],
+                stored_comment_from_row,
+            )
+            .optional()
+            .map_err(QghError::from)
+    }
+
+    pub fn find_issue_by_repo_number(
+        &self,
+        repo: &str,
+        issue_number: i64,
+    ) -> Result<Option<StoredIssue>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT im.source_id, im.repo, im.issue_number, im.title, im.body, im.state,
+                        im.labels_json, im.author, im.canonical_url,
+                        sv.body_hash, sv.github_updated_at, sv.indexed_at, sv.sync_run_id, sv.lifecycle_state
+                 FROM issue_metadata im
+                 JOIN source_entities se ON se.source_id = im.source_id
+                 JOIN source_versions sv ON sv.id = im.latest_version_id
+                 WHERE im.repo = ?1 AND im.issue_number = ?2 AND se.lifecycle_state = 'active'",
+                params![repo, issue_number],
+                stored_issue_from_row,
+            )
+            .optional()
+            .map_err(QghError::from)
+    }
+
+    pub fn find_issues_by_number(&self, issue_number: i64) -> Result<Vec<StoredIssue>, QghError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT im.source_id, im.repo, im.issue_number, im.title, im.body, im.state,
+                    im.labels_json, im.author, im.canonical_url,
+                    sv.body_hash, sv.github_updated_at, sv.indexed_at, sv.sync_run_id, sv.lifecycle_state
+             FROM issue_metadata im
+             JOIN source_entities se ON se.source_id = im.source_id
+             JOIN source_versions sv ON sv.id = im.latest_version_id
+             WHERE im.issue_number = ?1 AND se.lifecycle_state = 'active'
+             ORDER BY im.repo",
+        )?;
+        let rows = stmt.query_map(params![issue_number], stored_issue_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
+    }
+
     pub fn sync_cursors(&self) -> Result<Vec<StoredCursor>, QghError> {
         let mut stmt = self
             .conn
