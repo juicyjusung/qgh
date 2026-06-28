@@ -5,6 +5,7 @@ mod config;
 mod error;
 mod github;
 mod index;
+mod mcp;
 mod model;
 mod output;
 mod paths;

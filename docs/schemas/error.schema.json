@@ -36,6 +36,7 @@
         "validation.invalid_query",
         "validation.invalid_repo",
         "validation.invalid_state",
+        "validation.mcp",
         "validation.unsupported_filter",
         "validation.unsupported_source_type",
         "validation.ambiguous_locator",
