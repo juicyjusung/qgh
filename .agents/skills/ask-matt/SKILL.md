@@ -37,6 +37,8 @@ A starting situation that generates work, then merges onto the main flow.
 
   Triage is only for issues **you didn't create** — bug reports, incoming feature requests, anything that arrives raw. Issues that `/to-issues` produced are already agent-ready, so **don't triage them**.
 
+- **Issue/worktree coordination** → **`/orchestrating-qgh-worktrees`**. Use when choosing next qgh issue work, excluding active worktrees, finding safe parallel batches, starting issue worktrees, or checking completed issue lanes before merging back into the main flow.
+
 ## Codebase health
 
 Not feature work — upkeep.

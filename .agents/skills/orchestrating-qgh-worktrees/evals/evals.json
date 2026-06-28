@@ -1,0 +1,29 @@
+{
+  "skill_name": "orchestrating-qgh-worktrees",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "지금 qgh에서 구현 중인 worktree들은 빼고, 병렬로 안전하게 시작할 수 있는 이슈들 골라줘.",
+      "expected_output": "The agent should inventory git state, git worktrees, GitHub open issues, and #18/#19 before recommending work. It should exclude active lanes and #18/#19, classify ready vs blocked vs needs-grill vs merge-risk, and end with an issue update line.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "#5랑 #6 동시에 worktree 파서 돌려도 되는지 qgh 기준으로 봐줘.",
+      "expected_output": "The agent should inspect both issues, their comments and blockers, current worktrees, and qgh contract overlap. It should only recommend parallel work if D2 decisions and upstream dependencies are resolved and file/contract overlap is low.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "#9 worktree 만들어줘. 구현은 아직 하지 말고 worktree만.",
+      "expected_output": "The agent should use the using-git-worktrees flow, check existing issue branches/worktrees and #9 readiness, create or report the isolated lane without implementation, and report branch, path, base commit, and baseline verification status.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "#13 완료됐다는데 검수하고 필요한 issue 업데이트까지 해줘.",
+      "expected_output": "The agent should inspect the issue, branch/worktree state, diffs, tests, qgh guardrails, and dependent blockers before reporting completion. It should update #13 only when verified project truth changed and include Updated #13 or Issue update not needed.",
+      "files": []
+    }
+  ]
+}
