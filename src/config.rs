@@ -13,6 +13,7 @@ pub struct Profile {
     pub web_base_url: String,
     pub repos: Vec<RepoRef>,
     pub reconcile_after_days: Option<i64>,
+    pub max_in_flight_requests: usize,
     pub token_source: TokenSource,
     pub paths: ProfilePaths,
 }
@@ -53,6 +54,8 @@ struct RawProfile {
     repos: Vec<String>,
     #[serde(default)]
     reconcile_after_days: Option<i64>,
+    #[serde(default)]
+    max_in_flight_requests: Option<usize>,
     token_source: TokenSource,
 }
 
@@ -83,6 +86,12 @@ pub fn load_profile(profile_id: &str) -> Result<Profile, QghError> {
             "Profile reconcile_after_days must not be negative.",
         ));
     }
+    let max_in_flight_requests = raw.max_in_flight_requests.unwrap_or(4);
+    if !(1..=16).contains(&max_in_flight_requests) {
+        return Err(QghError::config(
+            "Profile max_in_flight_requests must be between 1 and 16.",
+        ));
+    }
     let repos = raw
         .repos
         .iter()
@@ -96,6 +105,7 @@ pub fn load_profile(profile_id: &str) -> Result<Profile, QghError> {
         web_base_url: raw.web_base_url.trim_end_matches('/').to_string(),
         repos,
         reconcile_after_days: raw.reconcile_after_days,
+        max_in_flight_requests,
         token_source: raw.token_source.clone(),
         paths,
     })

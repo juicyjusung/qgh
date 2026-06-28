@@ -1,8 +1,9 @@
 use crate::error::QghError;
 use crate::model::{
-    CommentRecord, CursorUpdate, CursorView, IndexSource, IssueRecord, ParentIssueView,
-    ReconciliationCandidate, ReconciliationRunView, SourceVersionView, StatusSnapshot,
-    StoredComment, StoredCursor, StoredIssue, StoredSource, SyncSummary, TombstoneView,
+    BackoffView, CommentRecord, CursorUpdate, CursorView, IndexSource, IssueRecord,
+    ParentIssueView, ReconciliationCandidate, ReconciliationRunView, SourceVersionView,
+    StatusSnapshot, StoredComment, StoredCursor, StoredIssue, StoredSource, SyncSummary,
+    TombstoneView,
 };
 use crate::paths::ProfilePaths;
 use crate::time::{now_rfc3339, now_run_id_suffix};
@@ -613,6 +614,57 @@ impl Store {
         Ok(())
     }
 
+    pub fn record_backoff_state(
+        &self,
+        reason: &str,
+        scope: &str,
+        retry_after_seconds: i64,
+        reset_at: Option<&str>,
+    ) -> Result<BackoffView, QghError> {
+        let observed_at = now_rfc3339();
+        let last_successful_sync: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT completed_at FROM sync_runs ORDER BY completed_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        self.conn.execute(
+            "INSERT INTO sync_backoff_state
+                (id, reason, scope, retry_after_seconds, reset_at, observed_at, last_successful_sync)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                reason = excluded.reason,
+                scope = excluded.scope,
+                retry_after_seconds = excluded.retry_after_seconds,
+                reset_at = excluded.reset_at,
+                observed_at = excluded.observed_at,
+                last_successful_sync = excluded.last_successful_sync",
+            params![
+                reason,
+                scope,
+                retry_after_seconds,
+                reset_at,
+                observed_at,
+                last_successful_sync
+            ],
+        )?;
+        Ok(BackoffView {
+            reason: reason.to_string(),
+            scope: scope.to_string(),
+            retry_after_seconds,
+            reset_at: reset_at.map(ToString::to_string),
+            observed_at,
+            last_successful_sync,
+        })
+    }
+
+    pub fn clear_backoff_state(&self) -> Result<(), QghError> {
+        self.conn.execute("DELETE FROM sync_backoff_state", [])?;
+        Ok(())
+    }
+
     pub fn next_index_generation(&self) -> Result<i64, QghError> {
         let current: Option<i64> = self
             .conn
@@ -678,6 +730,25 @@ impl Store {
                 },
             )
             .optional()?;
+        let backoff = self
+            .conn
+            .query_row(
+                "SELECT reason, scope, retry_after_seconds, reset_at, observed_at, last_successful_sync
+                 FROM sync_backoff_state
+                 WHERE id = 1",
+                [],
+                |row| {
+                    Ok(BackoffView {
+                        reason: row.get(0)?,
+                        scope: row.get(1)?,
+                        retry_after_seconds: row.get(2)?,
+                        reset_at: row.get(3)?,
+                        observed_at: row.get(4)?,
+                        last_successful_sync: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
         Ok(StatusSnapshot {
             issue_count,
             comment_count,
@@ -686,6 +757,7 @@ impl Store {
             dirty_task_count,
             last_sync_at,
             last_reconciliation,
+            backoff,
             cursors: self.cursor_views()?,
         })
     }
@@ -795,6 +867,16 @@ impl Store {
                 endpoint TEXT PRIMARY KEY,
                 cursor TEXT,
                 etag TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_backoff_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                reason TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                retry_after_seconds INTEGER NOT NULL,
+                reset_at TEXT,
+                observed_at TEXT NOT NULL,
+                last_successful_sync TEXT
             );
 
             CREATE TABLE IF NOT EXISTS tombstones (
