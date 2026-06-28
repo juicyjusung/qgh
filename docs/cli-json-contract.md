@@ -1,5 +1,42 @@
 # CLI JSON Contract
 
+## Envelope
+
+Machine-readable CLI output uses one versioned `qgh.v1` envelope on stdout.
+Diagnostics and human-readable failures go to stderr.
+
+Success:
+
+- `schema_version`: `qgh.v1`
+- `ok`: `true`
+- `data`: command-specific payload
+- `warnings`: array
+- `meta`: object
+
+Failure:
+
+- `schema_version`: `qgh.v1`
+- `ok`: `false`
+- `error`: structured error object
+- `warnings`: array
+- `meta`: object
+
+Released schema snapshots:
+
+- `docs/schemas/envelope.schema.json`: common success/error envelope.
+- `docs/schemas/error.schema.json`: stable error taxonomy and exit-code classes.
+- `docs/schemas/query-result.schema.json`: `query`/`search` data payload.
+- `docs/schemas/sync-output.schema.json`: `sync` data payload.
+- `docs/schemas/get-output.schema.json`: `get` data payload.
+- `docs/schemas/status-output.schema.json`: `status` data payload.
+- `docs/schemas/doctor-output.schema.json`: CLI-only `doctor` data payload.
+
+MCP uses the same envelope in structured tool content. Tool-level validation
+failures set `isError: true`; JSON-RPC protocol errors are reserved for malformed
+protocol messages or server faults.
+
+No-result query responses are successful envelopes with `data.results: []`.
+
 ## Query Results
 
 `query` and `search` return source candidates, not answers. Each result identifies a GitHub Issue or issue comment that can be fetched through `get`.

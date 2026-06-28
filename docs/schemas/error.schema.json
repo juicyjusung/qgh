@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/error.schema.json",
+  "title": "qgh structured error",
+  "type": "object",
+  "required": ["code", "message", "details", "hint", "retryable", "exit_code"],
+  "properties": {
+    "code": {
+      "$ref": "#/$defs/error_code"
+    },
+    "message": {
+      "type": "string"
+    },
+    "details": {
+      "type": "object"
+    },
+    "hint": {
+      "type": ["string", "null"]
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "exit_code": {
+      "type": "integer",
+      "enum": [2, 3, 4, 5, 6, 70]
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "error_code": {
+      "type": "string",
+      "enum": [
+        "config.invalid",
+        "config.missing_profile",
+        "validation.cli",
+        "validation.invalid_query",
+        "validation.invalid_repo",
+        "validation.invalid_state",
+        "validation.unsupported_filter",
+        "validation.unsupported_source_type",
+        "validation.ambiguous_locator",
+        "auth.token_unavailable",
+        "github.request_failed",
+        "source.not_found",
+        "source.tombstoned",
+        "storage.failure",
+        "index.failure",
+        "internal.failure"
+      ]
+    }
+  }
+}

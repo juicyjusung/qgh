@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/status-output.schema.json",
+  "title": "qgh status data",
+  "type": "object",
+  "required": [
+    "profile_id",
+    "github",
+    "paths",
+    "sources",
+    "database",
+    "index",
+    "sync",
+    "reconciliation",
+    "privacy"
+  ],
+  "properties": {
+    "profile_id": {
+      "type": "string"
+    },
+    "github": {
+      "type": "object"
+    },
+    "paths": {
+      "type": "object"
+    },
+    "sources": {
+      "type": "object"
+    },
+    "database": {
+      "type": "object"
+    },
+    "index": {
+      "type": "object"
+    },
+    "sync": {
+      "type": "object"
+    },
+    "reconciliation": {
+      "type": "object"
+    },
+    "privacy": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": false
+}

@@ -680,6 +680,68 @@ fn privacy_docs_describe_sensitive_derivative_data_paths() {
 }
 
 #[test]
+fn schema_snapshots_define_envelope_outputs_and_error_taxonomy() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema_dir = root.join("docs/schemas");
+    for file in [
+        "envelope.schema.json",
+        "error.schema.json",
+        "query-result.schema.json",
+        "sync-output.schema.json",
+        "get-output.schema.json",
+        "status-output.schema.json",
+        "doctor-output.schema.json",
+    ] {
+        let text = fs::read_to_string(schema_dir.join(file)).unwrap();
+        let json: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["$schema"],
+            "https://json-schema.org/draft/2020-12/schema"
+        );
+    }
+
+    let envelope: Value =
+        serde_json::from_str(&fs::read_to_string(schema_dir.join("envelope.schema.json")).unwrap())
+            .unwrap();
+    let required = envelope["required"].as_array().unwrap();
+    for field in ["schema_version", "ok", "warnings", "meta"] {
+        assert!(required.iter().any(|value| value == field));
+    }
+
+    let error_schema: Value =
+        serde_json::from_str(&fs::read_to_string(schema_dir.join("error.schema.json")).unwrap())
+            .unwrap();
+    let codes = error_schema["$defs"]["error_code"]["enum"]
+        .as_array()
+        .unwrap();
+    for code in [
+        "config.invalid",
+        "validation.cli",
+        "auth.token_unavailable",
+        "github.request_failed",
+        "source.not_found",
+        "source.tombstoned",
+        "storage.failure",
+        "index.failure",
+    ] {
+        assert!(
+            codes.iter().any(|value| value == code),
+            "missing error code {code}"
+        );
+    }
+
+    let docs = fs::read_to_string(root.join("docs/error-codes.md")).unwrap();
+    assert!(docs.contains("No-result query responses are successful"));
+    assert!(docs.contains("validation.cli"));
+    assert!(docs.contains("source.tombstoned"));
+
+    let cli_contract = fs::read_to_string(root.join("docs/cli-json-contract.md")).unwrap();
+    assert!(cli_contract.contains("qgh.v1"));
+    assert!(cli_contract.contains("docs/schemas/envelope.schema.json"));
+    assert!(cli_contract.contains("docs/schemas/error.schema.json"));
+}
+
+#[test]
 fn query_filter_errors_are_versioned_json_envelopes() {
     let fixture = TestFixture::new("filter-errors");
     fixture.write_config("http://127.0.0.1:1");
@@ -711,6 +773,18 @@ fn query_filter_errors_are_versioned_json_envelopes() {
         stdout_json(&unknown_flag)["error"]["code"],
         "validation.cli"
     );
+
+    let invalid_reconcile = fixture.qgh(["sync", "--reconcile", "bogus", "--json"]);
+    assert_eq!(invalid_reconcile.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&invalid_reconcile)["error"]["code"],
+        "validation.cli"
+    );
+
+    let human_invalid_state = fixture.qgh(["query", "anything", "--state", "merged"]);
+    assert_eq!(human_invalid_state.status.code(), Some(2));
+    assert!(stdout_text(&human_invalid_state).is_empty());
+    assert!(stderr_text(&human_invalid_state).contains("validation.invalid_state"));
 }
 
 #[test]
