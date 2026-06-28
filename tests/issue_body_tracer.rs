@@ -5,7 +5,7 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
@@ -666,6 +666,235 @@ fn doctor_runs_explicit_checks_and_reports_cli_only_scope() {
 }
 
 #[test]
+fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
+    let fixture = TestFixture::new("mcp-tools");
+    fixture.write_config("http://127.0.0.1:1");
+
+    let output = fixture.mcp([
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "qgh-test",
+                    "version": "0"
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {
+                    "query": "anything",
+                    "bogus": true
+                }
+            }
+        }),
+    ]);
+    assert_success(&output);
+    assert!(stderr_text(&output).is_empty());
+    let messages = stdout_json_lines(&output);
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["id"], 1);
+    assert_eq!(messages[0]["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(
+        messages[0]["result"]["capabilities"]["tools"]["listChanged"],
+        false
+    );
+
+    let tools = messages[1]["result"]["tools"].as_array().unwrap();
+    let names = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["query", "get", "status"]);
+    for forbidden in [
+        "sync", "doctor", "eval", "write", "embed", "delete", "update",
+    ] {
+        assert!(!names.contains(&forbidden));
+    }
+    for tool in tools {
+        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        assert_eq!(tool["inputSchema"]["type"], "object");
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        assert_eq!(tool["outputSchema"]["type"], "object");
+        assert!(tool["outputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("schema_version")));
+    }
+
+    let validation = &messages[2]["result"];
+    assert_eq!(validation["isError"], true);
+    assert_eq!(
+        validation["structuredContent"]["error"]["code"],
+        "validation.mcp"
+    );
+    assert_eq!(validation["structuredContent"]["schema_version"], "qgh.v1");
+    assert!(validation["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("validation.mcp"));
+}
+
+#[test]
+fn mcp_query_get_status_round_trips_issue_and_comment_sources() {
+    let fixture = TestFixture::new("mcp-workflow");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let issue_source_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    let comment_source_id = "qgh://github.com/issue-comment/IC_kwDOCOMMENT1";
+    let output = fixture.mcp([
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "qgh-test",
+                    "version": "0"
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {
+                    "query": "BM25 issue body tracer",
+                    "limit": 10
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "get",
+                "arguments": {
+                    "source_id": issue_source_id
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {
+                    "query": "comment-only mitigation",
+                    "limit": 10
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "get",
+                "arguments": {
+                    "source_id": comment_source_id
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {}
+            }
+        }),
+    ]);
+    assert_success(&output);
+    assert!(stderr_text(&output).is_empty());
+    let messages = stdout_json_lines(&output);
+    assert_eq!(messages.len(), 6);
+    for message in &messages {
+        assert!(
+            message.get("error").is_none(),
+            "unexpected MCP error: {message}"
+        );
+    }
+
+    let issue_query = &messages[1]["result"]["structuredContent"];
+    assert_eq!(issue_query["ok"], true);
+    assert_eq!(
+        issue_query["data"]["results"][0]["source_id"],
+        issue_source_id
+    );
+    assert!(messages[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains(issue_source_id));
+
+    let issue_get = &messages[2]["result"]["structuredContent"];
+    assert_eq!(issue_get["ok"], true);
+    assert_eq!(issue_get["data"]["source"]["source_id"], issue_source_id);
+    assert!(issue_get["data"]["source"]["body"]
+        .as_str()
+        .unwrap()
+        .contains("BM25 issue body tracer"));
+
+    let comment_query = &messages[3]["result"]["structuredContent"];
+    assert_eq!(comment_query["ok"], true);
+    assert_eq!(
+        comment_query["data"]["results"][0]["source_id"],
+        comment_source_id
+    );
+
+    let comment_get = &messages[4]["result"]["structuredContent"];
+    assert_eq!(comment_get["ok"], true);
+    assert_eq!(
+        comment_get["data"]["source"]["source_id"],
+        comment_source_id
+    );
+    assert_eq!(
+        comment_get["data"]["source"]["canonical_url"],
+        "https://github.com/owner/repo/issues/42#issuecomment-5001"
+    );
+    assert!(comment_get["data"]["source"]["body"]
+        .as_str()
+        .unwrap()
+        .contains("comment-only mitigation"));
+
+    let status = &messages[5]["result"]["structuredContent"];
+    assert_eq!(status["ok"], true);
+    assert_eq!(status["data"]["profile_id"], "work");
+    assert_eq!(status["data"]["sources"]["issue_count"], 1);
+    assert_eq!(status["data"]["sources"]["comment_count"], 1);
+}
+
+#[test]
 fn privacy_docs_describe_sensitive_derivative_data_paths() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let docs = fs::read_to_string(root.join("docs/privacy.md")).unwrap();
@@ -717,6 +946,7 @@ fn schema_snapshots_define_envelope_outputs_and_error_taxonomy() {
     for code in [
         "config.invalid",
         "validation.cli",
+        "validation.mcp",
         "auth.token_unavailable",
         "github.request_failed",
         "source.not_found",
@@ -1068,6 +1298,22 @@ env = "QGH_TEST_TOKEN"
         let mut cmd = self.base_command();
         cmd.args(args);
         cmd.output().unwrap()
+    }
+
+    fn mcp<const N: usize>(&self, messages: [Value; N]) -> Output {
+        let mut cmd = self.base_command();
+        cmd.args(["--profile", "work", "mcp"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        {
+            let stdin = child.stdin.as_mut().unwrap();
+            for message in messages {
+                writeln!(stdin, "{}", serde_json::to_string(&message).unwrap()).unwrap();
+            }
+        }
+        child.wait_with_output().unwrap()
     }
 
     fn base_command(&self) -> Command {
@@ -1594,6 +1840,21 @@ fn stdout_json(output: &Output) -> Value {
             stderr_text(output)
         )
     })
+}
+
+fn stdout_json_lines(output: &Output) -> Vec<Value> {
+    stdout_text(output)
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!(
+                    "stdout line was not JSON: {error}\nline:\n{line}\nstdout:\n{}\nstderr:\n{}",
+                    stdout_text(output),
+                    stderr_text(output)
+                )
+            })
+        })
+        .collect()
 }
 
 fn stdout_text(output: &Output) -> String {

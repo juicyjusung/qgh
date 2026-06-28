@@ -17,6 +17,7 @@ impl Cli {
             Command::Status { json } | Command::Doctor { json } => *json,
             Command::Query(args) | Command::Search(args) => args.json,
             Command::Get { json, .. } => *json,
+            Command::Mcp => false,
         }
     }
 }
@@ -39,6 +40,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    Mcp,
 }
 
 #[derive(Debug, Clone, Args)]

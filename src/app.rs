@@ -1,6 +1,7 @@
 use crate::cli::Cli;
 use crate::commands;
 use crate::error::QghError;
+use crate::mcp;
 use crate::output::{print_error, print_success};
 use clap::Parser;
 
@@ -13,6 +14,9 @@ pub async fn run_from_env() -> i32 {
             return qgh_error.exit_code;
         }
     };
+    if matches!(cli.command, crate::cli::Command::Mcp) {
+        return run_mcp(cli).await;
+    }
     let wants_json = cli.wants_json();
     match run(cli).await {
         Ok(data) => {
@@ -22,6 +26,22 @@ pub async fn run_from_env() -> i32 {
         Err(error) => {
             let exit_code = error.exit_code;
             print_error(&error, wants_json);
+            exit_code
+        }
+    }
+}
+
+async fn run_mcp(cli: Cli) -> i32 {
+    let Some(profile_id) = cli.profile else {
+        let error = QghError::missing_profile();
+        print_error(&error, false);
+        return error.exit_code;
+    };
+    match mcp::run_stdio(&profile_id).await {
+        Ok(()) => 0,
+        Err(error) => {
+            let exit_code = error.exit_code;
+            print_error(&error, false);
             exit_code
         }
     }
@@ -40,5 +60,6 @@ async fn run(cli: Cli) -> Result<serde_json::Value, QghError> {
         crate::cli::Command::Get { source_id, .. } => commands::get(&profile_id, &source_id).await,
         crate::cli::Command::Status { .. } => commands::status(&profile_id),
         crate::cli::Command::Doctor { .. } => commands::doctor(&profile_id).await,
+        crate::cli::Command::Mcp => unreachable!("MCP is handled before normal CLI output"),
     }
 }

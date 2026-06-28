@@ -368,6 +368,33 @@ pub async fn get(profile_id: &str, source_id: &str) -> Result<Value, QghError> {
     }))
 }
 
+pub fn get_local(profile_id: &str, source_id: &str) -> Result<Value, QghError> {
+    let profile = load_profile(profile_id)?;
+    let store = Store::open(&profile.paths)?;
+    if let Some(tombstone) = store.get_tombstone(source_id)? {
+        return Err(QghError::source_tombstoned(
+            &tombstone.source_id,
+            &tombstone.reason,
+            &tombstone.observed_at,
+        ));
+    }
+    let Some(source) = store.get_source(source_id)? else {
+        return Err(QghError::source_not_found(source_id));
+    };
+    let mut source_json = match source {
+        StoredSource::Issue(issue) => issue_source(issue),
+        StoredSource::Comment(comment) => comment_source(comment),
+    };
+    source_json["lifecycle_check"] = json!({
+        "status": "not_checked",
+        "reason": "mcp_read_only"
+    });
+    Ok(json!({
+        "profile_id": profile.id,
+        "source": source_json
+    }))
+}
+
 pub fn status(profile_id: &str) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
     let store = Store::open(&profile.paths)?;
