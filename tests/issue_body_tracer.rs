@@ -53,11 +53,21 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     let source_id = "qgh://github.com/issue/I_kwDOISSUE1";
     assert_eq!(result["source_id"], source_id);
     assert_eq!(result["entity_type"], "issue");
+    assert!(
+        result.get("body").is_none(),
+        "query results are source candidates; authoritative bodies must come from get"
+    );
     assert_eq!(
         result["canonical_url"],
         "https://github.com/owner/repo/issues/42"
     );
     assert_eq!(result["get_args"]["source_id"], source_id);
+    assert_eq!(result["ranking"]["kind"], "bm25");
+    assert!(result["ranking"]["lexical_score"]
+        .as_f64()
+        .is_some_and(f64::is_finite));
+    assert!(result["ranking"].get("confidence").is_none());
+    assert!(result["ranking"].get("probability").is_none());
     assert_eq!(
         result["source_version"]["github_updated_at"],
         "2026-01-02T03:04:05Z"
@@ -141,6 +151,7 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     assert_success(&get);
     let get_json = stdout_json(&get);
     let source = &get_json["data"]["source"];
+    assert_query_result_round_trips_to_get_result(result, source);
     assert_eq!(source["source_id"], source_id);
     assert_eq!(source["entity_type"], "issue");
     assert_eq!(source["repo"], "owner/repo");
@@ -166,11 +177,19 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     let comment_source_id = "qgh://github.com/issue-comment/IC_kwDOCOMMENT1";
     assert_eq!(comment_result["source_id"], comment_source_id);
     assert_eq!(comment_result["entity_type"], "issue_comment");
+    assert!(
+        comment_result.get("body").is_none(),
+        "query results are source candidates; authoritative bodies must come from get"
+    );
     assert_eq!(
         comment_result["canonical_url"],
         "https://github.com/owner/repo/issues/42#issuecomment-5001"
     );
     assert_eq!(comment_result["get_args"]["source_id"], comment_source_id);
+    assert_eq!(comment_result["ranking"]["kind"], "bm25");
+    assert!(comment_result["ranking"]["lexical_score"]
+        .as_f64()
+        .is_some_and(f64::is_finite));
     assert_eq!(
         comment_result["parent_issue"]["source_id"],
         "qgh://github.com/issue/I_kwDOISSUE1"
@@ -221,6 +240,7 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     assert_success(&comment_get);
     let comment_get_json = stdout_json(&comment_get);
     let comment_source = &comment_get_json["data"]["source"];
+    assert_query_result_round_trips_to_get_result(comment_result, comment_source);
     assert_eq!(comment_source["source_id"], comment_source_id);
     assert_eq!(comment_source["entity_type"], "issue_comment");
     assert_eq!(comment_source["repo"], "owner/repo");
@@ -245,6 +265,96 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     let second_sync = fixture.qgh(["sync", "--json"]);
     assert_success(&second_sync);
     fixture.assert_sqlite_comment_metadata(1);
+}
+
+#[test]
+fn exact_lookup_uses_typed_ranking_without_non_finite_scores() {
+    let fixture = TestFixture::new("exact-ranking");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let issue_lookup = fixture.qgh(["query", "#42", "--repo", "owner/repo", "--json"]);
+    assert_success(&issue_lookup);
+    let issue_json = stdout_json(&issue_lookup);
+    let issue_result = &issue_json["data"]["results"][0];
+    assert_eq!(issue_result["ranking"]["kind"], "exact");
+    assert!(issue_result["ranking"]["lexical_score"].is_null());
+    assert!(issue_result["ranking"].get("confidence").is_none());
+    assert!(issue_result["ranking"].get("probability").is_none());
+
+    let comment_lookup = fixture.qgh([
+        "query",
+        "https://github.com/owner/repo/issues/42#issuecomment-5001",
+        "--json",
+    ]);
+    assert_success(&comment_lookup);
+    let comment_json = stdout_json(&comment_lookup);
+    assert_eq!(
+        comment_json["data"]["results"][0]["ranking"]["kind"],
+        "exact"
+    );
+    assert!(comment_json["data"]["results"][0]["ranking"]["lexical_score"].is_null());
+}
+
+#[test]
+fn query_filters_unresolvable_index_hits_before_returning_results() {
+    let fixture = TestFixture::new("unresolvable-index-hit");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let source_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    fixture.mark_source_unavailable_without_reindex(source_id);
+
+    let query = fixture.qgh(["query", "BM25 issue body tracer", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    assert_eq!(query_json["data"]["results"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        query_json["data"]["result_filtering"]["unresolvable_hits"],
+        1
+    );
+
+    let get = fixture.qgh(["get", source_id, "--json"]);
+    assert_eq!(get.status.code(), Some(4));
+    assert_eq!(stdout_json(&get)["error"]["code"], "source.not_found");
+}
+
+#[test]
+fn citation_contract_schema_and_docs_are_issue_comment_only() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema_text =
+        fs::read_to_string(root.join("docs/schemas/query-result.schema.json")).unwrap();
+    let schema_json: Value = serde_json::from_str(&schema_text).unwrap();
+    let properties = &schema_json["$defs"]["query_result"]["properties"];
+    for key in [
+        "source_id",
+        "entity_type",
+        "canonical_url",
+        "snippet",
+        "get_args",
+        "source_version",
+        "ranking",
+    ] {
+        assert!(
+            properties.get(key).is_some(),
+            "query result schema must define {key}"
+        );
+    }
+    assert!(properties.get("body").is_none());
+    assert!(properties["snippet"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("preview, not citation evidence"));
+    assert!(!schema_text.to_ascii_lowercase().contains("wiki"));
+
+    let docs_text = fs::read_to_string(root.join("docs/cli-json-contract.md")).unwrap();
+    assert!(docs_text.contains("snippet is a preview, not citation evidence"));
+    assert!(docs_text.contains("Use the `get` response"));
+    assert!(docs_text.contains("Citation example from a `get` response"));
+    assert!(docs_text.contains("Query results intentionally omit `body`"));
+    assert!(!docs_text.to_ascii_lowercase().contains("wiki"));
 }
 
 #[test]
@@ -634,6 +744,18 @@ env = "QGH_TEST_TOKEN"
             .unwrap();
         assert_eq!(count, expected);
     }
+
+    fn mark_source_unavailable_without_reindex(&self, source_id: &str) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE source_entities SET lifecycle_state = 'unavailable' WHERE source_id = ?1",
+                [source_id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
 }
 
 impl Drop for TestFixture {
@@ -767,6 +889,14 @@ fn stdout_text(output: &Output) -> String {
 
 fn stderr_text(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn assert_query_result_round_trips_to_get_result(result: &Value, source: &Value) {
+    assert_eq!(result["get_args"]["source_id"], source["source_id"]);
+    assert_eq!(result["source_id"], source["source_id"]);
+    assert_eq!(result["entity_type"], source["entity_type"]);
+    assert_eq!(result["canonical_url"], source["canonical_url"]);
+    assert_eq!(result["source_version"], source["source_version"]);
 }
 
 struct EditingFakeGitHub {

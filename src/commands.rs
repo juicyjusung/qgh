@@ -69,22 +69,30 @@ pub fn query(profile_id: &str, args: QueryArgs) -> Result<Value, QghError> {
     if let Some(results) = exact_results(&store, &args.query, &filters)? {
         return Ok(json!({
             "profile_id": profile.id,
+            "result_filtering": {
+                "unresolvable_hits": 0
+            },
             "results": results
         }));
     }
     let hits = index::search(&profile.paths.index_active, &args.query, args.limit)?;
     let mut results = Vec::new();
+    let mut unresolvable_hits = 0;
     for hit in hits {
         let Some(source) = store.get_source(&hit.source_id)? else {
+            unresolvable_hits += 1;
             continue;
         };
         if !filters.matches(&source) {
             continue;
         }
-        results.push(source_result(source, hit.score));
+        results.push(source_result(source, Ranking::Bm25(hit.score)));
     }
     Ok(json!({
         "profile_id": profile.id,
+        "result_filtering": {
+            "unresolvable_hits": unresolvable_hits
+        },
         "results": results
     }))
 }
@@ -173,7 +181,7 @@ fn exact_results(
 ) -> Result<Option<Vec<Value>>, QghError> {
     if let Some(source) = exact_url_result(store, query_text)? {
         return Ok(Some(if filters.matches(&source) {
-            vec![source_result(source, f32::INFINITY)]
+            vec![source_result(source, Ranking::Exact)]
         } else {
             Vec::new()
         }));
@@ -201,7 +209,7 @@ fn exact_results(
             .into_iter()
             .map(StoredSource::Issue)
             .filter(|source| filters.matches(source))
-            .map(|source| source_result(source, f32::INFINITY))
+            .map(|source| source_result(source, Ranking::Exact))
             .collect(),
     ))
 }
@@ -323,23 +331,66 @@ pub fn doctor(profile_id: &str) -> Result<Value, QghError> {
     }))
 }
 
-fn source_result(source: StoredSource, score: f32) -> Value {
+enum Ranking {
+    Bm25(f32),
+    Exact,
+}
+
+fn source_result(source: StoredSource, ranking: Ranking) -> Value {
     match source {
-        StoredSource::Issue(issue) => {
-            let mut value = issue_source(issue);
-            value["snippet"] = json!(snippet(value["body"].as_str().unwrap_or_default()));
-            value["get_args"] = json!({ "source_id": value["source_id"] });
-            value["parent_issue"] = Value::Null;
-            value["ranking"] = json!({ "lexical_score": score });
-            value
-        }
-        StoredSource::Comment(comment) => {
-            let mut value = comment_source(comment);
-            value["snippet"] = json!(snippet(value["body"].as_str().unwrap_or_default()));
-            value["get_args"] = json!({ "source_id": value["source_id"] });
-            value["ranking"] = json!({ "lexical_score": score });
-            value
-        }
+        StoredSource::Issue(issue) => issue_result(issue, ranking),
+        StoredSource::Comment(comment) => comment_result(comment, ranking),
+    }
+}
+
+fn issue_result(issue: StoredIssue, ranking: Ranking) -> Value {
+    let source_id = issue.source_id;
+    json!({
+        "source_id": source_id,
+        "entity_type": "issue",
+        "repo": issue.repo,
+        "issue_number": issue.number,
+        "title": issue.title,
+        "canonical_url": issue.canonical_url,
+        "snippet": snippet(&issue.body),
+        "get_args": {
+            "source_id": source_id
+        },
+        "parent_issue": Value::Null,
+        "source_version": issue.source_version,
+        "ranking": ranking_json(ranking)
+    })
+}
+
+fn comment_result(comment: StoredComment, ranking: Ranking) -> Value {
+    let source_id = comment.source_id;
+    json!({
+        "source_id": source_id,
+        "entity_type": "issue_comment",
+        "repo": comment.repo,
+        "issue_number": comment.issue_number,
+        "author": comment.author,
+        "canonical_url": comment.canonical_url,
+        "parent_issue": comment.parent_issue,
+        "snippet": snippet(&comment.body),
+        "get_args": {
+            "source_id": source_id
+        },
+        "source_version": comment.source_version,
+        "ranking": ranking_json(ranking)
+    })
+}
+
+fn ranking_json(ranking: Ranking) -> Value {
+    match ranking {
+        Ranking::Bm25(score) => json!({
+            "kind": "bm25",
+            "lexical_score": score
+        }),
+        Ranking::Exact => json!({
+            "kind": "exact",
+            "lexical_score": Value::Null
+        }),
     }
 }
 
