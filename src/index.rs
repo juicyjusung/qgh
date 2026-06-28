@@ -1,5 +1,5 @@
 use crate::error::QghError;
-use crate::model::StoredIssue;
+use crate::model::IndexSource;
 use std::fs;
 use std::path::Path;
 use tantivy::collector::TopDocs;
@@ -16,7 +16,7 @@ pub fn rebuild(
     index_root: &Path,
     active_path: &Path,
     generation: i64,
-    issues: &[StoredIssue],
+    sources: &[IndexSource],
 ) -> Result<(), QghError> {
     fs::create_dir_all(index_root)?;
     let shadow_path = index_root.join(format!("shadow-{generation}"));
@@ -30,20 +30,21 @@ pub fn rebuild(
     let mut writer = index
         .writer(50_000_000)
         .map_err(|e| QghError::index(e.to_string()))?;
-    for issue in issues {
+    for source in sources {
         writer
             .add_document(doc!(
-                fields.source_id => issue.source_id.clone(),
-                fields.entity_type => "issue",
-                fields.repo => issue.repo.clone(),
-                fields.issue_number => issue.number.to_string(),
-                fields.state => issue.state.clone(),
-                fields.labels => issue.labels.join(" "),
-                fields.author => issue.author.clone().unwrap_or_default(),
-                fields.title => issue.title.clone(),
-                fields.body => issue.body.clone(),
-                fields.updated_at => issue.source_version.github_updated_at.clone(),
-                fields.indexed_at => issue.source_version.indexed_at.clone(),
+                fields.source_id => source.source_id.clone(),
+                fields.entity_type => source.entity_type.clone(),
+                fields.repo => source.repo.clone(),
+                fields.issue_number => source.issue_number.to_string(),
+                fields.state => source.state.clone(),
+                fields.labels => source.labels.join(" "),
+                fields.author => source.author.clone().unwrap_or_default(),
+                fields.title => source.title.clone(),
+                fields.body => source.body.clone(),
+                fields.parent_issue_title => source.parent_issue_title.clone(),
+                fields.updated_at => source.github_updated_at.clone(),
+                fields.indexed_at => source.indexed_at.clone(),
             ))
             .map_err(|e| QghError::index(e.to_string()))?;
     }
@@ -90,7 +91,11 @@ pub fn search(
         .map_err(|e| QghError::index(e.to_string()))?;
     let reader = index.reader().map_err(|e| QghError::index(e.to_string()))?;
     let searcher = reader.searcher();
-    let parser = QueryParser::for_index(&index, vec![title, body, labels, repo, issue_number]);
+    let mut query_fields = vec![title, body, labels, repo, issue_number];
+    if let Ok(parent_issue_title) = schema.get_field("parent_issue_title") {
+        query_fields.push(parent_issue_title);
+    }
+    let parser = QueryParser::for_index(&index, query_fields);
     let query = parser.parse_query(query_text).map_err(|e| {
         QghError::validation("validation.invalid_query", format!("Invalid query: {e}"))
     })?;
@@ -126,6 +131,7 @@ struct Fields {
     author: Field,
     title: Field,
     body: Field,
+    parent_issue_title: Field,
     updated_at: Field,
     indexed_at: Field,
 }
@@ -141,6 +147,7 @@ fn schema() -> (Schema, Fields) {
     let author = builder.add_text_field("author", STRING | STORED);
     let title = builder.add_text_field("title", TEXT | STORED);
     let body = builder.add_text_field("body", TEXT | STORED);
+    let parent_issue_title = builder.add_text_field("parent_issue_title", TEXT | STORED);
     let updated_at = builder.add_text_field("updated_at", STRING | STORED);
     let indexed_at = builder.add_text_field("indexed_at", STRING | STORED);
     (
@@ -155,6 +162,7 @@ fn schema() -> (Schema, Fields) {
             author,
             title,
             body,
+            parent_issue_title,
             updated_at,
             indexed_at,
         },

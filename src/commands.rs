@@ -2,7 +2,7 @@ use crate::config::{load_profile, resolve_token};
 use crate::error::QghError;
 use crate::github;
 use crate::index;
-use crate::model::StoredIssue;
+use crate::model::{StoredComment, StoredIssue, StoredSource};
 use crate::store::Store;
 use serde_json::{json, Value};
 
@@ -11,28 +11,36 @@ pub async fn sync(profile_id: &str) -> Result<Value, QghError> {
     let token = resolve_token(&profile)?;
     let fetched = github::fetch_issues(&profile, &token).await?;
     let mut store = Store::open(&profile.paths)?;
-    let summary = store.upsert_issues(&fetched.issues, fetched.skipped_pull_requests)?;
-    let issues = store.active_issues()?;
+    let summary = store.upsert_sources(
+        &fetched.issues,
+        &fetched.comments,
+        fetched.skipped_pull_requests,
+    )?;
+    let sources = store.active_index_sources()?;
     let generation = store.next_index_generation()?;
     index::rebuild(
         &profile.paths.index_root,
         &profile.paths.index_active,
         generation,
-        &issues,
+        &sources,
     )?;
     store.mark_index_published(
         generation,
         &profile.paths.index_active.to_string_lossy(),
-        issues.len(),
+        sources.len(),
     )?;
     let status = store.status()?;
     Ok(json!({
         "profile_id": profile.id,
         "sync_run_id": summary.sync_run_id,
         "issues": {
-            "fetched": summary.fetched,
-            "upserted": summary.upserted,
+            "fetched": summary.fetched_issues,
+            "upserted": summary.upserted_issues,
             "skipped_pull_requests": summary.skipped_pull_requests
+        },
+        "comments": {
+            "fetched": summary.fetched_comments,
+            "upserted": summary.upserted_comments
         },
         "index": {
             "active_generation": generation,
@@ -47,10 +55,10 @@ pub fn query(profile_id: &str, query_text: &str, limit: usize) -> Result<Value, 
     let hits = index::search(&profile.paths.index_active, query_text, limit)?;
     let mut results = Vec::new();
     for hit in hits {
-        let Some(issue) = store.get_issue(&hit.source_id)? else {
+        let Some(source) = store.get_source(&hit.source_id)? else {
             continue;
         };
-        results.push(issue_result(issue, hit.score));
+        results.push(source_result(source, hit.score));
     }
     Ok(json!({
         "profile_id": profile.id,
@@ -61,21 +69,16 @@ pub fn query(profile_id: &str, query_text: &str, limit: usize) -> Result<Value, 
 pub fn get(profile_id: &str, source_id: &str) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
     let store = Store::open(&profile.paths)?;
-    let Some(issue) = store.get_issue(source_id)? else {
+    let Some(source) = store.get_source(source_id)? else {
         return Err(QghError::source_not_found(source_id));
+    };
+    let source_json = match source {
+        StoredSource::Issue(issue) => issue_source(issue),
+        StoredSource::Comment(comment) => comment_source(comment),
     };
     Ok(json!({
         "profile_id": profile.id,
-        "source": {
-            "source_id": issue.source_id,
-            "entity_type": "issue",
-            "repo": issue.repo,
-            "issue_number": issue.number,
-            "title": issue.title,
-            "body": issue.body,
-            "canonical_url": issue.canonical_url,
-            "source_version": issue.source_version
-        }
+        "source": source_json
     }))
 }
 
@@ -99,6 +102,7 @@ pub fn status(profile_id: &str) -> Result<Value, QghError> {
         },
         "sources": {
             "issue_count": status.issue_count,
+            "comment_count": status.comment_count,
             "tombstone_count": status.tombstone_count
         },
         "database": {
@@ -127,23 +131,50 @@ pub fn doctor(profile_id: &str) -> Result<Value, QghError> {
     }))
 }
 
-fn issue_result(issue: StoredIssue, score: f32) -> Value {
+fn source_result(source: StoredSource, score: f32) -> Value {
+    match source {
+        StoredSource::Issue(issue) => {
+            let mut value = issue_source(issue);
+            value["snippet"] = json!(snippet(value["body"].as_str().unwrap_or_default()));
+            value["get_args"] = json!({ "source_id": value["source_id"] });
+            value["parent_issue"] = Value::Null;
+            value["ranking"] = json!({ "lexical_score": score });
+            value
+        }
+        StoredSource::Comment(comment) => {
+            let mut value = comment_source(comment);
+            value["snippet"] = json!(snippet(value["body"].as_str().unwrap_or_default()));
+            value["get_args"] = json!({ "source_id": value["source_id"] });
+            value["ranking"] = json!({ "lexical_score": score });
+            value
+        }
+    }
+}
+
+fn issue_source(issue: StoredIssue) -> Value {
     json!({
         "source_id": issue.source_id,
         "entity_type": "issue",
-        "snippet": snippet(&issue.body),
-        "canonical_url": issue.canonical_url,
-        "get_args": {
-            "source_id": issue.source_id
-        },
         "repo": issue.repo,
         "issue_number": issue.number,
         "title": issue.title,
-        "parent": null,
-        "source_version": issue.source_version,
-        "ranking": {
-            "lexical_score": score
-        }
+        "body": issue.body,
+        "canonical_url": issue.canonical_url,
+        "source_version": issue.source_version
+    })
+}
+
+fn comment_source(comment: StoredComment) -> Value {
+    json!({
+        "source_id": comment.source_id,
+        "entity_type": "issue_comment",
+        "repo": comment.repo,
+        "issue_number": comment.issue_number,
+        "author": comment.author,
+        "body": comment.body,
+        "canonical_url": comment.canonical_url,
+        "parent_issue": comment.parent_issue,
+        "source_version": comment.source_version
     })
 }
 

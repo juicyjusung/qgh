@@ -1,7 +1,10 @@
 use crate::error::QghError;
-use crate::model::{IssueRecord, SourceVersionView, StatusSnapshot, StoredIssue, SyncSummary};
+use crate::model::{
+    CommentRecord, IndexSource, IssueRecord, ParentIssueView, SourceVersionView, StatusSnapshot,
+    StoredComment, StoredIssue, StoredSource, SyncSummary,
+};
 use crate::paths::ProfilePaths;
-use crate::time::now_rfc3339;
+use crate::time::{now_rfc3339, now_run_id_suffix};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
 
@@ -20,18 +23,26 @@ impl Store {
         Ok(store)
     }
 
-    pub fn upsert_issues(
+    pub fn upsert_sources(
         &mut self,
         issues: &[IssueRecord],
+        comments: &[CommentRecord],
         skipped_pull_requests: usize,
     ) -> Result<SyncSummary, QghError> {
-        let sync_run_id = format!("sync-{}", now_rfc3339());
+        let sync_run_id = format!("sync-{}", now_run_id_suffix());
         let now = now_rfc3339();
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO sync_runs (id, started_at, completed_at, fetched_issue_count, upserted_issue_count, skipped_pull_request_count)
-             VALUES (?1, ?2, ?2, ?3, ?3, ?4)",
-            params![sync_run_id, now, issues.len() as i64, skipped_pull_requests as i64],
+            "INSERT INTO sync_runs
+                (id, started_at, completed_at, fetched_issue_count, upserted_issue_count, fetched_comment_count, upserted_comment_count, skipped_pull_request_count)
+             VALUES (?1, ?2, ?2, ?3, ?3, ?4, ?4, ?5)",
+            params![
+                sync_run_id,
+                now,
+                issues.len() as i64,
+                comments.len() as i64,
+                skipped_pull_requests as i64
+            ],
         )?;
 
         for issue in issues {
@@ -56,22 +67,18 @@ impl Store {
                 ],
             )?;
             tx.execute(
-                "INSERT OR IGNORE INTO source_versions
-                    (source_id, body_hash, github_updated_at, indexed_at, sync_run_id, lifecycle_state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'active')",
-                params![
-                    issue.source_id,
-                    issue.body_hash,
-                    issue.updated_at,
-                    issue.indexed_at,
-                    sync_run_id
-                ],
+                "INSERT INTO repositories (repo, host, owner, name)
+                 VALUES (?1, ?2, substr(?1, 1, instr(?1, '/') - 1), substr(?1, instr(?1, '/') + 1))
+                 ON CONFLICT(repo) DO UPDATE SET host = excluded.host",
+                params![issue.repo, issue.host],
             )?;
-            let version_id: i64 = tx.query_row(
-                "SELECT id FROM source_versions
-                 WHERE source_id = ?1 AND body_hash = ?2 AND github_updated_at = ?3",
-                params![issue.source_id, issue.body_hash, issue.updated_at],
-                |row| row.get(0),
+            let version_id = upsert_source_version(
+                &tx,
+                &issue.source_id,
+                &issue.body_hash,
+                &issue.updated_at,
+                &issue.indexed_at,
+                &sync_run_id,
             )?;
             tx.execute(
                 "INSERT INTO issue_metadata
@@ -125,11 +132,92 @@ impl Store {
             )?;
         }
 
+        for comment in comments {
+            tx.execute(
+                "INSERT INTO source_entities
+                    (source_id, entity_type, host, repo, node_id, github_id, lifecycle_state, created_at, updated_at, last_seen_at)
+                 VALUES (?1, 'issue_comment', ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8)
+                 ON CONFLICT(source_id) DO UPDATE SET
+                    repo = excluded.repo,
+                    lifecycle_state = 'active',
+                    updated_at = excluded.updated_at,
+                    last_seen_at = excluded.last_seen_at",
+                params![
+                    comment.source_id,
+                    comment.host,
+                    comment.repo,
+                    comment.node_id,
+                    comment.github_id,
+                    comment.created_at,
+                    comment.updated_at,
+                    now
+                ],
+            )?;
+            let version_id = upsert_source_version(
+                &tx,
+                &comment.source_id,
+                &comment.body_hash,
+                &comment.updated_at,
+                &comment.indexed_at,
+                &sync_run_id,
+            )?;
+            tx.execute(
+                "INSERT INTO comment_metadata
+                    (source_id, repo, issue_number, body, author, created_at, updated_at, canonical_url, parent_issue_source_id, parent_issue_title, parent_issue_canonical_url, latest_version_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(source_id) DO UPDATE SET
+                    repo = excluded.repo,
+                    issue_number = excluded.issue_number,
+                    body = excluded.body,
+                    author = excluded.author,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at,
+                    canonical_url = excluded.canonical_url,
+                    parent_issue_source_id = excluded.parent_issue_source_id,
+                    parent_issue_title = excluded.parent_issue_title,
+                    parent_issue_canonical_url = excluded.parent_issue_canonical_url,
+                    latest_version_id = excluded.latest_version_id",
+                params![
+                    comment.source_id,
+                    comment.repo,
+                    comment.parent_issue_number,
+                    comment.body,
+                    comment.author,
+                    comment.created_at,
+                    comment.updated_at,
+                    comment.canonical_url,
+                    comment.parent_issue_source_id,
+                    comment.parent_issue_title,
+                    comment.parent_issue_canonical_url,
+                    version_id
+                ],
+            )?;
+            upsert_alias(
+                &tx,
+                &comment.source_id,
+                "canonical_url",
+                &comment.canonical_url,
+            )?;
+            upsert_alias(
+                &tx,
+                &comment.source_id,
+                "rest_id",
+                &comment.github_id.to_string(),
+            )?;
+            tx.execute(
+                "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
+                 VALUES (?1, 'upsert', ?2, NULL)",
+                params![comment.source_id, now],
+            )?;
+        }
+
         tx.commit()?;
         Ok(SyncSummary {
             sync_run_id,
-            fetched: issues.len(),
-            upserted: issues.len(),
+            fetched_issues: issues.len(),
+            upserted_issues: issues.len(),
+            fetched_comments: comments.len(),
+            upserted_comments: comments.len(),
             skipped_pull_requests,
         })
     }
@@ -149,6 +237,53 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
     }
 
+    pub fn active_index_sources(&self) -> Result<Vec<IndexSource>, QghError> {
+        let mut sources = Vec::new();
+        for issue in self.active_issues()? {
+            sources.push(IndexSource {
+                source_id: issue.source_id,
+                entity_type: "issue".to_string(),
+                repo: issue.repo,
+                issue_number: issue.number,
+                state: issue.state,
+                labels: issue.labels,
+                author: issue.author,
+                title: issue.title,
+                body: issue.body,
+                parent_issue_title: String::new(),
+                github_updated_at: issue.source_version.github_updated_at,
+                indexed_at: issue.source_version.indexed_at,
+            });
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT cm.source_id, cm.repo, cm.issue_number, cm.body, cm.author,
+                    cm.parent_issue_title, sv.github_updated_at, sv.indexed_at
+             FROM comment_metadata cm
+             JOIN source_entities se ON se.source_id = cm.source_id
+             JOIN source_versions sv ON sv.id = cm.latest_version_id
+             WHERE se.lifecycle_state = 'active'
+             ORDER BY cm.repo, cm.issue_number, cm.source_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(IndexSource {
+                source_id: row.get(0)?,
+                entity_type: "issue_comment".to_string(),
+                repo: row.get(1)?,
+                issue_number: row.get(2)?,
+                state: String::new(),
+                labels: Vec::new(),
+                author: row.get(4)?,
+                title: String::new(),
+                body: row.get(3)?,
+                parent_issue_title: row.get(5)?,
+                github_updated_at: row.get(6)?,
+                indexed_at: row.get(7)?,
+            })
+        })?;
+        sources.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        Ok(sources)
+    }
+
     pub fn get_issue(&self, source_id: &str) -> Result<Option<StoredIssue>, QghError> {
         self.conn
             .query_row(
@@ -164,6 +299,33 @@ impl Store {
             )
             .optional()
             .map_err(QghError::from)
+    }
+
+    pub fn get_comment(&self, source_id: &str) -> Result<Option<StoredComment>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT cm.source_id, cm.repo, cm.issue_number, cm.body, cm.author,
+                        cm.canonical_url, cm.parent_issue_source_id, cm.parent_issue_title,
+                        cm.parent_issue_canonical_url, sv.body_hash, sv.github_updated_at, sv.indexed_at
+                 FROM comment_metadata cm
+                 JOIN source_entities se ON se.source_id = cm.source_id
+                 JOIN source_versions sv ON sv.id = cm.latest_version_id
+                 WHERE cm.source_id = ?1 AND se.lifecycle_state = 'active'",
+                params![source_id],
+                stored_comment_from_row,
+            )
+            .optional()
+            .map_err(QghError::from)
+    }
+
+    pub fn get_source(&self, source_id: &str) -> Result<Option<StoredSource>, QghError> {
+        if let Some(issue) = self.get_issue(source_id)? {
+            return Ok(Some(StoredSource::Issue(issue)));
+        }
+        if let Some(comment) = self.get_comment(source_id)? {
+            return Ok(Some(StoredSource::Comment(comment)));
+        }
+        Ok(None)
     }
 
     pub fn mark_index_published(
@@ -204,6 +366,11 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
+        let comment_count: i64 = self.conn.query_row(
+            "SELECT count(*) FROM source_entities WHERE entity_type = 'issue_comment' AND lifecycle_state = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
         let tombstone_count: i64 =
             self.conn
                 .query_row("SELECT count(*) FROM tombstones", [], |row| row.get(0))?;
@@ -230,6 +397,7 @@ impl Store {
             .optional()?;
         Ok(StatusSnapshot {
             issue_count,
+            comment_count,
             tombstone_count,
             active_generation: active_generation.unwrap_or(0),
             dirty_task_count,
@@ -307,7 +475,17 @@ impl Store {
 
             CREATE TABLE IF NOT EXISTS comment_metadata (
                 source_id TEXT PRIMARY KEY,
-                parent_issue_source_id TEXT NOT NULL
+                repo TEXT NOT NULL,
+                issue_number INTEGER NOT NULL,
+                body TEXT NOT NULL,
+                author TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                canonical_url TEXT NOT NULL,
+                parent_issue_source_id TEXT NOT NULL,
+                parent_issue_title TEXT NOT NULL,
+                parent_issue_canonical_url TEXT NOT NULL,
+                latest_version_id INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS chunks (
@@ -323,6 +501,8 @@ impl Store {
                 completed_at TEXT NOT NULL,
                 fetched_issue_count INTEGER NOT NULL,
                 upserted_issue_count INTEGER NOT NULL,
+                fetched_comment_count INTEGER NOT NULL DEFAULT 0,
+                upserted_comment_count INTEGER NOT NULL DEFAULT 0,
                 skipped_pull_request_count INTEGER NOT NULL
             );
 
@@ -360,6 +540,73 @@ impl Store {
             );
             "#,
         )?;
+        ensure_column(
+            &self.conn,
+            "comment_metadata",
+            "repo",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &self.conn,
+            "comment_metadata",
+            "issue_number",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &self.conn,
+            "comment_metadata",
+            "body",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(&self.conn, "comment_metadata", "author", "TEXT")?;
+        ensure_column(
+            &self.conn,
+            "comment_metadata",
+            "created_at",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &self.conn,
+            "comment_metadata",
+            "updated_at",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &self.conn,
+            "comment_metadata",
+            "canonical_url",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &self.conn,
+            "comment_metadata",
+            "parent_issue_title",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &self.conn,
+            "comment_metadata",
+            "parent_issue_canonical_url",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &self.conn,
+            "comment_metadata",
+            "latest_version_id",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &self.conn,
+            "sync_runs",
+            "fetched_comment_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &self.conn,
+            "sync_runs",
+            "upserted_comment_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 }
@@ -377,6 +624,34 @@ fn upsert_alias(
         params![source_id, alias_type, alias_value],
     )?;
     Ok(())
+}
+
+fn upsert_source_version(
+    tx: &rusqlite::Transaction<'_>,
+    source_id: &str,
+    body_hash: &str,
+    github_updated_at: &str,
+    indexed_at: &str,
+    sync_run_id: &str,
+) -> Result<i64, rusqlite::Error> {
+    tx.execute(
+        "INSERT OR IGNORE INTO source_versions
+            (source_id, body_hash, github_updated_at, indexed_at, sync_run_id, lifecycle_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'active')",
+        params![
+            source_id,
+            body_hash,
+            github_updated_at,
+            indexed_at,
+            sync_run_id
+        ],
+    )?;
+    tx.query_row(
+        "SELECT id FROM source_versions
+         WHERE source_id = ?1 AND body_hash = ?2 AND github_updated_at = ?3",
+        params![source_id, body_hash, github_updated_at],
+        |row| row.get(0),
+    )
 }
 
 fn stored_issue_from_row(row: &rusqlite::Row<'_>) -> Result<StoredIssue, rusqlite::Error> {
@@ -398,4 +673,49 @@ fn stored_issue_from_row(row: &rusqlite::Row<'_>) -> Result<StoredIssue, rusqlit
             indexed_at: row.get(11)?,
         },
     })
+}
+
+fn stored_comment_from_row(row: &rusqlite::Row<'_>) -> Result<StoredComment, rusqlite::Error> {
+    let repo: String = row.get(1)?;
+    let issue_number: i64 = row.get(2)?;
+    Ok(StoredComment {
+        source_id: row.get(0)?,
+        repo: repo.clone(),
+        issue_number,
+        body: row.get(3)?,
+        author: row.get(4)?,
+        canonical_url: row.get(5)?,
+        parent_issue: ParentIssueView {
+            source_id: row.get(6)?,
+            repo,
+            number: issue_number,
+            title: row.get(7)?,
+            canonical_url: row.get(8)?,
+        },
+        source_version: SourceVersionView {
+            body_hash: row.get(9)?,
+            github_updated_at: row.get(10)?,
+            indexed_at: row.get(11)?,
+        },
+    })
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), QghError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )?;
+    Ok(())
 }

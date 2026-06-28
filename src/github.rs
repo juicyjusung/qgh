@@ -1,6 +1,6 @@
 use crate::config::{Profile, RepoRef};
 use crate::error::QghError;
-use crate::model::IssueRecord;
+use crate::model::{CommentRecord, IssueRecord};
 use crate::time::now_rfc3339;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::header::{HeaderMap, LINK};
@@ -31,12 +31,14 @@ const SOURCE_ID_ENCODE_SET: &AsciiSet = &CONTROLS
 
 pub struct FetchResult {
     pub issues: Vec<IssueRecord>,
+    pub comments: Vec<CommentRecord>,
     pub skipped_pull_requests: usize,
 }
 
 pub async fn fetch_issues(profile: &Profile, token: &str) -> Result<FetchResult, QghError> {
     let client = reqwest::Client::new();
     let mut issues = Vec::new();
+    let mut comments = Vec::new();
     let mut skipped_pull_requests = 0;
 
     for repo in &profile.repos {
@@ -69,7 +71,9 @@ pub async fn fetch_issues(profile: &Profile, token: &str) -> Result<FetchResult,
                     skipped_pull_requests += 1;
                     continue;
                 }
-                issues.push(item.into_record(profile, repo, &indexed_at));
+                let issue = item.into_record(profile, repo, &indexed_at);
+                comments.extend(fetch_issue_comments(&client, profile, token, repo, &issue).await?);
+                issues.push(issue);
             }
             next_url = next_link(&headers);
         }
@@ -77,8 +81,50 @@ pub async fn fetch_issues(profile: &Profile, token: &str) -> Result<FetchResult,
 
     Ok(FetchResult {
         issues,
+        comments,
         skipped_pull_requests,
     })
+}
+
+async fn fetch_issue_comments(
+    client: &reqwest::Client,
+    profile: &Profile,
+    token: &str,
+    repo: &RepoRef,
+    issue: &IssueRecord,
+) -> Result<Vec<CommentRecord>, QghError> {
+    let mut comments = Vec::new();
+    let mut next_url = Some(format!(
+        "{}/repos/{}/{}/issues/{}/comments?per_page=100",
+        profile.api_base_url, repo.owner, repo.name, issue.number
+    ));
+    while let Some(url) = next_url.take() {
+        let response = client
+            .get(&url)
+            .bearer_auth(token)
+            .header("accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|error| QghError::github(error.to_string()))?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        if !status.is_success() {
+            return Err(QghError::github(format!(
+                "GitHub issue comments request failed with HTTP {status}."
+            )));
+        }
+        let page: Vec<ApiComment> = response
+            .json()
+            .await
+            .map_err(|error| QghError::github(format!("Invalid GitHub comment JSON: {error}")))?;
+        let indexed_at = now_rfc3339();
+        comments.extend(
+            page.into_iter()
+                .map(|comment| comment.into_record(profile, repo, issue, &indexed_at)),
+        );
+        next_url = next_link(&headers);
+    }
+    Ok(comments)
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +189,49 @@ struct ApiMilestone {
 #[derive(Debug, Deserialize)]
 struct ApiUser {
     login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiComment {
+    id: i64,
+    node_id: String,
+    body: Option<String>,
+    html_url: String,
+    created_at: String,
+    updated_at: String,
+    user: Option<ApiUser>,
+}
+
+impl ApiComment {
+    fn into_record(
+        self,
+        profile: &Profile,
+        repo: &RepoRef,
+        issue: &IssueRecord,
+        indexed_at: &str,
+    ) -> CommentRecord {
+        let body = self.body.unwrap_or_default();
+        let body_hash = hex_sha256(&body);
+        let encoded_node_id = utf8_percent_encode(&self.node_id, SOURCE_ID_ENCODE_SET).to_string();
+        CommentRecord {
+            source_id: format!("qgh://{}/issue-comment/{}", profile.host, encoded_node_id),
+            host: profile.host.clone(),
+            repo: repo.full_name(),
+            node_id: self.node_id,
+            github_id: self.id,
+            body,
+            author: self.user.map(|user| user.login),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            canonical_url: self.html_url,
+            body_hash,
+            indexed_at: indexed_at.to_string(),
+            parent_issue_source_id: issue.source_id.clone(),
+            parent_issue_number: issue.number,
+            parent_issue_title: issue.title.clone(),
+            parent_issue_canonical_url: issue.canonical_url.clone(),
+        }
+    }
 }
 
 fn next_link(headers: &HeaderMap) -> Option<String> {

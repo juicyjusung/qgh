@@ -23,8 +23,10 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     assert_eq!(sync_json["ok"], true);
     assert_eq!(sync_json["data"]["issues"]["upserted"], 1);
     assert_eq!(sync_json["data"]["issues"]["skipped_pull_requests"], 1);
+    assert_eq!(sync_json["data"]["comments"]["upserted"], 1);
     assert_eq!(sync_json["data"]["index"]["dirty_task_count"], 0);
     fixture.assert_sqlite_issue_metadata();
+    fixture.assert_sqlite_comment_metadata(1);
 
     let status = fixture.qgh(["status", "--json"]);
     assert_success(&status);
@@ -32,6 +34,7 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     assert_eq!(status_json["ok"], true);
     assert_eq!(status_json["data"]["profile_id"], "work");
     assert_eq!(status_json["data"]["sources"]["issue_count"], 1);
+    assert_eq!(status_json["data"]["sources"]["comment_count"], 1);
     assert_eq!(
         status_json["data"]["database"]["schema_version"],
         "qgh.db.v1"
@@ -41,7 +44,7 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     assert!(status_json["data"]["sync"]["last_sync_at"]
         .as_str()
         .is_some());
-    assert_eq!(server.request_count(), 1, "status must be local-only");
+    assert_eq!(server.request_count(), 2, "status must be local-only");
 
     let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
     assert_success(&query);
@@ -111,6 +114,67 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
         source["source_version"]["github_updated_at"],
         "2026-01-02T03:04:05Z"
     );
+
+    let comment_query = fixture.qgh(["query", "comment-only mitigation", "--json"]);
+    assert_success(&comment_query);
+    let comment_json = stdout_json(&comment_query);
+    let comment_result = &comment_json["data"]["results"][0];
+    let comment_source_id = "qgh://github.com/issue-comment/IC_kwDOCOMMENT1";
+    assert_eq!(comment_result["source_id"], comment_source_id);
+    assert_eq!(comment_result["entity_type"], "issue_comment");
+    assert_eq!(
+        comment_result["canonical_url"],
+        "https://github.com/owner/repo/issues/42#issuecomment-5001"
+    );
+    assert_eq!(comment_result["get_args"]["source_id"], comment_source_id);
+    assert_eq!(
+        comment_result["parent_issue"]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+    assert_eq!(comment_result["parent_issue"]["repo"], "owner/repo");
+    assert_eq!(comment_result["parent_issue"]["number"], 42);
+    assert_eq!(comment_result["parent_issue"]["title"], "Cache sync bug");
+    assert_eq!(
+        comment_result["parent_issue"]["canonical_url"],
+        "https://github.com/owner/repo/issues/42"
+    );
+    assert_eq!(
+        comment_result["source_version"]["github_updated_at"],
+        "2026-01-03T04:05:06Z"
+    );
+    assert!(comment_result["snippet"]
+        .as_str()
+        .unwrap()
+        .contains("comment-only mitigation"));
+
+    let comment_get = fixture.qgh(["get", comment_source_id, "--json"]);
+    assert_success(&comment_get);
+    let comment_get_json = stdout_json(&comment_get);
+    let comment_source = &comment_get_json["data"]["source"];
+    assert_eq!(comment_source["source_id"], comment_source_id);
+    assert_eq!(comment_source["entity_type"], "issue_comment");
+    assert_eq!(comment_source["repo"], "owner/repo");
+    assert_eq!(comment_source["issue_number"], 42);
+    assert_eq!(
+        comment_source["canonical_url"],
+        "https://github.com/owner/repo/issues/42#issuecomment-5001"
+    );
+    assert!(comment_source["body"]
+        .as_str()
+        .unwrap()
+        .contains("comment-only mitigation"));
+    assert_eq!(
+        comment_source["parent_issue"]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+    assert_eq!(
+        comment_source["source_version"]["github_updated_at"],
+        "2026-01-03T04:05:06Z"
+    );
+
+    let second_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&second_sync);
+    fixture.assert_sqlite_comment_metadata(1);
 }
 
 #[test]
@@ -136,7 +200,7 @@ fn issue_payload_with_pr() -> &'static str {
         "body": "The BM25 issue body tracer must round-trip through get before citation.",
         "state": "open",
         "locked": false,
-        "comments": 0,
+        "comments": 1,
         "html_url": "https://github.com/owner/repo/issues/42",
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": "2026-01-02T03:04:05Z",
@@ -163,6 +227,20 @@ fn issue_payload_with_pr() -> &'static str {
         "milestone": null,
         "assignees": [],
         "pull_request": {"url": "https://api.github.com/repos/owner/repo/pulls/43"}
+      }
+    ]"#
+}
+
+fn issue_comments_payload() -> &'static str {
+    r#"[
+      {
+        "id": 5001,
+        "node_id": "IC_kwDOCOMMENT1",
+        "body": "The answer lives in this comment-only mitigation note.",
+        "html_url": "https://github.com/owner/repo/issues/42#issuecomment-5001",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-03T04:05:06Z",
+        "user": {"login": "carol"}
       }
     ]"#
 }
@@ -280,6 +358,54 @@ env = "QGH_TEST_TOKEN"
             .unwrap();
         assert!(body.contains("BM25 issue body tracer"));
     }
+
+    fn assert_sqlite_comment_metadata(&self, expected_version_count: i64) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let source_id: String = conn
+            .query_row(
+                "SELECT source_id FROM source_entities WHERE entity_type = 'issue_comment'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_id, "qgh://github.com/issue-comment/IC_kwDOCOMMENT1");
+
+        let version_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM source_versions WHERE source_id = ?1",
+                [&source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version_count, expected_version_count);
+
+        let comment: (String, String, i64, String, String, String) = conn
+            .query_row(
+                "SELECT body, parent_issue_source_id, issue_number, parent_issue_title, parent_issue_canonical_url, canonical_url FROM comment_metadata WHERE source_id = ?1",
+                [&source_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(comment.0.contains("comment-only mitigation"));
+        assert_eq!(comment.1, "qgh://github.com/issue/I_kwDOISSUE1");
+        assert_eq!(comment.2, 42);
+        assert_eq!(comment.3, "Cache sync bug");
+        assert_eq!(comment.4, "https://github.com/owner/repo/issues/42");
+        assert_eq!(
+            comment.5,
+            "https://github.com/owner/repo/issues/42#issuecomment-5001"
+        );
+    }
 }
 
 impl Drop for TestFixture {
@@ -358,10 +484,14 @@ fn handle_connection(
         && request_line.contains("per_page=100")
     {
         issue_payload
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?")
+        && request_line.contains("per_page=100")
+    {
+        issue_comments_payload()
     } else {
         r#"{"message":"not found"}"#
     };
-    let status = if body == issue_payload {
+    let status = if body == issue_payload || body == issue_comments_payload() {
         "200 OK"
     } else {
         "404 Not Found"
