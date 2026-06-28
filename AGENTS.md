@@ -36,7 +36,7 @@ contracts. Do not rely on model memory for moving APIs or specs.
 
 ### Issue tracker
 
-Issues and PRDs are tracked as local markdown files under `.scratch/`; external PRs are not a triage surface. See `docs/agents/issue-tracker.md`.
+Issues and PRDs are tracked in GitHub Issues for `juicyjusung/qgh`; external PRs are not a triage surface. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
@@ -46,20 +46,21 @@ The canonical triage roles use the default label strings: `needs-triage`, `needs
 
 This repo uses a single-context domain docs layout. See `docs/agents/domain.md`.
 
-## Local issue tracker SSOT
+## GitHub issue tracker SSOT
 
-Issues, plans, and PRDs under `.scratch/` are the working tracker for
-agent skills. When project truth changes, update the owning local issue
-or PRD: scope, acceptance criteria, plan, blocker/risk, decision, and
-final verification.
+Issues, plans, and PRDs are tracked in GitHub Issues for
+`juicyjusung/qgh`. Existing `.scratch/` files are local drafts or legacy
+planning material unless the user explicitly says otherwise. When
+project truth changes, update the owning GitHub issue: scope, acceptance
+criteria, plan, blocker/risk, decision, and final verification.
 
-If the owning tracker file is unclear and the update matters, ask for the
-path. Skip noisy local attempts, secrets, tokens, and sensitive repo
-content.
+If the owning GitHub issue is unclear and the update matters, ask for the
+issue number. Skip noisy local attempts, secrets, tokens, and sensitive
+repo content.
 
 Final responses after issue-backed work should include either:
 
-- `Updated <path>: <reason>`
+- `Updated #<number>: <reason>`
 - `Issue update not needed: <reason>`
 
 ## Product guardrails
