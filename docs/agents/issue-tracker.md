@@ -31,14 +31,13 @@ states as issues using `gh pr` equivalents. GitHub shares one number
 space across issues and PRs, so a bare `#42` may be either; resolve with
 `gh pr view 42` and fall back to `gh issue view 42`.
 
-## Existing local drafts
+## Local tracker files
 
-Existing `.scratch/` files are local drafts or legacy planning material
-after this setup. Do not publish new tracker updates there unless the
-user explicitly asks for local markdown.
+`.scratch/` is not a tracker SSOT for this repo. Do not publish tracker
+updates there unless the user explicitly asks for local markdown.
 
-`.scratch/qgh-mvp/PRD.md` and `.scratch/qgh-mvp/issues/*.md` were
-migrated to GitHub Issues on 2026-06-28 KST:
+The old qgh MVP local tracker files were migrated to GitHub Issues on
+2026-06-28 KST and removed from the workspace:
 
 - PRD parent: #2
 - MVP implementation slices: #3 through #17

@@ -49,10 +49,10 @@ This repo uses a single-context domain docs layout. See `docs/agents/domain.md`.
 ## GitHub issue tracker SSOT
 
 Issues, plans, and PRDs are tracked in GitHub Issues for
-`juicyjusung/qgh`. Existing `.scratch/` files are local drafts or legacy
-planning material unless the user explicitly says otherwise. When
-project truth changes, update the owning GitHub issue: scope, acceptance
-criteria, plan, blocker/risk, decision, and final verification.
+`juicyjusung/qgh`. `.scratch/` is not a tracker SSOT for this repo unless
+the user explicitly asks for local markdown. When project truth changes,
+update the owning GitHub issue: scope, acceptance criteria, plan,
+blocker/risk, decision, and final verification.
 
 If the owning GitHub issue is unclear and the update matters, ask for the
 issue number. Skip noisy local attempts, secrets, tokens, and sensitive
