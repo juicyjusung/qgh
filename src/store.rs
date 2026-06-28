@@ -1,7 +1,8 @@
 use crate::error::QghError;
 use crate::model::{
-    CommentRecord, IndexSource, IssueRecord, ParentIssueView, SourceVersionView, StatusSnapshot,
-    StoredComment, StoredIssue, StoredSource, SyncSummary,
+    CommentRecord, CursorUpdate, CursorView, IndexSource, IssueRecord, ParentIssueView,
+    SourceVersionView, StatusSnapshot, StoredComment, StoredCursor, StoredIssue, StoredSource,
+    SyncSummary,
 };
 use crate::paths::ProfilePaths;
 use crate::time::{now_rfc3339, now_run_id_suffix};
@@ -28,6 +29,7 @@ impl Store {
         issues: &[IssueRecord],
         comments: &[CommentRecord],
         skipped_pull_requests: usize,
+        cursor_updates: &[CursorUpdate],
     ) -> Result<SyncSummary, QghError> {
         let sync_run_id = format!("sync-{}", now_run_id_suffix());
         let now = now_rfc3339();
@@ -211,7 +213,26 @@ impl Store {
             )?;
         }
 
+        for cursor in cursor_updates {
+            tx.execute(
+                "INSERT INTO sync_cursors (endpoint, cursor, etag)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(endpoint) DO UPDATE SET
+                    cursor = coalesce(excluded.cursor, sync_cursors.cursor),
+                    etag = coalesce(excluded.etag, sync_cursors.etag)",
+                params![cursor.endpoint, cursor.cursor, cursor.etag],
+            )?;
+        }
+
         tx.commit()?;
+        let cursor_views = cursor_updates
+            .iter()
+            .map(|cursor| CursorView {
+                endpoint: cursor.endpoint.clone(),
+                watermark: cursor.cursor.clone(),
+                has_etag: cursor.etag.is_some(),
+            })
+            .collect::<Vec<_>>();
         Ok(SyncSummary {
             sync_run_id,
             fetched_issues: issues.len(),
@@ -219,6 +240,11 @@ impl Store {
             fetched_comments: comments.len(),
             upserted_comments: comments.len(),
             skipped_pull_requests,
+            cursor_updates: cursor_views,
+            not_modified_endpoints: cursor_updates
+                .iter()
+                .filter(|cursor| cursor.not_modified)
+                .count(),
         })
     }
 
@@ -226,7 +252,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT im.source_id, im.repo, im.issue_number, im.title, im.body, im.state,
                     im.labels_json, im.author, im.canonical_url,
-                    sv.body_hash, sv.github_updated_at, sv.indexed_at
+                    sv.body_hash, sv.github_updated_at, sv.indexed_at, sv.sync_run_id, sv.lifecycle_state
              FROM issue_metadata im
              JOIN source_entities se ON se.source_id = im.source_id
              JOIN source_versions sv ON sv.id = im.latest_version_id
@@ -289,7 +315,7 @@ impl Store {
             .query_row(
                 "SELECT im.source_id, im.repo, im.issue_number, im.title, im.body, im.state,
                         im.labels_json, im.author, im.canonical_url,
-                        sv.body_hash, sv.github_updated_at, sv.indexed_at
+                        sv.body_hash, sv.github_updated_at, sv.indexed_at, sv.sync_run_id, sv.lifecycle_state
                  FROM issue_metadata im
                  JOIN source_entities se ON se.source_id = im.source_id
                  JOIN source_versions sv ON sv.id = im.latest_version_id
@@ -306,7 +332,8 @@ impl Store {
             .query_row(
                 "SELECT cm.source_id, cm.repo, cm.issue_number, cm.body, cm.author,
                         cm.canonical_url, cm.parent_issue_source_id, cm.parent_issue_title,
-                        cm.parent_issue_canonical_url, sv.body_hash, sv.github_updated_at, sv.indexed_at
+                        cm.parent_issue_canonical_url, sv.body_hash, sv.github_updated_at, sv.indexed_at,
+                        sv.sync_run_id, sv.lifecycle_state
                  FROM comment_metadata cm
                  JOIN source_entities se ON se.source_id = cm.source_id
                  JOIN source_versions sv ON sv.id = cm.latest_version_id
@@ -326,6 +353,32 @@ impl Store {
             return Ok(Some(StoredSource::Comment(comment)));
         }
         Ok(None)
+    }
+
+    pub fn sync_cursors(&self) -> Result<Vec<StoredCursor>, QghError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT endpoint, cursor, etag FROM sync_cursors ORDER BY endpoint")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StoredCursor {
+                endpoint: row.get(0)?,
+                cursor: row.get(1)?,
+                etag: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
+    }
+
+    pub fn cursor_views(&self) -> Result<Vec<CursorView>, QghError> {
+        Ok(self
+            .sync_cursors()?
+            .into_iter()
+            .map(|cursor| CursorView {
+                endpoint: cursor.endpoint,
+                watermark: cursor.cursor,
+                has_etag: cursor.etag.is_some(),
+            })
+            .collect())
     }
 
     pub fn mark_index_published(
@@ -402,6 +455,7 @@ impl Store {
             active_generation: active_generation.unwrap_or(0),
             dirty_task_count,
             last_sync_at,
+            cursors: self.cursor_views()?,
         })
     }
 
@@ -671,6 +725,8 @@ fn stored_issue_from_row(row: &rusqlite::Row<'_>) -> Result<StoredIssue, rusqlit
             body_hash: row.get(9)?,
             github_updated_at: row.get(10)?,
             indexed_at: row.get(11)?,
+            sync_run_id: row.get(12)?,
+            lifecycle_state: row.get(13)?,
         },
     })
 }
@@ -696,6 +752,8 @@ fn stored_comment_from_row(row: &rusqlite::Row<'_>) -> Result<StoredComment, rus
             body_hash: row.get(9)?,
             github_updated_at: row.get(10)?,
             indexed_at: row.get(11)?,
+            sync_run_id: row.get(12)?,
+            lifecycle_state: row.get(13)?,
         },
     })
 }

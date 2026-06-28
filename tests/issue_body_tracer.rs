@@ -5,7 +5,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
@@ -188,6 +188,117 @@ fn missing_profile_is_a_structured_usage_error() {
     assert_eq!(json["error"]["code"], "config.missing_profile");
     assert_eq!(json["error"]["exit_code"], 2);
     assert!(stderr_text(&output).is_empty());
+}
+
+#[test]
+fn incremental_sync_records_new_versions_and_uses_since_overlap_and_etag() {
+    let fixture = TestFixture::new("incremental-edit");
+    let server = EditingFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    let first_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&first_sync);
+    let issue_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    let comment_id = "qgh://github.com/issue-comment/IC_kwDOCOMMENT1";
+    let first_issue = stdout_json(&fixture.qgh(["get", issue_id, "--json"]));
+    let first_issue_version = first_issue["data"]["source"]["source_version"].clone();
+    assert_eq!(
+        first_issue_version["github_updated_at"],
+        "2026-01-02T03:04:05Z"
+    );
+    assert_eq!(first_issue_version["lifecycle_state"], "active");
+    assert!(first_issue_version["sync_run_id"].as_str().is_some());
+
+    server.set_mode(2);
+    let second_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&second_sync);
+    let second_sync_json = stdout_json(&second_sync);
+    assert_eq!(second_sync_json["data"]["issues"]["upserted"], 1);
+    assert_eq!(second_sync_json["data"]["comments"]["upserted"], 1);
+    assert_eq!(
+        second_sync_json["data"]["cursors"]["not_modified_endpoints"],
+        0
+    );
+    assert_eq!(
+        second_sync_json["data"]["cursors"]["watermarks"]["issues:owner/repo"],
+        "2026-01-04T00:00:00Z"
+    );
+
+    let requests = server.requests();
+    assert!(
+        requests.iter().any(|request| request.contains(
+            "GET /repos/owner/repo/issues?state=all&sort=updated&direction=asc&per_page=100&since=2026-01-02T03%3A03%3A05Z"
+        )),
+        "second issue sync must use the previous issue watermark with a 60-second overlap: {requests:#?}"
+    );
+    assert!(
+        requests.iter().any(|request| request
+            .to_ascii_lowercase()
+            .contains("if-none-match: \"issues-v1\"")),
+        "second issue sync must send the stored issue ETag: {requests:#?}"
+    );
+
+    let edited_issue = stdout_json(&fixture.qgh(["get", issue_id, "--json"]));
+    let edited_issue_source = &edited_issue["data"]["source"];
+    assert!(edited_issue_source["body"]
+        .as_str()
+        .unwrap()
+        .contains("updated issue body"));
+    assert_eq!(edited_issue_source["title"], "Cache sync bug updated");
+    assert_eq!(
+        edited_issue_source["source_version"]["github_updated_at"],
+        "2026-01-04T00:00:00Z"
+    );
+    assert_ne!(
+        edited_issue_source["source_version"]["body_hash"],
+        first_issue_version["body_hash"]
+    );
+    assert_ne!(
+        edited_issue_source["source_version"]["sync_run_id"],
+        first_issue_version["sync_run_id"]
+    );
+    assert_eq!(
+        edited_issue_source["source_version"]["lifecycle_state"],
+        "active"
+    );
+    let updated_query = stdout_json(&fixture.qgh(["query", "updated issue body", "--json"]));
+    assert_eq!(updated_query["data"]["results"][0]["source_id"], issue_id);
+    let old_query =
+        stdout_json(&fixture.qgh(["query", "round-trip through get before citation", "--json"]));
+    assert_eq!(old_query["data"]["results"].as_array().unwrap().len(), 0);
+
+    let edited_comment = stdout_json(&fixture.qgh(["get", comment_id, "--json"]));
+    let edited_comment_source = &edited_comment["data"]["source"];
+    assert!(edited_comment_source["body"]
+        .as_str()
+        .unwrap()
+        .contains("updated comment body"));
+    assert_eq!(
+        edited_comment_source["source_version"]["github_updated_at"],
+        "2026-01-04T00:01:00Z"
+    );
+    fixture.assert_source_version_count(issue_id, 2);
+    fixture.assert_source_version_count(comment_id, 2);
+
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(
+        status["data"]["sync"]["cursors"]["issues:owner/repo"]["watermark"],
+        "2026-01-04T00:00:00Z"
+    );
+    assert_eq!(
+        status["data"]["sync"]["cursors"]["comments:owner/repo#42"]["watermark"],
+        "2026-01-04T00:01:00Z"
+    );
+
+    let third_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&third_sync);
+    let third_sync_json = stdout_json(&third_sync);
+    assert_eq!(
+        third_sync_json["data"]["cursors"]["not_modified_endpoints"],
+        1
+    );
+    fixture.assert_source_version_count(issue_id, 2);
+    fixture.assert_source_version_count(comment_id, 2);
 }
 
 fn issue_payload_with_pr() -> &'static str {
@@ -406,6 +517,19 @@ env = "QGH_TEST_TOKEN"
             "https://github.com/owner/repo/issues/42#issuecomment-5001"
         );
     }
+
+    fn assert_source_version_count(&self, source_id: &str, expected: i64) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM source_versions WHERE source_id = ?1",
+                [source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, expected);
+    }
 }
 
 impl Drop for TestFixture {
@@ -539,4 +663,136 @@ fn stdout_text(output: &Output) -> String {
 
 fn stderr_text(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+struct EditingFakeGitHub {
+    base_url: String,
+    mode: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl EditingFakeGitHub {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        let mode = Arc::new(AtomicUsize::new(1));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_mode = Arc::clone(&mode);
+        let thread_requests = Arc::clone(&requests);
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                match stream {
+                    Ok(stream) => handle_editing_connection(stream, &thread_mode, &thread_requests),
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            base_url,
+            mode,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn set_mode(&self, mode: usize) {
+        self.mode.store(mode, Ordering::SeqCst);
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for EditingFakeGitHub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.base_url.strip_prefix("http://").unwrap());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn handle_editing_connection(
+    mut stream: TcpStream,
+    mode: &Arc<AtomicUsize>,
+    requests: &Arc<Mutex<Vec<String>>>,
+) {
+    let mut buffer = [0_u8; 8192];
+    let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+    let request_line = request.lines().next().unwrap_or("").to_string();
+    requests.lock().unwrap().push(request.clone());
+    let mode = mode.load(Ordering::SeqCst);
+    let lower = request.to_ascii_lowercase();
+
+    let (status, etag, body) = if request_line.starts_with("GET /repos/owner/repo/issues?") {
+        if mode == 2 && lower.contains("if-none-match: \"issues-v2\"") {
+            ("304 Not Modified", "\"issues-v2\"", "")
+        } else if mode == 2 {
+            ("200 OK", "\"issues-v2\"", edited_issue_payload())
+        } else {
+            ("200 OK", "\"issues-v1\"", issue_payload_with_pr())
+        }
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?") {
+        if mode == 2 {
+            ("200 OK", "\"comments-v2\"", edited_issue_comments_payload())
+        } else {
+            ("200 OK", "\"comments-v1\"", issue_comments_payload())
+        }
+    } else {
+        ("404 Not Found", "\"missing\"", r#"{"message":"not found"}"#)
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\netag: {etag}\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
+fn edited_issue_payload() -> &'static str {
+    r#"[
+      {
+        "id": 1001,
+        "node_id": "I_kwDOISSUE1",
+        "number": 42,
+        "title": "Cache sync bug updated",
+        "body": "The updated issue body must replace the old active search version.",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-04T00:00:00Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}, {"name": "mvp"}],
+        "milestone": {"title": "MVP"},
+        "assignees": [{"login": "alice"}]
+      }
+    ]"#
+}
+
+fn edited_issue_comments_payload() -> &'static str {
+    r#"[
+      {
+        "id": 5001,
+        "node_id": "IC_kwDOCOMMENT1",
+        "body": "The updated comment body must be the only active comment search version.",
+        "html_url": "https://github.com/owner/repo/issues/42#issuecomment-5001",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-04T00:01:00Z",
+        "user": {"login": "carol"}
+      }
+    ]"#
 }

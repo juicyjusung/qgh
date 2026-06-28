@@ -9,12 +9,14 @@ use serde_json::{json, Value};
 pub async fn sync(profile_id: &str) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
     let token = resolve_token(&profile)?;
-    let fetched = github::fetch_issues(&profile, &token).await?;
     let mut store = Store::open(&profile.paths)?;
+    let cursors = store.sync_cursors()?;
+    let fetched = github::fetch_issues(&profile, &token, &cursors).await?;
     let summary = store.upsert_sources(
         &fetched.issues,
         &fetched.comments,
         fetched.skipped_pull_requests,
+        &fetched.cursor_updates,
     )?;
     let sources = store.active_index_sources()?;
     let generation = store.next_index_generation()?;
@@ -30,6 +32,11 @@ pub async fn sync(profile_id: &str) -> Result<Value, QghError> {
         sources.len(),
     )?;
     let status = store.status()?;
+    let watermarks = summary
+        .cursor_updates
+        .iter()
+        .map(|cursor| (cursor.endpoint.clone(), json!(cursor.watermark)))
+        .collect::<serde_json::Map<_, _>>();
     Ok(json!({
         "profile_id": profile.id,
         "sync_run_id": summary.sync_run_id,
@@ -41,6 +48,11 @@ pub async fn sync(profile_id: &str) -> Result<Value, QghError> {
         "comments": {
             "fetched": summary.fetched_comments,
             "upserted": summary.upserted_comments
+        },
+        "cursors": {
+            "updated": summary.cursor_updates.len(),
+            "not_modified_endpoints": summary.not_modified_endpoints,
+            "watermarks": watermarks
         },
         "index": {
             "active_generation": generation,
@@ -86,6 +98,19 @@ pub fn status(profile_id: &str) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
     let store = Store::open(&profile.paths)?;
     let status = store.status()?;
+    let cursors = status
+        .cursors
+        .iter()
+        .map(|cursor| {
+            (
+                cursor.endpoint.clone(),
+                json!({
+                    "watermark": cursor.watermark,
+                    "has_etag": cursor.has_etag
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
     Ok(json!({
         "profile_id": profile.id,
         "github": {
@@ -113,7 +138,8 @@ pub fn status(profile_id: &str) -> Result<Value, QghError> {
             "dirty_task_count": status.dirty_task_count
         },
         "sync": {
-            "last_sync_at": status.last_sync_at
+            "last_sync_at": status.last_sync_at,
+            "cursors": cursors
         }
     }))
 }

@@ -48,6 +48,8 @@ pub struct SourceVersionView {
     pub body_hash: String,
     pub github_updated_at: String,
     pub indexed_at: String,
+    pub sync_run_id: String,
+    pub lifecycle_state: String,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +117,8 @@ pub struct SyncSummary {
     pub fetched_comments: usize,
     pub upserted_comments: usize,
     pub skipped_pull_requests: usize,
+    pub cursor_updates: Vec<CursorView>,
+    pub not_modified_endpoints: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -125,4 +129,27 @@ pub struct StatusSnapshot {
     pub active_generation: i64,
     pub dirty_task_count: i64,
     pub last_sync_at: Option<String>,
+    pub cursors: Vec<CursorView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CursorView {
+    pub endpoint: String,
+    pub watermark: Option<String>,
+    pub has_etag: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredCursor {
+    pub endpoint: String,
+    pub cursor: Option<String>,
+    pub etag: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CursorUpdate {
+    pub endpoint: String,
+    pub cursor: Option<String>,
+    pub etag: Option<String>,
+    pub not_modified: bool,
 }
