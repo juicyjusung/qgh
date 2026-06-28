@@ -117,6 +117,16 @@ pub struct ReconciliationRunView {
     pub estimated_api_cost_class: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BackoffView {
+    pub reason: String,
+    pub scope: String,
+    pub retry_after_seconds: i64,
+    pub reset_at: Option<String>,
+    pub observed_at: String,
+    pub last_successful_sync: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct IndexSource {
     pub source_id: String,
@@ -154,6 +164,7 @@ pub struct StatusSnapshot {
     pub dirty_task_count: i64,
     pub last_sync_at: Option<String>,
     pub last_reconciliation: Option<ReconciliationRunView>,
+    pub backoff: Option<BackoffView>,
     pub cursors: Vec<CursorView>,
 }
 

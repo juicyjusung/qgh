@@ -6,7 +6,7 @@ use crate::model::{
 use crate::time::now_rfc3339;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use reqwest::header::{HeaderMap, ETAG, IF_NONE_MATCH, LINK};
+use reqwest::header::{HeaderMap, ETAG, IF_NONE_MATCH, LINK, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -41,6 +41,18 @@ pub struct FetchResult {
     pub cursor_updates: Vec<CursorUpdate>,
 }
 
+pub enum FetchOutcome {
+    Fetched(FetchResult),
+    Backoff(BackoffPlan),
+}
+
+pub struct BackoffPlan {
+    pub reason: String,
+    pub scope: String,
+    pub retry_after_seconds: i64,
+    pub reset_at: Option<String>,
+}
+
 pub struct ReconciliationResult {
     pub checked_sources: usize,
     pub unavailable_sources: Vec<LifecycleFailure>,
@@ -60,7 +72,7 @@ pub async fn fetch_issues(
     profile: &Profile,
     token: &str,
     cursors: &[StoredCursor],
-) -> Result<FetchResult, QghError> {
+) -> Result<FetchOutcome, QghError> {
     let client = reqwest::Client::new();
     let cursor_map = cursor_map(cursors);
     let mut issues = Vec::new();
@@ -89,6 +101,13 @@ pub async fn fetch_issues(
                 .map_err(|error| QghError::github(error.to_string()))?;
             let status = response.status();
             let headers = response.headers().clone();
+            if let Some(backoff) = backoff_from_response(status, &headers, &endpoint) {
+                wait_for_backoff(&backoff);
+                return Ok(FetchOutcome::Backoff(backoff));
+            }
+            if status == StatusCode::NO_CONTENT {
+                break;
+            }
             if status == StatusCode::NOT_MODIFIED {
                 endpoint_not_modified = true;
                 break;
@@ -111,18 +130,25 @@ pub async fn fetch_issues(
                 }
                 let issue = item.into_record(profile, repo, &indexed_at);
                 max_watermark = max_timestamp(max_watermark, &issue.updated_at);
-                comments.extend(
-                    fetch_issue_comments(
-                        &client,
-                        profile,
-                        token,
-                        &cursor_map,
-                        &mut cursor_updates,
-                        repo,
-                        &issue,
-                    )
-                    .await?,
-                );
+                match fetch_issue_comments(
+                    &client,
+                    profile,
+                    token,
+                    &cursor_map,
+                    &mut cursor_updates,
+                    repo,
+                    &issue,
+                )
+                .await?
+                {
+                    CommentFetchOutcome::Fetched(fetched_comments) => {
+                        comments.extend(fetched_comments);
+                    }
+                    CommentFetchOutcome::Backoff(backoff) => {
+                        wait_for_backoff(&backoff);
+                        return Ok(FetchOutcome::Backoff(backoff));
+                    }
+                }
                 issues.push(issue);
             }
             next_url = next_link(&headers);
@@ -135,12 +161,12 @@ pub async fn fetch_issues(
         });
     }
 
-    Ok(FetchResult {
+    Ok(FetchOutcome::Fetched(FetchResult {
         issues,
         comments,
         skipped_pull_requests,
         cursor_updates,
-    })
+    }))
 }
 
 pub async fn reconcile_sources(
@@ -184,7 +210,7 @@ async fn fetch_issue_comments(
     cursor_updates: &mut Vec<CursorUpdate>,
     repo: &RepoRef,
     issue: &IssueRecord,
-) -> Result<Vec<CommentRecord>, QghError> {
+) -> Result<CommentFetchOutcome, QghError> {
     let mut comments = Vec::new();
     let endpoint = comment_endpoint(repo, issue.number);
     let stored_cursor = cursor_map.get(&endpoint);
@@ -206,6 +232,12 @@ async fn fetch_issue_comments(
             .map_err(|error| QghError::github(error.to_string()))?;
         let status = response.status();
         let headers = response.headers().clone();
+        if let Some(backoff) = backoff_from_response(status, &headers, &endpoint) {
+            return Ok(CommentFetchOutcome::Backoff(backoff));
+        }
+        if status == StatusCode::NO_CONTENT {
+            break;
+        }
         if status == StatusCode::NOT_MODIFIED {
             endpoint_not_modified = true;
             break;
@@ -233,7 +265,63 @@ async fn fetch_issue_comments(
         etag: response_etag,
         not_modified: endpoint_not_modified,
     });
-    Ok(comments)
+    Ok(CommentFetchOutcome::Fetched(comments))
+}
+
+enum CommentFetchOutcome {
+    Fetched(Vec<CommentRecord>),
+    Backoff(BackoffPlan),
+}
+
+fn backoff_from_response(
+    status: StatusCode,
+    headers: &HeaderMap,
+    scope: &str,
+) -> Option<BackoffPlan> {
+    if status != StatusCode::FORBIDDEN && status != StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok());
+    if remaining == Some("0") {
+        let reset_epoch = headers
+            .get("x-ratelimit-reset")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<i64>().ok());
+        let reset_at = reset_epoch
+            .and_then(|epoch| DateTime::from_timestamp(epoch, 0))
+            .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true));
+        let retry_after_seconds = reset_epoch
+            .map(|epoch| (epoch - Utc::now().timestamp()).max(0))
+            .unwrap_or(60);
+        return Some(BackoffPlan {
+            reason: "primary_rate_limit".to_string(),
+            scope: scope.to_string(),
+            retry_after_seconds,
+            reset_at,
+        });
+    }
+
+    let retry_after_seconds = headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(60);
+    Some(BackoffPlan {
+        reason: "secondary_rate_limit".to_string(),
+        scope: scope.to_string(),
+        retry_after_seconds,
+        reset_at: None,
+    })
+}
+
+fn wait_for_backoff(backoff: &BackoffPlan) {
+    let seconds = backoff.retry_after_seconds.clamp(0, 1);
+    if seconds > 0 {
+        std::thread::sleep(std::time::Duration::from_secs(seconds as u64));
+    }
 }
 
 fn lifecycle_client() -> Result<reqwest::Client, QghError> {

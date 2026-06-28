@@ -13,7 +13,39 @@ pub async fn sync(profile_id: &str, reconcile: Option<ReconcileMode>) -> Result<
     let token = resolve_token(&profile)?;
     let mut store = Store::open(&profile.paths)?;
     let cursors = store.sync_cursors()?;
-    let fetched = github::fetch_issues(&profile, &token, &cursors).await?;
+    let fetched = match github::fetch_issues(&profile, &token, &cursors).await? {
+        github::FetchOutcome::Fetched(fetched) => fetched,
+        github::FetchOutcome::Backoff(backoff) => {
+            let backoff = store.record_backoff_state(
+                &backoff.reason,
+                &backoff.scope,
+                backoff.retry_after_seconds,
+                backoff.reset_at.as_deref(),
+            )?;
+            let status = store.status()?;
+            return Ok(json!({
+                "profile_id": profile.id,
+                "sync_state": "backoff",
+                "backoff": backoff,
+                "sync": {
+                    "last_successful_sync": status.last_sync_at,
+                    "scheduler": {
+                        "max_in_flight_requests": profile.max_in_flight_requests,
+                        "hard_cap": 16
+                    }
+                },
+                "sources": {
+                    "issue_count": status.issue_count,
+                    "comment_count": status.comment_count,
+                    "tombstone_count": status.tombstone_count
+                },
+                "index": {
+                    "active_generation": status.active_generation,
+                    "dirty_task_count": status.dirty_task_count
+                }
+            }));
+        }
+    };
     let summary = store.upsert_sources(
         &fetched.issues,
         &fetched.comments,
@@ -46,6 +78,7 @@ pub async fn sync(profile_id: &str, reconcile: Option<ReconcileMode>) -> Result<
             "mode": "none"
         })
     };
+    store.clear_backoff_state()?;
     let sources = store.active_index_sources()?;
     let generation = store.next_index_generation()?;
     index::rebuild(
@@ -67,7 +100,12 @@ pub async fn sync(profile_id: &str, reconcile: Option<ReconcileMode>) -> Result<
         .collect::<serde_json::Map<_, _>>();
     Ok(json!({
         "profile_id": profile.id,
+        "sync_state": "ok",
         "sync_run_id": summary.sync_run_id,
+        "scheduler": {
+            "max_in_flight_requests": profile.max_in_flight_requests,
+            "hard_cap": 16
+        },
         "issues": {
             "fetched": summary.fetched_issues,
             "upserted": summary.upserted_issues,
@@ -389,7 +427,12 @@ pub fn status(profile_id: &str) -> Result<Value, QghError> {
         },
         "sync": {
             "last_sync_at": status.last_sync_at,
-            "cursors": cursors
+            "cursors": cursors,
+            "backoff": status.backoff,
+            "scheduler": {
+                "max_in_flight_requests": profile.max_in_flight_requests,
+                "hard_cap": 16
+            }
         },
         "reconciliation": {
             "last_full_at": last_reconciliation.map(|run| run.completed_at.clone()),

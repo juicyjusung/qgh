@@ -519,6 +519,99 @@ fn status_warns_about_stale_reconciliation_without_running_it() {
 }
 
 #[test]
+fn sync_records_primary_rate_limit_backoff_and_local_reads_continue() {
+    let fixture = TestFixture::new("primary-rate-limit");
+    let server = RateLimitFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    server.set_mode(RATE_LIMIT_PRIMARY);
+
+    let limited_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&limited_sync);
+    let limited_json = stdout_json(&limited_sync);
+    assert_eq!(limited_json["data"]["sync_state"], "backoff");
+    assert_eq!(
+        limited_json["data"]["backoff"]["reason"],
+        "primary_rate_limit"
+    );
+    assert_eq!(
+        limited_json["data"]["backoff"]["scope"],
+        "issues:owner/repo"
+    );
+    assert_eq!(limited_json["data"]["backoff"]["retry_after_seconds"], 0);
+    assert!(limited_json["data"]["backoff"]["reset_at"]
+        .as_str()
+        .is_some());
+    assert!(limited_json["data"]["backoff"]["last_successful_sync"]
+        .as_str()
+        .is_some());
+
+    let local_query = fixture.qgh(["query", "BM25 issue body tracer", "--json"]);
+    assert_success(&local_query);
+    assert_eq!(
+        stdout_json(&local_query)["data"]["results"][0]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+    let local_get = fixture.qgh(["get", "qgh://github.com/issue/I_kwDOISSUE1", "--json"]);
+    assert_success(&local_get);
+    assert_eq!(
+        stdout_json(&local_get)["data"]["source"]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(
+        status_json["data"]["sync"]["backoff"]["reason"],
+        "primary_rate_limit"
+    );
+    assert_eq!(
+        status_json["data"]["sync"]["backoff"]["scope"],
+        "issues:owner/repo"
+    );
+    assert!(status_json["data"]["sync"]["last_sync_at"]
+        .as_str()
+        .is_some());
+}
+
+#[test]
+fn sync_records_secondary_rate_limit_retry_after_without_generic_failure() {
+    let fixture = TestFixture::new("secondary-rate-limit");
+    let server = RateLimitFakeGitHub::start();
+    server.set_mode(RATE_LIMIT_SECONDARY);
+    fixture.write_config(&server.base_url);
+
+    let limited_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&limited_sync);
+    let limited_json = stdout_json(&limited_sync);
+    assert_eq!(limited_json["data"]["sync_state"], "backoff");
+    assert_eq!(
+        limited_json["data"]["backoff"]["reason"],
+        "secondary_rate_limit"
+    );
+    assert_eq!(
+        limited_json["data"]["backoff"]["scope"],
+        "issues:owner/repo"
+    );
+    assert_eq!(limited_json["data"]["backoff"]["retry_after_seconds"], 0);
+    assert_eq!(
+        limited_json["data"]["backoff"]["last_successful_sync"],
+        Value::Null
+    );
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(
+        status_json["data"]["sync"]["backoff"]["reason"],
+        "secondary_rate_limit"
+    );
+    assert_eq!(status_json["data"]["sources"]["issue_count"], 0);
+}
+
+#[test]
 fn query_filter_errors_are_versioned_json_envelopes() {
     let fixture = TestFixture::new("filter-errors");
     fixture.write_config("http://127.0.0.1:1");
@@ -1175,6 +1268,126 @@ fn handle_lifecycle_connection(
         }
     } else {
         ("404 Not Found", r#"{"message":"not found"}"#)
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
+const RATE_LIMIT_ACTIVE: usize = 1;
+const RATE_LIMIT_PRIMARY: usize = 2;
+const RATE_LIMIT_SECONDARY: usize = 3;
+
+struct RateLimitFakeGitHub {
+    base_url: String,
+    mode: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RateLimitFakeGitHub {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        let mode = Arc::new(AtomicUsize::new(RATE_LIMIT_ACTIVE));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_mode = Arc::clone(&mode);
+        let thread_stop = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                match stream {
+                    Ok(stream) => handle_rate_limit_connection(stream, &thread_mode),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            base_url,
+            mode,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn set_mode(&self, mode: usize) {
+        self.mode.store(mode, Ordering::SeqCst);
+    }
+}
+
+impl Drop for RateLimitFakeGitHub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.base_url.strip_prefix("http://").unwrap());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn handle_rate_limit_connection(mut stream: TcpStream, mode: &Arc<AtomicUsize>) {
+    let mut buffer = [0_u8; 8192];
+    let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let request_line = request.lines().next().unwrap_or("");
+    let mode = mode.load(Ordering::SeqCst);
+
+    if request_line.starts_with("GET /repos/owner/repo/issues?")
+        && request_line.contains("state=all")
+        && mode == RATE_LIMIT_PRIMARY
+    {
+        let body = r#"{"message":"primary rate limit"}"#;
+        let response = format!(
+            "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 0\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        return;
+    }
+    if request_line.starts_with("GET /repos/owner/repo/issues?")
+        && request_line.contains("state=all")
+        && mode == RATE_LIMIT_SECONDARY
+    {
+        let body = r#"{"message":"secondary rate limit"}"#;
+        let response = format!(
+            "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nretry-after: 0\r\nx-ratelimit-remaining: 42\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        return;
+    }
+
+    let body = if request_line.starts_with("GET /repos/owner/repo/issues?")
+        && request_line.contains("state=all")
+        && request_line.contains("per_page=100")
+    {
+        issue_payload_with_pr()
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?")
+        && request_line.contains("per_page=100")
+    {
+        issue_comments_payload()
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/42 ") {
+        issue_object_payload()
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/comments/5001 ") {
+        issue_comment_object_payload()
+    } else {
+        r#"{"message":"not found"}"#
+    };
+    let status = if body == issue_payload_with_pr()
+        || body == issue_comments_payload()
+        || body == issue_object_payload()
+        || body == issue_comment_object_payload()
+    {
+        "200 OK"
+    } else {
+        "404 Not Found"
     };
     let response = format!(
         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
