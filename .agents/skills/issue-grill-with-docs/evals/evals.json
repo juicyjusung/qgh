@@ -1,0 +1,23 @@
+{
+  "skill_name": "issue-grill-with-docs",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "$issue-grill-with-docs #3",
+      "expected_output": "Reads GitHub issue #3 and qgh source-of-truth docs, classifies open choices as D0-D3, writes concise Korean issue comments only for D1/D2/D3 decisions, avoids labels/closure/implementation, and ends with Updated #3 or Issue update not needed.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "#9 Citation Contract 방향 구현 전에 grill-with-docs로 정리해줘. 중요한 결정은 이슈 댓글로 남겨.",
+      "expected_output": "Treats Citation Contract choices as D2 when material, checks qgh PRD/ADR/domain docs, recommends a qgh-consistent provisional path, records Korean decision tracking on issue #9, and does not implement code.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "이슈 14 MCP read-only surface 애매한 부분 알아서 sharpen 해줘. write tool 추가가 필요하면 판단도 남겨.",
+      "expected_output": "Recognizes MCP write/sync expansion as D3 or D2 requiring human confirmation, gathers issue #14 context plus qgh guardrails, posts a concise blocker/provisional decision comment in Korean, and avoids changing labels, issue body, or source files.",
+      "files": []
+    }
+  ]
+}
