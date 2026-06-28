@@ -4,7 +4,11 @@
 대상: GitHub Issues + GitHub Wiki를 SSOT로 쓰는 조직/프로젝트의 별도 인덱싱 및 임베딩 기반 검색 시스템  
 검토 기준 저장소: `tobi/qmd` `v2.6.3`, commit `e428df76bc0274d9e93eb7ca3e95673315c42e90`
 
-## 0. 결론 요약
+## 0. 현재 MVP scope override
+
+2026-06-29 KST에 qgh MVP scope를 GitHub Issues와 issue comments only로 재설정했다. 또한 architecture lock은 Rust single-binary CLI/MCP, bundled SQLite authoritative store, Tantivy derived BM25 index, explicit XDG profile store다. 이 보고서의 Wiki, SQLite FTS5, sqlite-vec, server/search-engine 비교 분석은 post-MVP 또는 historical baseline 검토 자료로 남기며, 현재 MVP 계약이나 release gate가 아니다. 현재 canonical MVP scope는 `qgh-prd.md`, `qgh-product-brief.md`, `qgh-mvp-evidence-decision-summary.md`, ADR-0003~0007을 따른다.
+
+## 0.1 결론 요약
 
 최종 판단은 **조건부 가능, MVP는 Go**다.
 
