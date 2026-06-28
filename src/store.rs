@@ -22,8 +22,8 @@ impl Store {
         ensure_private_dir(&paths.log_dir)?;
         let conn = Connection::open(&paths.db_path)?;
         set_private_file(&paths.db_path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         let mut store = Self { conn };
         store.migrate()?;
         Ok(store)
