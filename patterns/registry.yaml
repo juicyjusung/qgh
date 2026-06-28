@@ -1,0 +1,53 @@
+# Machine-readable qgh loop pattern registry.
+# GitHub Issues remain the tracker source of truth; #18/#19 hold loop runtime state.
+
+patterns:
+  - id: issue-triage
+    name: qgh Issue Triage
+    file: issue-triage.md
+    goal: Keep the GitHub issue backlog actionable without mutating tracker state in L1.
+    cadence: 1d
+    risk: low
+    tools: [codex]
+    skills: [issue-triage, loop-budget]
+    state: "GitHub issue #18"
+    phases: [discover, score, propose-labels, human-review]
+    human_gates:
+      - product-scope
+      - privacy
+      - source-identity
+      - schema-contracts
+      - mcp-surface
+      - label-application
+    week_one_mode: L1
+    token_cost: low
+    cost:
+      tokens_noop: 3000
+      tokens_report: 30000
+      tokens_action: 0
+      suggested_daily_cap: 80000
+      early_exit_required: true
+
+  - id: daily-triage
+    name: qgh Daily Triage
+    file: daily-triage.md
+    goal: Summarize daily operating priorities from GitHub Issues, local state, and recent repo changes.
+    cadence: 1d
+    risk: low
+    tools: [codex]
+    skills: [loop-triage, loop-budget]
+    state: "GitHub issue #18"
+    phases: [report, watch, escalate]
+    human_gates:
+      - product-scope
+      - adr-changes
+      - github-writes
+      - implementation-work
+    week_one_mode: L1
+    token_cost: low
+    cost:
+      tokens_noop: 3000
+      tokens_report: 50000
+      tokens_action: 0
+      suggested_daily_cap: 100000
+      early_exit_required: true
