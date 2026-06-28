@@ -1,7 +1,9 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::{
@@ -44,6 +46,19 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     assert!(status_json["data"]["sync"]["last_sync_at"]
         .as_str()
         .is_some());
+    assert!(status_json["data"]["paths"]["logs"].as_str().is_some());
+    assert_eq!(
+        status_json["data"]["privacy"]["classification"],
+        "sensitive_derivative_data"
+    );
+    assert_eq!(
+        status_json["data"]["privacy"]["hosted_provider_egress"],
+        "disabled"
+    );
+    assert_eq!(
+        status_json["data"]["privacy"]["default_network_egress"],
+        "configured_github_host_only"
+    );
     assert_eq!(server.request_count(), 2, "status must be local-only");
 
     let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
@@ -265,6 +280,7 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     let second_sync = fixture.qgh(["sync", "--json"]);
     assert_success(&second_sync);
     fixture.assert_sqlite_comment_metadata(1);
+    fixture.assert_private_local_data_permissions();
 }
 
 #[test]
@@ -612,6 +628,58 @@ fn sync_records_secondary_rate_limit_retry_after_without_generic_failure() {
 }
 
 #[test]
+fn doctor_runs_explicit_checks_and_reports_cli_only_scope() {
+    let fixture = TestFixture::new("doctor");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let before_doctor = server.request_count();
+    let doctor = fixture.qgh(["doctor", "--json"]);
+    assert_success(&doctor);
+    assert!(
+        server.request_count() > before_doctor,
+        "doctor is the explicit command allowed to probe GitHub"
+    );
+    let doctor_json = stdout_json(&doctor);
+    let checks = doctor_json["data"]["checks"].as_array().unwrap();
+    for expected in [
+        "config",
+        "file_permissions",
+        "sqlite",
+        "tantivy",
+        "github_auth_reachability",
+        "rate_limit_headers",
+    ] {
+        assert!(
+            checks
+                .iter()
+                .any(|check| check["name"] == expected && check["ok"] == true),
+            "missing successful doctor check {expected}: {doctor_json:#}"
+        );
+    }
+    assert_eq!(doctor_json["data"]["mcp"]["doctor_exposed"], false);
+    assert_eq!(
+        doctor_json["data"]["mcp"]["tools"],
+        json!(["query", "get", "status"])
+    );
+}
+
+#[test]
+fn privacy_docs_describe_sensitive_derivative_data_paths() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let docs = fs::read_to_string(root.join("docs/privacy.md")).unwrap();
+    assert!(docs.contains("Sensitive Derivative Data"));
+    assert!(docs.contains("SQLite"));
+    assert!(docs.contains("Tantivy"));
+    assert!(docs.contains("logs"));
+    assert!(docs.contains("cache"));
+    assert!(docs
+        .to_ascii_lowercase()
+        .contains("hosted provider paths are disabled"));
+}
+
+#[test]
 fn query_filter_errors_are_versioned_json_envelopes() {
     let fixture = TestFixture::new("filter-errors");
     fixture.write_config("http://127.0.0.1:1");
@@ -857,6 +925,10 @@ fn issue_comment_object_payload() -> &'static str {
     }"#
 }
 
+fn rate_limit_payload() -> &'static str {
+    r#"{"resources":{"core":{"limit":5000,"remaining":4999,"reset":0}}}"#
+}
+
 struct TestFixture {
     root: PathBuf,
     config_home: PathBuf,
@@ -1044,6 +1116,27 @@ env = "QGH_TEST_TOKEN"
         assert_eq!(count, expected);
     }
 
+    fn assert_private_local_data_permissions(&self) {
+        #[cfg(unix)]
+        {
+            for path in [
+                self.data_home.join("qgh/profiles/work"),
+                self.data_home.join("qgh/profiles/work/qgh.sqlite3"),
+                self.data_home.join("qgh/profiles/work/tantivy/active"),
+                self.cache_home.join("qgh"),
+                self.cache_home.join("qgh/logs"),
+            ] {
+                let mode = fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(
+                    mode & 0o077,
+                    0,
+                    "{} must not be readable or writable by group/other",
+                    path.display()
+                );
+            }
+        }
+    }
+
     fn mark_source_unavailable_without_reindex(&self, source_id: &str) {
         let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
         let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -1141,6 +1234,8 @@ fn handle_connection(
         issue_object_payload()
     } else if request_line.starts_with("GET /repos/owner/repo/issues/comments/5001 ") {
         issue_comment_object_payload()
+    } else if request_line.starts_with("GET /rate_limit ") {
+        rate_limit_payload()
     } else {
         r#"{"message":"not found"}"#
     };
@@ -1148,13 +1243,14 @@ fn handle_connection(
         || body == issue_comments_payload()
         || body == issue_object_payload()
         || body == issue_comment_object_payload()
+        || body == rate_limit_payload()
     {
         "200 OK"
     } else {
         "404 Not Found"
     };
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();
@@ -1270,7 +1366,7 @@ fn handle_lifecycle_connection(
         ("404 Not Found", r#"{"message":"not found"}"#)
     };
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();
@@ -1345,7 +1441,7 @@ fn handle_rate_limit_connection(mut stream: TcpStream, mode: &Arc<AtomicUsize>) 
     {
         let body = r#"{"message":"primary rate limit"}"#;
         let response = format!(
-            "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 0\r\n\r\n{body}",
+            "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 0\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(response.as_bytes()).unwrap();
@@ -1357,7 +1453,7 @@ fn handle_rate_limit_connection(mut stream: TcpStream, mode: &Arc<AtomicUsize>) 
     {
         let body = r#"{"message":"secondary rate limit"}"#;
         let response = format!(
-            "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nretry-after: 0\r\nx-ratelimit-remaining: 42\r\n\r\n{body}",
+            "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nretry-after: 0\r\nx-ratelimit-remaining: 42\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(response.as_bytes()).unwrap();
@@ -1390,7 +1486,7 @@ fn handle_rate_limit_connection(mut stream: TcpStream, mode: &Arc<AtomicUsize>) 
         "404 Not Found"
     };
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();
@@ -1547,7 +1643,7 @@ fn handle_editing_connection(
         ("404 Not Found", "\"missing\"", r#"{"message":"not found"}"#)
     };
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\netag: {etag}\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\netag: {etag}\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();

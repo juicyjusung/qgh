@@ -1,5 +1,6 @@
 use crate::error::QghError;
 use crate::model::IndexSource;
+use crate::paths::{ensure_private_dir, set_private_dir};
 use std::fs;
 use std::path::Path;
 use tantivy::collector::TopDocs;
@@ -18,12 +19,12 @@ pub fn rebuild(
     generation: i64,
     sources: &[IndexSource],
 ) -> Result<(), QghError> {
-    fs::create_dir_all(index_root)?;
+    ensure_private_dir(index_root)?;
     let shadow_path = index_root.join(format!("shadow-{generation}"));
     if shadow_path.exists() {
         fs::remove_dir_all(&shadow_path)?;
     }
-    fs::create_dir_all(&shadow_path)?;
+    ensure_private_dir(&shadow_path)?;
     let (schema, fields) = schema();
     let index =
         Index::create_in_dir(&shadow_path, schema).map_err(|e| QghError::index(e.to_string()))?;
@@ -58,6 +59,7 @@ pub fn rebuild(
         fs::remove_dir_all(active_path)?;
     }
     fs::rename(&shadow_path, active_path)?;
+    set_private_dir(active_path)?;
     Ok(())
 }
 

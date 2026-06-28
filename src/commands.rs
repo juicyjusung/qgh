@@ -411,7 +411,8 @@ pub fn status(profile_id: &str) -> Result<Value, QghError> {
             "profile_data": profile.paths.profile_dir,
             "database": profile.paths.db_path,
             "tantivy_index": profile.paths.index_active,
-            "cache": profile.paths.cache_dir
+            "cache": profile.paths.cache_dir,
+            "logs": profile.paths.log_dir
         },
         "sources": {
             "issue_count": status.issue_count,
@@ -443,20 +444,62 @@ pub fn status(profile_id: &str) -> Result<Value, QghError> {
             "last_checked_source_count": last_reconciliation.map(|run| run.checked_source_count),
             "last_tombstoned_count": last_reconciliation.map(|run| run.tombstoned_count),
             "last_estimated_api_cost_class": last_reconciliation.map(|run| run.estimated_api_cost_class.clone())
+        },
+        "privacy": {
+            "classification": "sensitive_derivative_data",
+            "default_network_egress": "configured_github_host_only",
+            "hosted_provider_egress": "disabled",
+            "local_paths_may_contain_private_content": true,
+            "single_user_permissions": "0600_files_0700_dirs_where_supported"
         }
     }))
 }
 
-pub fn doctor(profile_id: &str) -> Result<Value, QghError> {
+pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
+    let store = Store::open(&profile.paths)?;
+    let status = store.status()?;
+    let permissions_ok = private_paths_ok(&profile.paths);
+    let sqlite_ok = status.active_generation >= 0;
+    let tantivy_ok = !profile.paths.index_active.exists()
+        || index::search(&profile.paths.index_active, "__qgh_doctor_probe__", 1).is_ok();
+    let (github_ok, rate_limit_ok, rate_limit_headers) = match resolve_token(&profile) {
+        Ok(token) => doctor_github_probe(&profile, &token).await,
+        Err(_) => (false, false, json!({})),
+    };
     Ok(json!({
         "profile_id": profile.id,
         "checks": [
             {
                 "name": "config",
                 "ok": true
+            },
+            {
+                "name": "file_permissions",
+                "ok": permissions_ok
+            },
+            {
+                "name": "sqlite",
+                "ok": sqlite_ok
+            },
+            {
+                "name": "tantivy",
+                "ok": tantivy_ok
+            },
+            {
+                "name": "github_auth_reachability",
+                "ok": github_ok
+            },
+            {
+                "name": "rate_limit_headers",
+                "ok": rate_limit_ok,
+                "headers": rate_limit_headers
             }
-        ]
+        ],
+        "mcp": {
+            "doctor_exposed": false,
+            "tools": ["query", "get", "status"]
+        }
     }))
 }
 
@@ -539,6 +582,67 @@ fn age_days(timestamp: &str) -> Option<i64> {
             .num_days()
             .max(0)
     })
+}
+
+async fn doctor_github_probe(profile: &crate::config::Profile, token: &str) -> (bool, bool, Value) {
+    let url = format!("{}/rate_limit", profile.api_base_url);
+    let response = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(token)
+        .header("accept", "application/vnd.github+json")
+        .send()
+        .await;
+    let Ok(response) = response else {
+        return (false, false, json!({}));
+    };
+    let headers = response.headers();
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let reset = headers
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let rate_limit_ok = remaining.is_some();
+    (
+        response.status().is_success(),
+        rate_limit_ok,
+        json!({
+            "x-ratelimit-remaining": remaining,
+            "x-ratelimit-reset": reset
+        }),
+    )
+}
+
+fn private_paths_ok(paths: &crate::paths::ProfilePaths) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dirs = [
+            &paths.profile_dir,
+            &paths.cache_dir,
+            &paths.log_dir,
+            &paths.index_active,
+        ];
+        for dir in dirs.into_iter().filter(|path| path.exists()) {
+            let Ok(metadata) = std::fs::metadata(dir) else {
+                return false;
+            };
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return false;
+            }
+        }
+        if paths.db_path.exists() {
+            let Ok(metadata) = std::fs::metadata(&paths.db_path) else {
+                return false;
+            };
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn issue_source(issue: StoredIssue) -> Value {
