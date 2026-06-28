@@ -1,0 +1,100 @@
+{
+  "schema_version": "qgh.release.v1",
+  "contract": {
+    "envelope_schema_version": "qgh.v1",
+    "cli_commands": ["sync", "query", "search", "get", "status", "doctor", "mcp"],
+    "canonical_cli_commands": ["sync", "query", "get", "status", "doctor"],
+    "cli_aliases": {
+      "search": "query"
+    },
+    "cli_only_commands": ["sync", "doctor"],
+    "mcp_protocol_version": "2025-11-25",
+    "mcp_tools": ["query", "get", "status"],
+    "mcp_read_only": true,
+    "not_exposed_to_mcp": [
+      "sync",
+      "doctor",
+      "eval",
+      "embed",
+      "delete",
+      "update",
+      "write",
+      "hosted_provider"
+    ],
+    "mvp_sources": ["GitHub Issues", "GitHub issue comments"],
+    "post_mvp_or_excluded_behavior": [
+      "Wiki",
+      "vector",
+      "shared server",
+      "write-back",
+      "user-facing eval",
+      "hosted provider default",
+      "GHES release gate"
+    ]
+  },
+  "schema_snapshots": [
+    "docs/schemas/envelope.schema.json",
+    "docs/schemas/error.schema.json",
+    "docs/schemas/sync-output.schema.json",
+    "docs/schemas/query-result.schema.json",
+    "docs/schemas/get-output.schema.json",
+    "docs/schemas/status-output.schema.json",
+    "docs/schemas/doctor-output.schema.json"
+  ],
+  "acceptance_snapshot": {
+    "included_in_mvp_gate": [
+      "AC-01",
+      "AC-02",
+      "AC-03",
+      "AC-04",
+      "AC-05",
+      "AC-06",
+      "AC-07",
+      "AC-08",
+      "AC-09",
+      "AC-10",
+      "AC-11",
+      "AC-12",
+      "AC-14",
+      "AC-15",
+      "AC-16",
+      "AC-17",
+      "AC-18",
+      "AC-19",
+      "AC-21",
+      "AC-22",
+      "AC-23",
+      "AC-24",
+      "AC-25",
+      "AC-26",
+      "AC-27",
+      "AC-28"
+    ],
+    "excluded_from_mvp_gate": [
+      {
+        "id": "AC-13",
+        "reason": "post-MVP vector/hybrid capability; BM25-only path remains the MVP gate"
+      },
+      {
+        "id": "AC-20",
+        "reason": "GHES is best-effort profile capability and not a release gate"
+      }
+    ]
+  },
+  "verification": [
+    "Tantivy BM25-only path",
+    "strict schema/envelope",
+    "MCP read-only tools",
+    "stdout cleanliness",
+    "privacy no-egress",
+    "DB/index permissions",
+    "doctor output",
+    "search eval result"
+  ],
+  "residual_risks": [
+    "Wiki source connector is post-MVP",
+    "vector and hosted provider quality improvements require an explicit future decision",
+    "shared server and GitHub App token operations require separate ACL and audit design",
+    "GHES remains best-effort until a dedicated compatibility pass"
+  ]
+}
