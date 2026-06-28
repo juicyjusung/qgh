@@ -7,6 +7,7 @@ use crate::model::{StoredComment, StoredIssue, StoredSource};
 use crate::store::Store;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 
 pub async fn sync(profile_id: &str, reconcile: Option<ReconcileMode>) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
@@ -80,16 +81,13 @@ pub async fn sync(profile_id: &str, reconcile: Option<ReconcileMode>) -> Result<
     };
     store.clear_backoff_state()?;
     let sources = store.active_index_sources()?;
-    let generation = store.next_index_generation()?;
-    index::rebuild(
-        &profile.paths.index_root,
-        &profile.paths.index_active,
-        generation,
-        &sources,
-    )?;
+    let (generation, reserved_generation_path) =
+        store.reserve_index_generation(&profile.paths.index_root, sources.len())?;
+    let generation_path = index::rebuild(&profile.paths.index_root, generation, &sources)?;
+    debug_assert_eq!(generation_path, reserved_generation_path);
     store.mark_index_published(
         generation,
-        &profile.paths.index_active.to_string_lossy(),
+        &generation_path.to_string_lossy(),
         sources.len(),
     )?;
     let status = store.status()?;
@@ -141,7 +139,8 @@ pub fn query(profile_id: &str, args: QueryArgs) -> Result<Value, QghError> {
             "results": results
         }));
     }
-    let hits = index::search(&profile.paths.index_active, &args.query, args.limit)?;
+    let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
+    let hits = index::search(&active_index_path, &args.query, args.limit)?;
     let mut results = Vec::new();
     let mut unresolvable_hits = 0;
     for hit in hits {
@@ -399,6 +398,7 @@ pub fn status(profile_id: &str) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
     let store = Store::open(&profile.paths)?;
     let status = store.status()?;
+    let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
     let source_count = (status.issue_count + status.comment_count) as usize;
     let age_days = status
         .last_reconciliation
@@ -437,7 +437,7 @@ pub fn status(profile_id: &str) -> Result<Value, QghError> {
             "config": profile.paths.config_file,
             "profile_data": profile.paths.profile_dir,
             "database": profile.paths.db_path,
-            "tantivy_index": profile.paths.index_active,
+            "tantivy_index": active_index_path,
             "cache": profile.paths.cache_dir,
             "logs": profile.paths.log_dir
         },
@@ -488,8 +488,9 @@ pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
     let status = store.status()?;
     let permissions_ok = private_paths_ok(&profile.paths);
     let sqlite_ok = status.active_generation >= 0;
-    let tantivy_ok = !profile.paths.index_active.exists()
-        || index::search(&profile.paths.index_active, "__qgh_doctor_probe__", 1).is_ok();
+    let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
+    let tantivy_ok = !active_index_path.exists()
+        || index::search(&active_index_path, "__qgh_doctor_probe__", 1).is_ok();
     let (github_ok, rate_limit_ok, rate_limit_headers) = match resolve_token(&profile) {
         Ok(token) => doctor_github_probe(&profile, &token).await,
         Err(_) => (false, false, json!({})),
@@ -528,6 +529,13 @@ pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
             "tools": ["query", "get", "status"]
         }
     }))
+}
+
+fn active_index_path(store: &Store, fallback: &std::path::Path) -> Result<PathBuf, QghError> {
+    Ok(store
+        .active_index_path()?
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fallback.to_path_buf()))
 }
 
 enum Ranking {
