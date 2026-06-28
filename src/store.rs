@@ -6,9 +6,9 @@ use crate::model::{
     TombstoneView,
 };
 use crate::paths::ProfilePaths;
+use crate::paths::{ensure_private_dir, set_private_file};
 use crate::time::{now_rfc3339, now_run_id_suffix};
 use rusqlite::{params, Connection, OptionalExtension};
-use std::fs;
 
 pub struct Store {
     conn: Connection,
@@ -16,8 +16,11 @@ pub struct Store {
 
 impl Store {
     pub fn open(paths: &ProfilePaths) -> Result<Self, QghError> {
-        fs::create_dir_all(&paths.profile_dir)?;
+        ensure_private_dir(&paths.profile_dir)?;
+        ensure_private_dir(&paths.cache_dir)?;
+        ensure_private_dir(&paths.log_dir)?;
         let conn = Connection::open(&paths.db_path)?;
+        set_private_file(&paths.db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self { conn };

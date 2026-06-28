@@ -39,6 +39,6 @@ async fn run(cli: Cli) -> Result<serde_json::Value, QghError> {
         }
         crate::cli::Command::Get { source_id, .. } => commands::get(&profile_id, &source_id).await,
         crate::cli::Command::Status { .. } => commands::status(&profile_id),
-        crate::cli::Command::Doctor { .. } => commands::doctor(&profile_id),
+        crate::cli::Command::Doctor { .. } => commands::doctor(&profile_id).await,
     }
 }
