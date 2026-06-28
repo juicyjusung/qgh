@@ -9,6 +9,7 @@ use crate::paths::ProfilePaths;
 use crate::paths::{ensure_private_dir, set_private_file};
 use crate::time::{now_rfc3339, now_run_id_suffix};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::path::{Path, PathBuf};
 
 pub struct Store {
     conn: Connection,
@@ -23,7 +24,7 @@ impl Store {
         set_private_file(&paths.db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let store = Self { conn };
+        let mut store = Self { conn };
         store.migrate()?;
         Ok(store)
     }
@@ -573,24 +574,41 @@ impl Store {
     }
 
     pub fn mark_index_published(
-        &self,
+        &mut self,
         generation: i64,
         path: &str,
         source_count: usize,
     ) -> Result<(), QghError> {
         let now = now_rfc3339();
-        self.conn
-            .execute("UPDATE index_generations SET active = 0", [])?;
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute("UPDATE index_generations SET active = 0", [])?;
+        tx.execute(
             "INSERT INTO index_generations (generation, path, source_count, created_at, active)
-             VALUES (?1, ?2, ?3, ?4, 1)",
+             VALUES (?1, ?2, ?3, ?4, 1)
+             ON CONFLICT(generation) DO UPDATE SET
+                path = excluded.path,
+                source_count = excluded.source_count,
+                created_at = excluded.created_at,
+                active = 1",
             params![generation, path, source_count as i64, now],
         )?;
-        self.conn.execute(
+        tx.execute(
             "UPDATE index_tasks SET completed_at = ?1 WHERE completed_at IS NULL",
             params![now],
         )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    pub fn active_index_path(&self) -> Result<Option<String>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT path FROM index_generations WHERE active = 1 ORDER BY generation DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(QghError::from)
     }
 
     pub fn record_reconciliation_run(
@@ -668,15 +686,33 @@ impl Store {
         Ok(())
     }
 
-    pub fn next_index_generation(&self) -> Result<i64, QghError> {
-        let current: Option<i64> = self
-            .conn
+    pub fn reserve_index_generation(
+        &mut self,
+        index_root: &Path,
+        source_count: usize,
+    ) -> Result<(i64, PathBuf), QghError> {
+        let now = now_rfc3339();
+        let tx = self.conn.transaction()?;
+        let current: Option<i64> = tx
             .query_row("SELECT max(generation) FROM index_generations", [], |row| {
                 row.get(0)
             })
             .optional()?
             .flatten();
-        Ok(current.unwrap_or(0) + 1)
+        let generation = current.unwrap_or(0) + 1;
+        let generation_path = index_root.join(format!("generation-{generation}"));
+        tx.execute(
+            "INSERT INTO index_generations (generation, path, source_count, created_at, active)
+             VALUES (?1, ?2, ?3, ?4, 0)",
+            params![
+                generation,
+                generation_path.to_string_lossy(),
+                source_count as i64,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok((generation, generation_path))
     }
 
     pub fn status(&self) -> Result<StatusSnapshot, QghError> {
@@ -765,7 +801,22 @@ impl Store {
         })
     }
 
-    fn migrate(&self) -> Result<(), QghError> {
+    fn migrate(&mut self) -> Result<(), QghError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.migrate_inner();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn migrate_inner(&self) -> Result<(), QghError> {
         self.conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS profile_meta (
@@ -987,6 +1038,12 @@ impl Store {
             "upserted_comment_count",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        self.conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(version) DO NOTHING",
+            params!["qgh.db.v1", now_rfc3339()],
+        )?;
         Ok(())
     }
 }
@@ -1118,4 +1175,69 @@ fn ensure_column(
         [],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn reserve_index_generation_allocates_distinct_inactive_rows() {
+        let paths = temp_profile_paths("index-generation-reservation");
+        let mut store = Store::open(&paths).unwrap();
+
+        let (first_generation, first_path) = store
+            .reserve_index_generation(&paths.index_root, 2)
+            .unwrap();
+        let (second_generation, second_path) = store
+            .reserve_index_generation(&paths.index_root, 2)
+            .unwrap();
+
+        assert_eq!(first_generation, 1);
+        assert_eq!(second_generation, 2);
+        assert_ne!(first_path, second_path);
+        assert_eq!(store.status().unwrap().active_generation, 0);
+
+        store
+            .mark_index_published(first_generation, &first_path.to_string_lossy(), 2)
+            .unwrap();
+        store
+            .mark_index_published(second_generation, &second_path.to_string_lossy(), 2)
+            .unwrap();
+
+        assert_eq!(store.status().unwrap().active_generation, 2);
+        let active_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM index_generations WHERE active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_count, 1);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    fn temp_profile_paths(name: &str) -> ProfilePaths {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile_dir = std::env::temp_dir().join(format!("qgh-store-{name}-{nanos}"));
+        let cache_dir = profile_dir.join("cache");
+        let log_dir = cache_dir.join("logs");
+        let index_root = profile_dir.join("tantivy");
+        ProfilePaths {
+            config_file: profile_dir.join("config.toml"),
+            db_path: profile_dir.join("qgh.sqlite3"),
+            index_active: index_root.join("active"),
+            index_root,
+            log_dir,
+            cache_dir,
+            profile_dir,
+        }
+    }
 }

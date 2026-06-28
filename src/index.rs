@@ -2,7 +2,7 @@ use crate::error::QghError;
 use crate::model::IndexSource;
 use crate::paths::{ensure_private_dir, set_private_dir};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, Schema, Value, STORED, STRING, TEXT};
@@ -15,14 +15,17 @@ pub struct SearchHit {
 
 pub fn rebuild(
     index_root: &Path,
-    active_path: &Path,
     generation: i64,
     sources: &[IndexSource],
-) -> Result<(), QghError> {
+) -> Result<PathBuf, QghError> {
     ensure_private_dir(index_root)?;
     let shadow_path = index_root.join(format!("shadow-{generation}"));
+    let generation_path = index_root.join(format!("generation-{generation}"));
     if shadow_path.exists() {
         fs::remove_dir_all(&shadow_path)?;
+    }
+    if generation_path.exists() {
+        fs::remove_dir_all(&generation_path)?;
     }
     ensure_private_dir(&shadow_path)?;
     let (schema, fields) = schema();
@@ -55,12 +58,9 @@ pub fn rebuild(
     writer
         .wait_merging_threads()
         .map_err(|e| QghError::index(e.to_string()))?;
-    if active_path.exists() {
-        fs::remove_dir_all(active_path)?;
-    }
-    fs::rename(&shadow_path, active_path)?;
-    set_private_dir(active_path)?;
-    Ok(())
+    fs::rename(&shadow_path, &generation_path)?;
+    set_private_dir(&generation_path)?;
+    Ok(generation_path)
 }
 
 pub fn search(
@@ -169,4 +169,67 @@ fn schema() -> (Schema, Fields) {
             indexed_at,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::IndexSource;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn rebuild_uses_generation_path_and_warm_bm25_p95_stays_under_500ms() {
+        let index_root = temp_index_root("bm25-performance");
+        let sources = (0..10_000)
+            .map(|number| IndexSource {
+                source_id: format!("qgh://github.com/issue/NODE{number}"),
+                entity_type: "issue".to_string(),
+                repo: "owner/repo".to_string(),
+                issue_number: number,
+                state: "open".to_string(),
+                labels: vec!["mvp".to_string()],
+                author: Some("alice".to_string()),
+                title: format!("Perf issue {number}"),
+                body: format!("BM25 performance fixture body needle{number} sharedtoken"),
+                parent_issue_title: String::new(),
+                github_updated_at: "2026-01-01T00:00:00Z".to_string(),
+                indexed_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .collect::<Vec<_>>();
+
+        let generation_path = rebuild(&index_root, 1, &sources).unwrap();
+        assert!(generation_path.ends_with("generation-1"));
+        assert!(generation_path.exists());
+
+        let cold_start = Instant::now();
+        let cold_hits = search(&generation_path, "needle9999", 5).unwrap();
+        let _cold_start_latency = cold_start.elapsed();
+        assert_eq!(cold_hits[0].source_id, "qgh://github.com/issue/NODE9999");
+
+        let mut warm_latencies = Vec::new();
+        for _ in 0..20 {
+            let started = Instant::now();
+            let hits = search(&generation_path, "sharedtoken", 5).unwrap();
+            warm_latencies.push(started.elapsed());
+            assert!(!hits.is_empty());
+        }
+        warm_latencies.sort();
+        let p95 = warm_latencies[(warm_latencies.len() * 95 / 100).min(warm_latencies.len() - 1)];
+        assert!(
+            p95 <= Duration::from_millis(500),
+            "BM25 warm p95 exceeded 500ms: {p95:?}"
+        );
+
+        let _ = fs::remove_dir_all(index_root);
+    }
+
+    fn temp_index_root(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("qgh-index-{name}-{nanos}"));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
 }

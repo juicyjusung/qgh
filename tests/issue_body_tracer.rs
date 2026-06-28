@@ -895,6 +895,121 @@ fn mcp_query_get_status_round_trips_issue_and_comment_sources() {
 }
 
 #[test]
+fn sqlite_and_tantivy_publish_state_are_concurrency_hardened() {
+    let fixture = TestFixture::new("concurrency-state");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let db_path = fixture.data_home.join("qgh/profiles/work/qgh.sqlite3");
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let journal_mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    let busy_timeout_ms: i64 = conn
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .unwrap();
+    assert!(busy_timeout_ms >= 5_000);
+    let migration_record_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM schema_migrations WHERE version = 'qgh.db.v1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(migration_record_count, 1);
+
+    let (generation, active_path): (i64, String) = conn
+        .query_row(
+            "SELECT generation, path FROM index_generations WHERE active = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(generation, 1);
+    assert!(active_path.contains("generation-1"));
+    assert!(!active_path.ends_with("/active"));
+    assert!(PathBuf::from(active_path).exists());
+}
+
+#[test]
+fn concurrent_cli_sync_and_mcp_reads_keep_index_queryable() {
+    let fixture = TestFixture::new("concurrent-sync-mcp");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let mut sync_cmd = fixture.base_command();
+    sync_cmd
+        .args(["--profile", "work", "sync", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let sync_child = sync_cmd.spawn().unwrap();
+
+    let mcp = fixture.mcp([
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "qgh-test", "version": "0"}
+            }
+        }),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {
+                    "query": "BM25 issue body tracer",
+                    "limit": 5
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {}
+            }
+        }),
+    ]);
+    let sync = sync_child.wait_with_output().unwrap();
+    assert_success(&sync);
+    assert_success(&mcp);
+
+    let messages = stdout_json_lines(&mcp);
+    let query = &messages[1]["result"]["structuredContent"];
+    assert_eq!(query["ok"], true);
+    assert_eq!(
+        query["data"]["results"][0]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+    let status = &messages[2]["result"]["structuredContent"];
+    assert_eq!(status["ok"], true);
+    assert!(
+        status["data"]["index"]["active_generation"]
+            .as_i64()
+            .unwrap()
+            >= 1
+    );
+
+    let final_query = fixture.qgh(["query", "BM25 issue body tracer", "--json"]);
+    assert_success(&final_query);
+    assert_eq!(
+        stdout_json(&final_query)["data"]["results"][0]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+}
+
+#[test]
 fn privacy_docs_describe_sensitive_derivative_data_paths() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let docs = fs::read_to_string(root.join("docs/privacy.md")).unwrap();
@@ -1439,10 +1554,19 @@ env = "QGH_TEST_TOKEN"
     fn assert_private_local_data_permissions(&self) {
         #[cfg(unix)]
         {
+            let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let active_index_path: String = conn
+                .query_row(
+                    "SELECT path FROM index_generations WHERE active = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
             for path in [
                 self.data_home.join("qgh/profiles/work"),
-                self.data_home.join("qgh/profiles/work/qgh.sqlite3"),
-                self.data_home.join("qgh/profiles/work/tantivy/active"),
+                db_path,
+                PathBuf::from(active_index_path),
                 self.cache_home.join("qgh"),
                 self.cache_home.join("qgh/logs"),
             ] {
