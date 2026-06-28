@@ -3,11 +3,21 @@ use crate::commands;
 use crate::error::QghError;
 use crate::mcp;
 use crate::output::{print_error, print_success};
+use clap::error::ErrorKind;
 use clap::Parser;
 
 pub async fn run_from_env() -> i32 {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            print!("{error}");
+            return 0;
+        }
         Err(error) => {
             let qgh_error = QghError::validation("validation.cli", error.to_string());
             print_error(&qgh_error, std::env::args().any(|arg| arg == "--json"));
