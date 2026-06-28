@@ -94,6 +94,30 @@ pub enum StoredSource {
 }
 
 #[derive(Debug, Clone)]
+pub struct ReconciliationCandidate {
+    pub source_id: String,
+    pub entity_type: String,
+    pub repo: String,
+    pub issue_number: i64,
+    pub github_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TombstoneView {
+    pub source_id: String,
+    pub reason: String,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReconciliationRunView {
+    pub completed_at: String,
+    pub checked_source_count: i64,
+    pub tombstoned_count: i64,
+    pub estimated_api_cost_class: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct IndexSource {
     pub source_id: String,
     pub entity_type: String,
@@ -129,6 +153,7 @@ pub struct StatusSnapshot {
     pub active_generation: i64,
     pub dirty_task_count: i64,
     pub last_sync_at: Option<String>,
+    pub last_reconciliation: Option<ReconciliationRunView>,
     pub cursors: Vec<CursorView>,
 }
 

@@ -1,13 +1,14 @@
-use crate::cli::QueryArgs;
+use crate::cli::{QueryArgs, ReconcileMode};
 use crate::config::{load_profile, resolve_token};
 use crate::error::QghError;
 use crate::github;
 use crate::index;
 use crate::model::{StoredComment, StoredIssue, StoredSource};
 use crate::store::Store;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
-pub async fn sync(profile_id: &str) -> Result<Value, QghError> {
+pub async fn sync(profile_id: &str, reconcile: Option<ReconcileMode>) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
     let token = resolve_token(&profile)?;
     let mut store = Store::open(&profile.paths)?;
@@ -19,6 +20,32 @@ pub async fn sync(profile_id: &str) -> Result<Value, QghError> {
         fetched.skipped_pull_requests,
         &fetched.cursor_updates,
     )?;
+    let reconciliation = if reconcile == Some(ReconcileMode::Full) {
+        let candidates = store.active_reconciliation_candidates()?;
+        let estimated_api_cost_class = estimate_api_cost_class(candidates.len());
+        let result = github::reconcile_sources(&profile, &token, &candidates).await?;
+        let mut tombstoned_sources = 0;
+        for unavailable in result.unavailable_sources {
+            store.tombstone_source(&unavailable.source_id, &unavailable.reason)?;
+            tombstoned_sources += 1;
+        }
+        store.record_reconciliation_run(
+            "full",
+            result.checked_sources,
+            tombstoned_sources,
+            estimated_api_cost_class,
+        )?;
+        json!({
+            "mode": "full",
+            "checked_sources": result.checked_sources,
+            "tombstoned_sources": tombstoned_sources,
+            "estimated_api_cost_class": estimated_api_cost_class
+        })
+    } else {
+        json!({
+            "mode": "none"
+        })
+    };
     let sources = store.active_index_sources()?;
     let generation = store.next_index_generation()?;
     index::rebuild(
@@ -58,7 +85,8 @@ pub async fn sync(profile_id: &str) -> Result<Value, QghError> {
         "index": {
             "active_generation": generation,
             "dirty_task_count": status.dirty_task_count
-        }
+        },
+        "reconciliation": reconciliation
     }))
 }
 
@@ -252,15 +280,49 @@ fn validate_repo(repo: &str) -> Result<(), QghError> {
     Ok(())
 }
 
-pub fn get(profile_id: &str, source_id: &str) -> Result<Value, QghError> {
+pub async fn get(profile_id: &str, source_id: &str) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
-    let store = Store::open(&profile.paths)?;
+    let mut store = Store::open(&profile.paths)?;
+    if let Some(tombstone) = store.get_tombstone(source_id)? {
+        return Err(QghError::source_tombstoned(
+            &tombstone.source_id,
+            &tombstone.reason,
+            &tombstone.observed_at,
+        ));
+    }
     let Some(source) = store.get_source(source_id)? else {
         return Err(QghError::source_not_found(source_id));
     };
-    let source_json = match source {
+    let mut source_json = match source {
         StoredSource::Issue(issue) => issue_source(issue),
         StoredSource::Comment(comment) => comment_source(comment),
+    };
+    source_json["lifecycle_check"] = match resolve_token(&profile) {
+        Ok(token) => {
+            if let Some(candidate) = store.get_reconciliation_candidate(source_id)? {
+                match github::check_source_lifecycle(&profile, &token, &candidate).await {
+                    Ok(github::LifecycleCheck::Active) => json!({ "status": "active" }),
+                    Ok(github::LifecycleCheck::Unavailable { reason }) => {
+                        let tombstone = store.tombstone_source(source_id, &reason)?;
+                        return Err(QghError::source_tombstoned(
+                            &tombstone.source_id,
+                            &tombstone.reason,
+                            &tombstone.observed_at,
+                        ));
+                    }
+                    Err(error) => json!({
+                        "status": "not_checked",
+                        "error_code": error.code
+                    }),
+                }
+            } else {
+                json!({ "status": "not_checked", "reason": "missing_candidate" })
+            }
+        }
+        Err(error) => json!({
+            "status": "not_checked",
+            "error_code": error.code
+        }),
     };
     Ok(json!({
         "profile_id": profile.id,
@@ -272,6 +334,20 @@ pub fn status(profile_id: &str) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
     let store = Store::open(&profile.paths)?;
     let status = store.status()?;
+    let source_count = (status.issue_count + status.comment_count) as usize;
+    let age_days = status
+        .last_reconciliation
+        .as_ref()
+        .and_then(|run| age_days(&run.completed_at));
+    let stale = profile
+        .reconcile_after_days
+        .is_some_and(|days| age_days.is_none_or(|age| age > days));
+    let stale_warning = if stale {
+        json!("reconciliation.stale")
+    } else {
+        Value::Null
+    };
+    let last_reconciliation = status.last_reconciliation.as_ref();
     let cursors = status
         .cursors
         .iter()
@@ -314,6 +390,16 @@ pub fn status(profile_id: &str) -> Result<Value, QghError> {
         "sync": {
             "last_sync_at": status.last_sync_at,
             "cursors": cursors
+        },
+        "reconciliation": {
+            "last_full_at": last_reconciliation.map(|run| run.completed_at.clone()),
+            "age_days": age_days,
+            "stale": stale,
+            "stale_warning": stale_warning,
+            "estimated_api_cost_class": estimate_api_cost_class(source_count),
+            "last_checked_source_count": last_reconciliation.map(|run| run.checked_source_count),
+            "last_tombstoned_count": last_reconciliation.map(|run| run.tombstoned_count),
+            "last_estimated_api_cost_class": last_reconciliation.map(|run| run.estimated_api_cost_class.clone())
         }
     }))
 }
@@ -392,6 +478,24 @@ fn ranking_json(ranking: Ranking) -> Value {
             "lexical_score": Value::Null
         }),
     }
+}
+
+fn estimate_api_cost_class(source_count: usize) -> &'static str {
+    match source_count {
+        0 => "none",
+        1..=100 => "low",
+        101..=1000 => "medium",
+        _ => "high",
+    }
+}
+
+fn age_days(timestamp: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(timestamp).ok().map(|parsed| {
+        Utc::now()
+            .signed_duration_since(parsed.with_timezone(&Utc))
+            .num_days()
+            .max(0)
+    })
 }
 
 fn issue_source(issue: StoredIssue) -> Value {

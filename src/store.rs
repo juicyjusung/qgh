@@ -1,8 +1,8 @@
 use crate::error::QghError;
 use crate::model::{
     CommentRecord, CursorUpdate, CursorView, IndexSource, IssueRecord, ParentIssueView,
-    SourceVersionView, StatusSnapshot, StoredComment, StoredCursor, StoredIssue, StoredSource,
-    SyncSummary,
+    ReconciliationCandidate, ReconciliationRunView, SourceVersionView, StatusSnapshot,
+    StoredComment, StoredCursor, StoredIssue, StoredSource, SyncSummary, TombstoneView,
 };
 use crate::paths::ProfilePaths;
 use crate::time::{now_rfc3339, now_run_id_suffix};
@@ -67,6 +67,10 @@ impl Store {
                     issue.updated_at,
                     now
                 ],
+            )?;
+            tx.execute(
+                "DELETE FROM tombstones WHERE source_id = ?1",
+                params![issue.source_id],
             )?;
             tx.execute(
                 "INSERT INTO repositories (repo, host, owner, name)
@@ -154,6 +158,10 @@ impl Store {
                     comment.updated_at,
                     now
                 ],
+            )?;
+            tx.execute(
+                "DELETE FROM tombstones WHERE source_id = ?1",
+                params![comment.source_id],
             )?;
             let version_id = upsert_source_version(
                 &tx,
@@ -355,6 +363,108 @@ impl Store {
         Ok(None)
     }
 
+    pub fn get_tombstone(&self, source_id: &str) -> Result<Option<TombstoneView>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT source_id, reason, observed_at FROM tombstones WHERE source_id = ?1",
+                params![source_id],
+                |row| {
+                    Ok(TombstoneView {
+                        source_id: row.get(0)?,
+                        reason: row.get(1)?,
+                        observed_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(QghError::from)
+    }
+
+    pub fn get_reconciliation_candidate(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<ReconciliationCandidate>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT se.source_id, se.entity_type, se.repo,
+                        coalesce(im.issue_number, cm.issue_number) AS issue_number,
+                        se.github_id
+                 FROM source_entities se
+                 LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+                 LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+                 WHERE se.source_id = ?1 AND se.lifecycle_state = 'active'",
+                params![source_id],
+                reconciliation_candidate_from_row,
+            )
+            .optional()
+            .map_err(QghError::from)
+    }
+
+    pub fn active_reconciliation_candidates(
+        &self,
+    ) -> Result<Vec<ReconciliationCandidate>, QghError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT se.source_id, se.entity_type, se.repo,
+                    coalesce(im.issue_number, cm.issue_number) AS issue_number,
+                    se.github_id
+             FROM source_entities se
+             LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+             LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+             WHERE se.lifecycle_state = 'active'
+             ORDER BY se.repo, issue_number, se.entity_type, se.source_id",
+        )?;
+        let rows = stmt.query_map([], reconciliation_candidate_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
+    }
+
+    pub fn tombstone_source(
+        &mut self,
+        source_id: &str,
+        reason: &str,
+    ) -> Result<TombstoneView, QghError> {
+        let observed_at = now_rfc3339();
+        let tx = self.conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE source_entities
+             SET lifecycle_state = 'tombstoned'
+             WHERE source_id = ?1 AND lifecycle_state = 'active'",
+            params![source_id],
+        )?;
+        tx.execute(
+            "UPDATE source_versions
+             SET lifecycle_state = 'tombstoned'
+             WHERE source_id = ?1",
+            params![source_id],
+        )?;
+        tx.execute(
+            "UPDATE source_aliases
+             SET is_current = 0
+             WHERE source_id = ?1",
+            params![source_id],
+        )?;
+        tx.execute(
+            "INSERT INTO tombstones (source_id, reason, observed_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(source_id) DO UPDATE SET
+                reason = excluded.reason,
+                observed_at = excluded.observed_at",
+            params![source_id, reason, observed_at],
+        )?;
+        if changed > 0 {
+            tx.execute(
+                "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
+                 VALUES (?1, 'delete', ?2, NULL)",
+                params![source_id, observed_at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(TombstoneView {
+            source_id: source_id.to_string(),
+            reason: reason.to_string(),
+            observed_at,
+        })
+    }
+
     pub fn find_issue_by_canonical_url(
         &self,
         canonical_url: &str,
@@ -479,6 +589,30 @@ impl Store {
         Ok(())
     }
 
+    pub fn record_reconciliation_run(
+        &self,
+        mode: &str,
+        checked_source_count: usize,
+        tombstoned_count: usize,
+        estimated_api_cost_class: &str,
+    ) -> Result<(), QghError> {
+        let now = now_rfc3339();
+        self.conn.execute(
+            "INSERT INTO reconciliation_runs
+                (id, mode, started_at, completed_at, checked_source_count, tombstoned_count, estimated_api_cost_class)
+             VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6)",
+            params![
+                format!("reconcile-{}", now_run_id_suffix()),
+                mode,
+                now,
+                checked_source_count as i64,
+                tombstoned_count as i64,
+                estimated_api_cost_class
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn next_index_generation(&self) -> Result<i64, QghError> {
         let current: Option<i64> = self
             .conn
@@ -525,6 +659,25 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
+        let last_reconciliation = self
+            .conn
+            .query_row(
+                "SELECT completed_at, checked_source_count, tombstoned_count, estimated_api_cost_class
+                 FROM reconciliation_runs
+                 WHERE mode = 'full'
+                 ORDER BY completed_at DESC
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok(ReconciliationRunView {
+                        completed_at: row.get(0)?,
+                        checked_source_count: row.get(1)?,
+                        tombstoned_count: row.get(2)?,
+                        estimated_api_cost_class: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
         Ok(StatusSnapshot {
             issue_count,
             comment_count,
@@ -532,6 +685,7 @@ impl Store {
             active_generation: active_generation.unwrap_or(0),
             dirty_task_count,
             last_sync_at,
+            last_reconciliation,
             cursors: self.cursor_views()?,
         })
     }
@@ -647,6 +801,16 @@ impl Store {
                 source_id TEXT PRIMARY KEY,
                 reason TEXT NOT NULL,
                 observed_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS reconciliation_runs (
+                id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                checked_source_count INTEGER NOT NULL,
+                tombstoned_count INTEGER NOT NULL,
+                estimated_api_cost_class TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS index_generations (
@@ -766,9 +930,13 @@ fn upsert_source_version(
     sync_run_id: &str,
 ) -> Result<i64, rusqlite::Error> {
     tx.execute(
-        "INSERT OR IGNORE INTO source_versions
+        "INSERT INTO source_versions
             (source_id, body_hash, github_updated_at, indexed_at, sync_run_id, lifecycle_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'active')",
+         VALUES (?1, ?2, ?3, ?4, ?5, 'active')
+         ON CONFLICT(source_id, body_hash, github_updated_at) DO UPDATE SET
+            indexed_at = excluded.indexed_at,
+            sync_run_id = excluded.sync_run_id,
+            lifecycle_state = 'active'",
         params![
             source_id,
             body_hash,
@@ -832,6 +1000,18 @@ fn stored_comment_from_row(row: &rusqlite::Row<'_>) -> Result<StoredComment, rus
             sync_run_id: row.get(12)?,
             lifecycle_state: row.get(13)?,
         },
+    })
+}
+
+fn reconciliation_candidate_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<ReconciliationCandidate, rusqlite::Error> {
+    Ok(ReconciliationCandidate {
+        source_id: row.get(0)?,
+        entity_type: row.get(1)?,
+        repo: row.get(2)?,
+        issue_number: row.get(3)?,
+        github_id: row.get(4)?,
     })
 }
 

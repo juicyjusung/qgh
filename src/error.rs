@@ -59,6 +59,15 @@ impl QghError {
             .with_details(json!({ "source_id": source_id }))
     }
 
+    pub fn source_tombstoned(source_id: &str, reason: &str, observed_at: &str) -> Self {
+        Self::new("source.tombstoned", "Source is tombstoned.", 4).with_details(json!({
+            "source_id": source_id,
+            "reason": reason,
+            "observed_at": observed_at,
+            "lifecycle_state": "tombstoned"
+        }))
+    }
+
     pub fn storage(message: impl Into<String>) -> Self {
         Self::new("storage.failure", message, 6)
     }

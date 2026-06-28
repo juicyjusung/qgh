@@ -12,6 +12,7 @@ pub struct Profile {
     pub api_base_url: String,
     pub web_base_url: String,
     pub repos: Vec<RepoRef>,
+    pub reconcile_after_days: Option<i64>,
     pub token_source: TokenSource,
     pub paths: ProfilePaths,
 }
@@ -50,6 +51,8 @@ struct RawProfile {
     api_base_url: String,
     web_base_url: String,
     repos: Vec<String>,
+    #[serde(default)]
+    reconcile_after_days: Option<i64>,
     token_source: TokenSource,
 }
 
@@ -75,6 +78,11 @@ pub fn load_profile(profile_id: &str) -> Result<Profile, QghError> {
     if raw.repos.is_empty() {
         return Err(QghError::config("Profile repos must not be empty."));
     }
+    if raw.reconcile_after_days.is_some_and(|days| days < 0) {
+        return Err(QghError::config(
+            "Profile reconcile_after_days must not be negative.",
+        ));
+    }
     let repos = raw
         .repos
         .iter()
@@ -87,6 +95,7 @@ pub fn load_profile(profile_id: &str) -> Result<Profile, QghError> {
         api_base_url: raw.api_base_url.trim_end_matches('/').to_string(),
         web_base_url: raw.web_base_url.trim_end_matches('/').to_string(),
         repos,
+        reconcile_after_days: raw.reconcile_after_days,
         token_source: raw.token_source.clone(),
         paths,
     })
