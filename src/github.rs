@@ -1,6 +1,8 @@
 use crate::config::{Profile, RepoRef};
 use crate::error::QghError;
-use crate::model::{CommentRecord, CursorUpdate, IssueRecord, StoredCursor};
+use crate::model::{
+    CommentRecord, CursorUpdate, IssueRecord, ReconciliationCandidate, StoredCursor,
+};
 use crate::time::now_rfc3339;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -37,6 +39,21 @@ pub struct FetchResult {
     pub comments: Vec<CommentRecord>,
     pub skipped_pull_requests: usize,
     pub cursor_updates: Vec<CursorUpdate>,
+}
+
+pub struct ReconciliationResult {
+    pub checked_sources: usize,
+    pub unavailable_sources: Vec<LifecycleFailure>,
+}
+
+pub struct LifecycleFailure {
+    pub source_id: String,
+    pub reason: String,
+}
+
+pub enum LifecycleCheck {
+    Active,
+    Unavailable { reason: String },
 }
 
 pub async fn fetch_issues(
@@ -126,6 +143,39 @@ pub async fn fetch_issues(
     })
 }
 
+pub async fn reconcile_sources(
+    profile: &Profile,
+    token: &str,
+    candidates: &[ReconciliationCandidate],
+) -> Result<ReconciliationResult, QghError> {
+    let client = lifecycle_client()?;
+    let mut unavailable_sources = Vec::new();
+    for candidate in candidates {
+        match check_candidate_lifecycle(&client, profile, token, candidate).await? {
+            LifecycleCheck::Active => {}
+            LifecycleCheck::Unavailable { reason } => {
+                unavailable_sources.push(LifecycleFailure {
+                    source_id: candidate.source_id.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+    Ok(ReconciliationResult {
+        checked_sources: candidates.len(),
+        unavailable_sources,
+    })
+}
+
+pub async fn check_source_lifecycle(
+    profile: &Profile,
+    token: &str,
+    candidate: &ReconciliationCandidate,
+) -> Result<LifecycleCheck, QghError> {
+    let client = lifecycle_client()?;
+    check_candidate_lifecycle(&client, profile, token, candidate).await
+}
+
 async fn fetch_issue_comments(
     client: &reqwest::Client,
     profile: &Profile,
@@ -184,6 +234,79 @@ async fn fetch_issue_comments(
         not_modified: endpoint_not_modified,
     });
     Ok(comments)
+}
+
+fn lifecycle_client() -> Result<reqwest::Client, QghError> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| QghError::github(error.to_string()))
+}
+
+async fn check_candidate_lifecycle(
+    client: &reqwest::Client,
+    profile: &Profile,
+    token: &str,
+    candidate: &ReconciliationCandidate,
+) -> Result<LifecycleCheck, QghError> {
+    let url = source_check_url(profile, candidate)?;
+    let response = client
+        .get(url)
+        .bearer_auth(token)
+        .header("accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|error| QghError::github(error.to_string()))?;
+    Ok(match response.status() {
+        StatusCode::OK => LifecycleCheck::Active,
+        StatusCode::NOT_FOUND => LifecycleCheck::Unavailable {
+            reason: "not_found".to_string(),
+        },
+        StatusCode::GONE => LifecycleCheck::Unavailable {
+            reason: "gone".to_string(),
+        },
+        StatusCode::MOVED_PERMANENTLY
+        | StatusCode::FOUND
+        | StatusCode::TEMPORARY_REDIRECT
+        | StatusCode::PERMANENT_REDIRECT => LifecycleCheck::Unavailable {
+            reason: "moved".to_string(),
+        },
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => LifecycleCheck::Unavailable {
+            reason: "permission_denied".to_string(),
+        },
+        status if status.is_success() => LifecycleCheck::Active,
+        status => {
+            return Err(QghError::github(format!(
+                "GitHub source lifecycle check failed with HTTP {status}."
+            )));
+        }
+    })
+}
+
+fn source_check_url(
+    profile: &Profile,
+    candidate: &ReconciliationCandidate,
+) -> Result<String, QghError> {
+    let Some((owner, repo)) = candidate.repo.split_once('/') else {
+        return Err(QghError::validation(
+            "validation.invalid_repo",
+            "Stored repo must use owner/repo format.",
+        ));
+    };
+    match candidate.entity_type.as_str() {
+        "issue" => Ok(format!(
+            "{}/repos/{owner}/{repo}/issues/{}",
+            profile.api_base_url, candidate.issue_number
+        )),
+        "issue_comment" => Ok(format!(
+            "{}/repos/{owner}/{repo}/issues/comments/{}",
+            profile.api_base_url, candidate.github_id
+        )),
+        _ => Err(QghError::validation(
+            "validation.unsupported_source_type",
+            "Unsupported source type for lifecycle check.",
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]

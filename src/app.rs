@@ -33,11 +33,11 @@ async fn run(cli: Cli) -> Result<serde_json::Value, QghError> {
     };
 
     match cli.command {
-        crate::cli::Command::Sync { .. } => commands::sync(&profile_id).await,
+        crate::cli::Command::Sync(args) => commands::sync(&profile_id, args.reconcile).await,
         crate::cli::Command::Query(args) | crate::cli::Command::Search(args) => {
             commands::query(&profile_id, args)
         }
-        crate::cli::Command::Get { source_id, .. } => commands::get(&profile_id, &source_id),
+        crate::cli::Command::Get { source_id, .. } => commands::get(&profile_id, &source_id).await,
         crate::cli::Command::Status { .. } => commands::status(&profile_id),
         crate::cli::Command::Doctor { .. } => commands::doctor(&profile_id),
     }

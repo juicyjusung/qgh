@@ -358,6 +358,167 @@ fn citation_contract_schema_and_docs_are_issue_comment_only() {
 }
 
 #[test]
+fn full_reconciliation_tombstones_deleted_comments_and_updates_status() {
+    let fixture = TestFixture::new("deleted-comment-reconciliation");
+    let server = LifecycleFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let comment_source_id = "qgh://github.com/issue-comment/IC_kwDOCOMMENT1";
+    let comment_query = fixture.qgh(["query", "comment-only mitigation", "--json"]);
+    assert_success(&comment_query);
+    assert_eq!(
+        stdout_json(&comment_query)["data"]["results"][0]["source_id"],
+        comment_source_id
+    );
+
+    server.set_mode(LIFECYCLE_DELETED_COMMENT);
+    let reconcile = fixture.qgh(["sync", "--reconcile", "full", "--json"]);
+    assert_success(&reconcile);
+    let reconcile_json = stdout_json(&reconcile);
+    assert_eq!(reconcile_json["data"]["reconciliation"]["mode"], "full");
+    assert_eq!(
+        reconcile_json["data"]["reconciliation"]["tombstoned_sources"],
+        1
+    );
+    assert_eq!(
+        reconcile_json["data"]["reconciliation"]["estimated_api_cost_class"],
+        "low"
+    );
+
+    let deleted_query = fixture.qgh(["query", "comment-only mitigation", "--json"]);
+    assert_success(&deleted_query);
+    let deleted_query_json = stdout_json(&deleted_query);
+    assert_eq!(
+        deleted_query_json["data"]["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    let deleted_get = fixture.qgh(["get", comment_source_id, "--json"]);
+    assert_eq!(deleted_get.status.code(), Some(4));
+    let deleted_get_json = stdout_json(&deleted_get);
+    assert_eq!(deleted_get_json["error"]["code"], "source.tombstoned");
+    assert_eq!(
+        deleted_get_json["error"]["details"]["source_id"],
+        comment_source_id
+    );
+    assert_eq!(deleted_get_json["error"]["details"]["reason"], "not_found");
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["sources"]["tombstone_count"], 1);
+    assert!(status_json["data"]["reconciliation"]["last_full_at"]
+        .as_str()
+        .is_some());
+    assert!(status_json["data"]["reconciliation"]["age_days"]
+        .as_i64()
+        .is_some());
+    assert_eq!(
+        status_json["data"]["reconciliation"]["estimated_api_cost_class"],
+        "low"
+    );
+    assert_eq!(status_json["data"]["reconciliation"]["stale"], false);
+}
+
+#[test]
+fn get_tombstones_unavailable_issue_and_filters_active_query() {
+    let fixture = TestFixture::new("get-unavailable-issue");
+    let server = LifecycleFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let issue_source_id = "qgh://github.com/issue/I_kwDOISSUE1";
+
+    server.set_mode(LIFECYCLE_UNAVAILABLE_ISSUE);
+    let get = fixture.qgh(["get", issue_source_id, "--json"]);
+    assert_eq!(get.status.code(), Some(4));
+    let get_json = stdout_json(&get);
+    assert_eq!(get_json["error"]["code"], "source.tombstoned");
+    assert_eq!(get_json["error"]["details"]["source_id"], issue_source_id);
+    assert_eq!(get_json["error"]["details"]["reason"], "not_found");
+    assert!(get_json["error"]["details"]["observed_at"]
+        .as_str()
+        .is_some());
+
+    let query = fixture.qgh(["query", "BM25 issue body tracer", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    assert_eq!(query_json["data"]["results"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        query_json["data"]["result_filtering"]["unresolvable_hits"],
+        1
+    );
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    assert_eq!(
+        stdout_json(&status)["data"]["sources"]["tombstone_count"],
+        1
+    );
+}
+
+#[test]
+fn get_tombstones_moved_issue_as_structured_lifecycle_state() {
+    let fixture = TestFixture::new("get-moved-issue");
+    let server = LifecycleFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let issue_source_id = "qgh://github.com/issue/I_kwDOISSUE1";
+
+    server.set_mode(LIFECYCLE_MOVED_ISSUE);
+    let get = fixture.qgh(["get", issue_source_id, "--json"]);
+    assert_eq!(get.status.code(), Some(4));
+    let get_json = stdout_json(&get);
+    assert_eq!(get_json["error"]["code"], "source.tombstoned");
+    assert_eq!(get_json["error"]["details"]["source_id"], issue_source_id);
+    assert_eq!(get_json["error"]["details"]["reason"], "moved");
+    assert_eq!(
+        get_json["error"]["details"]["lifecycle_state"],
+        "tombstoned"
+    );
+}
+
+#[test]
+fn status_warns_about_stale_reconciliation_without_running_it() {
+    let fixture = TestFixture::new("stale-reconciliation-status");
+    let server = LifecycleFakeGitHub::start();
+    fixture.write_config_with_reconcile_after(&server.base_url, Some(0));
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let requests_before_status = server.request_count();
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    assert_eq!(
+        server.request_count(),
+        requests_before_status,
+        "status must not run hidden reconciliation network work"
+    );
+    let status_json = stdout_json(&status);
+    assert_eq!(
+        status_json["data"]["reconciliation"]["last_full_at"],
+        Value::Null
+    );
+    assert_eq!(
+        status_json["data"]["reconciliation"]["age_days"],
+        Value::Null
+    );
+    assert_eq!(status_json["data"]["reconciliation"]["stale"], true);
+    assert_eq!(
+        status_json["data"]["reconciliation"]["stale_warning"],
+        "reconciliation.stale"
+    );
+    assert_eq!(
+        status_json["data"]["reconciliation"]["estimated_api_cost_class"],
+        "low"
+    );
+}
+
+#[test]
 fn query_filter_errors_are_versioned_json_envelopes() {
     let fixture = TestFixture::new("filter-errors");
     fixture.write_config("http://127.0.0.1:1");
@@ -570,6 +731,39 @@ fn issue_comments_payload() -> &'static str {
     ]"#
 }
 
+fn issue_object_payload() -> &'static str {
+    r#"{
+        "id": 1001,
+        "node_id": "I_kwDOISSUE1",
+        "number": 42,
+        "title": "Cache sync bug",
+        "body": "The BM25 issue body tracer must round-trip through get before citation.",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:05Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}, {"name": "mvp"}],
+        "milestone": {"title": "MVP"},
+        "assignees": [{"login": "alice"}]
+    }"#
+}
+
+fn issue_comment_object_payload() -> &'static str {
+    r#"{
+        "id": 5001,
+        "node_id": "IC_kwDOCOMMENT1",
+        "body": "The answer lives in this comment-only mitigation note.",
+        "html_url": "https://github.com/owner/repo/issues/42#issuecomment-5001",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-03T04:05:06Z",
+        "user": {"login": "carol"}
+    }"#
+}
+
 struct TestFixture {
     root: PathBuf,
     config_home: PathBuf,
@@ -595,6 +789,17 @@ impl TestFixture {
     }
 
     fn write_config(&self, api_base_url: &str) {
+        self.write_config_with_reconcile_after(api_base_url, None);
+    }
+
+    fn write_config_with_reconcile_after(
+        &self,
+        api_base_url: &str,
+        reconcile_after_days: Option<i64>,
+    ) {
+        let reconcile_after_days = reconcile_after_days
+            .map(|days| format!("reconcile_after_days = {days}\n"))
+            .unwrap_or_default();
         let config = format!(
             r#"
 schema_version = "qgh.config.v1"
@@ -604,6 +809,7 @@ host = "github.com"
 api_base_url = "{api_base_url}"
 web_base_url = "https://github.com"
 repos = ["owner/repo"]
+{reconcile_after_days}
 
 [profiles.work.token_source]
 type = "env"
@@ -838,13 +1044,137 @@ fn handle_connection(
         && request_line.contains("per_page=100")
     {
         issue_comments_payload()
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/42 ") {
+        issue_object_payload()
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/comments/5001 ") {
+        issue_comment_object_payload()
     } else {
         r#"{"message":"not found"}"#
     };
-    let status = if body == issue_payload || body == issue_comments_payload() {
+    let status = if body == issue_payload
+        || body == issue_comments_payload()
+        || body == issue_object_payload()
+        || body == issue_comment_object_payload()
+    {
         "200 OK"
     } else {
         "404 Not Found"
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
+const LIFECYCLE_ACTIVE: usize = 1;
+const LIFECYCLE_DELETED_COMMENT: usize = 2;
+const LIFECYCLE_UNAVAILABLE_ISSUE: usize = 3;
+const LIFECYCLE_MOVED_ISSUE: usize = 4;
+
+struct LifecycleFakeGitHub {
+    base_url: String,
+    mode: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl LifecycleFakeGitHub {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        let mode = Arc::new(AtomicUsize::new(LIFECYCLE_ACTIVE));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_mode = Arc::clone(&mode);
+        let thread_requests = Arc::clone(&requests);
+        let thread_stop = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                match stream {
+                    Ok(stream) => {
+                        handle_lifecycle_connection(stream, &thread_mode, &thread_requests)
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            base_url,
+            mode,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn set_mode(&self, mode: usize) {
+        self.mode.store(mode, Ordering::SeqCst);
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+}
+
+impl Drop for LifecycleFakeGitHub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.base_url.strip_prefix("http://").unwrap());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn handle_lifecycle_connection(
+    mut stream: TcpStream,
+    mode: &Arc<AtomicUsize>,
+    requests: &Arc<Mutex<Vec<String>>>,
+) {
+    let mut buffer = [0_u8; 8192];
+    let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let request_line = request.lines().next().unwrap_or("").to_string();
+    requests.lock().unwrap().push(request_line.clone());
+    let mode = mode.load(Ordering::SeqCst);
+
+    let (status, body) = if request_line.starts_with("GET /repos/owner/repo/issues?")
+        && request_line.contains("state=all")
+        && request_line.contains("per_page=100")
+    {
+        ("200 OK", issue_payload_with_pr())
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?")
+        && request_line.contains("per_page=100")
+    {
+        if mode == LIFECYCLE_DELETED_COMMENT {
+            ("200 OK", "[]")
+        } else {
+            ("200 OK", issue_comments_payload())
+        }
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/42 ") {
+        if mode == LIFECYCLE_UNAVAILABLE_ISSUE {
+            ("404 Not Found", r#"{"message":"not found"}"#)
+        } else if mode == LIFECYCLE_MOVED_ISSUE {
+            ("301 Moved Permanently", r#"{"message":"moved"}"#)
+        } else {
+            ("200 OK", issue_object_payload())
+        }
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/comments/5001 ") {
+        if mode == LIFECYCLE_DELETED_COMMENT {
+            ("404 Not Found", r#"{"message":"not found"}"#)
+        } else {
+            ("200 OK", issue_comment_object_payload())
+        }
+    } else {
+        ("404 Not Found", r#"{"message":"not found"}"#)
     };
     let response = format!(
         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
@@ -984,6 +1314,22 @@ fn handle_editing_connection(
         } else {
             ("200 OK", "\"comments-v1\"", issue_comments_payload())
         }
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/42 ") {
+        if mode == 2 {
+            ("200 OK", "\"issue-v2\"", edited_issue_object_payload())
+        } else {
+            ("200 OK", "\"issue-v1\"", issue_object_payload())
+        }
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/comments/5001 ") {
+        if mode == 2 {
+            (
+                "200 OK",
+                "\"comment-v2\"",
+                edited_issue_comment_object_payload(),
+            )
+        } else {
+            ("200 OK", "\"comment-v1\"", issue_comment_object_payload())
+        }
     } else {
         ("404 Not Found", "\"missing\"", r#"{"message":"not found"}"#)
     };
@@ -1017,6 +1363,27 @@ fn edited_issue_payload() -> &'static str {
     ]"#
 }
 
+fn edited_issue_object_payload() -> &'static str {
+    r#"{
+        "id": 1001,
+        "node_id": "I_kwDOISSUE1",
+        "number": 42,
+        "title": "Cache sync bug updated",
+        "body": "The updated issue body must replace the old active search version.",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-04T00:00:00Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}, {"name": "mvp"}],
+        "milestone": {"title": "MVP"},
+        "assignees": [{"login": "alice"}]
+    }"#
+}
+
 fn edited_issue_comments_payload() -> &'static str {
     r#"[
       {
@@ -1029,4 +1396,16 @@ fn edited_issue_comments_payload() -> &'static str {
         "user": {"login": "carol"}
       }
     ]"#
+}
+
+fn edited_issue_comment_object_payload() -> &'static str {
+    r#"{
+        "id": 5001,
+        "node_id": "IC_kwDOCOMMENT1",
+        "body": "The updated comment body must be the only active comment search version.",
+        "html_url": "https://github.com/owner/repo/issues/42#issuecomment-5001",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-04T00:01:00Z",
+        "user": {"login": "carol"}
+    }"#
 }

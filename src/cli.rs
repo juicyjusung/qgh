@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "qgh", version, about = "Local GitHub Issues retrieval")]
@@ -13,7 +13,8 @@ pub struct Cli {
 impl Cli {
     pub fn wants_json(&self) -> bool {
         match &self.command {
-            Command::Sync { json } | Command::Status { json } | Command::Doctor { json } => *json,
+            Command::Sync(args) => args.json,
+            Command::Status { json } | Command::Doctor { json } => *json,
             Command::Query(args) | Command::Search(args) => args.json,
             Command::Get { json, .. } => *json,
         }
@@ -22,10 +23,7 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    Sync {
-        #[arg(long)]
-        json: bool,
-    },
+    Sync(SyncArgs),
     Query(QueryArgs),
     Search(QueryArgs),
     Get {
@@ -41,6 +39,19 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SyncArgs {
+    #[arg(long)]
+    pub reconcile: Option<ReconcileMode>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ReconcileMode {
+    Full,
 }
 
 #[derive(Debug, Clone, Args)]
