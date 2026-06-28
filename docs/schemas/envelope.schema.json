@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/envelope.schema.json",
+  "title": "qgh JSON envelope",
+  "type": "object",
+  "required": ["schema_version", "ok", "warnings", "meta"],
+  "properties": {
+    "schema_version": {
+      "const": "qgh.v1"
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "data": {
+      "type": "object"
+    },
+    "error": {
+      "$ref": "error.schema.json"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "meta": {
+      "type": "object"
+    }
+  },
+  "oneOf": [
+    {
+      "required": ["data"],
+      "properties": {
+        "ok": {
+          "const": true
+        }
+      },
+      "not": {
+        "required": ["error"]
+      }
+    },
+    {
+      "required": ["error"],
+      "properties": {
+        "ok": {
+          "const": false
+        }
+      },
+      "not": {
+        "required": ["data"]
+      }
+    }
+  ],
+  "additionalProperties": false
+}

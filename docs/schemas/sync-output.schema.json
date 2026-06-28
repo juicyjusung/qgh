@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/sync-output.schema.json",
+  "title": "qgh sync data",
+  "type": "object",
+  "required": ["profile_id", "sync_state"],
+  "properties": {
+    "profile_id": {
+      "type": "string"
+    },
+    "sync_state": {
+      "type": "string",
+      "enum": ["ok", "backoff"]
+    },
+    "sync_run_id": {
+      "type": "string"
+    },
+    "issues": {
+      "type": "object"
+    },
+    "comments": {
+      "type": "object"
+    },
+    "cursors": {
+      "type": "object"
+    },
+    "index": {
+      "type": "object"
+    },
+    "reconciliation": {
+      "type": "object"
+    },
+    "backoff": {
+      "type": "object"
+    },
+    "scheduler": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}

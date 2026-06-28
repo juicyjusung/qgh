@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/doctor-output.schema.json",
+  "title": "qgh doctor data",
+  "type": "object",
+  "required": ["profile_id", "checks", "mcp"],
+  "properties": {
+    "profile_id": {
+      "type": "string"
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "ok"],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "mcp": {
+      "type": "object",
+      "required": ["doctor_exposed", "tools"],
+      "properties": {
+        "doctor_exposed": {
+          "const": false
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["query", "get", "status"]
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

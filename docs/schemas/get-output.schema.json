@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/get-output.schema.json",
+  "title": "qgh get data",
+  "type": "object",
+  "required": ["profile_id", "source"],
+  "properties": {
+    "profile_id": {
+      "type": "string"
+    },
+    "source": {
+      "type": "object",
+      "required": ["source_id", "entity_type", "canonical_url", "body", "source_version"],
+      "properties": {
+        "source_id": {
+          "type": "string"
+        },
+        "entity_type": {
+          "type": "string",
+          "enum": ["issue", "issue_comment"]
+        },
+        "canonical_url": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "source_version": {
+          "type": "object"
+        },
+        "lifecycle_check": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}
