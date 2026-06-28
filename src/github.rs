@@ -1,11 +1,14 @@
 use crate::config::{Profile, RepoRef};
 use crate::error::QghError;
-use crate::model::{CommentRecord, IssueRecord};
+use crate::model::{CommentRecord, CursorUpdate, IssueRecord, StoredCursor};
 use crate::time::now_rfc3339;
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use reqwest::header::{HeaderMap, LINK};
+use reqwest::header::{HeaderMap, ETAG, IF_NONE_MATCH, LINK};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 const SOURCE_ID_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -33,34 +36,52 @@ pub struct FetchResult {
     pub issues: Vec<IssueRecord>,
     pub comments: Vec<CommentRecord>,
     pub skipped_pull_requests: usize,
+    pub cursor_updates: Vec<CursorUpdate>,
 }
 
-pub async fn fetch_issues(profile: &Profile, token: &str) -> Result<FetchResult, QghError> {
+pub async fn fetch_issues(
+    profile: &Profile,
+    token: &str,
+    cursors: &[StoredCursor],
+) -> Result<FetchResult, QghError> {
     let client = reqwest::Client::new();
+    let cursor_map = cursor_map(cursors);
     let mut issues = Vec::new();
     let mut comments = Vec::new();
+    let mut cursor_updates = Vec::new();
     let mut skipped_pull_requests = 0;
 
     for repo in &profile.repos {
-        let mut next_url = Some(format!(
-            "{}/repos/{}/{}/issues?state=all&sort=updated&direction=asc&per_page=100",
-            profile.api_base_url, repo.owner, repo.name
-        ));
+        let endpoint = issue_endpoint(repo);
+        let stored_cursor = cursor_map.get(&endpoint);
+        let mut max_watermark = stored_cursor.and_then(|cursor| cursor.cursor.clone());
+        let mut next_url = Some(issue_url(profile, repo, stored_cursor));
+        let mut endpoint_not_modified = false;
+        let mut response_etag = stored_cursor.and_then(|cursor| cursor.etag.clone());
         while let Some(url) = next_url.take() {
-            let response = client
+            let mut request = client
                 .get(&url)
                 .bearer_auth(token)
-                .header("accept", "application/vnd.github+json")
+                .header("accept", "application/vnd.github+json");
+            if let Some(etag) = stored_cursor.and_then(|cursor| cursor.etag.as_ref()) {
+                request = request.header(IF_NONE_MATCH, etag);
+            }
+            let response = request
                 .send()
                 .await
                 .map_err(|error| QghError::github(error.to_string()))?;
             let status = response.status();
             let headers = response.headers().clone();
+            if status == StatusCode::NOT_MODIFIED {
+                endpoint_not_modified = true;
+                break;
+            }
             if !status.is_success() {
                 return Err(QghError::github(format!(
                     "GitHub issues request failed with HTTP {status}."
                 )));
             }
+            response_etag = header_string(&headers, ETAG).or(response_etag);
             let page: Vec<ApiIssue> = response
                 .json()
                 .await
@@ -72,17 +93,36 @@ pub async fn fetch_issues(profile: &Profile, token: &str) -> Result<FetchResult,
                     continue;
                 }
                 let issue = item.into_record(profile, repo, &indexed_at);
-                comments.extend(fetch_issue_comments(&client, profile, token, repo, &issue).await?);
+                max_watermark = max_timestamp(max_watermark, &issue.updated_at);
+                comments.extend(
+                    fetch_issue_comments(
+                        &client,
+                        profile,
+                        token,
+                        &cursor_map,
+                        &mut cursor_updates,
+                        repo,
+                        &issue,
+                    )
+                    .await?,
+                );
                 issues.push(issue);
             }
             next_url = next_link(&headers);
         }
+        cursor_updates.push(CursorUpdate {
+            endpoint,
+            cursor: max_watermark,
+            etag: response_etag,
+            not_modified: endpoint_not_modified,
+        });
     }
 
     Ok(FetchResult {
         issues,
         comments,
         skipped_pull_requests,
+        cursor_updates,
     })
 }
 
@@ -90,40 +130,59 @@ async fn fetch_issue_comments(
     client: &reqwest::Client,
     profile: &Profile,
     token: &str,
+    cursor_map: &BTreeMap<String, StoredCursor>,
+    cursor_updates: &mut Vec<CursorUpdate>,
     repo: &RepoRef,
     issue: &IssueRecord,
 ) -> Result<Vec<CommentRecord>, QghError> {
     let mut comments = Vec::new();
-    let mut next_url = Some(format!(
-        "{}/repos/{}/{}/issues/{}/comments?per_page=100",
-        profile.api_base_url, repo.owner, repo.name, issue.number
-    ));
+    let endpoint = comment_endpoint(repo, issue.number);
+    let stored_cursor = cursor_map.get(&endpoint);
+    let mut max_watermark = stored_cursor.and_then(|cursor| cursor.cursor.clone());
+    let mut response_etag = stored_cursor.and_then(|cursor| cursor.etag.clone());
+    let mut endpoint_not_modified = false;
+    let mut next_url = Some(comment_url(profile, repo, issue.number, stored_cursor));
     while let Some(url) = next_url.take() {
-        let response = client
+        let mut request = client
             .get(&url)
             .bearer_auth(token)
-            .header("accept", "application/vnd.github+json")
+            .header("accept", "application/vnd.github+json");
+        if let Some(etag) = stored_cursor.and_then(|cursor| cursor.etag.as_ref()) {
+            request = request.header(IF_NONE_MATCH, etag);
+        }
+        let response = request
             .send()
             .await
             .map_err(|error| QghError::github(error.to_string()))?;
         let status = response.status();
         let headers = response.headers().clone();
+        if status == StatusCode::NOT_MODIFIED {
+            endpoint_not_modified = true;
+            break;
+        }
         if !status.is_success() {
             return Err(QghError::github(format!(
                 "GitHub issue comments request failed with HTTP {status}."
             )));
         }
+        response_etag = header_string(&headers, ETAG).or(response_etag);
         let page: Vec<ApiComment> = response
             .json()
             .await
             .map_err(|error| QghError::github(format!("Invalid GitHub comment JSON: {error}")))?;
         let indexed_at = now_rfc3339();
-        comments.extend(
-            page.into_iter()
-                .map(|comment| comment.into_record(profile, repo, issue, &indexed_at)),
-        );
+        for comment in page {
+            max_watermark = max_timestamp(max_watermark, &comment.updated_at);
+            comments.push(comment.into_record(profile, repo, issue, &indexed_at));
+        }
         next_url = next_link(&headers);
     }
+    cursor_updates.push(CursorUpdate {
+        endpoint,
+        cursor: max_watermark,
+        etag: response_etag,
+        not_modified: endpoint_not_modified,
+    });
     Ok(comments)
 }
 
@@ -246,6 +305,80 @@ fn next_link(headers: &HeaderMap) -> Option<String> {
         return Some(trimmed[start..end].to_string());
     }
     None
+}
+
+fn cursor_map(cursors: &[StoredCursor]) -> BTreeMap<String, StoredCursor> {
+    cursors
+        .iter()
+        .cloned()
+        .map(|cursor| (cursor.endpoint.clone(), cursor))
+        .collect()
+}
+
+fn issue_endpoint(repo: &RepoRef) -> String {
+    format!("issues:{}", repo.full_name())
+}
+
+fn comment_endpoint(repo: &RepoRef, issue_number: i64) -> String {
+    format!("comments:{}#{issue_number}", repo.full_name())
+}
+
+fn issue_url(profile: &Profile, repo: &RepoRef, cursor: Option<&StoredCursor>) -> String {
+    let mut url = format!(
+        "{}/repos/{}/{}/issues?state=all&sort=updated&direction=asc&per_page=100",
+        profile.api_base_url, repo.owner, repo.name
+    );
+    if let Some(since) = cursor
+        .and_then(|cursor| cursor.cursor.as_deref())
+        .map(overlapped_since)
+    {
+        url.push_str("&since=");
+        url.push_str(&utf8_percent_encode(&since, SOURCE_ID_ENCODE_SET).to_string());
+    }
+    url
+}
+
+fn comment_url(
+    profile: &Profile,
+    repo: &RepoRef,
+    issue_number: i64,
+    cursor: Option<&StoredCursor>,
+) -> String {
+    let mut url = format!(
+        "{}/repos/{}/{}/issues/{issue_number}/comments?per_page=100",
+        profile.api_base_url, repo.owner, repo.name
+    );
+    if let Some(since) = cursor
+        .and_then(|cursor| cursor.cursor.as_deref())
+        .map(overlapped_since)
+    {
+        url.push_str("&since=");
+        url.push_str(&utf8_percent_encode(&since, SOURCE_ID_ENCODE_SET).to_string());
+    }
+    url
+}
+
+fn overlapped_since(timestamp: &str) -> String {
+    DateTime::parse_from_rfc3339(timestamp)
+        .map(|parsed| {
+            (parsed.with_timezone(&Utc) - Duration::seconds(60))
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        })
+        .unwrap_or_else(|_| timestamp.to_string())
+}
+
+fn max_timestamp(current: Option<String>, candidate: &str) -> Option<String> {
+    match current {
+        Some(current) if current.as_str() >= candidate => Some(current),
+        _ => Some(candidate.to_string()),
+    }
+}
+
+fn header_string(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string())
 }
 
 fn hex_sha256(value: &str) -> String {
