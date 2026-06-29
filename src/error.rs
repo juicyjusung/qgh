@@ -93,6 +93,24 @@ impl QghError {
         }))
     }
 
+    pub fn source_outside_effective_scope(
+        source_id: &str,
+        source_repo: &str,
+        effective_repo_scope: &str,
+    ) -> Self {
+        Self::new(
+            "source.outside_effective_scope",
+            "Source is outside the effective repo scope.",
+            4,
+        )
+        .with_details(json!({
+            "source_id": source_id,
+            "source_repo": source_repo,
+            "effective_repo_scope": effective_repo_scope
+        }))
+        .with_hint("Use get --profile-id from query get_args to round-trip an explicit result.")
+    }
+
     pub fn storage(message: impl Into<String>) -> Self {
         Self::new("storage.failure", message, 6)
     }

@@ -8,6 +8,9 @@
       "search": "query"
     },
     "cli_only_commands": ["init", "sync", "doctor"],
+    "init_behavior": "top-level init is a first-run profile/repo bootstrap wizard; init repo is repo-policy-only",
+    "command_resolution_sources": ["explicit", "repo_policy", "git_remote"],
+    "sync_default_scope": "effective_repo_scope_when_available",
     "mcp_protocol_version": "2025-11-25",
     "mcp_tools": ["query", "get", "status"],
     "mcp_read_only": true,

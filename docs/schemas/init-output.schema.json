@@ -3,14 +3,71 @@
   "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/init-output.schema.json",
   "title": "qgh init data",
   "type": "object",
-  "required": ["path", "repo", "repo_source", "overwritten", "profile_validation"],
+  "oneOf": [
+    {
+      "title": "top-level init wizard output",
+      "required": [
+        "profile_config_path",
+        "profile_id",
+        "profile_action",
+        "repo",
+        "repo_allowlist_action",
+        "repo_policy_action",
+        "repo_policy_path",
+        "token_source",
+        "next_steps"
+      ]
+    },
+    {
+      "title": "init repo output",
+      "required": ["path", "repo", "repo_source", "overwritten", "profile_validation"]
+    }
+  ],
   "properties": {
-    "path": {
+    "profile_config_path": {
       "type": "string"
+    },
+    "profile_id": {
+      "type": "string"
+    },
+    "profile_action": {
+      "type": "string",
+      "enum": ["created", "updated"]
     },
     "repo": {
       "type": "string",
       "pattern": "^[^/]+/[^/]+$"
+    },
+    "repo_allowlist_action": {
+      "type": "string",
+      "enum": ["added", "already_present"]
+    },
+    "repo_policy_action": {
+      "type": "string",
+      "enum": ["created", "overwritten", "already_exists", "skipped"]
+    },
+    "repo_policy_path": {
+      "type": ["string", "null"]
+    },
+    "token_source": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["github_cli", "env"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "next_steps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "path": {
+      "type": "string"
     },
     "repo_source": {
       "type": "string",

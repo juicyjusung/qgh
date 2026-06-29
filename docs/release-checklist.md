@@ -28,7 +28,7 @@ Excluded or post-MVP gates:
 | --- | --- |
 | Tantivy BM25-only path | `sync`, `query`, `get`, and `status` pass without vector, model, GPU, or hosted provider dependencies. |
 | strict schema/envelope | CLI JSON and MCP structured content use `qgh.v1`; unknown CLI/MCP/config parameters fail with structured errors. |
-| init output | `init` is CLI-only, writes only tracked repo policy, emits `docs/schemas/init-output.schema.json`, and never appears in MCP `tools/list`. |
+| init output | top-level `init` is CLI-only first-run profile/repo bootstrap, `init repo` is repo-policy-only, both emit `docs/schemas/init-output.schema.json`, and neither appears in MCP `tools/list`. |
 | MCP read-only tools | `tools/list` exposes only `query`, `get`, and `status`, each with `readOnlyHint: true`. |
 | stdout cleanliness | MCP stdio writes only protocol JSON messages to stdout; CLI JSON envelopes go to stdout and human diagnostics go to stderr. |
 | privacy no-egress | Default behavior sends data only to the configured GitHub host for sync, `get` lifecycle checks, and explicit `doctor`; no hosted provider path is enabled. |

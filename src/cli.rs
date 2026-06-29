@@ -52,6 +52,8 @@ pub struct SyncArgs {
     #[arg(long)]
     pub reconcile: Option<ReconcileMode>,
     #[arg(long)]
+    pub all: bool,
+    #[arg(long)]
     pub json: bool,
 }
 
@@ -61,6 +63,18 @@ pub struct InitArgs {
     pub target: Option<InitTarget>,
     #[arg(long)]
     pub repo: Option<String>,
+    #[arg(long)]
+    pub yes: bool,
+    #[arg(long)]
+    pub host: Option<String>,
+    #[arg(long)]
+    pub api_base_url: Option<String>,
+    #[arg(long)]
+    pub web_base_url: Option<String>,
+    #[arg(long)]
+    pub token_source: Option<InitTokenSourceArg>,
+    #[arg(long)]
+    pub token_env: Option<String>,
     #[arg(long)]
     pub force: bool,
     #[arg(long)]
@@ -97,6 +111,13 @@ pub struct InitRepoArgs {
     pub force: bool,
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum InitTokenSourceArg {
+    GithubCli,
+    Env,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

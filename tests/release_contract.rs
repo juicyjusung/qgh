@@ -94,14 +94,17 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     )
     .unwrap();
     for required in [
-        "path",
+        "profile_config_path",
+        "profile_id",
+        "profile_action",
         "repo",
-        "repo_source",
-        "overwritten",
-        "profile_validation",
+        "repo_allowlist_action",
+        "repo_policy_action",
+        "token_source",
+        "next_steps",
     ] {
         assert!(
-            init_schema["required"]
+            init_schema["oneOf"][0]["required"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -110,8 +113,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         );
     }
     assert_eq!(
-        init_schema["properties"]["repo_source"]["enum"],
-        json!(["cli", "git_remote"])
+        init_schema["properties"]["repo_policy_action"]["enum"],
+        json!(["created", "overwritten", "already_exists", "skipped"])
     );
     let included = artifact["acceptance_snapshot"]["included_in_mvp_gate"]
         .as_array()

@@ -332,6 +332,7 @@ impl EvalReport {
 }
 
 struct EvalFixture {
+    root: PathBuf,
     config_home: PathBuf,
     data_home: PathBuf,
     cache_home: PathBuf,
@@ -347,6 +348,7 @@ impl EvalFixture {
         fs::create_dir_all(&data_home).unwrap();
         fs::create_dir_all(&cache_home).unwrap();
         Self {
+            root,
             config_home,
             data_home,
             cache_home,
@@ -388,6 +390,7 @@ env = "QGH_TEST_TOKEN"
             .env("XDG_CACHE_HOME", &self.cache_home)
             .env("QGH_TEST_TOKEN", "fixture-token")
             .env_remove("RUST_LOG")
+            .current_dir(&self.root)
             .args(["--profile", "work"])
             .args(args);
         cmd.output().unwrap()

@@ -1,4 +1,7 @@
-use crate::config::{discover_repo_policy, load_profile, single_matching_profile_id};
+use crate::config::{
+    discover_repo_policy, load_profile, origin_remote_from_current_worktree,
+    single_matching_profile_id,
+};
 use crate::error::QghError;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -15,6 +18,7 @@ pub(crate) struct ResolvedCommandContext {
 pub(crate) struct ResolvedRepoScope {
     pub(crate) repo: String,
     pub(crate) source: &'static str,
+    pub(crate) host: Option<String>,
     pub(crate) repo_policy_path: Option<PathBuf>,
 }
 
@@ -28,8 +32,10 @@ pub(crate) fn resolve_context(
     if let Ok(profile_id) = std::env::var("QGH_PROFILE") {
         return resolve_explicit_context(&profile_id, "env", repo_scope);
     }
-    let profile_id =
-        single_matching_profile_id(repo_scope.as_ref().map(|scope| scope.repo.as_str()))?;
+    let profile_id = single_matching_profile_id(
+        repo_scope.as_ref().map(|scope| scope.repo.as_str()),
+        repo_scope.as_ref().and_then(|scope| scope.host.as_deref()),
+    )?;
     Ok(ResolvedCommandContext {
         profile_id,
         profile_source: "single_match",
@@ -59,12 +65,18 @@ fn validate_profile_allows_scope(
     repo_scope: &ResolvedRepoScope,
 ) -> Result<(), QghError> {
     let profile = load_profile(profile_id)?;
-    if profile.allows_repo(&repo_scope.repo) {
+    if profile.allows_repo(&repo_scope.repo)
+        && repo_scope
+            .host
+            .as_deref()
+            .is_none_or(|host| profile.host == host)
+    {
         return Ok(());
     }
     let details = json!({
         "profile_id": profile.id,
         "repo": repo_scope.repo,
+        "host": repo_scope.host.as_ref(),
         "repo_policy_path": repo_scope
             .repo_policy_path
             .as_ref()
@@ -93,8 +105,23 @@ pub(crate) fn repo_scope_from_policy() -> Result<Option<ResolvedRepoScope>, QghE
     Ok(discover_repo_policy()?.map(|policy| ResolvedRepoScope {
         repo: policy.repo.full_name(),
         source: "repo_policy",
+        host: None,
         repo_policy_path: Some(policy.path),
     }))
+}
+
+pub(crate) fn repo_scope_from_worktree() -> Result<Option<ResolvedRepoScope>, QghError> {
+    if let Some(scope) = repo_scope_from_policy()? {
+        return Ok(Some(scope));
+    }
+    Ok(
+        origin_remote_from_current_worktree()?.map(|remote| ResolvedRepoScope {
+            repo: remote.repo,
+            source: "git_remote",
+            host: Some(remote.host),
+            repo_policy_path: None,
+        }),
+    )
 }
 
 pub(crate) fn repo_scope_from_cli_arg(repo: &str) -> Result<ResolvedRepoScope, QghError> {
@@ -113,6 +140,7 @@ fn repo_scope_from_explicit_arg(
     Ok(ResolvedRepoScope {
         repo: repo.to_string(),
         source,
+        host: None,
         repo_policy_path: None,
     })
 }

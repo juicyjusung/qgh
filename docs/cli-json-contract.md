@@ -44,21 +44,44 @@ metadata when resolution has run:
 - `meta.profile_id`: resolved profile id.
 - `meta.profile_source`: `cli`, `env`, `single_match`, or `get_args`.
 - `meta.repo`: effective `owner/repo` scope, or `null` when the command has no repo scope.
-- `meta.repo_source`: `cli`, `repo_policy`, `command` for MCP tool arguments, or `null`.
+- `meta.repo_source`: `cli`, `repo_policy`, `git_remote`, `command` for MCP tool arguments, or `null`.
 - `meta.repo_policy_path`: current worktree repo policy path when a repo policy supplied scope, otherwise `null`.
 
 `status` also includes `data.resolution` with the same resolved profile and
 repo-scope fields. CLI-only `doctor` includes the same diagnostics and is the
 explicit command that may run probes. MCP exposes `status`, but not `doctor`.
-CLI-only `init` creates tracked repo policy and is not exposed to MCP.
+CLI-only top-level `init` bootstraps profile config plus repo scope. `init repo`
+creates tracked repo policy only. Neither command is exposed to MCP.
 
 ## Init Output
 
-`init` and `init repo` create or overwrite the current git worktree root
-`.qgh.toml` repo policy. They never create profile config, token source config,
-profile store paths, arbitrary DB paths, or user-local absolute paths.
+Top-level `init` is the first-run wizard. It reads the current git worktree
+`origin` remote, proposes GitHub.com or GHES host defaults, creates or updates
+`${XDG_CONFIG_HOME:-~/.config}/qgh/config.toml`, adds the current repo to the
+selected profile allowlist without duplicates, and creates `.qgh.toml` as a
+default-on repo policy convenience file. It stores token source references only,
+never literal token values.
 
-`init --json` returns:
+`init repo` creates or overwrites only the current git worktree root `.qgh.toml`
+repo policy. It never creates profile config, token source config, profile store
+paths, arbitrary DB paths, or user-local absolute paths.
+
+Top-level `init --json` returns:
+
+- `profile_config_path`: created or updated profile config path.
+- `profile_id`: resolved or selected profile id.
+- `profile_action`: `created` or `updated`.
+- `repo`: effective `owner/repo` scope.
+- `repo_allowlist_action`: `added` or `already_present`.
+- `repo_policy_action`: `created`, `overwritten`, `already_exists`, or `skipped`.
+- `repo_policy_path`: `.qgh.toml` path when written or already present, otherwise `null`.
+- `token_source.kind`: `github_cli` or `env`.
+- `next_steps`: short command suggestions.
+
+`init --yes` is the non-interactive automation path. Missing required values fail
+with structured validation errors instead of falling back to prompts.
+
+`init repo --json` returns:
 
 - `path`: created or overwritten `.qgh.toml` path.
 - `repo`: generated `owner/repo` policy scope.
@@ -68,7 +91,7 @@ profile store paths, arbitrary DB paths, or user-local absolute paths.
 - `profile_validation`: `validated` with `profile_id` and `profile_source`
   when `--profile` or `QGH_PROFILE` was provided, otherwise `not_checked`.
 
-When no profile is explicit, `init` may still create repo policy, but the
+When no profile is explicit, `init repo` may still create repo policy, but the
 success envelope includes a `config.profile_not_checked` warning. Commands that
 use the policy later still apply normal profile resolution and allowlist checks.
 

@@ -363,7 +363,7 @@ fn repo_policy_defaults_cli_query_to_current_worktree_repo_scope() {
     fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
     let nested_worktree_dir = fixture.init_git_worktree_with_repo_policy("owner/repo");
 
-    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--json"]));
+    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--all", "--json"]));
 
     let default_query = fixture.qgh_in(
         &nested_worktree_dir,
@@ -429,6 +429,102 @@ fn repo_policy_defaults_cli_query_to_current_worktree_repo_scope() {
 }
 
 #[test]
+fn git_origin_scope_without_repo_policy_drives_sync_query_status_and_get() {
+    let fixture = TestFixture::new("git-origin-command-resolution");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let sync = fixture.qgh_without_profile_in(&nested_worktree_dir, ["sync", "--json"]);
+    assert_success(&sync);
+    let sync_json = stdout_json(&sync);
+    assert_eq!(sync_json["meta"]["profile_id"], "work");
+    assert_eq!(sync_json["meta"]["profile_source"], "single_match");
+    assert_eq!(sync_json["meta"]["repo"], "owner/repo");
+    assert_eq!(sync_json["meta"]["repo_source"], "git_remote");
+    assert_eq!(sync_json["data"]["issues"]["upserted"], 1);
+
+    let owner_query = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        ["query", "shared repo policy tracer", "--json"],
+    );
+    assert_success(&owner_query);
+    let owner_query_json = stdout_json(&owner_query);
+    assert_eq!(owner_query_json["meta"]["repo_source"], "git_remote");
+    assert_eq!(owner_query_json["data"]["results"][0]["repo"], "owner/repo");
+
+    let status = fixture.qgh_without_profile_in(&nested_worktree_dir, ["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(
+        status_json["data"]["resolution"]["effective_repo_scope"],
+        "owner/repo"
+    );
+    assert_eq!(
+        status_json["data"]["resolution"]["repo_source"],
+        "git_remote"
+    );
+
+    let other_get = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        [
+            "get",
+            "qgh://github.com/issue/I_POLICY_OTHER",
+            "--profile-id",
+            "work",
+            "--json",
+        ],
+    );
+    assert_eq!(other_get.status.code(), Some(4));
+    assert_eq!(stdout_json(&other_get)["error"]["code"], "source.not_found");
+}
+
+#[test]
+fn get_without_profile_id_enforces_current_origin_scope_but_profile_id_round_trips() {
+    let fixture = TestFixture::new("get-origin-scope");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--all", "--json"]));
+
+    let scoped_get = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        ["get", "qgh://github.com/issue/I_POLICY_OTHER", "--json"],
+    );
+    assert_eq!(scoped_get.status.code(), Some(4));
+    let scoped_json = stdout_json(&scoped_get);
+    assert_eq!(
+        scoped_json["error"]["code"],
+        "source.outside_effective_scope"
+    );
+    assert_eq!(
+        scoped_json["error"]["details"]["effective_repo_scope"],
+        "owner/repo"
+    );
+
+    let round_trip_get = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        [
+            "get",
+            "qgh://github.com/issue/I_POLICY_OTHER",
+            "--profile-id",
+            "work",
+            "--json",
+        ],
+    );
+    assert_success(&round_trip_get);
+    let round_trip_json = stdout_json(&round_trip_get);
+    assert_eq!(round_trip_json["meta"]["profile_source"], "get_args");
+    assert_eq!(
+        round_trip_json["data"]["source"]["source_id"],
+        "qgh://github.com/issue/I_POLICY_OTHER"
+    );
+}
+
+#[test]
 fn repo_policy_query_limit_sets_default_when_query_omits_limit() {
     let fixture = TestFixture::new("repo-policy-query-limit");
     let server = FakeGitHub::start(limit_policy_issue_payload());
@@ -436,7 +532,7 @@ fn repo_policy_query_limit_sets_default_when_query_omits_limit() {
     let nested_worktree_dir = fixture.init_git_worktree_with_repo_policy("owner/repo");
     fixture.write_repo_policy_with_query_limit("owner/repo", 3);
 
-    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--json"]));
+    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--all", "--json"]));
 
     let default_limit = fixture.qgh_in(
         &nested_worktree_dir,
@@ -630,6 +726,195 @@ fn init_repo_writes_repo_policy_from_cli_repo_at_current_worktree_root() {
 }
 
 #[test]
+fn init_yes_bootstraps_profile_config_and_repo_policy_without_secret_or_store_paths() {
+    let fixture = TestFixture::new("init-yes-bootstrap");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        [
+            "init",
+            "--yes",
+            "--profile",
+            "work",
+            "--repo",
+            "owner/repo",
+            "--host",
+            "github.com",
+            "--api-base-url",
+            "https://api.github.com",
+            "--web-base-url",
+            "https://github.com",
+            "--token-source",
+            "env",
+            "--token-env",
+            "QGH_TEST_TOKEN",
+            "--json",
+        ],
+    );
+    assert_success(&init);
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["data"]["profile_id"], "work");
+    assert_eq!(init_json["data"]["profile_action"], "created");
+    assert_eq!(init_json["data"]["repo"], "owner/repo");
+    assert_eq!(init_json["data"]["repo_allowlist_action"], "added");
+    assert_eq!(init_json["data"]["repo_policy_action"], "created");
+    assert_eq!(init_json["data"]["token_source"]["kind"], "env");
+    assert_eq!(
+        init_json["data"]["next_steps"],
+        json!(["qgh sync", "qgh query <terms>"])
+    );
+
+    let config_text = fs::read_to_string(fixture.config_home.join("qgh/config.toml")).unwrap();
+    assert!(config_text.contains(r#"schema_version = "qgh.config.v1""#));
+    assert!(config_text.contains("[profiles.work]"));
+    assert!(config_text.contains(r#"host = "github.com""#));
+    assert!(config_text.contains(r#"api_base_url = "https://api.github.com""#));
+    assert!(config_text.contains(r#"web_base_url = "https://github.com""#));
+    assert!(config_text.contains(r#"repos = ["owner/repo"]"#));
+    assert!(config_text.contains(r#"type = "env""#));
+    assert!(config_text.contains(r#"env = "QGH_TEST_TOKEN""#));
+    for forbidden in [
+        "fixture-token",
+        "qgh.sqlite3",
+        "profiles/work",
+        fixture.data_home.to_str().unwrap(),
+    ] {
+        assert!(
+            !config_text.contains(forbidden),
+            "config must not contain {forbidden}: {config_text}"
+        );
+        assert!(
+            !stdout_text(&init).contains(forbidden),
+            "init output must not contain {forbidden}: {}",
+            stdout_text(&init)
+        );
+    }
+
+    let policy = fs::read_to_string(fixture.root.join(".qgh.toml")).unwrap();
+    assert!(policy.contains(r#"github = "owner/repo""#));
+    assert!(!policy.contains("QGH_TEST_TOKEN"));
+    assert!(!policy.contains("profiles/work"));
+
+    let status = fixture.qgh_without_profile_in(&nested_worktree_dir, ["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["meta"]["profile_source"], "single_match");
+    assert_eq!(
+        status_json["data"]["resolution"]["effective_repo_scope"],
+        "owner/repo"
+    );
+}
+
+#[test]
+fn init_yes_with_explicit_values_does_not_require_origin_remote() {
+    let fixture = TestFixture::new("init-yes-no-origin");
+    let nested_worktree_dir = fixture.init_git_worktree();
+
+    let init = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        [
+            "init",
+            "--yes",
+            "--profile",
+            "work",
+            "--repo",
+            "owner/repo",
+            "--host",
+            "github.com",
+            "--api-base-url",
+            "https://api.github.com",
+            "--web-base-url",
+            "https://github.com",
+            "--token-source",
+            "env",
+            "--token-env",
+            "QGH_TEST_TOKEN",
+            "--json",
+        ],
+    );
+    assert_success(&init);
+    assert!(fixture.config_home.join("qgh/config.toml").exists());
+    assert!(fixture.root.join(".qgh.toml").exists());
+}
+
+#[test]
+fn init_interactive_wizard_reads_stdin_defaults_and_bootstraps_profile() {
+    let fixture = TestFixture::new("init-interactive");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in_with_stdin(
+        &nested_worktree_dir,
+        ["init", "--json"],
+        "work\n\n\n\nenv\nQGH_TEST_TOKEN\ny\n",
+    );
+    assert_success(&init);
+    assert!(stdout_text(&init).starts_with('{'));
+    assert!(stderr_text(&init).contains("profile id"));
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["data"]["profile_id"], "work");
+    assert_eq!(init_json["data"]["profile_action"], "created");
+    assert_eq!(init_json["data"]["repo"], "owner/repo");
+    assert_eq!(init_json["data"]["token_source"]["kind"], "env");
+    assert_eq!(init_json["data"]["repo_policy_action"], "created");
+
+    let config_text = fs::read_to_string(fixture.config_home.join("qgh/config.toml")).unwrap();
+    assert!(config_text.contains(r#"host = "github.com""#));
+    assert!(config_text.contains(r#"api_base_url = "https://api.github.com""#));
+    assert!(config_text.contains(r#"web_base_url = "https://github.com""#));
+    assert!(config_text.contains(r#"env = "QGH_TEST_TOKEN""#));
+    assert!(!config_text.contains("fixture-token"));
+}
+
+#[test]
+fn init_yes_infers_ghes_defaults_from_origin_remote() {
+    let fixture = TestFixture::new("init-ghes-defaults");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("git@ghe.internal.example:team/repo.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        [
+            "init",
+            "--yes",
+            "--profile",
+            "enterprise",
+            "--token-source",
+            "github_cli",
+            "--json",
+        ],
+    );
+    assert_success(&init);
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["data"]["repo"], "team/repo");
+    assert_eq!(init_json["data"]["token_source"]["kind"], "github_cli");
+
+    let config_text = fs::read_to_string(fixture.config_home.join("qgh/config.toml")).unwrap();
+    assert!(config_text.contains(r#"host = "ghe.internal.example""#));
+    assert!(config_text.contains(r#"api_base_url = "https://ghe.internal.example/api/v3""#));
+    assert!(config_text.contains(r#"web_base_url = "https://ghe.internal.example""#));
+    assert!(config_text.contains(r#"repos = ["team/repo"]"#));
+    assert!(config_text.contains(r#"type = "github_cli""#));
+}
+
+#[test]
+fn init_yes_missing_required_values_fails_without_prompting() {
+    let fixture = TestFixture::new("init-yes-missing");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(&nested_worktree_dir, ["init", "--yes", "--json"]);
+    assert_eq!(init.status.code(), Some(2));
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["error"]["code"], "validation.missing_init_value");
+    assert!(stderr_text(&init).is_empty());
+    assert!(!fixture.config_home.join("qgh/config.toml").exists());
+    assert!(!fixture.root.join(".qgh.toml").exists());
+}
+
+#[test]
 fn init_infers_repo_from_github_origin_remote_without_profile_resolution() {
     for (case, remote) in [
         ("https-dot-git", "https://github.com/owner/repo.git"),
@@ -639,7 +924,7 @@ fn init_infers_repo_from_github_origin_remote_without_profile_resolution() {
         let fixture = TestFixture::new(&format!("init-origin-{case}"));
         let nested_worktree_dir = fixture.init_git_worktree_with_origin(remote);
 
-        let init = fixture.qgh_without_profile_in(&nested_worktree_dir, ["init", "--json"]);
+        let init = fixture.qgh_without_profile_in(&nested_worktree_dir, ["init", "repo", "--json"]);
         assert_success(&init);
         let init_json = stdout_json(&init);
         assert_eq!(init_json["data"]["repo"], "owner/repo");
@@ -660,7 +945,7 @@ fn init_infers_repo_from_github_origin_remote_without_profile_resolution() {
 fn init_fails_outside_git_worktree_without_writing_policy() {
     let fixture = TestFixture::new("init-no-worktree");
 
-    let init = fixture.qgh_without_profile(["init", "--repo", "owner/repo", "--json"]);
+    let init = fixture.qgh_without_profile(["init", "repo", "--repo", "owner/repo", "--json"]);
     assert_eq!(init.status.code(), Some(2));
     let init_json = stdout_json(&init);
     assert_eq!(init_json["error"]["code"], "config.no_git_worktree");
@@ -671,7 +956,8 @@ fn init_fails_outside_git_worktree_without_writing_policy() {
 fn init_fails_for_missing_malformed_or_non_github_origin() {
     let missing = TestFixture::new("init-missing-origin");
     let missing_nested = missing.init_git_worktree();
-    let missing_output = missing.qgh_without_profile_in(&missing_nested, ["init", "--json"]);
+    let missing_output =
+        missing.qgh_without_profile_in(&missing_nested, ["init", "repo", "--json"]);
     assert_eq!(missing_output.status.code(), Some(2));
     assert_eq!(
         stdout_json(&missing_output)["error"]["code"],
@@ -679,13 +965,10 @@ fn init_fails_for_missing_malformed_or_non_github_origin() {
     );
     assert!(!missing.root.join(".qgh.toml").exists());
 
-    for (case, remote) in [
-        ("malformed", "not a github remote"),
-        ("non-github", "https://example.com/owner/repo.git"),
-    ] {
+    for (case, remote) in [("malformed", "not a github remote")] {
         let fixture = TestFixture::new(&format!("init-bad-origin-{case}"));
         let nested = fixture.init_git_worktree_with_origin(remote);
-        let output = fixture.qgh_without_profile_in(&nested, ["init", "--json"]);
+        let output = fixture.qgh_without_profile_in(&nested, ["init", "repo", "--json"]);
         assert_eq!(output.status.code(), Some(2));
         assert_eq!(
             stdout_json(&output)["error"]["code"],
@@ -701,8 +984,8 @@ fn init_refuses_existing_policy_unless_force_overwrites() {
     fixture.write_config_with_repos("http://127.0.0.1:1", &["owner/repo", "other/repo"]);
     let nested = fixture.init_git_worktree();
 
-    assert_success(&fixture.qgh_in(&nested, ["init", "--repo", "owner/repo", "--json"]));
-    let existing = fixture.qgh_in(&nested, ["init", "--repo", "other/repo", "--json"]);
+    assert_success(&fixture.qgh_in(&nested, ["init", "repo", "--repo", "owner/repo", "--json"]));
+    let existing = fixture.qgh_in(&nested, ["init", "repo", "--repo", "other/repo", "--json"]);
     assert_eq!(existing.status.code(), Some(2));
     assert_eq!(
         stdout_json(&existing)["error"]["code"],
@@ -714,7 +997,7 @@ fn init_refuses_existing_policy_unless_force_overwrites() {
 
     let forced = fixture.qgh_in(
         &nested,
-        ["init", "--repo", "other/repo", "--force", "--json"],
+        ["init", "repo", "--repo", "other/repo", "--force", "--json"],
     );
     assert_success(&forced);
     assert_eq!(stdout_json(&forced)["data"]["overwritten"], true);
@@ -729,7 +1012,7 @@ fn init_validates_profile_allowlist_before_writing_policy() {
     fixture.write_config("http://127.0.0.1:1");
     let nested = fixture.init_git_worktree();
 
-    let output = fixture.qgh_in(&nested, ["init", "--repo", "other/repo", "--json"]);
+    let output = fixture.qgh_in(&nested, ["init", "repo", "--repo", "other/repo", "--json"]);
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         stdout_json(&output)["error"]["code"],
@@ -1311,7 +1594,7 @@ fn mcp_without_profile_uses_repo_policy_single_match_scope() {
     let server = MultiRepoFakeGitHub::start();
     fixture.write_config_with_work_and_alt_profiles(&server.base_url);
     let nested_worktree_dir = fixture.init_git_worktree_with_repo_policy("owner/repo");
-    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--json"]));
+    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--all", "--json"]));
 
     let output = fixture.mcp_without_profile_in(
         &nested_worktree_dir,
@@ -1406,12 +1689,61 @@ fn mcp_without_profile_uses_repo_policy_single_match_scope() {
 }
 
 #[test]
+fn mcp_without_profile_uses_git_origin_single_match_scope_without_repo_policy() {
+    let fixture = TestFixture::new("mcp-origin-single-match");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+    assert_success(&fixture.qgh_without_profile_in(&nested_worktree_dir, ["sync", "--json"]));
+
+    let output = fixture.mcp_without_profile_in(
+        &nested_worktree_dir,
+        [
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "query",
+                    "arguments": {
+                        "query": "shared repo policy tracer"
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "status",
+                    "arguments": {}
+                }
+            }),
+        ],
+    );
+    assert_success(&output);
+    assert!(stderr_text(&output).is_empty());
+    let messages = stdout_json_lines(&output);
+    let query = &messages[0]["result"]["structuredContent"];
+    assert_eq!(query["ok"], true);
+    assert_eq!(query["meta"]["profile_source"], "single_match");
+    assert_eq!(query["meta"]["repo"], "owner/repo");
+    assert_eq!(query["meta"]["repo_source"], "git_remote");
+    assert_eq!(query["data"]["results"][0]["repo"], "owner/repo");
+
+    let status = &messages[1]["result"]["structuredContent"];
+    assert_eq!(status["ok"], true);
+    assert_eq!(status["data"]["resolution"]["repo_source"], "git_remote");
+}
+
+#[test]
 fn mcp_repo_argument_override_uses_command_scope_and_checks_allowlist() {
     let fixture = TestFixture::new("mcp-repo-override");
     let server = MultiRepoFakeGitHub::start();
     fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
     let nested_worktree_dir = fixture.init_git_worktree_with_repo_policy("owner/repo");
-    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--json"]));
+    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--all", "--json"]));
 
     let output = fixture.mcp_without_profile_in(
         &nested_worktree_dir,
@@ -1482,7 +1814,11 @@ fn query_get_args_carry_profile_for_no_profile_repo_override_round_trip() {
     let nested_worktree_dir = fixture.init_git_worktree_with_repo_policy("owner/repo");
 
     assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--json"]));
-    assert_success(&fixture.qgh_in_profile(&nested_worktree_dir, "alt", ["sync", "--json"]));
+    assert_success(&fixture.qgh_in_profile(
+        &nested_worktree_dir,
+        "alt",
+        ["sync", "--all", "--json"],
+    ));
 
     let cli_query = fixture.qgh_without_profile_in(
         &nested_worktree_dir,
@@ -2698,6 +3034,28 @@ limit = {limit}
         let mut cmd = self.base_command();
         cmd.current_dir(cwd).args(args);
         cmd.output().unwrap()
+    }
+
+    fn qgh_without_profile_in_with_stdin<const N: usize>(
+        &self,
+        cwd: &Path,
+        args: [&str; N],
+        stdin_text: &str,
+    ) -> Output {
+        let mut cmd = self.base_command();
+        cmd.current_dir(cwd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(stdin_text.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
     }
 
     fn mcp<const N: usize>(&self, messages: [Value; N]) -> Output {

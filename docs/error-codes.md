@@ -13,7 +13,7 @@ Stable error families:
 - `index.*`: Tantivy index failures.
 - `internal.*`: unexpected internal failures.
 
-Common codes include `config.no_matching_profile`, `config.ambiguous_profile`, `config.invalid_repo_policy`, `validation.cli`, `validation.mcp`, `validation.unsupported_filter`, `auth.token_unavailable`, `source.not_found`, and `source.tombstoned`.
+Common codes include `config.no_matching_profile`, `config.ambiguous_profile`, `config.invalid_repo_policy`, `validation.cli`, `validation.mcp`, `validation.unsupported_filter`, `auth.token_unavailable`, `source.not_found`, `source.tombstoned`, and `source.outside_effective_scope`.
 
 `init` may additionally return:
 
@@ -22,9 +22,12 @@ Common codes include `config.no_matching_profile`, `config.ambiguous_profile`, `
 - `config.unsupported_git_remote`: `origin` was malformed or not a supported GitHub remote URL.
 - `config.repo_policy_exists`: `.qgh.toml` already exists and `--force` was omitted.
 - `validation.invalid_repo`: explicit repo or profile allowlist validation failed before writing `.qgh.toml`.
+- `validation.missing_init_value`: `qgh init --yes` was missing a required non-interactive value.
+- `validation.init_requires_input`: interactive `qgh init` could not read a required prompt answer.
+- `validation.invalid_token_source`: token source was not `github_cli` or `env`, or an env var name was invalid.
 
-`init` success without an explicit profile includes a warning object with code
-`config.profile_not_checked`; later `status/query` commands still perform normal
-profile resolution and allowlist checks.
+`init repo` success without an explicit profile includes a warning object with
+code `config.profile_not_checked`; later `status/query` commands still perform
+normal profile resolution and allowlist checks.
 
 Human output and JSON output share exit-code classes. Human diagnostics go to stderr; JSON envelopes go to stdout.

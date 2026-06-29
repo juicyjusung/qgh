@@ -4,7 +4,7 @@ use crate::error::QghError;
 use crate::mcp;
 use crate::output::{print_error, print_success};
 use crate::resolution::{
-    repo_scope_from_cli_arg, repo_scope_from_policy, resolve_context, resolve_explicit_context,
+    repo_scope_from_cli_arg, repo_scope_from_worktree, resolve_context, resolve_explicit_context,
     ResolvedCommandContext, ResolvedRepoScope,
 };
 use clap::error::ErrorKind;
@@ -65,7 +65,7 @@ struct CommandOutcome {
 
 async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
     if let crate::cli::Command::Init(args) = &cli.command {
-        let outcome = commands::init(cli.profile.as_deref(), args.repo_args())?;
+        let outcome = commands::init(cli.profile.as_deref(), args)?;
         return Ok(CommandOutcome {
             data: outcome.data,
             warnings: outcome.warnings,
@@ -80,11 +80,15 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
     let is_doctor = matches!(command, crate::cli::Command::Doctor { .. });
 
     let mut data = match command {
-        crate::cli::Command::Sync(args) => commands::sync(&profile_id, args.reconcile).await,
-        crate::cli::Command::Query(args) | crate::cli::Command::Search(args) => {
-            commands::query(&profile_id, args)
+        crate::cli::Command::Sync(args) => {
+            commands::sync(&profile_id, args.reconcile, context.repo_scope.as_ref()).await
         }
-        crate::cli::Command::Get { source_id, .. } => commands::get(&profile_id, &source_id).await,
+        crate::cli::Command::Query(args) | crate::cli::Command::Search(args) => {
+            commands::query(&profile_id, args, context.repo_scope.as_ref())
+        }
+        crate::cli::Command::Get { source_id, .. } => {
+            commands::get(&profile_id, &source_id, context.repo_scope.as_ref()).await
+        }
         crate::cli::Command::Status { .. } => commands::status(&profile_id),
         crate::cli::Command::Doctor { .. } => commands::doctor(&profile_id).await,
         crate::cli::Command::Init(_) => unreachable!("init is handled before normal resolution"),
@@ -158,7 +162,7 @@ fn effective_repo_scope_for_command(
             if let Some(repo) = &args.repo {
                 return repo_scope_from_cli_arg(repo).map(Some);
             }
-            repo_scope_from_policy()
+            repo_scope_from_worktree()
         }
         crate::cli::Command::Get {
             profile_id: Some(_),
@@ -168,8 +172,14 @@ fn effective_repo_scope_for_command(
             profile_id: None, ..
         }
         | crate::cli::Command::Status { .. }
-        | crate::cli::Command::Doctor { .. } => repo_scope_from_policy(),
-        crate::cli::Command::Sync(_) => Ok(None),
+        | crate::cli::Command::Doctor { .. } => repo_scope_from_worktree(),
+        crate::cli::Command::Sync(args) => {
+            if args.all {
+                Ok(None)
+            } else {
+                repo_scope_from_worktree()
+            }
+        }
         crate::cli::Command::Init(_) => unreachable!("init is handled before normal resolution"),
         crate::cli::Command::Mcp => unreachable!("MCP is handled before normal CLI output"),
     }

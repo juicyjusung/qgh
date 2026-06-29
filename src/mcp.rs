@@ -3,8 +3,8 @@ use crate::commands;
 use crate::error::QghError;
 use crate::output::{error_envelope, success_envelope_with_meta};
 use crate::resolution::{
-    repo_scope_from_command_arg, repo_scope_from_policy, resolve_context, resolve_explicit_context,
-    ResolvedCommandContext, ResolvedRepoScope,
+    repo_scope_from_command_arg, repo_scope_from_worktree, resolve_context,
+    resolve_explicit_context, ResolvedCommandContext, ResolvedRepoScope,
 };
 use serde_json::{json, Map, Value};
 use std::io::{self, BufRead, Write};
@@ -101,20 +101,24 @@ fn tool_query(session: &McpSession, arguments: &Value) -> Result<Value, QghError
     let args = parse_query_args(arguments)?;
     let repo_scope = effective_query_repo_scope(&args)?;
     let context = resolve_mcp_context(session, repo_scope)?;
-    let data = commands::query(&context.profile_id, args)?;
+    let data = commands::query(&context.profile_id, args, context.repo_scope.as_ref())?;
     Ok(tool_success(data, context.meta_json()))
 }
 
 fn tool_get(session: &McpSession, arguments: &Value) -> Result<Value, QghError> {
     let args = parse_get_args(arguments)?;
     let context = resolve_mcp_get_context(session, args.profile_id.as_deref())?;
-    let data = commands::get_local(&context.profile_id, &args.source_id)?;
+    let data = commands::get_local(
+        &context.profile_id,
+        &args.source_id,
+        context.repo_scope.as_ref(),
+    )?;
     Ok(tool_success(data, context.meta_json()))
 }
 
 fn tool_status(session: &McpSession, arguments: &Value) -> Result<Value, QghError> {
     parse_empty_args(arguments)?;
-    let context = resolve_mcp_context(session, repo_scope_from_policy()?)?;
+    let context = resolve_mcp_context(session, repo_scope_from_worktree()?)?;
     let mut data = commands::status(&context.profile_id)?;
     data["resolution"] = context.resolution_json();
     Ok(tool_success(data, context.meta_json()))
@@ -124,7 +128,7 @@ fn effective_query_repo_scope(args: &QueryArgs) -> Result<Option<ResolvedRepoSco
     if let Some(repo) = &args.repo {
         return repo_scope_from_command_arg(repo).map(Some);
     }
-    repo_scope_from_policy()
+    repo_scope_from_worktree()
 }
 
 fn resolve_mcp_context(
@@ -140,16 +144,22 @@ fn resolve_mcp_get_context(
 ) -> Result<ResolvedCommandContext, QghError> {
     if let Some(session_profile_id) = session.profile_arg.as_deref() {
         reject_profile_mismatch(session_profile_id, get_args_profile_id, "server --profile")?;
-        return resolve_context(Some(session_profile_id), repo_scope_from_policy()?);
+        if get_args_profile_id.is_some() {
+            return resolve_explicit_context(session_profile_id, "get_args", None);
+        }
+        return resolve_context(Some(session_profile_id), repo_scope_from_worktree()?);
     }
     if let Ok(env_profile_id) = std::env::var("QGH_PROFILE") {
         reject_profile_mismatch(&env_profile_id, get_args_profile_id, "QGH_PROFILE")?;
-        return resolve_context(None, repo_scope_from_policy()?);
+        if get_args_profile_id.is_some() {
+            return resolve_explicit_context(&env_profile_id, "get_args", None);
+        }
+        return resolve_context(None, repo_scope_from_worktree()?);
     }
     if let Some(profile_id) = get_args_profile_id {
         return resolve_explicit_context(profile_id, "get_args", None);
     }
-    resolve_context(None, repo_scope_from_policy()?)
+    resolve_context(None, repo_scope_from_worktree()?)
 }
 
 fn reject_profile_mismatch(
@@ -466,7 +476,7 @@ fn envelope_output_schema() -> Value {
                     },
                     "repo_source": {
                         "type": ["string", "null"],
-                        "enum": ["cli", "repo_policy", "command", null]
+                        "enum": ["cli", "repo_policy", "git_remote", "command", null]
                     },
                     "repo_policy_path": {
                         "type": ["string", "null"]

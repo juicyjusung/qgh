@@ -71,7 +71,7 @@
         },
         "repo_source": {
           "type": ["string", "null"],
-          "enum": ["cli", "repo_policy", "command", null]
+          "enum": ["cli", "repo_policy", "git_remote", "command", null]
         },
         "repo_policy_path": {
           "type": ["string", "null"]
