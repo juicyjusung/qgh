@@ -284,6 +284,20 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
 }
 
 #[test]
+fn sync_sends_github_rest_headers_required_by_real_api() {
+    let fixture = TestFixture::new("github-required-headers");
+    let server = HeaderCheckingFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+    let sync_json = stdout_json(&sync);
+    assert_eq!(sync_json["data"]["sync_state"], "ok");
+    assert_eq!(sync_json["data"]["issues"]["upserted"], 1);
+    assert_eq!(sync_json["data"]["comments"]["upserted"], 1);
+}
+
+#[test]
 fn exact_lookup_uses_typed_ranking_without_non_finite_scores() {
     let fixture = TestFixture::new("exact-ranking");
     let server = FakeGitHub::start(issue_payload_with_pr());
@@ -1692,6 +1706,84 @@ fn handle_connection(
         "200 OK"
     } else {
         "404 Not Found"
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
+struct HeaderCheckingFakeGitHub {
+    base_url: String,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl HeaderCheckingFakeGitHub {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                match stream {
+                    Ok(stream) => handle_header_checking_connection(stream),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            base_url,
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for HeaderCheckingFakeGitHub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.base_url.strip_prefix("http://").unwrap());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn handle_header_checking_connection(mut stream: TcpStream) {
+    let mut buffer = [0_u8; 8192];
+    let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let request_line = request.lines().next().unwrap_or("");
+    let lower = request.to_ascii_lowercase();
+    let has_required_headers = lower.contains("user-agent: qgh/")
+        && lower.contains("x-github-api-version: 2022-11-28")
+        && lower.contains("accept: application/vnd.github+json");
+
+    let (status, body) = if !has_required_headers {
+        (
+            "403 Forbidden",
+            r#"{"message":"Missing required GitHub REST request headers"}"#,
+        )
+    } else if request_line.starts_with("GET /repos/owner/repo/issues?")
+        && request_line.contains("state=all")
+        && request_line.contains("per_page=100")
+    {
+        ("200 OK", issue_payload_with_pr())
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?")
+        && request_line.contains("per_page=100")
+    {
+        ("200 OK", issue_comments_payload())
+    } else {
+        ("404 Not Found", r#"{"message":"not found"}"#)
     };
     let response = format!(
         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",

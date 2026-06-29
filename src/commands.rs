@@ -625,6 +625,8 @@ async fn doctor_github_probe(profile: &crate::config::Profile, token: &str) -> (
         .get(url)
         .bearer_auth(token)
         .header("accept", "application/vnd.github+json")
+        .header("user-agent", github::user_agent())
+        .header("x-github-api-version", github::GITHUB_API_VERSION)
         .send()
         .await;
     let Ok(response) = response else {

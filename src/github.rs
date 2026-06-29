@@ -33,6 +33,11 @@ const SOURCE_ID_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b']')
     .add(b'^')
     .add(b'|');
+pub const GITHUB_API_VERSION: &str = "2022-11-28";
+
+pub fn user_agent() -> String {
+    format!("qgh/{}", env!("CARGO_PKG_VERSION"))
+}
 
 pub struct FetchResult {
     pub issues: Vec<IssueRecord>,
@@ -88,10 +93,7 @@ pub async fn fetch_issues(
         let mut endpoint_not_modified = false;
         let mut response_etag = stored_cursor.and_then(|cursor| cursor.etag.clone());
         while let Some(url) = next_url.take() {
-            let mut request = client
-                .get(&url)
-                .bearer_auth(token)
-                .header("accept", "application/vnd.github+json");
+            let mut request = github_get(&client, &url, token);
             if let Some(etag) = stored_cursor.and_then(|cursor| cursor.etag.as_ref()) {
                 request = request.header(IF_NONE_MATCH, etag);
             }
@@ -219,10 +221,7 @@ async fn fetch_issue_comments(
     let mut endpoint_not_modified = false;
     let mut next_url = Some(comment_url(profile, repo, issue.number, stored_cursor));
     while let Some(url) = next_url.take() {
-        let mut request = client
-            .get(&url)
-            .bearer_auth(token)
-            .header("accept", "application/vnd.github+json");
+        let mut request = github_get(client, &url, token);
         if let Some(etag) = stored_cursor.and_then(|cursor| cursor.etag.as_ref()) {
             request = request.header(IF_NONE_MATCH, etag);
         }
@@ -338,10 +337,7 @@ async fn check_candidate_lifecycle(
     candidate: &ReconciliationCandidate,
 ) -> Result<LifecycleCheck, QghError> {
     let url = source_check_url(profile, candidate)?;
-    let response = client
-        .get(url)
-        .bearer_auth(token)
-        .header("accept", "application/vnd.github+json")
+    let response = github_get(client, &url, token)
         .send()
         .await
         .map_err(|error| QghError::github(error.to_string()))?;
@@ -369,6 +365,15 @@ async fn check_candidate_lifecycle(
             )));
         }
     })
+}
+
+fn github_get(client: &reqwest::Client, url: &str, token: &str) -> reqwest::RequestBuilder {
+    client
+        .get(url)
+        .bearer_auth(token)
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", user_agent())
+        .header("x-github-api-version", GITHUB_API_VERSION)
 }
 
 fn source_check_url(
