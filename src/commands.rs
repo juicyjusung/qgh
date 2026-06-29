@@ -1,5 +1,8 @@
-use crate::cli::{QueryArgs, ReconcileMode};
-use crate::config::{discover_repo_policy, load_profile, resolve_token, Profile, RepoPolicy};
+use crate::cli::{InitRepoArgs, QueryArgs, ReconcileMode};
+use crate::config::{
+    current_git_worktree_root, discover_repo_policy, load_profile, load_repo_policy_at, parse_repo,
+    resolve_token, Profile, RepoPolicy,
+};
 use crate::error::QghError;
 use crate::github;
 use crate::index;
@@ -7,7 +10,15 @@ use crate::model::{StoredComment, StoredIssue, StoredSource};
 use crate::store::Store;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
+use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
+
+pub struct InitCommandOutcome {
+    pub data: Value,
+    pub warnings: Vec<Value>,
+    pub meta: Value,
+}
 
 pub async fn sync(profile_id: &str, reconcile: Option<ReconcileMode>) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
@@ -126,6 +137,122 @@ pub async fn sync(profile_id: &str, reconcile: Option<ReconcileMode>) -> Result<
     }))
 }
 
+pub fn init(profile_arg: Option<&str>, args: InitRepoArgs) -> Result<InitCommandOutcome, QghError> {
+    let Some(root) = current_git_worktree_root() else {
+        return Err(QghError::validation(
+            "config.no_git_worktree",
+            "qgh init must be run inside a git worktree.",
+        )
+        .with_hint("Run qgh init from a git worktree or pass --repo after initializing git."));
+    };
+
+    let (repo, repo_source) = match args.repo.as_deref() {
+        Some(repo) => {
+            parse_repo(repo).map_err(|message| {
+                QghError::validation(
+                    "validation.invalid_repo",
+                    format!("Repo `{repo}` {message}"),
+                )
+                .with_details(json!({ "repo": repo }))
+                .with_hint("Use explicit owner/repo format.")
+            })?;
+            (repo.to_string(), "cli")
+        }
+        None => (repo_from_origin_remote(&root)?, "git_remote"),
+    };
+
+    let explicit_profile = explicit_profile_for_init(profile_arg);
+    let (profile_validation, warnings, meta_profile_id, meta_profile_source) =
+        match explicit_profile {
+            Some((profile_id, profile_source)) => {
+                let profile = load_profile(&profile_id)?;
+                if !profile.allows_repo(&repo) {
+                    return Err(QghError::validation(
+                        "validation.invalid_repo",
+                        format!(
+                            "Repo `{repo}` is outside profile `{}` allowlist.",
+                            profile.id
+                        ),
+                    )
+                    .with_details(json!({
+                        "profile_id": profile.id,
+                        "repo": repo
+                    }))
+                    .with_hint(
+                        "Use a repo from the profile allowlist or update the profile config.",
+                    ));
+                }
+                (
+                    json!({
+                        "status": "validated",
+                        "profile_id": profile.id,
+                        "profile_source": profile_source,
+                        "allowlist_match": true
+                    }),
+                    Vec::new(),
+                    Some(profile_id),
+                    Some(profile_source),
+                )
+            }
+            None => (
+                json!({
+                    "status": "not_checked",
+                    "profile_id": Value::Null,
+                    "profile_source": Value::Null,
+                    "allowlist_match": Value::Null
+                }),
+                vec![json!({
+                    "code": "config.profile_not_checked",
+                    "message": "Profile allowlist was not checked because no profile was explicit."
+                })],
+                None,
+                None,
+            ),
+        };
+
+    let path = root.join(".qgh.toml");
+    let overwritten = path.exists();
+    if overwritten && !args.force {
+        return Err(QghError::validation(
+            "config.repo_policy_exists",
+            "Repo policy already exists.",
+        )
+        .with_details(json!({ "path": path.to_string_lossy() }))
+        .with_hint("Use --force to overwrite the existing .qgh.toml."));
+    }
+
+    fs::write(&path, repo_policy_toml(&repo)).map_err(|error| {
+        QghError::storage(format!(
+            "Failed to write repo policy at {}: {error}",
+            path.display()
+        ))
+    })?;
+    load_repo_policy_at(&path)?;
+
+    let meta_repo_source = if repo_source == "cli" {
+        Some("cli")
+    } else {
+        None
+    };
+    Ok(InitCommandOutcome {
+        data: json!({
+            "path": path.to_string_lossy(),
+            "repo": repo,
+            "repo_source": repo_source,
+            "overwritten": overwritten,
+            "profile_validation": profile_validation
+        }),
+        warnings,
+        meta: json!({
+            "profile_id": meta_profile_id,
+            "profile_source": meta_profile_source,
+            "repo": repo,
+            "repo_source": meta_repo_source,
+            "repo_policy_path": Value::Null
+        }),
+    })
+}
+
 pub fn query(profile_id: &str, args: QueryArgs) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
     let repo_policy = discover_repo_policy()?;
@@ -162,6 +289,87 @@ pub fn query(profile_id: &str, args: QueryArgs) -> Result<Value, QghError> {
         },
         "results": results
     }))
+}
+
+fn explicit_profile_for_init(profile_arg: Option<&str>) -> Option<(String, &'static str)> {
+    if let Some(profile_id) = profile_arg {
+        return Some((profile_id.to_string(), "cli"));
+    }
+    std::env::var("QGH_PROFILE")
+        .ok()
+        .map(|profile_id| (profile_id, "env"))
+}
+
+fn repo_from_origin_remote(root: &std::path::Path) -> Result<String, QghError> {
+    let output = Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| {
+            QghError::validation(
+                "config.git_remote_unavailable",
+                format!("Failed to read git origin remote: {error}"),
+            )
+            .with_hint("Pass --repo owner/repo or configure a GitHub origin remote.")
+        })?;
+    if !output.status.success() {
+        return Err(QghError::validation(
+            "config.git_remote_unavailable",
+            "Git origin remote is not configured.",
+        )
+        .with_hint("Pass --repo owner/repo or configure a GitHub origin remote."));
+    }
+    let remote = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if remote.is_empty() {
+        return Err(QghError::validation(
+            "config.git_remote_unavailable",
+            "Git origin remote is empty.",
+        )
+        .with_hint("Pass --repo owner/repo or configure a GitHub origin remote."));
+    }
+    parse_github_remote_repo(&remote)
+}
+
+fn parse_github_remote_repo(remote: &str) -> Result<String, QghError> {
+    let remote = remote.trim().trim_end_matches('/');
+    let candidate = remote
+        .strip_prefix("https://github.com/")
+        .or_else(|| remote.strip_prefix("git@github.com:"))
+        .map(|repo| repo.trim_end_matches(".git"));
+    let Some(repo) = candidate else {
+        return Err(unsupported_git_remote(remote));
+    };
+    parse_repo(repo)
+        .map(|parsed| parsed.full_name())
+        .map_err(|_| unsupported_git_remote(remote))
+}
+
+fn unsupported_git_remote(remote: &str) -> QghError {
+    QghError::validation(
+        "config.unsupported_git_remote",
+        "Git origin remote is not a supported GitHub repository remote.",
+    )
+    .with_details(json!({ "remote": remote }))
+    .with_hint("Pass --repo owner/repo or use a GitHub origin remote.")
+}
+
+fn repo_policy_toml(repo: &str) -> String {
+    format!(
+        r#"schema_version = "qgh.repo.v1"
+
+[repo]
+github = "{repo}"
+
+[defaults]
+scope = "repo"
+state = "all"
+source_types = ["issue", "issue_comment"]
+labels = []
+
+[query]
+limit = 10
+"#
+    )
 }
 
 #[derive(Debug)]

@@ -15,6 +15,7 @@
 개정: 2026-06-29 — profile resolution (CLI/env/single-match profile precedence)
 개정: 2026-06-29 — effective scope metadata (CLI meta, status, doctor diagnostics)
 개정: 2026-06-29 — MCP scope resolution (read-only tools share CLI repo policy/profile contract)
+개정: 2026-06-29 — repo policy bootstrap (`qgh init` CLI-only tracked `.qgh.toml` creation)
 
 ## 1. 제품 정의
 
@@ -97,7 +98,7 @@ MVP는 작은 범위를 강하게 검증한다.
 - Rust crate baseline: `clap`, `serde`/`toml`/`schemars`, `reqwest`+rustls, `tokio`, `rusqlite` bundled, `tantivy`, official MCP Rust SDK 우선
 - BM25/keyword 검색 기본 동작 (한국어/영어 mixed corpus는 Tantivy tokenizer baseline + CJK n-gram fallback field를 eval로 검증)
 - optional vector/hybrid search는 post-MVP capability (sqlite-vec/ONNX 후보, MVP release gate 아님)
-- CLI 명령: `sync`, `search` 또는 `query`, `get`, `status`, `doctor`
+- CLI 명령: `init`, `sync`, `search` 또는 `query`, `get`, `status`, `doctor`
 - MCP tools: `query`, `get`, `status` (MCP 2025-11-25: structured output `outputSchema`, `readOnlyHint: true`, validation/resolution 실패는 `isError`)
 - 검색 결과의 stable source id, entity type, canonical URL, `get` 호출 정보
 - versioned JSON output envelope (`data`, `error`, `warnings`, `meta`)와 stable namespaced error code
@@ -140,7 +141,7 @@ MVP에서 제외할 항목은 제품 집중도를 지키기 위한 의도적 결
 
 ### 6.1 초기 설정
 
-사용자는 검색하고 싶은 repo를 `~/.config/qgh/config.toml`의 strict TOML profile에 명시한다. qgh는 token source, GitHub host, repo allowlist를 하나의 profile로 고정하고, SQLite/Tantivy data path는 XDG data dir과 profile id에서 파생한다. Repository는 tracked `.qgh.toml`로 query/search의 기본 repo scope와 safe filters를 정의할 수 있지만 profile id, token source, literal token, profile store path, arbitrary DB path, user-local absolute path는 정의할 수 없다. CLI `--profile`과 `QGH_PROFILE`이 없으면 effective repo scope를 allowlist에 포함하는 profile이 정확히 하나일 때만 profile을 자동 선택한다.
+사용자는 검색하고 싶은 repo를 `~/.config/qgh/config.toml`의 strict TOML profile에 명시한다. qgh는 token source, GitHub host, repo allowlist를 하나의 profile로 고정하고, SQLite/Tantivy data path는 XDG data dir과 profile id에서 파생한다. Repository는 tracked `.qgh.toml`로 query/search의 기본 repo scope와 safe filters를 정의할 수 있지만 profile id, token source, literal token, profile store path, arbitrary DB path, user-local absolute path는 정의할 수 없다. CLI-only `qgh init`은 current git worktree root에 이 repo policy를 생성하는 bootstrap command이며, XDG profile config를 생성하지 않고 MCP에도 노출되지 않는다. CLI `--profile`과 `QGH_PROFILE`이 없으면 effective repo scope를 allowlist에 포함하는 profile이 정확히 하나일 때만 profile을 자동 선택한다.
 
 성공 경험:
 

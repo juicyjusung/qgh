@@ -25,6 +25,7 @@ Released schema snapshots:
 
 - `docs/schemas/envelope.schema.json`: common success/error envelope.
 - `docs/schemas/error.schema.json`: stable error taxonomy and exit-code classes.
+- `docs/schemas/init-output.schema.json`: CLI-only `init` data payload.
 - `docs/schemas/query-result.schema.json`: `query`/`search` data payload.
 - `docs/schemas/sync-output.schema.json`: `sync` data payload.
 - `docs/schemas/get-output.schema.json`: `get` data payload.
@@ -49,6 +50,27 @@ metadata when resolution has run:
 `status` also includes `data.resolution` with the same resolved profile and
 repo-scope fields. CLI-only `doctor` includes the same diagnostics and is the
 explicit command that may run probes. MCP exposes `status`, but not `doctor`.
+CLI-only `init` creates tracked repo policy and is not exposed to MCP.
+
+## Init Output
+
+`init` and `init repo` create or overwrite the current git worktree root
+`.qgh.toml` repo policy. They never create profile config, token source config,
+profile store paths, arbitrary DB paths, or user-local absolute paths.
+
+`init --json` returns:
+
+- `path`: created or overwritten `.qgh.toml` path.
+- `repo`: generated `owner/repo` policy scope.
+- `repo_source`: `cli` when `--repo owner/repo` was used, or `git_remote` when
+  inferred from a supported GitHub `origin` remote.
+- `overwritten`: whether an existing policy was replaced with `--force`.
+- `profile_validation`: `validated` with `profile_id` and `profile_source`
+  when `--profile` or `QGH_PROFILE` was provided, otherwise `not_checked`.
+
+When no profile is explicit, `init` may still create repo policy, but the
+success envelope includes a `config.profile_not_checked` warning. Commands that
+use the policy later still apply normal profile resolution and allowlist checks.
 
 ## Query Results
 

@@ -9,7 +9,9 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     let help = qgh(&["--help"]);
     assert_success(&help);
     let help_text = stdout_text(&help);
-    for command in ["sync", "query", "search", "get", "status", "doctor", "mcp"] {
+    for command in [
+        "init", "sync", "query", "search", "get", "status", "doctor", "mcp",
+    ] {
         assert!(
             help_text.contains(command),
             "missing top-level help command: {command}"
@@ -23,6 +25,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     }
 
     for args in [
+        &["init", "--help"][..],
+        &["init", "repo", "--help"][..],
         &["sync", "--help"][..],
         &["query", "--help"][..],
         &["get", "--help"][..],
@@ -74,12 +78,41 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         artifact["contract"]["cli_only_commands"],
-        json!(["sync", "doctor"])
+        json!(["init", "sync", "doctor"])
     );
+    assert!(artifact["contract"]["not_exposed_to_mcp"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|command| command == "init"));
     for path in artifact["schema_snapshots"].as_array().unwrap() {
         let path = path.as_str().unwrap();
         assert!(root.join(path).exists(), "missing schema snapshot: {path}");
     }
+    let init_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/init-output.schema.json")).unwrap(),
+    )
+    .unwrap();
+    for required in [
+        "path",
+        "repo",
+        "repo_source",
+        "overwritten",
+        "profile_validation",
+    ] {
+        assert!(
+            init_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == required),
+            "init output schema must require {required}"
+        );
+    }
+    assert_eq!(
+        init_schema["properties"]["repo_source"]["enum"],
+        json!(["cli", "git_remote"])
+    );
     let included = artifact["acceptance_snapshot"]["included_in_mvp_gate"]
         .as_array()
         .unwrap();
@@ -99,6 +132,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     for required in [
         "Tantivy BM25-only path",
         "strict schema/envelope",
+        "init output",
         "MCP read-only tools",
         "stdout cleanliness",
         "privacy no-egress",

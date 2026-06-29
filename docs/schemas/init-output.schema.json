@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/init-output.schema.json",
+  "title": "qgh init data",
+  "type": "object",
+  "required": ["path", "repo", "repo_source", "overwritten", "profile_validation"],
+  "properties": {
+    "path": {
+      "type": "string"
+    },
+    "repo": {
+      "type": "string",
+      "pattern": "^[^/]+/[^/]+$"
+    },
+    "repo_source": {
+      "type": "string",
+      "enum": ["cli", "git_remote"]
+    },
+    "overwritten": {
+      "type": "boolean"
+    },
+    "profile_validation": {
+      "type": "object",
+      "required": ["status", "profile_id", "profile_source", "allowlist_match"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["validated", "not_checked"]
+        },
+        "profile_id": {
+          "type": ["string", "null"]
+        },
+        "profile_source": {
+          "type": ["string", "null"],
+          "enum": ["cli", "env", null]
+        },
+        "allowlist_match": {
+          "type": ["boolean", "null"]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

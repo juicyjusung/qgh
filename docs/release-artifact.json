@@ -2,17 +2,18 @@
   "schema_version": "qgh.release.v1",
   "contract": {
     "envelope_schema_version": "qgh.v1",
-    "cli_commands": ["sync", "query", "search", "get", "status", "doctor", "mcp"],
-    "canonical_cli_commands": ["sync", "query", "get", "status", "doctor"],
+    "cli_commands": ["init", "sync", "query", "search", "get", "status", "doctor", "mcp"],
+    "canonical_cli_commands": ["init", "sync", "query", "get", "status", "doctor"],
     "cli_aliases": {
       "search": "query"
     },
-    "cli_only_commands": ["sync", "doctor"],
+    "cli_only_commands": ["init", "sync", "doctor"],
     "mcp_protocol_version": "2025-11-25",
     "mcp_tools": ["query", "get", "status"],
     "mcp_read_only": true,
     "not_exposed_to_mcp": [
       "sync",
+      "init",
       "doctor",
       "eval",
       "embed",
@@ -35,6 +36,7 @@
   "schema_snapshots": [
     "docs/schemas/envelope.schema.json",
     "docs/schemas/error.schema.json",
+    "docs/schemas/init-output.schema.json",
     "docs/schemas/sync-output.schema.json",
     "docs/schemas/query-result.schema.json",
     "docs/schemas/get-output.schema.json",

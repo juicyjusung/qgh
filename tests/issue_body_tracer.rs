@@ -574,6 +574,171 @@ fn repo_policy_and_cli_repo_override_cannot_widen_profile_allowlist() {
 }
 
 #[test]
+fn init_repo_writes_repo_policy_from_cli_repo_at_current_worktree_root() {
+    let fixture = TestFixture::new("init-cli-repo");
+    fixture.write_config_with_repos("http://127.0.0.1:1", &["owner/repo"]);
+    let nested_worktree_dir = fixture.init_git_worktree();
+
+    let init = fixture.qgh_in(
+        &nested_worktree_dir,
+        ["init", "repo", "--repo", "owner/repo", "--json"],
+    );
+    assert_success(&init);
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["data"]["repo"], "owner/repo");
+    assert_eq!(init_json["data"]["repo_source"], "cli");
+    assert_eq!(init_json["data"]["overwritten"], false);
+    assert_eq!(
+        init_json["data"]["profile_validation"]["status"],
+        "validated"
+    );
+    assert_eq!(
+        init_json["data"]["profile_validation"]["profile_id"],
+        "work"
+    );
+    assert_eq!(init_json["warnings"].as_array().unwrap().len(), 0);
+    assert!(init_json["data"]["path"]
+        .as_str()
+        .unwrap()
+        .ends_with(".qgh.toml"));
+
+    let policy_path = fixture.root.join(".qgh.toml");
+    let policy = fs::read_to_string(&policy_path).unwrap();
+    assert!(policy.contains(r#"schema_version = "qgh.repo.v1""#));
+    assert!(policy.contains(r#"github = "owner/repo""#));
+    assert!(policy.contains(r#"scope = "repo""#));
+    assert!(policy.contains(r#"source_types = ["issue", "issue_comment"]"#));
+    assert!(policy.contains("limit = 10"));
+    for forbidden in ["token", "token_source", "profile_id", "db_path", "/Users/"] {
+        assert!(
+            !policy.contains(forbidden),
+            "generated repo policy must not contain {forbidden}: {policy}"
+        );
+    }
+
+    let status = fixture.qgh_in(&nested_worktree_dir, ["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(
+        status_json["data"]["resolution"]["repo_source"],
+        "repo_policy"
+    );
+    assert_eq!(
+        status_json["data"]["resolution"]["effective_repo_scope"],
+        "owner/repo"
+    );
+}
+
+#[test]
+fn init_infers_repo_from_github_origin_remote_without_profile_resolution() {
+    for (case, remote) in [
+        ("https-dot-git", "https://github.com/owner/repo.git"),
+        ("https-no-dot-git", "https://github.com/owner/repo"),
+        ("ssh-dot-git", "git@github.com:owner/repo.git"),
+    ] {
+        let fixture = TestFixture::new(&format!("init-origin-{case}"));
+        let nested_worktree_dir = fixture.init_git_worktree_with_origin(remote);
+
+        let init = fixture.qgh_without_profile_in(&nested_worktree_dir, ["init", "--json"]);
+        assert_success(&init);
+        let init_json = stdout_json(&init);
+        assert_eq!(init_json["data"]["repo"], "owner/repo");
+        assert_eq!(init_json["data"]["repo_source"], "git_remote");
+        assert_eq!(
+            init_json["data"]["profile_validation"]["status"],
+            "not_checked"
+        );
+        assert_eq!(
+            init_json["warnings"][0]["code"],
+            "config.profile_not_checked"
+        );
+        assert!(fixture.root.join(".qgh.toml").exists());
+    }
+}
+
+#[test]
+fn init_fails_outside_git_worktree_without_writing_policy() {
+    let fixture = TestFixture::new("init-no-worktree");
+
+    let init = fixture.qgh_without_profile(["init", "--repo", "owner/repo", "--json"]);
+    assert_eq!(init.status.code(), Some(2));
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["error"]["code"], "config.no_git_worktree");
+    assert!(!fixture.root.join(".qgh.toml").exists());
+}
+
+#[test]
+fn init_fails_for_missing_malformed_or_non_github_origin() {
+    let missing = TestFixture::new("init-missing-origin");
+    let missing_nested = missing.init_git_worktree();
+    let missing_output = missing.qgh_without_profile_in(&missing_nested, ["init", "--json"]);
+    assert_eq!(missing_output.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&missing_output)["error"]["code"],
+        "config.git_remote_unavailable"
+    );
+    assert!(!missing.root.join(".qgh.toml").exists());
+
+    for (case, remote) in [
+        ("malformed", "not a github remote"),
+        ("non-github", "https://example.com/owner/repo.git"),
+    ] {
+        let fixture = TestFixture::new(&format!("init-bad-origin-{case}"));
+        let nested = fixture.init_git_worktree_with_origin(remote);
+        let output = fixture.qgh_without_profile_in(&nested, ["init", "--json"]);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(
+            stdout_json(&output)["error"]["code"],
+            "config.unsupported_git_remote"
+        );
+        assert!(!fixture.root.join(".qgh.toml").exists());
+    }
+}
+
+#[test]
+fn init_refuses_existing_policy_unless_force_overwrites() {
+    let fixture = TestFixture::new("init-force");
+    fixture.write_config_with_repos("http://127.0.0.1:1", &["owner/repo", "other/repo"]);
+    let nested = fixture.init_git_worktree();
+
+    assert_success(&fixture.qgh_in(&nested, ["init", "--repo", "owner/repo", "--json"]));
+    let existing = fixture.qgh_in(&nested, ["init", "--repo", "other/repo", "--json"]);
+    assert_eq!(existing.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&existing)["error"]["code"],
+        "config.repo_policy_exists"
+    );
+    assert!(fs::read_to_string(fixture.root.join(".qgh.toml"))
+        .unwrap()
+        .contains(r#"github = "owner/repo""#));
+
+    let forced = fixture.qgh_in(
+        &nested,
+        ["init", "--repo", "other/repo", "--force", "--json"],
+    );
+    assert_success(&forced);
+    assert_eq!(stdout_json(&forced)["data"]["overwritten"], true);
+    assert!(fs::read_to_string(fixture.root.join(".qgh.toml"))
+        .unwrap()
+        .contains(r#"github = "other/repo""#));
+}
+
+#[test]
+fn init_validates_profile_allowlist_before_writing_policy() {
+    let fixture = TestFixture::new("init-profile-allowlist");
+    fixture.write_config("http://127.0.0.1:1");
+    let nested = fixture.init_git_worktree();
+
+    let output = fixture.qgh_in(&nested, ["init", "--repo", "other/repo", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&output)["error"]["code"],
+        "validation.invalid_repo"
+    );
+    assert!(!fixture.root.join(".qgh.toml").exists());
+}
+
+#[test]
 fn citation_contract_schema_and_docs_are_issue_comment_only() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let schema_text =
@@ -2452,13 +2617,29 @@ env = "QGH_TEST_TOKEN"
     }
 
     fn init_git_worktree_with_repo_policy(&self, repo: &str) -> PathBuf {
+        let nested = self.init_git_worktree();
+        self.write_repo_policy(repo);
+        nested
+    }
+
+    fn init_git_worktree_with_origin(&self, remote: &str) -> PathBuf {
+        let nested = self.init_git_worktree();
+        let remote_add = Command::new("git")
+            .args(["remote", "add", "origin", remote])
+            .current_dir(&self.root)
+            .output()
+            .unwrap();
+        assert_success(&remote_add);
+        nested
+    }
+
+    fn init_git_worktree(&self) -> PathBuf {
         let init = Command::new("git")
             .arg("init")
             .current_dir(&self.root)
             .output()
             .unwrap();
         assert_success(&init);
-        self.write_repo_policy(repo);
         let nested = self.root.join("nested/worktree/path");
         fs::create_dir_all(&nested).unwrap();
         nested
