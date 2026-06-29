@@ -7,7 +7,7 @@ use crate::config::{
 use crate::error::QghError;
 use crate::github;
 use crate::index;
-use crate::model::{StoredComment, StoredIssue, StoredSource};
+use crate::model::{ReconciliationCandidate, StoredComment, StoredIssue, StoredSource};
 use crate::resolution::ResolvedRepoScope;
 use crate::store::Store;
 use chrono::{DateTime, Utc};
@@ -73,8 +73,9 @@ pub async fn sync(
     )?;
     let reconciliation = if reconcile == Some(ReconcileMode::Full) {
         let candidates = store.active_reconciliation_candidates()?;
+        let candidates = reconciliation_candidates_scoped_to_repo(candidates, repo_scope);
         let estimated_api_cost_class = estimate_api_cost_class(candidates.len());
-        let result = github::reconcile_sources(&profile, &token, &candidates).await?;
+        let result = github::reconcile_sources(&fetch_profile, &token, &candidates).await?;
         let mut tombstoned_sources = 0;
         for unavailable in result.unavailable_sources {
             store.tombstone_source(&unavailable.source_id, &unavailable.reason)?;
@@ -173,6 +174,19 @@ fn profile_scoped_to_repo(
     let mut scoped = profile.clone();
     scoped.repos = vec![repo];
     Ok(scoped)
+}
+
+fn reconciliation_candidates_scoped_to_repo(
+    candidates: Vec<ReconciliationCandidate>,
+    repo_scope: Option<&ResolvedRepoScope>,
+) -> Vec<ReconciliationCandidate> {
+    let Some(repo_scope) = repo_scope else {
+        return candidates;
+    };
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate.repo == repo_scope.repo)
+        .collect()
 }
 
 pub fn init(profile_arg: Option<&str>, args: &InitArgs) -> Result<InitCommandOutcome, QghError> {
@@ -463,6 +477,14 @@ fn finish_profile_init(
     root: &std::path::Path,
     plan: ProfileInitPlan,
 ) -> Result<InitCommandOutcome, QghError> {
+    let policy_path = root.join(".qgh.toml");
+    let repo_policy_action = plan_repo_policy_action(
+        &policy_path,
+        &plan.repo,
+        plan.write_repo_policy,
+        plan.force_repo_policy,
+    )?;
+
     let bootstrap = bootstrap_profile_repo(ProfileBootstrapInput {
         profile_id: plan.profile_id.clone(),
         host: plan.host,
@@ -472,34 +494,7 @@ fn finish_profile_init(
         token_source: plan.token_source,
     })?;
 
-    let policy_path = root.join(".qgh.toml");
-    let repo_policy_action = if plan.write_repo_policy {
-        if policy_path.exists() {
-            if plan.force_repo_policy {
-                fs::write(&policy_path, repo_policy_toml(&plan.repo)).map_err(|error| {
-                    QghError::storage(format!(
-                        "Failed to write repo policy at {}: {error}",
-                        policy_path.display()
-                    ))
-                })?;
-                load_repo_policy_at(&policy_path)?;
-                "overwritten"
-            } else {
-                "already_exists"
-            }
-        } else {
-            fs::write(&policy_path, repo_policy_toml(&plan.repo)).map_err(|error| {
-                QghError::storage(format!(
-                    "Failed to write repo policy at {}: {error}",
-                    policy_path.display()
-                ))
-            })?;
-            load_repo_policy_at(&policy_path)?;
-            "created"
-        }
-    } else {
-        "skipped"
-    };
+    apply_repo_policy_action(&policy_path, &plan.repo, repo_policy_action)?;
 
     let profile_id = plan.profile_id;
     let repo = plan.repo;
@@ -531,6 +526,56 @@ fn finish_profile_init(
             "repo_policy_path": repo_policy_path
         }),
     })
+}
+
+fn plan_repo_policy_action(
+    policy_path: &std::path::Path,
+    requested_repo: &str,
+    write_repo_policy: bool,
+    force_repo_policy: bool,
+) -> Result<&'static str, QghError> {
+    if !write_repo_policy {
+        return Ok("skipped");
+    }
+    if !policy_path.exists() {
+        return Ok("created");
+    }
+    if force_repo_policy {
+        return Ok("overwritten");
+    }
+    let existing_policy = load_repo_policy_at(policy_path)?;
+    let existing_repo = existing_policy.repo.full_name();
+    if existing_repo == requested_repo {
+        return Ok("already_exists");
+    }
+    Err(QghError::validation(
+        "config.repo_policy_exists",
+        "Repo policy already exists for a different repo.",
+    )
+    .with_details(json!({
+        "path": policy_path.to_string_lossy(),
+        "existing_repo": existing_repo,
+        "requested_repo": requested_repo
+    }))
+    .with_hint("Use --force to overwrite the existing .qgh.toml."))
+}
+
+fn apply_repo_policy_action(
+    policy_path: &std::path::Path,
+    repo: &str,
+    action: &'static str,
+) -> Result<(), QghError> {
+    if !matches!(action, "created" | "overwritten") {
+        return Ok(());
+    }
+    fs::write(policy_path, repo_policy_toml(repo)).map_err(|error| {
+        QghError::storage(format!(
+            "Failed to write repo policy at {}: {error}",
+            policy_path.display()
+        ))
+    })?;
+    load_repo_policy_at(policy_path)?;
+    Ok(())
 }
 
 fn prompt_line(label: &str, default: &str) -> Result<String, QghError> {

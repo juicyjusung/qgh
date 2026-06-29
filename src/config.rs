@@ -174,6 +174,7 @@ pub fn bootstrap_profile_repo(
     });
     let profile_action;
     let repo_allowlist_action;
+    let effective_token_source_kind;
     match config.profiles.get_mut(&input.profile_id) {
         Some(profile) => {
             if profile.host != input.host
@@ -192,8 +193,10 @@ pub fn bootstrap_profile_repo(
                 profile.repos.push(input.repo.clone());
                 repo_allowlist_action = "added";
             }
+            effective_token_source_kind = token_source_kind(&profile.token_source);
         }
         None => {
+            effective_token_source_kind = token_source_kind(&input.token_source);
             config.profiles.insert(
                 input.profile_id.clone(),
                 RawProfile {
@@ -228,7 +231,7 @@ pub fn bootstrap_profile_repo(
         config_path,
         profile_action,
         repo_allowlist_action,
-        token_source_kind: token_source_kind(&input.token_source),
+        token_source_kind: effective_token_source_kind,
     })
 }
 
@@ -415,7 +418,7 @@ fn parse_github_remote(remote: &str) -> Result<GitRemote, QghError> {
         let Some((host, path)) = rest.split_once('/') else {
             return Err(unsupported_git_remote(remote));
         };
-        (host, path)
+        (strip_url_userinfo(host), path)
     } else if let Some(rest) = remote.strip_prefix("git@") {
         let Some((host, path)) = rest.split_once(':') else {
             return Err(unsupported_git_remote(remote));
@@ -429,6 +432,9 @@ fn parse_github_remote(remote: &str) -> Result<GitRemote, QghError> {
     } else {
         return Err(unsupported_git_remote(remote));
     };
+    if host.is_empty() {
+        return Err(unsupported_git_remote(remote));
+    }
     let repo = repo.trim_end_matches(".git");
     let parsed = parse_repo(repo).map_err(|_| unsupported_git_remote(remote))?;
     let repo = parsed.full_name();
@@ -446,13 +452,32 @@ fn parse_github_remote(remote: &str) -> Result<GitRemote, QghError> {
     })
 }
 
+fn strip_url_userinfo(host: &str) -> &str {
+    host.rsplit_once('@')
+        .map(|(_, host_without_userinfo)| host_without_userinfo)
+        .unwrap_or(host)
+}
+
 fn unsupported_git_remote(remote: &str) -> QghError {
     QghError::validation(
         "config.unsupported_git_remote",
         "Git origin remote is not a supported GitHub repository remote.",
     )
-    .with_details(serde_json::json!({ "remote": remote }))
+    .with_details(serde_json::json!({ "remote": sanitized_remote_for_error(remote) }))
     .with_hint("Pass --repo owner/repo or use a GitHub origin remote.")
+}
+
+fn sanitized_remote_for_error(remote: &str) -> String {
+    let remote = remote.trim();
+    if let Some((scheme, rest)) = remote.split_once("://") {
+        if let Some((_, after_userinfo)) = rest.split_once('@') {
+            return format!("{scheme}://<redacted>@{after_userinfo}");
+        }
+    }
+    if let Some((_, after_userinfo)) = remote.rsplit_once('@') {
+        return format!("<redacted>@{after_userinfo}");
+    }
+    remote.to_string()
 }
 
 pub(crate) fn load_repo_policy_at(path: &Path) -> Result<RepoPolicy, QghError> {
@@ -551,7 +576,7 @@ fn reject_local_path_like(field: &str, value: &str) -> Result<(), QghError> {
 }
 
 fn validate_remote_host(host: &str) -> Result<(), QghError> {
-    if host.is_empty() || host.contains('/') || host.contains('*') {
+    if host.is_empty() || host.contains('/') || host.contains('*') || host.contains('@') {
         return Err(QghError::validation(
             "validation.invalid_host",
             "Host must be a plain GitHub host name.",

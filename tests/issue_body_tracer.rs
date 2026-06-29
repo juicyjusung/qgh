@@ -481,6 +481,42 @@ fn git_origin_scope_without_repo_policy_drives_sync_query_status_and_get() {
 }
 
 #[test]
+fn scoped_reconcile_does_not_probe_other_repos_without_all() {
+    let fixture = TestFixture::new("scoped-reconcile");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--all", "--json"]));
+    server.clear_requests();
+
+    let sync = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        ["sync", "--reconcile", "full", "--json"],
+    );
+    assert_success(&sync);
+    let sync_json = stdout_json(&sync);
+    assert_eq!(sync_json["meta"]["repo"], "owner/repo");
+    assert_eq!(sync_json["meta"]["repo_source"], "git_remote");
+    assert_eq!(sync_json["data"]["reconciliation"]["checked_sources"], 1);
+
+    let requests = server.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.starts_with("GET /repos/owner/repo/issues/42 ")),
+        "scoped reconciliation should check the effective repo: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.contains("/repos/other/repo/")),
+        "scoped reconciliation must not touch unrelated repos: {requests:?}"
+    );
+}
+
+#[test]
 fn get_without_profile_id_enforces_current_origin_scope_but_profile_id_round_trips() {
     let fixture = TestFixture::new("get-origin-scope");
     let server = MultiRepoFakeGitHub::start();
@@ -897,6 +933,149 @@ fn init_yes_infers_ghes_defaults_from_origin_remote() {
     assert!(config_text.contains(r#"web_base_url = "https://ghe.internal.example""#));
     assert!(config_text.contains(r#"repos = ["team/repo"]"#));
     assert!(config_text.contains(r#"type = "github_cli""#));
+}
+
+#[test]
+fn init_yes_strips_userinfo_from_origin_defaults_before_writing_config() {
+    let fixture = TestFixture::new("init-origin-userinfo");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://alice:ghp_secret@ghe.example/team/repo.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        [
+            "init",
+            "--yes",
+            "--profile",
+            "enterprise",
+            "--token-source",
+            "github_cli",
+            "--json",
+        ],
+    );
+    assert_success(&init);
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["data"]["repo"], "team/repo");
+
+    let config_text = fs::read_to_string(fixture.config_home.join("qgh/config.toml")).unwrap();
+    assert!(config_text.contains(r#"host = "ghe.example""#));
+    assert!(config_text.contains(r#"api_base_url = "https://ghe.example/api/v3""#));
+    assert!(config_text.contains(r#"web_base_url = "https://ghe.example""#));
+    for forbidden in ["alice", "ghp_secret", "alice:ghp_secret@ghe.example"] {
+        assert!(
+            !config_text.contains(forbidden),
+            "config must not persist origin credentials: {config_text}"
+        );
+        assert!(
+            !stdout_text(&init).contains(forbidden),
+            "init output must not expose origin credentials: {}",
+            stdout_text(&init)
+        );
+    }
+}
+
+#[test]
+fn init_yes_rejects_explicit_host_userinfo_without_writing_config() {
+    let fixture = TestFixture::new("init-explicit-host-userinfo");
+    let nested_worktree_dir = fixture.init_git_worktree();
+
+    let init = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        [
+            "init",
+            "--yes",
+            "--profile",
+            "work",
+            "--repo",
+            "owner/repo",
+            "--host",
+            "alice:ghp_secret@github.com",
+            "--api-base-url",
+            "https://api.github.com",
+            "--web-base-url",
+            "https://github.com",
+            "--token-source",
+            "github_cli",
+            "--json",
+        ],
+    );
+    assert_eq!(init.status.code(), Some(2));
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["error"]["code"], "validation.invalid_host");
+    assert!(!stdout_text(&init).contains("ghp_secret"));
+    assert!(!fixture.config_home.join("qgh/config.toml").exists());
+    assert!(!fixture.root.join(".qgh.toml").exists());
+}
+
+#[test]
+fn init_yes_reports_existing_profile_token_source_when_not_changed() {
+    let fixture = TestFixture::new("init-existing-token-source");
+    fixture.write_config("https://api.github.com");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        [
+            "init",
+            "--yes",
+            "--profile",
+            "work",
+            "--repo",
+            "owner/repo",
+            "--host",
+            "github.com",
+            "--api-base-url",
+            "https://api.github.com",
+            "--web-base-url",
+            "https://github.com",
+            "--token-source",
+            "github_cli",
+            "--json",
+        ],
+    );
+    assert_success(&init);
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["data"]["profile_action"], "updated");
+    assert_eq!(init_json["data"]["token_source"]["kind"], "env");
+
+    let config_text = fs::read_to_string(fixture.config_home.join("qgh/config.toml")).unwrap();
+    assert!(config_text.contains(r#"type = "env""#));
+    assert!(!config_text.contains(r#"type = "github_cli""#));
+}
+
+#[test]
+fn init_yes_rejects_existing_policy_for_different_repo_without_config_mutation() {
+    let fixture = TestFixture::new("init-policy-mismatch");
+    fixture.write_repo_policy("owner/repo");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/other/repo.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        [
+            "init",
+            "--yes",
+            "--profile",
+            "work",
+            "--token-source",
+            "github_cli",
+            "--json",
+        ],
+    );
+    assert_eq!(init.status.code(), Some(2));
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["error"]["code"], "config.repo_policy_exists");
+    assert_eq!(init_json["error"]["details"]["existing_repo"], "owner/repo");
+    assert_eq!(
+        init_json["error"]["details"]["requested_repo"],
+        "other/repo"
+    );
+    assert!(!fixture.config_home.join("qgh/config.toml").exists());
+
+    let policy = fs::read_to_string(fixture.root.join(".qgh.toml")).unwrap();
+    assert!(policy.contains(r#"github = "owner/repo""#));
+    assert!(!policy.contains(r#"github = "other/repo""#));
 }
 
 #[test]
@@ -3316,6 +3495,7 @@ impl Drop for FakeGitHub {
 
 struct MultiRepoFakeGitHub {
     base_url: String,
+    requests: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -3325,7 +3505,9 @@ impl MultiRepoFakeGitHub {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{}", addr);
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let thread_requests = Arc::clone(&requests);
         let thread_stop = Arc::clone(&stop);
 
         let handle = thread::spawn(move || {
@@ -3334,7 +3516,7 @@ impl MultiRepoFakeGitHub {
                     break;
                 }
                 match stream {
-                    Ok(stream) => handle_multi_repo_connection(stream),
+                    Ok(stream) => handle_multi_repo_connection(stream, &thread_requests),
                     Err(_) => break,
                 }
             }
@@ -3342,9 +3524,18 @@ impl MultiRepoFakeGitHub {
 
         Self {
             base_url,
+            requests,
             stop,
             handle: Some(handle),
         }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn clear_requests(&self) {
+        self.requests.lock().unwrap().clear();
     }
 }
 
@@ -3358,11 +3549,12 @@ impl Drop for MultiRepoFakeGitHub {
     }
 }
 
-fn handle_multi_repo_connection(mut stream: TcpStream) {
+fn handle_multi_repo_connection(mut stream: TcpStream, requests: &Arc<Mutex<Vec<String>>>) {
     let mut buffer = [0_u8; 8192];
     let bytes_read = stream.read(&mut buffer).unwrap_or(0);
     let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-    let request_line = request.lines().next().unwrap_or("");
+    let request_line = request.lines().next().unwrap_or("").to_string();
+    requests.lock().unwrap().push(request_line.clone());
 
     let (status, body) = if request_line.starts_with("GET /repos/owner/repo/issues?")
         && request_line.contains("state=all")
