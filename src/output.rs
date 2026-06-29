@@ -1,10 +1,6 @@
 use crate::error::QghError;
 use serde_json::{json, Value};
 
-pub fn success_envelope(data: Value) -> Value {
-    success_envelope_with_meta(data, json!({}))
-}
-
 pub fn success_envelope_with_meta(data: Value, meta: Value) -> Value {
     json!({
         "schema_version": "qgh.v1",

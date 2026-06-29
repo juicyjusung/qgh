@@ -893,6 +893,16 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
             .as_array()
             .unwrap()
             .contains(&json!("schema_version")));
+        assert_eq!(
+            tool["outputSchema"]["properties"]["meta"]["additionalProperties"],
+            false
+        );
+        assert!(
+            tool["outputSchema"]["properties"]["meta"]["properties"]["repo_source"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("command"))
+        );
     }
 
     let validation = &messages[2]["result"];
@@ -1048,6 +1058,279 @@ fn mcp_query_get_status_round_trips_issue_and_comment_sources() {
     assert_eq!(status["data"]["profile_id"], "work");
     assert_eq!(status["data"]["sources"]["issue_count"], 1);
     assert_eq!(status["data"]["sources"]["comment_count"], 1);
+}
+
+#[test]
+fn mcp_without_profile_uses_repo_policy_single_match_scope() {
+    let fixture = TestFixture::new("mcp-policy-single-match");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_work_and_alt_profiles(&server.base_url);
+    let nested_worktree_dir = fixture.init_git_worktree_with_repo_policy("owner/repo");
+    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--json"]));
+
+    let output = fixture.mcp_without_profile_in(
+        &nested_worktree_dir,
+        [
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "qgh-test",
+                        "version": "0"
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list"
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "query",
+                    "arguments": {
+                        "query": "shared repo policy tracer",
+                        "limit": 10
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "get",
+                    "arguments": {
+                        "source_id": "qgh://github.com/issue/I_POLICY_OWNER"
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "status",
+                    "arguments": {}
+                }
+            }),
+        ],
+    );
+    assert_success(&output);
+    assert!(stderr_text(&output).is_empty());
+    let messages = stdout_json_lines(&output);
+    assert_eq!(messages.len(), 5);
+    assert_eq!(messages[1]["result"]["tools"].as_array().unwrap().len(), 3);
+
+    let query = &messages[2]["result"]["structuredContent"];
+    assert_eq!(query["ok"], true);
+    assert_eq!(query["meta"]["profile_id"], "work");
+    assert_eq!(query["meta"]["profile_source"], "single_match");
+    assert_eq!(query["meta"]["repo"], "owner/repo");
+    assert_eq!(query["meta"]["repo_source"], "repo_policy");
+    assert!(query["meta"]["repo_policy_path"]
+        .as_str()
+        .unwrap()
+        .ends_with(".qgh.toml"));
+    assert_eq!(query["data"]["results"][0]["repo"], "owner/repo");
+
+    let get = &messages[3]["result"]["structuredContent"];
+    assert_eq!(get["ok"], true);
+    assert_eq!(get["meta"]["profile_id"], "work");
+    assert_eq!(get["meta"]["repo"], "owner/repo");
+    assert_eq!(
+        get["data"]["source"]["source_id"],
+        "qgh://github.com/issue/I_POLICY_OWNER"
+    );
+
+    let status = &messages[4]["result"]["structuredContent"];
+    assert_eq!(status["ok"], true);
+    assert_eq!(status["meta"]["profile_source"], "single_match");
+    assert_eq!(
+        status["data"]["resolution"]["effective_repo_scope"],
+        "owner/repo"
+    );
+    assert_eq!(status["data"]["resolution"]["repo_source"], "repo_policy");
+}
+
+#[test]
+fn mcp_repo_argument_override_uses_command_scope_and_checks_allowlist() {
+    let fixture = TestFixture::new("mcp-repo-override");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    let nested_worktree_dir = fixture.init_git_worktree_with_repo_policy("owner/repo");
+    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--json"]));
+
+    let output = fixture.mcp_without_profile_in(
+        &nested_worktree_dir,
+        [json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {
+                    "query": "shared repo policy tracer",
+                    "repo": "other/repo",
+                    "limit": 10
+                }
+            }
+        })],
+    );
+    assert_success(&output);
+    assert!(stderr_text(&output).is_empty());
+    let messages = stdout_json_lines(&output);
+    let query = &messages[0]["result"]["structuredContent"];
+    assert_eq!(query["ok"], true);
+    assert_eq!(query["meta"]["profile_id"], "work");
+    assert_eq!(query["meta"]["profile_source"], "single_match");
+    assert_eq!(query["meta"]["repo"], "other/repo");
+    assert_eq!(query["meta"]["repo_source"], "command");
+    assert_eq!(query["meta"]["repo_policy_path"], Value::Null);
+    assert_eq!(query["data"]["results"][0]["repo"], "other/repo");
+
+    let restricted = TestFixture::new("mcp-repo-override-restricted");
+    let restricted_server = MultiRepoFakeGitHub::start();
+    restricted.write_config(&restricted_server.base_url);
+    let restricted_worktree = restricted.init_git_worktree_with_repo_policy("owner/repo");
+    assert_success(&restricted.qgh_in(&restricted_worktree, ["sync", "--json"]));
+
+    let error_output = restricted.mcp_in(
+        &restricted_worktree,
+        Some("work"),
+        [json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {
+                    "query": "shared repo policy tracer",
+                    "repo": "other/repo"
+                }
+            }
+        })],
+    );
+    assert_success(&error_output);
+    assert!(stderr_text(&error_output).is_empty());
+    let error_messages = stdout_json_lines(&error_output);
+    let result = &error_messages[0]["result"];
+    assert_eq!(result["isError"], true);
+    assert_eq!(
+        result["structuredContent"]["error"]["code"],
+        "validation.invalid_repo"
+    );
+}
+
+#[test]
+fn mcp_resolution_failures_are_structured_tool_errors() {
+    let no_match = TestFixture::new("mcp-resolution-no-match");
+    no_match.write_config("http://127.0.0.1:1");
+    let no_match_worktree = no_match.init_git_worktree_with_repo_policy("other/repo");
+    let no_match_output = no_match.mcp_without_profile_in(
+        &no_match_worktree,
+        [
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "qgh-test",
+                        "version": "0"
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "query",
+                    "arguments": {
+                        "query": "anything"
+                    }
+                }
+            }),
+        ],
+    );
+    assert_success(&no_match_output);
+    assert!(stderr_text(&no_match_output).is_empty());
+    let no_match_messages = stdout_json_lines(&no_match_output);
+    assert_eq!(no_match_messages[0]["id"], 1);
+    assert_eq!(no_match_messages[1]["result"]["isError"], true);
+    assert_eq!(
+        no_match_messages[1]["result"]["structuredContent"]["error"]["code"],
+        "config.no_matching_profile"
+    );
+
+    let ambiguous = TestFixture::new("mcp-resolution-ambiguous");
+    ambiguous.write_config_with_duplicate_owner_profiles("http://127.0.0.1:1");
+    let ambiguous_worktree = ambiguous.init_git_worktree_with_repo_policy("owner/repo");
+    let ambiguous_output = ambiguous.mcp_without_profile_in(
+        &ambiguous_worktree,
+        [json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {}
+            }
+        })],
+    );
+    assert_success(&ambiguous_output);
+    assert!(stderr_text(&ambiguous_output).is_empty());
+    let ambiguous_messages = stdout_json_lines(&ambiguous_output);
+    assert_eq!(ambiguous_messages[0]["result"]["isError"], true);
+    assert_eq!(
+        ambiguous_messages[0]["result"]["structuredContent"]["error"]["code"],
+        "config.ambiguous_profile"
+    );
+
+    let invalid_policy = TestFixture::new("mcp-resolution-invalid-policy");
+    invalid_policy.write_config("http://127.0.0.1:1");
+    let invalid_policy_worktree = invalid_policy.init_git_worktree_with_repo_policy("owner/repo");
+    fs::write(
+        invalid_policy.root.join(".qgh.toml"),
+        r#"
+schema_version = "qgh.repo.v1"
+token = "ghp_plaintext"
+
+[repo]
+github = "owner/repo"
+"#,
+    )
+    .unwrap();
+    let invalid_policy_output = invalid_policy.mcp_without_profile_in(
+        &invalid_policy_worktree,
+        [json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {}
+            }
+        })],
+    );
+    assert_success(&invalid_policy_output);
+    assert!(stderr_text(&invalid_policy_output).is_empty());
+    let invalid_policy_messages = stdout_json_lines(&invalid_policy_output);
+    assert_eq!(invalid_policy_messages[0]["result"]["isError"], true);
+    assert_eq!(
+        invalid_policy_messages[0]["result"]["structuredContent"]["error"]["code"],
+        "config.invalid_repo_policy"
+    );
 }
 
 #[test]
@@ -1289,7 +1572,7 @@ fn query_filter_errors_are_versioned_json_envelopes() {
 }
 
 #[test]
-fn missing_profile_is_a_structured_usage_error() {
+fn no_matching_profile_is_a_structured_usage_error() {
     let fixture = TestFixture::new("missing-profile");
     let output = fixture.qgh_without_profile(["status", "--json"]);
     assert_eq!(output.status.code(), Some(2));
@@ -1896,8 +2179,25 @@ limit = 10
     }
 
     fn mcp<const N: usize>(&self, messages: [Value; N]) -> Output {
+        self.mcp_in(&self.root, Some("work"), messages)
+    }
+
+    fn mcp_without_profile_in<const N: usize>(&self, cwd: &Path, messages: [Value; N]) -> Output {
+        self.mcp_in(cwd, None, messages)
+    }
+
+    fn mcp_in<const N: usize>(
+        &self,
+        cwd: &Path,
+        profile: Option<&str>,
+        messages: [Value; N],
+    ) -> Output {
         let mut cmd = self.base_command();
-        cmd.args(["--profile", "work", "mcp"])
+        cmd.current_dir(cwd);
+        if let Some(profile) = profile {
+            cmd.args(["--profile", profile]);
+        }
+        cmd.arg("mcp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

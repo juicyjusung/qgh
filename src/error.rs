@@ -33,11 +33,6 @@ impl QghError {
         self
     }
 
-    pub fn missing_profile() -> Self {
-        Self::new("config.missing_profile", "Missing required --profile.", 2)
-            .with_hint("Run qgh with --profile <profile-id>.")
-    }
-
     pub fn no_matching_profile(repo: Option<&str>) -> Self {
         let details = repo
             .map(|repo| json!({ "repo": repo }))

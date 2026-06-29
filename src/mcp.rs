@@ -1,14 +1,19 @@
 use crate::cli::QueryArgs;
 use crate::commands;
 use crate::error::QghError;
-use crate::output::{error_envelope, success_envelope};
+use crate::output::{error_envelope, success_envelope_with_meta};
+use crate::resolution::{
+    repo_scope_from_command_arg, repo_scope_from_policy, resolve_context, ResolvedCommandContext,
+    ResolvedRepoScope,
+};
 use serde_json::{json, Map, Value};
 use std::io::{self, BufRead, Write};
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
 const JSON_SCHEMA: &str = "https://json-schema.org/draft/2020-12/schema";
 
-pub async fn run_stdio(profile_id: &str) -> Result<(), QghError> {
+pub async fn run_stdio(profile_arg: Option<String>) -> Result<(), QghError> {
+    let session = McpSession { profile_arg };
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -17,7 +22,7 @@ pub async fn run_stdio(profile_id: &str) -> Result<(), QghError> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => handle_message(profile_id, message).await,
+            Ok(message) => handle_message(&session, message).await,
             Err(_) => Some(protocol_error(Value::Null, -32700, "Parse error")),
         };
         if let Some(response) = response {
@@ -35,7 +40,11 @@ pub async fn run_stdio(profile_id: &str) -> Result<(), QghError> {
     Ok(())
 }
 
-async fn handle_message(profile_id: &str, message: Value) -> Option<Value> {
+struct McpSession {
+    profile_arg: Option<String>,
+}
+
+async fn handle_message(session: &McpSession, message: Value) -> Option<Value> {
     let id = message.get("id").cloned();
     let method = message.get("method").and_then(Value::as_str);
     let Some(method) = method else {
@@ -52,7 +61,7 @@ async fn handle_message(profile_id: &str, message: Value) -> Option<Value> {
         "initialize" => success_response(id, initialize_result()),
         "ping" => success_response(id, json!({})),
         "tools/list" => success_response(id, json!({ "tools": tool_list() })),
-        "tools/call" => call_tool(profile_id, id, message.get("params")).await,
+        "tools/call" => call_tool(session, id, message.get("params")).await,
         _ => protocol_error(id, -32601, "Method not found"),
     })
 }
@@ -73,21 +82,12 @@ fn initialize_result() -> Value {
     })
 }
 
-async fn call_tool(profile_id: &str, id: Value, params: Option<&Value>) -> Value {
+async fn call_tool(session: &McpSession, id: Value, params: Option<&Value>) -> Value {
     let result = match parse_call(params) {
         Ok(call) => match call.name.as_str() {
-            "query" => parse_query_args(&call.arguments)
-                .and_then(|args| commands::query(profile_id, args))
-                .map(tool_success)
-                .unwrap_or_else(tool_error),
-            "get" => parse_get_args(&call.arguments)
-                .and_then(|source_id| commands::get_local(profile_id, &source_id))
-                .map(tool_success)
-                .unwrap_or_else(tool_error),
-            "status" => parse_empty_args(&call.arguments)
-                .and_then(|()| commands::status(profile_id))
-                .map(tool_success)
-                .unwrap_or_else(tool_error),
+            "query" => tool_query(session, &call.arguments).unwrap_or_else(tool_error),
+            "get" => tool_get(session, &call.arguments).unwrap_or_else(tool_error),
+            "status" => tool_status(session, &call.arguments).unwrap_or_else(tool_error),
             _ => {
                 return protocol_error(id, -32601, "Tool not found");
             }
@@ -95,6 +95,43 @@ async fn call_tool(profile_id: &str, id: Value, params: Option<&Value>) -> Value
         Err(error) => tool_error(error),
     };
     success_response(id, result)
+}
+
+fn tool_query(session: &McpSession, arguments: &Value) -> Result<Value, QghError> {
+    let args = parse_query_args(arguments)?;
+    let repo_scope = effective_query_repo_scope(&args)?;
+    let context = resolve_mcp_context(session, repo_scope)?;
+    let data = commands::query(&context.profile_id, args)?;
+    Ok(tool_success(data, context.meta_json()))
+}
+
+fn tool_get(session: &McpSession, arguments: &Value) -> Result<Value, QghError> {
+    let source_id = parse_get_args(arguments)?;
+    let context = resolve_mcp_context(session, repo_scope_from_policy()?)?;
+    let data = commands::get_local(&context.profile_id, &source_id)?;
+    Ok(tool_success(data, context.meta_json()))
+}
+
+fn tool_status(session: &McpSession, arguments: &Value) -> Result<Value, QghError> {
+    parse_empty_args(arguments)?;
+    let context = resolve_mcp_context(session, repo_scope_from_policy()?)?;
+    let mut data = commands::status(&context.profile_id)?;
+    data["resolution"] = context.resolution_json();
+    Ok(tool_success(data, context.meta_json()))
+}
+
+fn effective_query_repo_scope(args: &QueryArgs) -> Result<Option<ResolvedRepoScope>, QghError> {
+    if let Some(repo) = &args.repo {
+        return repo_scope_from_command_arg(repo).map(Some);
+    }
+    repo_scope_from_policy()
+}
+
+fn resolve_mcp_context(
+    session: &McpSession,
+    repo_scope: Option<ResolvedRepoScope>,
+) -> Result<ResolvedCommandContext, QghError> {
+    resolve_context(session.profile_arg.as_deref(), repo_scope)
 }
 
 struct ToolCall {
@@ -234,8 +271,8 @@ fn optional_usize(object: &Map<String, Value>, key: &str) -> Result<Option<usize
         .transpose()
 }
 
-fn tool_success(data: Value) -> Value {
-    let envelope = success_envelope(data);
+fn tool_success(data: Value, meta: Value) -> Value {
+    let envelope = success_envelope_with_meta(data, meta);
     tool_result(envelope, false)
 }
 
@@ -367,7 +404,30 @@ fn envelope_output_schema() -> Value {
             "data": { "type": "object" },
             "error": { "type": "object" },
             "warnings": { "type": "array" },
-            "meta": { "type": "object" }
+            "meta": {
+                "type": "object",
+                "properties": {
+                    "profile_id": {
+                        "type": ["string", "null"]
+                    },
+                    "profile_source": {
+                        "type": ["string", "null"],
+                        "enum": ["cli", "env", "single_match", null]
+                    },
+                    "repo": {
+                        "type": ["string", "null"],
+                        "pattern": "^[^/]+/[^/]+$"
+                    },
+                    "repo_source": {
+                        "type": ["string", "null"],
+                        "enum": ["cli", "repo_policy", "command", null]
+                    },
+                    "repo_policy_path": {
+                        "type": ["string", "null"]
+                    }
+                },
+                "additionalProperties": false
+            }
         },
         "additionalProperties": false
     })

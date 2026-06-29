@@ -37,15 +37,18 @@ protocol messages or server faults.
 
 No-result query responses are successful envelopes with `data.results: []`.
 
-CLI command envelopes include Effective Scope metadata when resolution has run:
+CLI command envelopes and MCP structured tool content include Effective Scope
+metadata when resolution has run:
 
 - `meta.profile_id`: resolved profile id.
 - `meta.profile_source`: `cli`, `env`, or `single_match`.
 - `meta.repo`: effective `owner/repo` scope, or `null` when the command has no repo scope.
-- `meta.repo_source`: `cli`, `repo_policy`, command-specific source, or `null`.
+- `meta.repo_source`: `cli`, `repo_policy`, `command` for MCP tool arguments, or `null`.
 - `meta.repo_policy_path`: current worktree repo policy path when a repo policy supplied scope, otherwise `null`.
 
-`status` and `doctor` also include `data.resolution` with the same resolved profile and repo-scope fields. `status` remains local-only; `doctor` is the explicit command that may run diagnostic probes.
+`status` also includes `data.resolution` with the same resolved profile and
+repo-scope fields. CLI-only `doctor` includes the same diagnostics and is the
+explicit command that may run probes. MCP exposes `status`, but not `doctor`.
 
 ## Query Results
 

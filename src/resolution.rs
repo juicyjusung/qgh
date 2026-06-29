@@ -1,0 +1,122 @@
+use crate::config::{discover_repo_policy, single_matching_profile_id};
+use crate::error::QghError;
+use serde_json::{json, Value};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedCommandContext {
+    pub(crate) profile_id: String,
+    pub(crate) profile_source: &'static str,
+    pub(crate) repo_scope: Option<ResolvedRepoScope>,
+    pub(crate) allowlist_match_count: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedRepoScope {
+    pub(crate) repo: String,
+    pub(crate) source: &'static str,
+    pub(crate) repo_policy_path: Option<PathBuf>,
+}
+
+pub(crate) fn resolve_context(
+    profile_arg: Option<&str>,
+    repo_scope: Option<ResolvedRepoScope>,
+) -> Result<ResolvedCommandContext, QghError> {
+    if let Some(profile_id) = profile_arg {
+        return Ok(ResolvedCommandContext {
+            profile_id: profile_id.to_string(),
+            profile_source: "cli",
+            repo_scope,
+            allowlist_match_count: None,
+        });
+    }
+    if let Ok(profile_id) = std::env::var("QGH_PROFILE") {
+        return Ok(ResolvedCommandContext {
+            profile_id,
+            profile_source: "env",
+            repo_scope,
+            allowlist_match_count: None,
+        });
+    }
+    let profile_id =
+        single_matching_profile_id(repo_scope.as_ref().map(|scope| scope.repo.as_str()))?;
+    Ok(ResolvedCommandContext {
+        profile_id,
+        profile_source: "single_match",
+        repo_scope,
+        allowlist_match_count: Some(1),
+    })
+}
+
+pub(crate) fn repo_scope_from_policy() -> Result<Option<ResolvedRepoScope>, QghError> {
+    Ok(discover_repo_policy()?.map(|policy| ResolvedRepoScope {
+        repo: policy.repo.full_name(),
+        source: "repo_policy",
+        repo_policy_path: Some(policy.path),
+    }))
+}
+
+pub(crate) fn repo_scope_from_cli_arg(repo: &str) -> Result<ResolvedRepoScope, QghError> {
+    repo_scope_from_explicit_arg(repo, "cli")
+}
+
+pub(crate) fn repo_scope_from_command_arg(repo: &str) -> Result<ResolvedRepoScope, QghError> {
+    repo_scope_from_explicit_arg(repo, "command")
+}
+
+fn repo_scope_from_explicit_arg(
+    repo: &str,
+    source: &'static str,
+) -> Result<ResolvedRepoScope, QghError> {
+    validate_repo_scope(repo)?;
+    Ok(ResolvedRepoScope {
+        repo: repo.to_string(),
+        source,
+        repo_policy_path: None,
+    })
+}
+
+fn validate_repo_scope(repo: &str) -> Result<(), QghError> {
+    let Some((owner, name)) = repo.split_once('/') else {
+        return Err(QghError::validation(
+            "validation.invalid_repo",
+            "Repo filter must use owner/repo format.",
+        ));
+    };
+    if owner.is_empty() || name.is_empty() || name.contains('/') || repo.contains('*') {
+        return Err(QghError::validation(
+            "validation.invalid_repo",
+            "Repo filter must use explicit owner/repo format.",
+        ));
+    }
+    Ok(())
+}
+
+impl ResolvedCommandContext {
+    pub(crate) fn meta_json(&self) -> Value {
+        json!({
+            "profile_id": self.profile_id,
+            "profile_source": self.profile_source,
+            "repo": self.repo_scope.as_ref().map(|scope| scope.repo.clone()),
+            "repo_source": self.repo_scope.as_ref().map(|scope| scope.source),
+            "repo_policy_path": self.repo_scope
+                .as_ref()
+                .and_then(|scope| scope.repo_policy_path.as_ref())
+                .map(|path| path.to_string_lossy().to_string())
+        })
+    }
+
+    pub(crate) fn resolution_json(&self) -> Value {
+        json!({
+            "profile_id": self.profile_id,
+            "profile_source": self.profile_source,
+            "effective_repo_scope": self.repo_scope.as_ref().map(|scope| scope.repo.clone()),
+            "repo_source": self.repo_scope.as_ref().map(|scope| scope.source),
+            "repo_policy_path": self.repo_scope
+                .as_ref()
+                .and_then(|scope| scope.repo_policy_path.as_ref())
+                .map(|path| path.to_string_lossy().to_string()),
+            "allowlist_match_count": self.allowlist_match_count
+        })
+    }
+}
