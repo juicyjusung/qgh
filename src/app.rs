@@ -35,7 +35,7 @@ pub async fn run_from_env() -> i32 {
     let wants_json = cli.wants_json();
     match run(cli).await {
         Ok(outcome) => {
-            print_success(outcome.data, outcome.meta);
+            print_success(outcome.data, outcome.warnings, outcome.meta);
             0
         }
         Err(error) => {
@@ -59,10 +59,20 @@ async fn run_mcp(cli: Cli) -> i32 {
 
 struct CommandOutcome {
     data: Value,
+    warnings: Vec<Value>,
     meta: Value,
 }
 
 async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
+    if let crate::cli::Command::Init(args) = &cli.command {
+        let outcome = commands::init(cli.profile.as_deref(), args.repo_args())?;
+        return Ok(CommandOutcome {
+            data: outcome.data,
+            warnings: outcome.warnings,
+            meta: outcome.meta,
+        });
+    }
+
     let context = resolve_command_context(&cli)?;
     let profile_id = context.profile_id.clone();
     let command = cli.command;
@@ -77,6 +87,7 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
         crate::cli::Command::Get { source_id, .. } => commands::get(&profile_id, &source_id).await,
         crate::cli::Command::Status { .. } => commands::status(&profile_id),
         crate::cli::Command::Doctor { .. } => commands::doctor(&profile_id).await,
+        crate::cli::Command::Init(_) => unreachable!("init is handled before normal resolution"),
         crate::cli::Command::Mcp => unreachable!("MCP is handled before normal CLI output"),
     }?;
 
@@ -89,6 +100,7 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
 
     Ok(CommandOutcome {
         data,
+        warnings: Vec::new(),
         meta: context.meta_json(),
     })
 }
@@ -158,6 +170,7 @@ fn effective_repo_scope_for_command(
         | crate::cli::Command::Status { .. }
         | crate::cli::Command::Doctor { .. } => repo_scope_from_policy(),
         crate::cli::Command::Sync(_) => Ok(None),
+        crate::cli::Command::Init(_) => unreachable!("init is handled before normal resolution"),
         crate::cli::Command::Mcp => unreachable!("MCP is handled before normal CLI output"),
     }
 }

@@ -227,7 +227,7 @@ pub fn discover_repo_policy() -> Result<Option<RepoPolicy>, QghError> {
     load_repo_policy_at(&path).map(Some)
 }
 
-fn current_git_worktree_root() -> Option<PathBuf> {
+pub(crate) fn current_git_worktree_root() -> Option<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -243,7 +243,7 @@ fn current_git_worktree_root() -> Option<PathBuf> {
     }
 }
 
-fn load_repo_policy_at(path: &Path) -> Result<RepoPolicy, QghError> {
+pub(crate) fn load_repo_policy_at(path: &Path) -> Result<RepoPolicy, QghError> {
     let text = fs::read_to_string(path).map_err(|error| {
         QghError::invalid_repo_policy(format!(
             "Failed to read repo policy at {}: {error}",
@@ -392,7 +392,7 @@ fn validate_profile_id(profile_id: &str) -> Result<(), QghError> {
     Ok(())
 }
 
-fn parse_repo(value: &str) -> Result<RepoRef, String> {
+pub(crate) fn parse_repo(value: &str) -> Result<RepoRef, String> {
     let Some((owner, name)) = value.split_once('/') else {
         return Err("must use owner/repo format.".to_string());
     };

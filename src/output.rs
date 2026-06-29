@@ -2,11 +2,19 @@ use crate::error::QghError;
 use serde_json::{json, Value};
 
 pub fn success_envelope_with_meta(data: Value, meta: Value) -> Value {
+    success_envelope_with_meta_and_warnings(data, meta, Vec::new())
+}
+
+pub fn success_envelope_with_meta_and_warnings(
+    data: Value,
+    meta: Value,
+    warnings: Vec<Value>,
+) -> Value {
     json!({
         "schema_version": "qgh.v1",
         "ok": true,
         "data": data,
-        "warnings": [],
+        "warnings": warnings,
         "meta": meta
     })
 }
@@ -21,8 +29,8 @@ pub fn error_envelope(error: &QghError) -> Value {
     })
 }
 
-pub fn print_success(data: Value, meta: Value) {
-    let envelope = success_envelope_with_meta(data, meta);
+pub fn print_success(data: Value, warnings: Vec<Value>, meta: Value) {
+    let envelope = success_envelope_with_meta_and_warnings(data, meta, warnings);
     println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
 }
 

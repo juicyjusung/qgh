@@ -4,12 +4,12 @@ This release artifact is for the qgh MVP contract. It does not define new produc
 
 ## Contract Surface
 
-- CLI commands: `sync`, `query`, `search`, `get`, `status`, `doctor`, `mcp`.
-- Canonical CLI workflow: `sync -> query -> get -> cite -> status`.
+- CLI commands: `init`, `sync`, `query`, `search`, `get`, `status`, `doctor`, `mcp`.
+- Canonical CLI workflow: `init -> sync -> query -> get -> cite -> status`.
 - `search` is a CLI alias for `query`.
-- CLI-only commands: `sync`, `doctor`.
+- CLI-only commands: `init`, `sync`, `doctor`.
 - MCP tools: `query`, `get`, `status`.
-- MCP read-only tools only: no `sync`, `doctor`, `eval`, mutation, hosted-provider, or write-back tools.
+- MCP read-only tools only: no `init`, `sync`, `doctor`, `eval`, mutation, hosted-provider, or write-back tools.
 - Machine output schema version: `qgh.v1`.
 - Release artifact schema version: `qgh.release.v1`.
 
@@ -28,6 +28,7 @@ Excluded or post-MVP gates:
 | --- | --- |
 | Tantivy BM25-only path | `sync`, `query`, `get`, and `status` pass without vector, model, GPU, or hosted provider dependencies. |
 | strict schema/envelope | CLI JSON and MCP structured content use `qgh.v1`; unknown CLI/MCP/config parameters fail with structured errors. |
+| init output | `init` is CLI-only, writes only tracked repo policy, emits `docs/schemas/init-output.schema.json`, and never appears in MCP `tools/list`. |
 | MCP read-only tools | `tools/list` exposes only `query`, `get`, and `status`, each with `readOnlyHint: true`. |
 | stdout cleanliness | MCP stdio writes only protocol JSON messages to stdout; CLI JSON envelopes go to stdout and human diagnostics go to stderr. |
 | privacy no-egress | Default behavior sends data only to the configured GitHub host for sync, `get` lifecycle checks, and explicit `doctor`; no hosted provider path is enabled. |

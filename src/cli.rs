@@ -14,6 +14,7 @@ impl Cli {
     pub fn wants_json(&self) -> bool {
         match &self.command {
             Command::Sync(args) => args.json,
+            Command::Init(args) => args.wants_json(),
             Command::Status { json } | Command::Doctor { json } => *json,
             Command::Query(args) | Command::Search(args) => args.json,
             Command::Get { json, .. } => *json,
@@ -25,6 +26,7 @@ impl Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Sync(SyncArgs),
+    Init(InitArgs),
     Query(QueryArgs),
     Search(QueryArgs),
     Get {
@@ -49,6 +51,50 @@ pub enum Command {
 pub struct SyncArgs {
     #[arg(long)]
     pub reconcile: Option<ReconcileMode>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct InitArgs {
+    #[command(subcommand)]
+    pub target: Option<InitTarget>,
+    #[arg(long)]
+    pub repo: Option<String>,
+    #[arg(long)]
+    pub force: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl InitArgs {
+    pub fn repo_args(&self) -> InitRepoArgs {
+        match &self.target {
+            Some(InitTarget::Repo(args)) => args.clone(),
+            None => InitRepoArgs {
+                repo: self.repo.clone(),
+                force: self.force,
+                json: self.json,
+            },
+        }
+    }
+
+    fn wants_json(&self) -> bool {
+        self.repo_args().json
+    }
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum InitTarget {
+    Repo(InitRepoArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct InitRepoArgs {
+    #[arg(long)]
+    pub repo: Option<String>,
+    #[arg(long)]
+    pub force: bool,
     #[arg(long)]
     pub json: bool,
 }
