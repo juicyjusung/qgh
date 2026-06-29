@@ -64,6 +64,11 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
     assert_success(&query);
     let query_json = stdout_json(&query);
+    assert_eq!(query_json["meta"]["profile_id"], "work");
+    assert_eq!(query_json["meta"]["profile_source"], "cli");
+    assert_eq!(query_json["meta"]["repo"], Value::Null);
+    assert_eq!(query_json["meta"]["repo_source"], Value::Null);
+    assert_eq!(query_json["meta"]["repo_policy_path"], Value::Null);
     let result = &query_json["data"]["results"][0];
     let source_id = "qgh://github.com/issue/I_kwDOISSUE1";
     assert_eq!(result["source_id"], source_id);
@@ -365,7 +370,16 @@ fn repo_policy_defaults_cli_query_to_current_worktree_repo_scope() {
         ["query", "shared repo policy tracer", "--json"],
     );
     assert_success(&default_query);
-    let default_results = stdout_json(&default_query)["data"]["results"]
+    let default_query_json = stdout_json(&default_query);
+    assert_eq!(default_query_json["meta"]["profile_id"], "work");
+    assert_eq!(default_query_json["meta"]["profile_source"], "cli");
+    assert_eq!(default_query_json["meta"]["repo"], "owner/repo");
+    assert_eq!(default_query_json["meta"]["repo_source"], "repo_policy");
+    assert!(default_query_json["meta"]["repo_policy_path"]
+        .as_str()
+        .unwrap()
+        .ends_with(".qgh.toml"));
+    let default_results = default_query_json["data"]["results"]
         .as_array()
         .unwrap()
         .iter()
@@ -1323,6 +1337,10 @@ fn profile_resolution_uses_cli_then_env_then_repo_scope_single_match() {
     assert_success(&single_match_query);
     let single_match_json = stdout_json(&single_match_query);
     assert_eq!(single_match_json["data"]["profile_id"], "work");
+    assert_eq!(single_match_json["meta"]["profile_id"], "work");
+    assert_eq!(single_match_json["meta"]["profile_source"], "single_match");
+    assert_eq!(single_match_json["meta"]["repo"], "owner/repo");
+    assert_eq!(single_match_json["meta"]["repo_source"], "repo_policy");
     assert_eq!(
         single_match_json["data"]["results"][0]["repo"],
         "owner/repo"
@@ -1330,14 +1348,31 @@ fn profile_resolution_uses_cli_then_env_then_repo_scope_single_match() {
 
     let status = fixture.qgh_without_profile_in(&nested_worktree_dir, ["status", "--json"]);
     assert_success(&status);
-    assert_eq!(stdout_json(&status)["data"]["profile_id"], "work");
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["profile_id"], "work");
+    assert_eq!(status_json["meta"]["profile_source"], "single_match");
+    assert_eq!(status_json["data"]["resolution"]["profile_id"], "work");
+    assert_eq!(
+        status_json["data"]["resolution"]["effective_repo_scope"],
+        "owner/repo"
+    );
+    assert_eq!(
+        status_json["data"]["resolution"]["repo_source"],
+        "repo_policy"
+    );
+    assert!(status_json["data"]["resolution"]["repo_policy_path"]
+        .as_str()
+        .unwrap()
+        .ends_with(".qgh.toml"));
 
     let get = fixture.qgh_without_profile_in(
         &nested_worktree_dir,
         ["get", "qgh://github.com/issue/I_POLICY_OWNER", "--json"],
     );
     assert_success(&get);
-    assert_eq!(stdout_json(&get)["data"]["profile_id"], "work");
+    let get_json = stdout_json(&get);
+    assert_eq!(get_json["data"]["profile_id"], "work");
+    assert_eq!(get_json["meta"]["profile_source"], "single_match");
 }
 
 #[test]
@@ -1357,6 +1392,11 @@ fn profile_resolution_reports_no_match_and_ambiguous_match() {
         .unwrap()
         .contains("--profile"));
 
+    let human_no_match =
+        fixture.qgh_without_profile_in(&nested_worktree_dir, ["query", "anything"]);
+    assert_eq!(human_no_match.status.code(), Some(2));
+    assert!(stderr_text(&human_no_match).contains("--profile"));
+
     fixture.write_config_with_duplicate_owner_profiles("http://127.0.0.1:1");
     let ambiguous =
         fixture.qgh_without_profile_in(&nested_worktree_dir, ["query", "anything", "--json"]);
@@ -1367,6 +1407,55 @@ fn profile_resolution_reports_no_match_and_ambiguous_match() {
     assert_eq!(
         ambiguous_json["error"]["details"]["matching_profile_ids"],
         json!(["other", "work"])
+    );
+}
+
+#[test]
+fn status_and_doctor_report_effective_scope_diagnostics() {
+    let fixture = TestFixture::new("effective-scope-diagnostics");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    let nested_worktree_dir = fixture.init_git_worktree_with_repo_policy("owner/repo");
+
+    let status_before = server.request_count();
+    let status = fixture.qgh_without_profile_in(&nested_worktree_dir, ["status", "--json"]);
+    assert_success(&status);
+    assert_eq!(
+        server.request_count(),
+        status_before,
+        "status must remain local-only while reporting resolution"
+    );
+    let status_json = stdout_json(&status);
+    assert_eq!(
+        status_json["data"]["resolution"]["profile_source"],
+        "single_match"
+    );
+    assert_eq!(
+        status_json["data"]["resolution"]["effective_repo_scope"],
+        "owner/repo"
+    );
+    assert!(status_json["data"]["paths"]["profile_data"]
+        .as_str()
+        .unwrap()
+        .contains("profiles/work"));
+
+    let doctor = fixture.qgh_without_profile_in(&nested_worktree_dir, ["doctor", "--json"]);
+    assert_success(&doctor);
+    let doctor_json = stdout_json(&doctor);
+    let checks = doctor_json["data"]["checks"].as_array().unwrap();
+    assert!(checks
+        .iter()
+        .any(|check| check["name"] == "repo_policy" && check["ok"] == true));
+    assert!(checks
+        .iter()
+        .any(|check| check["name"] == "profile_resolution" && check["ok"] == true));
+    assert_eq!(
+        doctor_json["data"]["resolution"]["allowlist_match_count"],
+        1
+    );
+    assert_eq!(
+        doctor_json["data"]["resolution"]["repo_source"],
+        "repo_policy"
     );
 }
 

@@ -13,6 +13,7 @@
 개정: 2026-06-29 — grill closure (CLI-only doctor, REST sync scheduler contract, user-facing eval deferral)
 개정: 2026-06-29 — config policy (worktree-root repo policy for query repo scope defaults)
 개정: 2026-06-29 — profile resolution (CLI/env/single-match profile precedence)
+개정: 2026-06-29 — effective scope metadata (CLI meta, status, doctor diagnostics)
 
 ## 1. 제품 정의
 
@@ -99,6 +100,7 @@ MVP는 작은 범위를 강하게 검증한다.
 - MCP tools: `query`, `get`, `status` (MCP 2025-11-25: structured output `outputSchema`, `readOnlyHint: true`, validation 실패는 `isError`)
 - 검색 결과의 stable source id, entity type, canonical URL, `get` 호출 정보
 - versioned JSON output envelope (`data`, `error`, `warnings`, `meta`)와 stable namespaced error code
+- CLI JSON envelope `meta`와 `status`/`doctor` diagnostics에 resolved profile/effective repo scope 표시
 - read-only 동작
 - local-first privacy default
 - strict config/CLI/MCP schema validation
@@ -211,8 +213,8 @@ MCP client는 `query -> get -> cite` 순서로 qgh를 사용한다. MCP v1은 re
 - vector 기능이 없어도 BM25-only 경로로 core workflow가 작동한다.
 - CLI/MCP/config의 unknown parameter와 malformed input은 structured error를 낸다.
 - no-result는 성공(`results: []`)이고 validation/auth/rate-limit/source-not-found는 실패 envelope로 구분된다.
-- `status`가 last sync, source count, stale count, reconciliation age, DB/schema 상태, profile paths, Tantivy generation, dirty index task count를 보여준다. vector mode가 later 활성화되면 missing embeddings도 표시한다.
-- `doctor`가 명시적 실행에서만 GitHub auth/reachability/rate-limit probe를 수행하고 같은 JSON envelope로 결과를 낸다.
+- `status`가 resolved profile, effective repo scope, repo policy path, last sync, source count, stale count, reconciliation age, DB/schema 상태, profile paths, Tantivy generation, dirty index task count를 보여준다. vector mode가 later 활성화되면 missing embeddings도 표시한다.
+- `doctor`가 명시적 실행에서만 repo policy/profile resolution diagnostics와 GitHub auth/reachability/rate-limit probe를 수행하고 같은 JSON envelope로 결과를 낸다.
 
 ### Not success
 
