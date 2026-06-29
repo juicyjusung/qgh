@@ -75,13 +75,16 @@
         },
         "snippet": {
           "type": "string",
-          "description": "Local preview, not citation evidence. Fetch get_args.source_id before citing."
+          "description": "Local preview, not citation evidence. Fetch get_args before citing."
         },
         "get_args": {
           "type": "object",
-          "required": ["source_id"],
+          "required": ["source_id", "profile_id"],
           "properties": {
             "source_id": {
+              "type": "string"
+            },
+            "profile_id": {
               "type": "string"
             }
           },

@@ -1,14 +1,19 @@
 use crate::cli::QueryArgs;
 use crate::commands;
 use crate::error::QghError;
-use crate::output::{error_envelope, success_envelope};
+use crate::output::{error_envelope, success_envelope_with_meta};
+use crate::resolution::{
+    repo_scope_from_command_arg, repo_scope_from_policy, resolve_context, resolve_explicit_context,
+    ResolvedCommandContext, ResolvedRepoScope,
+};
 use serde_json::{json, Map, Value};
 use std::io::{self, BufRead, Write};
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
 const JSON_SCHEMA: &str = "https://json-schema.org/draft/2020-12/schema";
 
-pub async fn run_stdio(profile_id: &str) -> Result<(), QghError> {
+pub async fn run_stdio(profile_arg: Option<String>) -> Result<(), QghError> {
+    let session = McpSession { profile_arg };
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -17,7 +22,7 @@ pub async fn run_stdio(profile_id: &str) -> Result<(), QghError> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => handle_message(profile_id, message).await,
+            Ok(message) => handle_message(&session, message).await,
             Err(_) => Some(protocol_error(Value::Null, -32700, "Parse error")),
         };
         if let Some(response) = response {
@@ -35,7 +40,11 @@ pub async fn run_stdio(profile_id: &str) -> Result<(), QghError> {
     Ok(())
 }
 
-async fn handle_message(profile_id: &str, message: Value) -> Option<Value> {
+struct McpSession {
+    profile_arg: Option<String>,
+}
+
+async fn handle_message(session: &McpSession, message: Value) -> Option<Value> {
     let id = message.get("id").cloned();
     let method = message.get("method").and_then(Value::as_str);
     let Some(method) = method else {
@@ -52,7 +61,7 @@ async fn handle_message(profile_id: &str, message: Value) -> Option<Value> {
         "initialize" => success_response(id, initialize_result()),
         "ping" => success_response(id, json!({})),
         "tools/list" => success_response(id, json!({ "tools": tool_list() })),
-        "tools/call" => call_tool(profile_id, id, message.get("params")).await,
+        "tools/call" => call_tool(session, id, message.get("params")).await,
         _ => protocol_error(id, -32601, "Method not found"),
     })
 }
@@ -73,21 +82,12 @@ fn initialize_result() -> Value {
     })
 }
 
-async fn call_tool(profile_id: &str, id: Value, params: Option<&Value>) -> Value {
+async fn call_tool(session: &McpSession, id: Value, params: Option<&Value>) -> Value {
     let result = match parse_call(params) {
         Ok(call) => match call.name.as_str() {
-            "query" => parse_query_args(&call.arguments)
-                .and_then(|args| commands::query(profile_id, args))
-                .map(tool_success)
-                .unwrap_or_else(tool_error),
-            "get" => parse_get_args(&call.arguments)
-                .and_then(|source_id| commands::get_local(profile_id, &source_id))
-                .map(tool_success)
-                .unwrap_or_else(tool_error),
-            "status" => parse_empty_args(&call.arguments)
-                .and_then(|()| commands::status(profile_id))
-                .map(tool_success)
-                .unwrap_or_else(tool_error),
+            "query" => tool_query(session, &call.arguments).unwrap_or_else(tool_error),
+            "get" => tool_get(session, &call.arguments).unwrap_or_else(tool_error),
+            "status" => tool_status(session, &call.arguments).unwrap_or_else(tool_error),
             _ => {
                 return protocol_error(id, -32601, "Tool not found");
             }
@@ -97,9 +97,88 @@ async fn call_tool(profile_id: &str, id: Value, params: Option<&Value>) -> Value
     success_response(id, result)
 }
 
+fn tool_query(session: &McpSession, arguments: &Value) -> Result<Value, QghError> {
+    let args = parse_query_args(arguments)?;
+    let repo_scope = effective_query_repo_scope(&args)?;
+    let context = resolve_mcp_context(session, repo_scope)?;
+    let data = commands::query(&context.profile_id, args)?;
+    Ok(tool_success(data, context.meta_json()))
+}
+
+fn tool_get(session: &McpSession, arguments: &Value) -> Result<Value, QghError> {
+    let args = parse_get_args(arguments)?;
+    let context = resolve_mcp_get_context(session, args.profile_id.as_deref())?;
+    let data = commands::get_local(&context.profile_id, &args.source_id)?;
+    Ok(tool_success(data, context.meta_json()))
+}
+
+fn tool_status(session: &McpSession, arguments: &Value) -> Result<Value, QghError> {
+    parse_empty_args(arguments)?;
+    let context = resolve_mcp_context(session, repo_scope_from_policy()?)?;
+    let mut data = commands::status(&context.profile_id)?;
+    data["resolution"] = context.resolution_json();
+    Ok(tool_success(data, context.meta_json()))
+}
+
+fn effective_query_repo_scope(args: &QueryArgs) -> Result<Option<ResolvedRepoScope>, QghError> {
+    if let Some(repo) = &args.repo {
+        return repo_scope_from_command_arg(repo).map(Some);
+    }
+    repo_scope_from_policy()
+}
+
+fn resolve_mcp_context(
+    session: &McpSession,
+    repo_scope: Option<ResolvedRepoScope>,
+) -> Result<ResolvedCommandContext, QghError> {
+    resolve_context(session.profile_arg.as_deref(), repo_scope)
+}
+
+fn resolve_mcp_get_context(
+    session: &McpSession,
+    get_args_profile_id: Option<&str>,
+) -> Result<ResolvedCommandContext, QghError> {
+    if let Some(session_profile_id) = session.profile_arg.as_deref() {
+        reject_profile_mismatch(session_profile_id, get_args_profile_id, "server --profile")?;
+        return resolve_context(Some(session_profile_id), repo_scope_from_policy()?);
+    }
+    if let Ok(env_profile_id) = std::env::var("QGH_PROFILE") {
+        reject_profile_mismatch(&env_profile_id, get_args_profile_id, "QGH_PROFILE")?;
+        return resolve_context(None, repo_scope_from_policy()?);
+    }
+    if let Some(profile_id) = get_args_profile_id {
+        return resolve_explicit_context(profile_id, "get_args", None);
+    }
+    resolve_context(None, repo_scope_from_policy()?)
+}
+
+fn reject_profile_mismatch(
+    boundary_profile_id: &str,
+    get_args_profile_id: Option<&str>,
+    boundary_source: &str,
+) -> Result<(), QghError> {
+    if get_args_profile_id.is_some_and(|profile_id| profile_id != boundary_profile_id) {
+        return Err(QghError::validation(
+            "validation.mcp",
+            format!("MCP get_args.profile_id cannot differ from {boundary_source}."),
+        )
+        .with_details(json!({
+            "boundary_profile_id": boundary_profile_id,
+            "get_args_profile_id": get_args_profile_id
+        }))
+        .with_hint("Start a separate MCP server for a different profile."));
+    }
+    Ok(())
+}
+
 struct ToolCall {
     name: String,
     arguments: Value,
+}
+
+struct GetArgs {
+    source_id: String,
+    profile_id: Option<String>,
 }
 
 fn parse_call(params: Option<&Value>) -> Result<ToolCall, QghError> {
@@ -129,7 +208,7 @@ fn parse_query_args(arguments: &Value) -> Result<QueryArgs, QghError> {
     )?;
     Ok(QueryArgs {
         query: required_string(object, "query")?,
-        limit: optional_usize(object, "limit")?.unwrap_or(10),
+        limit: optional_usize(object, "limit")?,
         repo: optional_string(object, "repo")?,
         label: optional_string_array(object, "label")?,
         state: optional_string(object, "state")?,
@@ -140,10 +219,13 @@ fn parse_query_args(arguments: &Value) -> Result<QueryArgs, QghError> {
     })
 }
 
-fn parse_get_args(arguments: &Value) -> Result<String, QghError> {
+fn parse_get_args(arguments: &Value) -> Result<GetArgs, QghError> {
     let object = argument_object(arguments)?;
-    reject_unknown(object, &["source_id"])?;
-    required_string(object, "source_id")
+    reject_unknown(object, &["source_id", "profile_id"])?;
+    Ok(GetArgs {
+        source_id: required_string(object, "source_id")?,
+        profile_id: optional_string(object, "profile_id")?,
+    })
 }
 
 fn parse_empty_args(arguments: &Value) -> Result<(), QghError> {
@@ -234,8 +316,8 @@ fn optional_usize(object: &Map<String, Value>, key: &str) -> Result<Option<usize
         .transpose()
 }
 
-fn tool_success(data: Value) -> Value {
-    let envelope = success_envelope(data);
+fn tool_success(data: Value, meta: Value) -> Value {
+    let envelope = success_envelope_with_meta(data, meta);
     tool_result(envelope, false)
 }
 
@@ -342,7 +424,8 @@ fn get_input_schema() -> Value {
         "type": "object",
         "required": ["source_id"],
         "properties": {
-            "source_id": { "type": "string" }
+            "source_id": { "type": "string" },
+            "profile_id": { "type": "string" }
         },
         "additionalProperties": false
     })
@@ -367,7 +450,30 @@ fn envelope_output_schema() -> Value {
             "data": { "type": "object" },
             "error": { "type": "object" },
             "warnings": { "type": "array" },
-            "meta": { "type": "object" }
+            "meta": {
+                "type": "object",
+                "properties": {
+                    "profile_id": {
+                        "type": ["string", "null"]
+                    },
+                    "profile_source": {
+                        "type": ["string", "null"],
+                        "enum": ["cli", "env", "single_match", "get_args", null]
+                    },
+                    "repo": {
+                        "type": ["string", "null"],
+                        "pattern": "^[^/]+/[^/]+$"
+                    },
+                    "repo_source": {
+                        "type": ["string", "null"],
+                        "enum": ["cli", "repo_policy", "command", null]
+                    },
+                    "repo_policy_path": {
+                        "type": ["string", "null"]
+                    }
+                },
+                "additionalProperties": false
+            }
         },
         "additionalProperties": false
     })

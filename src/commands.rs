@@ -1,5 +1,5 @@
 use crate::cli::{QueryArgs, ReconcileMode};
-use crate::config::{load_profile, resolve_token};
+use crate::config::{discover_repo_policy, load_profile, resolve_token, Profile, RepoPolicy};
 use crate::error::QghError;
 use crate::github;
 use crate::index;
@@ -127,10 +127,12 @@ pub async fn sync(profile_id: &str, reconcile: Option<ReconcileMode>) -> Result<
 }
 
 pub fn query(profile_id: &str, args: QueryArgs) -> Result<Value, QghError> {
-    let filters = QueryFilters::from_args(&args)?;
     let profile = load_profile(profile_id)?;
+    let repo_policy = discover_repo_policy()?;
+    let filters = QueryFilters::from_args(&args, &profile, repo_policy.as_ref())?;
+    let limit = effective_limit(&args, repo_policy.as_ref());
     let store = Store::open(&profile.paths)?;
-    if let Some(results) = exact_results(&store, &args.query, &filters)? {
+    if let Some(results) = exact_results(&store, &args.query, &filters, &profile.id)? {
         return Ok(json!({
             "profile_id": profile.id,
             "result_filtering": {
@@ -140,7 +142,7 @@ pub fn query(profile_id: &str, args: QueryArgs) -> Result<Value, QghError> {
         }));
     }
     let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
-    let hits = index::search(&active_index_path, &args.query, args.limit)?;
+    let hits = index::search(&active_index_path, &args.query, limit)?;
     let mut results = Vec::new();
     let mut unresolvable_hits = 0;
     for hit in hits {
@@ -151,7 +153,7 @@ pub fn query(profile_id: &str, args: QueryArgs) -> Result<Value, QghError> {
         if !filters.matches(&source) {
             continue;
         }
-        results.push(source_result(source, Ranking::Bm25(hit.score)));
+        results.push(source_result(source, Ranking::Bm25(hit.score), &profile.id));
     }
     Ok(json!({
         "profile_id": profile.id,
@@ -169,47 +171,48 @@ struct QueryFilters {
     state: Option<String>,
     author: Option<String>,
     issue: Option<i64>,
+    source_types: Vec<String>,
 }
 
 impl QueryFilters {
-    fn from_args(args: &QueryArgs) -> Result<Self, QghError> {
+    fn from_args(
+        args: &QueryArgs,
+        profile: &Profile,
+        repo_policy: Option<&RepoPolicy>,
+    ) -> Result<Self, QghError> {
         if args.wiki.is_some() {
             return Err(QghError::validation(
                 "validation.unsupported_filter",
                 "Wiki filters are post-MVP and unsupported.",
             ));
         }
-        if let Some(repo) = &args.repo {
-            validate_repo(repo)?;
-        }
-        if let Some(state) = &args.state {
-            if !matches!(state.as_str(), "open" | "closed") {
-                return Err(QghError::validation(
-                    "validation.invalid_state",
-                    "State filter must be `open` or `closed`.",
-                ));
-            }
-        }
+        let repo = effective_repo(args, profile, repo_policy)?;
+        let state = effective_state(args, repo_policy)?;
+        let labels = effective_labels(args, repo_policy);
+        let source_types = effective_source_types(repo_policy);
         Ok(Self {
-            repo: args.repo.clone(),
-            labels: args.label.clone(),
-            state: args.state.clone(),
+            repo,
+            labels,
+            state,
             author: args.author.clone(),
             issue: args.issue,
+            source_types,
         })
     }
 
     fn matches(&self, source: &StoredSource) -> bool {
         match source {
             StoredSource::Issue(issue) => {
-                self.repo_matches(&issue.repo)
+                self.source_type_matches("issue")
+                    && self.repo_matches(&issue.repo)
                     && self.issue_matches(issue.number)
                     && self.author_matches(issue.author.as_deref())
                     && self.state_matches(Some(&issue.state))
                     && self.labels.iter().all(|label| issue.labels.contains(label))
             }
             StoredSource::Comment(comment) => {
-                self.repo_matches(&comment.repo)
+                self.source_type_matches("issue_comment")
+                    && self.repo_matches(&comment.repo)
                     && self.issue_matches(comment.issue_number)
                     && self.author_matches(comment.author.as_deref())
                     && self.state.is_none()
@@ -237,16 +240,103 @@ impl QueryFilters {
             .as_ref()
             .is_none_or(|expected| state == Some(expected))
     }
+
+    fn source_type_matches(&self, source_type: &str) -> bool {
+        self.source_types
+            .iter()
+            .any(|allowed| allowed == source_type)
+    }
+}
+
+fn effective_repo(
+    args: &QueryArgs,
+    profile: &Profile,
+    repo_policy: Option<&RepoPolicy>,
+) -> Result<Option<String>, QghError> {
+    if let Some(repo) = &args.repo {
+        validate_repo(repo)?;
+        if !profile.allows_repo(repo) {
+            return Err(QghError::validation(
+                "validation.invalid_repo",
+                format!(
+                    "Repo `{repo}` is outside profile `{}` allowlist.",
+                    profile.id
+                ),
+            )
+            .with_details(json!({
+                "profile_id": profile.id,
+                "repo": repo
+            }))
+            .with_hint("Use a repo from the profile allowlist or update the profile config."));
+        }
+        return Ok(Some(repo.clone()));
+    }
+
+    let Some(repo_policy) = repo_policy else {
+        return Ok(None);
+    };
+    let repo = repo_policy.repo.full_name();
+    if !profile.allows_repo(&repo) {
+        return Err(QghError::invalid_repo_policy(format!(
+            "Repo policy repo `{repo}` is outside profile `{}` allowlist.",
+            profile.id
+        ))
+        .with_details(json!({
+            "profile_id": profile.id,
+            "repo": repo,
+            "repo_policy_path": repo_policy.path
+        }))
+        .with_hint("Update `.qgh.toml` or the profile repo allowlist."));
+    }
+    Ok(Some(repo))
+}
+
+fn effective_state(
+    args: &QueryArgs,
+    repo_policy: Option<&RepoPolicy>,
+) -> Result<Option<String>, QghError> {
+    if let Some(state) = &args.state {
+        if !matches!(state.as_str(), "open" | "closed") {
+            return Err(QghError::validation(
+                "validation.invalid_state",
+                "State filter must be `open` or `closed`.",
+            ));
+        }
+        return Ok(Some(state.clone()));
+    }
+    Ok(repo_policy.and_then(|policy| policy.defaults.state.clone()))
+}
+
+fn effective_labels(args: &QueryArgs, repo_policy: Option<&RepoPolicy>) -> Vec<String> {
+    if !args.label.is_empty() {
+        return args.label.clone();
+    }
+    repo_policy
+        .map(|policy| policy.defaults.labels.clone())
+        .unwrap_or_default()
+}
+
+fn effective_source_types(repo_policy: Option<&RepoPolicy>) -> Vec<String> {
+    repo_policy
+        .map(|policy| policy.defaults.source_types.clone())
+        .unwrap_or_else(|| vec!["issue".to_string(), "issue_comment".to_string()])
+}
+
+fn effective_limit(args: &QueryArgs, repo_policy: Option<&RepoPolicy>) -> usize {
+    args.limit
+        .or_else(|| repo_policy.and_then(|policy| policy.query.limit))
+        .unwrap_or(10)
 }
 
 fn exact_results(
     store: &Store,
     query_text: &str,
     filters: &QueryFilters,
+    profile_id: &str,
 ) -> Result<Option<Vec<Value>>, QghError> {
     if let Some(source) = exact_url_result(store, query_text)? {
         return Ok(Some(if filters.matches(&source) {
-            vec![source_result(source, Ranking::Exact)]
+            vec![source_result(source, Ranking::Exact, profile_id)]
         } else {
             Vec::new()
         }));
@@ -274,7 +364,7 @@ fn exact_results(
             .into_iter()
             .map(StoredSource::Issue)
             .filter(|source| filters.matches(source))
-            .map(|source| source_result(source, Ranking::Exact))
+            .map(|source| source_result(source, Ranking::Exact, profile_id))
             .collect(),
     ))
 }
@@ -543,14 +633,14 @@ enum Ranking {
     Exact,
 }
 
-fn source_result(source: StoredSource, ranking: Ranking) -> Value {
+fn source_result(source: StoredSource, ranking: Ranking, profile_id: &str) -> Value {
     match source {
-        StoredSource::Issue(issue) => issue_result(issue, ranking),
-        StoredSource::Comment(comment) => comment_result(comment, ranking),
+        StoredSource::Issue(issue) => issue_result(issue, ranking, profile_id),
+        StoredSource::Comment(comment) => comment_result(comment, ranking, profile_id),
     }
 }
 
-fn issue_result(issue: StoredIssue, ranking: Ranking) -> Value {
+fn issue_result(issue: StoredIssue, ranking: Ranking, profile_id: &str) -> Value {
     let source_id = issue.source_id;
     json!({
         "source_id": source_id,
@@ -561,7 +651,8 @@ fn issue_result(issue: StoredIssue, ranking: Ranking) -> Value {
         "canonical_url": issue.canonical_url,
         "snippet": snippet(&issue.body),
         "get_args": {
-            "source_id": source_id
+            "source_id": source_id,
+            "profile_id": profile_id
         },
         "parent_issue": Value::Null,
         "source_version": issue.source_version,
@@ -569,7 +660,7 @@ fn issue_result(issue: StoredIssue, ranking: Ranking) -> Value {
     })
 }
 
-fn comment_result(comment: StoredComment, ranking: Ranking) -> Value {
+fn comment_result(comment: StoredComment, ranking: Ranking, profile_id: &str) -> Value {
     let source_id = comment.source_id;
     json!({
         "source_id": source_id,
@@ -581,7 +672,8 @@ fn comment_result(comment: StoredComment, ranking: Ranking) -> Value {
         "parent_issue": comment.parent_issue,
         "snippet": snippet(&comment.body),
         "get_args": {
-            "source_id": source_id
+            "source_id": source_id,
+            "profile_id": profile_id
         },
         "source_version": comment.source_version,
         "ranking": ranking_json(ranking)

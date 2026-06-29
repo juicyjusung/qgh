@@ -11,6 +11,10 @@
 개정: 2026-06-29 — MVP scope reset (GitHub Issues와 issue comments만 포함, Wiki는 post-MVP)
 개정: 2026-06-29 — architecture lock (Rust single-binary CLI, XDG profile store, bundled SQLite authoritative store, Tantivy derived BM25 index)
 개정: 2026-06-29 — grill closure (CLI-only doctor, REST sync scheduler contract, user-facing eval deferral)
+개정: 2026-06-29 — config policy (worktree-root repo policy for query repo scope defaults)
+개정: 2026-06-29 — profile resolution (CLI/env/single-match profile precedence)
+개정: 2026-06-29 — effective scope metadata (CLI meta, status, doctor diagnostics)
+개정: 2026-06-29 — MCP scope resolution (read-only tools share CLI repo policy/profile contract)
 
 ## 1. 제품 정의
 
@@ -84,7 +88,8 @@ MVP는 작은 범위를 강하게 검증한다.
 
 - 명시적 repo allowlist
 - Rust single-binary CLI/MCP
-- XDG config/data/cache 기반 explicit profile store (`--profile` required, data path override 없음)
+- XDG config/data/cache 기반 profile store (`--profile`/`QGH_PROFILE` 우선, repo scope single-match profile resolution 허용, data path override 없음)
+- current git worktree root의 tracked `.qgh.toml` repo policy로 CLI/MCP query 기본 repo scope와 safe filters 제공
 - GitHub Issues title/body metadata sync
 - issue comments sync
 - bundled SQLite authoritative store
@@ -93,9 +98,10 @@ MVP는 작은 범위를 강하게 검증한다.
 - BM25/keyword 검색 기본 동작 (한국어/영어 mixed corpus는 Tantivy tokenizer baseline + CJK n-gram fallback field를 eval로 검증)
 - optional vector/hybrid search는 post-MVP capability (sqlite-vec/ONNX 후보, MVP release gate 아님)
 - CLI 명령: `sync`, `search` 또는 `query`, `get`, `status`, `doctor`
-- MCP tools: `query`, `get`, `status` (MCP 2025-11-25: structured output `outputSchema`, `readOnlyHint: true`, validation 실패는 `isError`)
+- MCP tools: `query`, `get`, `status` (MCP 2025-11-25: structured output `outputSchema`, `readOnlyHint: true`, validation/resolution 실패는 `isError`)
 - 검색 결과의 stable source id, entity type, canonical URL, `get` 호출 정보
 - versioned JSON output envelope (`data`, `error`, `warnings`, `meta`)와 stable namespaced error code
+- CLI JSON envelope와 MCP structuredContent `meta`, `status`/`doctor` diagnostics에 resolved profile/effective repo scope 표시
 - read-only 동작
 - local-first privacy default
 - strict config/CLI/MCP schema validation
@@ -103,8 +109,8 @@ MVP는 작은 범위를 강하게 검증한다.
 
 ### MVP에서 반드시 지킬 제약
 
-- repo는 사용자가 명시해야 한다.
-- 모든 command는 명시적 `--profile`을 요구하고 implicit CWD/HOME/env fallback으로 corpus를 선택하지 않는다.
+- repo allowlist는 profile config에 명시해야 한다. CLI query/search는 explicit `--repo`가 없을 때 current git worktree root의 repo policy로 기본 repo scope를 정할 수 있지만 profile allowlist 밖으로 넓힐 수 없다.
+- profile resolution은 CLI `--profile` > `QGH_PROFILE` > repo scope single-match 순서다. Repo scope 없이 configured profile 개수만 보고 profile을 고르지 않는다.
 - hosted embedding/rerank는 기본값이 아니다.
 - vector 기능이 없어도 sync/query/get/status는 작동해야 한다.
 - `status`는 local-only snapshot이고, network/auth/schema probe는 CLI-only `doctor`에서만 수행한다.
@@ -134,13 +140,13 @@ MVP에서 제외할 항목은 제품 집중도를 지키기 위한 의도적 결
 
 ### 6.1 초기 설정
 
-사용자는 검색하고 싶은 repo를 `~/.config/qgh/config.toml`의 strict TOML profile에 명시한다. qgh는 token source, GitHub host, repo allowlist를 하나의 profile로 고정하고, SQLite/Tantivy data path는 XDG data dir과 profile id에서 파생한다. CLI와 MCP 모두 `--profile` 없이 실행되면 실패한다.
+사용자는 검색하고 싶은 repo를 `~/.config/qgh/config.toml`의 strict TOML profile에 명시한다. qgh는 token source, GitHub host, repo allowlist를 하나의 profile로 고정하고, SQLite/Tantivy data path는 XDG data dir과 profile id에서 파생한다. Repository는 tracked `.qgh.toml`로 query/search의 기본 repo scope와 safe filters를 정의할 수 있지만 profile id, token source, literal token, profile store path, arbitrary DB path, user-local absolute path는 정의할 수 없다. CLI `--profile`과 `QGH_PROFILE`이 없으면 effective repo scope를 allowlist에 포함하는 profile이 정확히 하나일 때만 profile을 자동 선택한다.
 
 성공 경험:
 
-- 어떤 repo가 인덱싱되는지 명확하다.
+- 어떤 repo가 인덱싱되는지 명확하고, repo worktree에서 query/search 기본 scope가 profile allowlist 안의 current repo로 제한된다.
 - CLI와 MCP가 같은 profile, 같은 SQLite store, 같은 Tantivy index를 본다.
-- 잘못된 repo, 누락된 token, unknown config key는 조용히 무시되지 않고 실패한다.
+- 잘못된 repo, 누락된 token, unknown config key, no matching profile, ambiguous profile은 조용히 무시되지 않고 실패한다.
 
 ### 6.2 동기화
 
@@ -158,7 +164,7 @@ MVP에서 제외할 항목은 제품 집중도를 지키기 위한 의도적 결
 
 ### 6.3 검색
 
-사용자 또는 agent는 자연어, keyword, issue number, repo/label/state 같은 filter로 검색한다. 결과는 답변이 아니라 source 후보로 표시된다.
+사용자 또는 agent는 자연어, keyword, issue number, repo/label/state 같은 filter로 검색한다. current git worktree root에 repo policy가 있으면 CLI query/search 기본 repo scope는 해당 repository의 Issues/comments다. Explicit `--repo`는 repo policy 기본값을 override할 수 있지만 profile allowlist 밖 repo는 structured error로 실패한다. 결과는 답변이 아니라 source 후보로 표시된다.
 
 성공 경험:
 
@@ -207,15 +213,16 @@ MCP client는 `query -> get -> cite` 순서로 qgh를 사용한다. MCP v1은 re
 - 모든 top-k 검색 결과가 `get`으로 round-trip 된다.
 - vector 기능이 없어도 BM25-only 경로로 core workflow가 작동한다.
 - CLI/MCP/config의 unknown parameter와 malformed input은 structured error를 낸다.
+- MCP launch도 `--profile`/`QGH_PROFILE`/repo-scope single-match profile resolution을 사용하고, repo policy 기본 scope와 explicit `repo` argument allowlist 검사를 structured tool result로 반환한다.
 - no-result는 성공(`results: []`)이고 validation/auth/rate-limit/source-not-found는 실패 envelope로 구분된다.
-- `status`가 last sync, source count, stale count, reconciliation age, DB/schema 상태, profile paths, Tantivy generation, dirty index task count를 보여준다. vector mode가 later 활성화되면 missing embeddings도 표시한다.
-- `doctor`가 명시적 실행에서만 GitHub auth/reachability/rate-limit probe를 수행하고 같은 JSON envelope로 결과를 낸다.
+- `status`가 resolved profile, effective repo scope, repo policy path, last sync, source count, stale count, reconciliation age, DB/schema 상태, profile paths, Tantivy generation, dirty index task count를 보여준다. vector mode가 later 활성화되면 missing embeddings도 표시한다.
+- `doctor`가 명시적 실행에서만 repo policy/profile resolution diagnostics와 GitHub auth/reachability/rate-limit probe를 수행하고 같은 JSON envelope로 결과를 낸다.
 
 ### Not success
 
 - 검색 결과가 좋아 보여도 `get`으로 원문을 확인할 수 없다.
 - hosted embedding을 켜야만 쓸 만하다.
-- implicit repo/profile fallback 때문에 CLI와 MCP가 다른 corpus를 검색한다.
+- repo scope 없는 implicit profile fallback 때문에 CLI와 MCP가 다른 corpus를 검색한다.
 - shared server/ACL 문제를 풀기 전에 MVP가 조직형 플랫폼으로 커진다.
 
 ## 8. 주요 리스크

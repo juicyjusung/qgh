@@ -9,6 +9,7 @@ mod mcp;
 mod model;
 mod output;
 mod paths;
+mod resolution;
 mod store;
 mod time;
 

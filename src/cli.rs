@@ -30,6 +30,8 @@ pub enum Command {
     Get {
         source_id: String,
         #[arg(long)]
+        profile_id: Option<String>,
+        #[arg(long)]
         json: bool,
     },
     Status {
@@ -59,8 +61,8 @@ pub enum ReconcileMode {
 #[derive(Debug, Clone, Args)]
 pub struct QueryArgs {
     pub query: String,
-    #[arg(long, default_value_t = 10)]
-    pub limit: usize,
+    #[arg(long)]
+    pub limit: Option<usize>,
     #[arg(long)]
     pub repo: Option<String>,
     #[arg(long)]

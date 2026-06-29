@@ -12,6 +12,7 @@
     "index",
     "sync",
     "reconciliation",
+    "resolution",
     "privacy"
   ],
   "properties": {
@@ -39,9 +40,50 @@
     "reconciliation": {
       "type": "object"
     },
+    "resolution": {
+      "$ref": "#/$defs/resolution"
+    },
     "privacy": {
       "type": "object"
     }
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "$defs": {
+    "resolution": {
+      "type": "object",
+      "required": [
+        "profile_id",
+        "profile_source",
+        "effective_repo_scope",
+        "repo_source",
+        "repo_policy_path",
+        "allowlist_match_count"
+      ],
+      "properties": {
+        "profile_id": {
+          "type": "string"
+        },
+        "profile_source": {
+          "type": "string",
+          "enum": ["cli", "env", "single_match"]
+        },
+        "effective_repo_scope": {
+          "type": ["string", "null"],
+          "pattern": "^[^/]+/[^/]+$"
+        },
+        "repo_source": {
+          "type": ["string", "null"],
+          "enum": ["cli", "repo_policy", "command", null]
+        },
+        "repo_policy_path": {
+          "type": ["string", "null"]
+        },
+        "allowlist_match_count": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
 }

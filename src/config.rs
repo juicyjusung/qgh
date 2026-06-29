@@ -1,8 +1,9 @@
 use crate::error::QghError;
-use crate::paths::ProfilePaths;
+use crate::paths::{config_file_path, ProfilePaths};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone)]
@@ -18,6 +19,14 @@ pub struct Profile {
     pub paths: ProfilePaths,
 }
 
+impl Profile {
+    pub fn allows_repo(&self, repo: &str) -> bool {
+        self.repos
+            .iter()
+            .any(|allowed_repo| allowed_repo.full_name() == repo)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RepoRef {
     pub owner: String,
@@ -28,6 +37,26 @@ impl RepoRef {
     pub fn full_name(&self) -> String {
         format!("{}/{}", self.owner, self.name)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoPolicy {
+    pub path: PathBuf,
+    pub repo: RepoRef,
+    pub defaults: RepoPolicyDefaults,
+    pub query: RepoPolicyQuery,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoPolicyDefaults {
+    pub state: Option<String>,
+    pub labels: Vec<String>,
+    pub source_types: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoPolicyQuery {
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,13 +88,87 @@ struct RawProfile {
     token_source: TokenSource,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoPolicyFile {
+    schema_version: String,
+    repo: RawRepoPolicyRepo,
+    #[serde(default)]
+    defaults: RawRepoPolicyDefaults,
+    #[serde(default)]
+    query: RawRepoPolicyQuery,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRepoPolicyRepo {
+    github: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRepoPolicyDefaults {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    source_types: Vec<String>,
+    #[serde(default)]
+    labels: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRepoPolicyQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 pub fn load_profile(profile_id: &str) -> Result<Profile, QghError> {
     validate_profile_id(profile_id)?;
-    let paths = ProfilePaths::resolve(profile_id)?;
-    let text = fs::read_to_string(&paths.config_file).map_err(|error| {
+    let config = load_config_file()?;
+    let Some(raw) = config.profiles.get(profile_id) else {
+        return Err(QghError::config(format!(
+            "Profile `{profile_id}` is not defined."
+        )));
+    };
+    profile_from_raw(profile_id, raw)
+}
+
+pub fn single_matching_profile_id(repo_scope: Option<&str>) -> Result<String, QghError> {
+    let Some(repo_scope) = repo_scope else {
+        return Err(QghError::no_matching_profile(None));
+    };
+    let config = load_config_file()?;
+    let mut matches = Vec::new();
+    for (profile_id, raw) in &config.profiles {
+        validate_profile_id(profile_id)?;
+        if raw
+            .repos
+            .iter()
+            .map(|repo| parse_repo(repo))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|message| QghError::config(format!("Profile `{profile_id}` {message}")))?
+            .iter()
+            .any(|repo| repo.full_name() == repo_scope)
+        {
+            matches.push(profile_id.clone());
+        }
+    }
+    match matches.len() {
+        0 => Err(QghError::no_matching_profile(Some(repo_scope))),
+        1 => Ok(matches.remove(0)),
+        _ => Err(QghError::ambiguous_profile(repo_scope, matches)),
+    }
+}
+
+fn load_config_file() -> Result<ConfigFile, QghError> {
+    let config_file = config_file_path()?;
+    let text = fs::read_to_string(&config_file).map_err(|error| {
         QghError::config(format!(
             "Failed to read config at {}: {error}",
-            paths.config_file.display()
+            config_file.display()
         ))
     })?;
     let config: ConfigFile = toml::from_str(&text)
@@ -73,11 +176,11 @@ pub fn load_profile(profile_id: &str) -> Result<Profile, QghError> {
     if config.schema_version != "qgh.config.v1" {
         return Err(QghError::config("Unsupported config schema_version."));
     }
-    let Some(raw) = config.profiles.get(profile_id) else {
-        return Err(QghError::config(format!(
-            "Profile `{profile_id}` is not defined."
-        )));
-    };
+    Ok(config)
+}
+
+fn profile_from_raw(profile_id: &str, raw: &RawProfile) -> Result<Profile, QghError> {
+    let paths = ProfilePaths::resolve(profile_id)?;
     if raw.repos.is_empty() {
         return Err(QghError::config("Profile repos must not be empty."));
     }
@@ -95,7 +198,9 @@ pub fn load_profile(profile_id: &str) -> Result<Profile, QghError> {
     let repos = raw
         .repos
         .iter()
-        .map(|repo| parse_repo(repo))
+        .map(|repo| {
+            parse_repo(repo).map_err(|message| QghError::config(format!("Repo `{repo}` {message}")))
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Profile {
@@ -109,6 +214,136 @@ pub fn load_profile(profile_id: &str) -> Result<Profile, QghError> {
         token_source: raw.token_source.clone(),
         paths,
     })
+}
+
+pub fn discover_repo_policy() -> Result<Option<RepoPolicy>, QghError> {
+    let Some(root) = current_git_worktree_root() else {
+        return Ok(None);
+    };
+    let path = root.join(".qgh.toml");
+    if !path.exists() {
+        return Ok(None);
+    }
+    load_repo_policy_at(&path).map(Some)
+}
+
+fn current_git_worktree_root() -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(root))
+    }
+}
+
+fn load_repo_policy_at(path: &Path) -> Result<RepoPolicy, QghError> {
+    let text = fs::read_to_string(path).map_err(|error| {
+        QghError::invalid_repo_policy(format!(
+            "Failed to read repo policy at {}: {error}",
+            path.display()
+        ))
+    })?;
+    let policy: RepoPolicyFile = toml::from_str(&text).map_err(|error| {
+        QghError::invalid_repo_policy(format!("Invalid repo policy TOML: {error}"))
+    })?;
+    if policy.schema_version != "qgh.repo.v1" {
+        return Err(QghError::invalid_repo_policy(
+            "Unsupported repo policy schema_version.",
+        ));
+    }
+    reject_local_path_like("repo.github", &policy.repo.github)?;
+    let repo = parse_repo(&policy.repo.github).map_err(QghError::invalid_repo_policy)?;
+    let defaults = parse_repo_policy_defaults(policy.defaults)?;
+    let query = parse_repo_policy_query(policy.query)?;
+    Ok(RepoPolicy {
+        path: path.to_path_buf(),
+        repo,
+        defaults,
+        query,
+    })
+}
+
+fn parse_repo_policy_defaults(raw: RawRepoPolicyDefaults) -> Result<RepoPolicyDefaults, QghError> {
+    if let Some(scope) = &raw.scope {
+        reject_local_path_like("defaults.scope", scope)?;
+        if scope != "repo" {
+            return Err(QghError::invalid_repo_policy(
+                "Repo policy defaults.scope must be `repo`.",
+            ));
+        }
+    }
+
+    let state = match raw.state {
+        Some(state) => {
+            reject_local_path_like("defaults.state", &state)?;
+            match state.as_str() {
+                "all" => None,
+                "open" | "closed" => Some(state),
+                _ => {
+                    return Err(QghError::invalid_repo_policy(
+                        "Repo policy defaults.state must be `all`, `open`, or `closed`.",
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
+
+    let source_types = if raw.source_types.is_empty() {
+        vec!["issue".to_string(), "issue_comment".to_string()]
+    } else {
+        raw.source_types
+    };
+    for source_type in &source_types {
+        reject_local_path_like("defaults.source_types", source_type)?;
+        if !matches!(source_type.as_str(), "issue" | "issue_comment") {
+            return Err(QghError::invalid_repo_policy(
+                "Repo policy defaults.source_types may contain only `issue` or `issue_comment`.",
+            ));
+        }
+    }
+    for label in &raw.labels {
+        reject_local_path_like("defaults.labels", label)?;
+    }
+
+    Ok(RepoPolicyDefaults {
+        state,
+        labels: raw.labels,
+        source_types,
+    })
+}
+
+fn parse_repo_policy_query(raw: RawRepoPolicyQuery) -> Result<RepoPolicyQuery, QghError> {
+    if raw.limit.is_some_and(|limit| limit == 0) {
+        return Err(QghError::invalid_repo_policy(
+            "Repo policy query.limit must be greater than zero.",
+        ));
+    }
+    Ok(RepoPolicyQuery { limit: raw.limit })
+}
+
+fn reject_local_path_like(field: &str, value: &str) -> Result<(), QghError> {
+    if value.starts_with('/') || value.starts_with('~') || looks_like_windows_absolute_path(value) {
+        return Err(QghError::invalid_repo_policy(format!(
+            "Repo policy field `{field}` must not contain a user-local absolute path."
+        )));
+    }
+    Ok(())
+}
+
+fn looks_like_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+        && bytes[0].is_ascii_alphabetic()
 }
 
 pub fn resolve_token(profile: &Profile) -> Result<String, QghError> {
@@ -157,11 +392,9 @@ fn validate_profile_id(profile_id: &str) -> Result<(), QghError> {
     Ok(())
 }
 
-fn parse_repo(value: &str) -> Result<RepoRef, QghError> {
+fn parse_repo(value: &str) -> Result<RepoRef, String> {
     let Some((owner, name)) = value.split_once('/') else {
-        return Err(QghError::config(format!(
-            "Repo `{value}` must use owner/repo format."
-        )));
+        return Err("must use owner/repo format.".to_string());
     };
     if owner.is_empty()
         || name.is_empty()
@@ -169,9 +402,7 @@ fn parse_repo(value: &str) -> Result<RepoRef, QghError> {
         || name.contains('/')
         || value.contains('*')
     {
-        return Err(QghError::config(format!(
-            "Repo `{value}` must be an explicit owner/repo allowlist entry."
-        )));
+        return Err("must be an explicit owner/repo allowlist entry.".to_string());
     }
     Ok(RepoRef {
         owner: owner.to_string(),

@@ -24,7 +24,28 @@
       }
     },
     "meta": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "profile_id": {
+          "type": ["string", "null"]
+        },
+        "profile_source": {
+          "type": ["string", "null"],
+          "enum": ["cli", "env", "single_match", "get_args", null]
+        },
+        "repo": {
+          "type": ["string", "null"],
+          "pattern": "^[^/]+/[^/]+$"
+        },
+        "repo_source": {
+          "type": ["string", "null"],
+          "enum": ["cli", "repo_policy", "command", null]
+        },
+        "repo_policy_path": {
+          "type": ["string", "null"]
+        }
+      },
+      "additionalProperties": false
     }
   },
   "oneOf": [
