@@ -44,6 +44,7 @@ pub struct RepoPolicy {
     pub path: PathBuf,
     pub repo: RepoRef,
     pub defaults: RepoPolicyDefaults,
+    pub query: RepoPolicyQuery,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +52,11 @@ pub struct RepoPolicyDefaults {
     pub state: Option<String>,
     pub labels: Vec<String>,
     pub source_types: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoPolicyQuery {
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -255,11 +261,12 @@ fn load_repo_policy_at(path: &Path) -> Result<RepoPolicy, QghError> {
     reject_local_path_like("repo.github", &policy.repo.github)?;
     let repo = parse_repo(&policy.repo.github).map_err(QghError::invalid_repo_policy)?;
     let defaults = parse_repo_policy_defaults(policy.defaults)?;
-    parse_repo_policy_query(policy.query)?;
+    let query = parse_repo_policy_query(policy.query)?;
     Ok(RepoPolicy {
         path: path.to_path_buf(),
         repo,
         defaults,
+        query,
     })
 }
 
@@ -313,13 +320,13 @@ fn parse_repo_policy_defaults(raw: RawRepoPolicyDefaults) -> Result<RepoPolicyDe
     })
 }
 
-fn parse_repo_policy_query(raw: RawRepoPolicyQuery) -> Result<(), QghError> {
+fn parse_repo_policy_query(raw: RawRepoPolicyQuery) -> Result<RepoPolicyQuery, QghError> {
     if raw.limit.is_some_and(|limit| limit == 0) {
         return Err(QghError::invalid_repo_policy(
             "Repo policy query.limit must be greater than zero.",
         ));
     }
-    Ok(())
+    Ok(RepoPolicyQuery { limit: raw.limit })
 }
 
 fn reject_local_path_like(field: &str, value: &str) -> Result<(), QghError> {

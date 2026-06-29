@@ -31,7 +31,7 @@
         },
         "profile_source": {
           "type": ["string", "null"],
-          "enum": ["cli", "env", "single_match", null]
+          "enum": ["cli", "env", "single_match", "get_args", null]
         },
         "repo": {
           "type": ["string", "null"],

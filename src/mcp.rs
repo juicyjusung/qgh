@@ -3,8 +3,8 @@ use crate::commands;
 use crate::error::QghError;
 use crate::output::{error_envelope, success_envelope_with_meta};
 use crate::resolution::{
-    repo_scope_from_command_arg, repo_scope_from_policy, resolve_context, ResolvedCommandContext,
-    ResolvedRepoScope,
+    repo_scope_from_command_arg, repo_scope_from_policy, resolve_context, resolve_explicit_context,
+    ResolvedCommandContext, ResolvedRepoScope,
 };
 use serde_json::{json, Map, Value};
 use std::io::{self, BufRead, Write};
@@ -106,9 +106,9 @@ fn tool_query(session: &McpSession, arguments: &Value) -> Result<Value, QghError
 }
 
 fn tool_get(session: &McpSession, arguments: &Value) -> Result<Value, QghError> {
-    let source_id = parse_get_args(arguments)?;
-    let context = resolve_mcp_context(session, repo_scope_from_policy()?)?;
-    let data = commands::get_local(&context.profile_id, &source_id)?;
+    let args = parse_get_args(arguments)?;
+    let context = resolve_mcp_get_context(session, args.profile_id.as_deref())?;
+    let data = commands::get_local(&context.profile_id, &args.source_id)?;
     Ok(tool_success(data, context.meta_json()))
 }
 
@@ -134,9 +134,51 @@ fn resolve_mcp_context(
     resolve_context(session.profile_arg.as_deref(), repo_scope)
 }
 
+fn resolve_mcp_get_context(
+    session: &McpSession,
+    get_args_profile_id: Option<&str>,
+) -> Result<ResolvedCommandContext, QghError> {
+    if let Some(session_profile_id) = session.profile_arg.as_deref() {
+        reject_profile_mismatch(session_profile_id, get_args_profile_id, "server --profile")?;
+        return resolve_context(Some(session_profile_id), repo_scope_from_policy()?);
+    }
+    if let Ok(env_profile_id) = std::env::var("QGH_PROFILE") {
+        reject_profile_mismatch(&env_profile_id, get_args_profile_id, "QGH_PROFILE")?;
+        return resolve_context(None, repo_scope_from_policy()?);
+    }
+    if let Some(profile_id) = get_args_profile_id {
+        return resolve_explicit_context(profile_id, "get_args", None);
+    }
+    resolve_context(None, repo_scope_from_policy()?)
+}
+
+fn reject_profile_mismatch(
+    boundary_profile_id: &str,
+    get_args_profile_id: Option<&str>,
+    boundary_source: &str,
+) -> Result<(), QghError> {
+    if get_args_profile_id.is_some_and(|profile_id| profile_id != boundary_profile_id) {
+        return Err(QghError::validation(
+            "validation.mcp",
+            format!("MCP get_args.profile_id cannot differ from {boundary_source}."),
+        )
+        .with_details(json!({
+            "boundary_profile_id": boundary_profile_id,
+            "get_args_profile_id": get_args_profile_id
+        }))
+        .with_hint("Start a separate MCP server for a different profile."));
+    }
+    Ok(())
+}
+
 struct ToolCall {
     name: String,
     arguments: Value,
+}
+
+struct GetArgs {
+    source_id: String,
+    profile_id: Option<String>,
 }
 
 fn parse_call(params: Option<&Value>) -> Result<ToolCall, QghError> {
@@ -166,7 +208,7 @@ fn parse_query_args(arguments: &Value) -> Result<QueryArgs, QghError> {
     )?;
     Ok(QueryArgs {
         query: required_string(object, "query")?,
-        limit: optional_usize(object, "limit")?.unwrap_or(10),
+        limit: optional_usize(object, "limit")?,
         repo: optional_string(object, "repo")?,
         label: optional_string_array(object, "label")?,
         state: optional_string(object, "state")?,
@@ -177,10 +219,13 @@ fn parse_query_args(arguments: &Value) -> Result<QueryArgs, QghError> {
     })
 }
 
-fn parse_get_args(arguments: &Value) -> Result<String, QghError> {
+fn parse_get_args(arguments: &Value) -> Result<GetArgs, QghError> {
     let object = argument_object(arguments)?;
-    reject_unknown(object, &["source_id"])?;
-    required_string(object, "source_id")
+    reject_unknown(object, &["source_id", "profile_id"])?;
+    Ok(GetArgs {
+        source_id: required_string(object, "source_id")?,
+        profile_id: optional_string(object, "profile_id")?,
+    })
 }
 
 fn parse_empty_args(arguments: &Value) -> Result<(), QghError> {
@@ -379,7 +424,8 @@ fn get_input_schema() -> Value {
         "type": "object",
         "required": ["source_id"],
         "properties": {
-            "source_id": { "type": "string" }
+            "source_id": { "type": "string" },
+            "profile_id": { "type": "string" }
         },
         "additionalProperties": false
     })
@@ -412,7 +458,7 @@ fn envelope_output_schema() -> Value {
                     },
                     "profile_source": {
                         "type": ["string", "null"],
-                        "enum": ["cli", "env", "single_match", null]
+                        "enum": ["cli", "env", "single_match", "get_args", null]
                     },
                     "repo": {
                         "type": ["string", "null"],

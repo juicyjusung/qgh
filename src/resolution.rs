@@ -1,4 +1,4 @@
-use crate::config::{discover_repo_policy, single_matching_profile_id};
+use crate::config::{discover_repo_policy, load_profile, single_matching_profile_id};
 use crate::error::QghError;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -23,20 +23,10 @@ pub(crate) fn resolve_context(
     repo_scope: Option<ResolvedRepoScope>,
 ) -> Result<ResolvedCommandContext, QghError> {
     if let Some(profile_id) = profile_arg {
-        return Ok(ResolvedCommandContext {
-            profile_id: profile_id.to_string(),
-            profile_source: "cli",
-            repo_scope,
-            allowlist_match_count: None,
-        });
+        return resolve_explicit_context(profile_id, "cli", repo_scope);
     }
     if let Ok(profile_id) = std::env::var("QGH_PROFILE") {
-        return Ok(ResolvedCommandContext {
-            profile_id,
-            profile_source: "env",
-            repo_scope,
-            allowlist_match_count: None,
-        });
+        return resolve_explicit_context(&profile_id, "env", repo_scope);
     }
     let profile_id =
         single_matching_profile_id(repo_scope.as_ref().map(|scope| scope.repo.as_str()))?;
@@ -46,6 +36,57 @@ pub(crate) fn resolve_context(
         repo_scope,
         allowlist_match_count: Some(1),
     })
+}
+
+pub(crate) fn resolve_explicit_context(
+    profile_id: &str,
+    profile_source: &'static str,
+    repo_scope: Option<ResolvedRepoScope>,
+) -> Result<ResolvedCommandContext, QghError> {
+    if let Some(scope) = &repo_scope {
+        validate_profile_allows_scope(profile_id, scope)?;
+    }
+    Ok(ResolvedCommandContext {
+        profile_id: profile_id.to_string(),
+        profile_source,
+        repo_scope,
+        allowlist_match_count: None,
+    })
+}
+
+fn validate_profile_allows_scope(
+    profile_id: &str,
+    repo_scope: &ResolvedRepoScope,
+) -> Result<(), QghError> {
+    let profile = load_profile(profile_id)?;
+    if profile.allows_repo(&repo_scope.repo) {
+        return Ok(());
+    }
+    let details = json!({
+        "profile_id": profile.id,
+        "repo": repo_scope.repo,
+        "repo_policy_path": repo_scope
+            .repo_policy_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+    });
+    if repo_scope.source == "repo_policy" {
+        return Err(QghError::invalid_repo_policy(format!(
+            "Repo policy repo `{}` is outside profile `{}` allowlist.",
+            repo_scope.repo, profile.id
+        ))
+        .with_details(details)
+        .with_hint("Update `.qgh.toml` or the profile repo allowlist."));
+    }
+    Err(QghError::validation(
+        "validation.invalid_repo",
+        format!(
+            "Repo `{}` is outside profile `{}` allowlist.",
+            repo_scope.repo, profile.id
+        ),
+    )
+    .with_details(details)
+    .with_hint("Use a repo from the profile allowlist or update the profile config."))
 }
 
 pub(crate) fn repo_scope_from_policy() -> Result<Option<ResolvedRepoScope>, QghError> {

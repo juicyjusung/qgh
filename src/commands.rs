@@ -130,8 +130,9 @@ pub fn query(profile_id: &str, args: QueryArgs) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
     let repo_policy = discover_repo_policy()?;
     let filters = QueryFilters::from_args(&args, &profile, repo_policy.as_ref())?;
+    let limit = effective_limit(&args, repo_policy.as_ref());
     let store = Store::open(&profile.paths)?;
-    if let Some(results) = exact_results(&store, &args.query, &filters)? {
+    if let Some(results) = exact_results(&store, &args.query, &filters, &profile.id)? {
         return Ok(json!({
             "profile_id": profile.id,
             "result_filtering": {
@@ -141,7 +142,7 @@ pub fn query(profile_id: &str, args: QueryArgs) -> Result<Value, QghError> {
         }));
     }
     let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
-    let hits = index::search(&active_index_path, &args.query, args.limit)?;
+    let hits = index::search(&active_index_path, &args.query, limit)?;
     let mut results = Vec::new();
     let mut unresolvable_hits = 0;
     for hit in hits {
@@ -152,7 +153,7 @@ pub fn query(profile_id: &str, args: QueryArgs) -> Result<Value, QghError> {
         if !filters.matches(&source) {
             continue;
         }
-        results.push(source_result(source, Ranking::Bm25(hit.score)));
+        results.push(source_result(source, Ranking::Bm25(hit.score), &profile.id));
     }
     Ok(json!({
         "profile_id": profile.id,
@@ -321,14 +322,21 @@ fn effective_source_types(repo_policy: Option<&RepoPolicy>) -> Vec<String> {
         .unwrap_or_else(|| vec!["issue".to_string(), "issue_comment".to_string()])
 }
 
+fn effective_limit(args: &QueryArgs, repo_policy: Option<&RepoPolicy>) -> usize {
+    args.limit
+        .or_else(|| repo_policy.and_then(|policy| policy.query.limit))
+        .unwrap_or(10)
+}
+
 fn exact_results(
     store: &Store,
     query_text: &str,
     filters: &QueryFilters,
+    profile_id: &str,
 ) -> Result<Option<Vec<Value>>, QghError> {
     if let Some(source) = exact_url_result(store, query_text)? {
         return Ok(Some(if filters.matches(&source) {
-            vec![source_result(source, Ranking::Exact)]
+            vec![source_result(source, Ranking::Exact, profile_id)]
         } else {
             Vec::new()
         }));
@@ -356,7 +364,7 @@ fn exact_results(
             .into_iter()
             .map(StoredSource::Issue)
             .filter(|source| filters.matches(source))
-            .map(|source| source_result(source, Ranking::Exact))
+            .map(|source| source_result(source, Ranking::Exact, profile_id))
             .collect(),
     ))
 }
@@ -625,14 +633,14 @@ enum Ranking {
     Exact,
 }
 
-fn source_result(source: StoredSource, ranking: Ranking) -> Value {
+fn source_result(source: StoredSource, ranking: Ranking, profile_id: &str) -> Value {
     match source {
-        StoredSource::Issue(issue) => issue_result(issue, ranking),
-        StoredSource::Comment(comment) => comment_result(comment, ranking),
+        StoredSource::Issue(issue) => issue_result(issue, ranking, profile_id),
+        StoredSource::Comment(comment) => comment_result(comment, ranking, profile_id),
     }
 }
 
-fn issue_result(issue: StoredIssue, ranking: Ranking) -> Value {
+fn issue_result(issue: StoredIssue, ranking: Ranking, profile_id: &str) -> Value {
     let source_id = issue.source_id;
     json!({
         "source_id": source_id,
@@ -643,7 +651,8 @@ fn issue_result(issue: StoredIssue, ranking: Ranking) -> Value {
         "canonical_url": issue.canonical_url,
         "snippet": snippet(&issue.body),
         "get_args": {
-            "source_id": source_id
+            "source_id": source_id,
+            "profile_id": profile_id
         },
         "parent_issue": Value::Null,
         "source_version": issue.source_version,
@@ -651,7 +660,7 @@ fn issue_result(issue: StoredIssue, ranking: Ranking) -> Value {
     })
 }
 
-fn comment_result(comment: StoredComment, ranking: Ranking) -> Value {
+fn comment_result(comment: StoredComment, ranking: Ranking, profile_id: &str) -> Value {
     let source_id = comment.source_id;
     json!({
         "source_id": source_id,
@@ -663,7 +672,8 @@ fn comment_result(comment: StoredComment, ranking: Ranking) -> Value {
         "parent_issue": comment.parent_issue,
         "snippet": snippet(&comment.body),
         "get_args": {
-            "source_id": source_id
+            "source_id": source_id,
+            "profile_id": profile_id
         },
         "source_version": comment.source_version,
         "ranking": ranking_json(ranking)

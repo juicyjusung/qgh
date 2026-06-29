@@ -4,8 +4,8 @@ use crate::error::QghError;
 use crate::mcp;
 use crate::output::{print_error, print_success};
 use crate::resolution::{
-    repo_scope_from_cli_arg, repo_scope_from_policy, resolve_context, ResolvedCommandContext,
-    ResolvedRepoScope,
+    repo_scope_from_cli_arg, repo_scope_from_policy, resolve_context, resolve_explicit_context,
+    ResolvedCommandContext, ResolvedRepoScope,
 };
 use clap::error::ErrorKind;
 use clap::Parser;
@@ -94,8 +94,48 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
 }
 
 fn resolve_command_context(cli: &Cli) -> Result<ResolvedCommandContext, QghError> {
+    if let crate::cli::Command::Get {
+        profile_id: Some(profile_id),
+        ..
+    } = &cli.command
+    {
+        return resolve_get_args_context(cli.profile.as_deref(), profile_id);
+    }
     let repo_scope = effective_repo_scope_for_command(&cli.command)?;
     resolve_context(cli.profile.as_deref(), repo_scope)
+}
+
+fn resolve_get_args_context(
+    cli_profile_arg: Option<&str>,
+    get_args_profile_id: &str,
+) -> Result<ResolvedCommandContext, QghError> {
+    if let Some(cli_profile_id) = cli_profile_arg {
+        reject_cli_profile_mismatch(cli_profile_id, get_args_profile_id, "--profile")?;
+        return resolve_explicit_context(get_args_profile_id, "get_args", None);
+    }
+    if let Ok(env_profile_id) = std::env::var("QGH_PROFILE") {
+        reject_cli_profile_mismatch(&env_profile_id, get_args_profile_id, "QGH_PROFILE")?;
+    }
+    resolve_explicit_context(get_args_profile_id, "get_args", None)
+}
+
+fn reject_cli_profile_mismatch(
+    boundary_profile_id: &str,
+    get_args_profile_id: &str,
+    boundary_source: &str,
+) -> Result<(), QghError> {
+    if get_args_profile_id != boundary_profile_id {
+        return Err(QghError::validation(
+            "validation.cli",
+            format!("get --profile-id cannot differ from {boundary_source}."),
+        )
+        .with_details(json!({
+            "boundary_profile_id": boundary_profile_id,
+            "get_args_profile_id": get_args_profile_id
+        }))
+        .with_hint("Use the profile_id emitted by the query result without a conflicting profile override."));
+    }
+    Ok(())
 }
 
 fn effective_repo_scope_for_command(
@@ -108,7 +148,13 @@ fn effective_repo_scope_for_command(
             }
             repo_scope_from_policy()
         }
-        crate::cli::Command::Get { .. }
+        crate::cli::Command::Get {
+            profile_id: Some(_),
+            ..
+        } => Ok(None),
+        crate::cli::Command::Get {
+            profile_id: None, ..
+        }
         | crate::cli::Command::Status { .. }
         | crate::cli::Command::Doctor { .. } => repo_scope_from_policy(),
         crate::cli::Command::Sync(_) => Ok(None),

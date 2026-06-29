@@ -41,7 +41,7 @@ CLI command envelopes and MCP structured tool content include Effective Scope
 metadata when resolution has run:
 
 - `meta.profile_id`: resolved profile id.
-- `meta.profile_source`: `cli`, `env`, or `single_match`.
+- `meta.profile_source`: `cli`, `env`, `single_match`, or `get_args`.
 - `meta.repo`: effective `owner/repo` scope, or `null` when the command has no repo scope.
 - `meta.repo_source`: `cli`, `repo_policy`, `command` for MCP tool arguments, or `null`.
 - `meta.repo_policy_path`: current worktree repo policy path when a repo policy supplied scope, otherwise `null`.
@@ -60,7 +60,8 @@ Every result includes:
 - `entity_type`: `issue` or `issue_comment`.
 - `canonical_url`: GitHub URL for the source.
 - `snippet`: short local preview text. The snippet is a preview, not citation evidence.
-- `get_args`: arguments that must round-trip through `get`.
+- `get_args`: arguments that must round-trip through `get`, including the
+  profile store that produced the result.
 - `parent_issue`: issue context for comments, or `null` for issue bodies.
 - `source_version`: body hash, GitHub updated timestamp, indexed timestamp, sync run, and lifecycle state.
 - `ranking`: typed ordering evidence. `lexical_score` is a BM25 ordering signal, not confidence or probability.
@@ -70,7 +71,10 @@ Query results intentionally omit `body`. Use the `get` response when source text
 ## Citation Flow
 
 1. Run `query` to find source candidates.
-2. Run `get` with the result's `get_args.source_id`.
+2. Run `get` with the result's `get_args.source_id` and
+   `get_args.profile_id`. For CLI automation, pass `get_args.profile_id` as
+   `get --profile-id <profile_id>`; for MCP, pass it as the `profile_id`
+   argument.
 3. Use the `get` response `source.source_id`, `source.canonical_url`, and source text for the final citation.
 
 Citation example from a `get` response:
