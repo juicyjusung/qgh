@@ -12,6 +12,18 @@ _Avoid_: workspace, project, implicit repo
 The explicit list of GitHub repositories a profile may sync and query.
 _Avoid_: org discovery, fallback repo, current-directory inference
 
+**Repo Policy**:
+A repository-owned retrieval policy that defines safe default query scope and filters for that repository without defining credentials, token source, or local storage.
+_Avoid_: profile, token config, personal binding
+
+**Repo Scope**:
+The subset of a profile corpus limited to one repository's issues and issue comments.
+_Avoid_: issue focus, branch task, current ticket
+
+**Effective Scope**:
+The final bounded retrieval scope for a command after combining explicit CLI inputs, environment inputs, repo policy, and profile constraints.
+_Avoid_: implicit repo, guessed context
+
 **Corpus**:
 The set of source entities and source versions currently indexed for one profile.
 _Avoid_: knowledge base, dataset

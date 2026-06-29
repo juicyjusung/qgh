@@ -1,5 +1,5 @@
 use crate::cli::{QueryArgs, ReconcileMode};
-use crate::config::{load_profile, resolve_token};
+use crate::config::{discover_repo_policy, load_profile, resolve_token, Profile, RepoPolicy};
 use crate::error::QghError;
 use crate::github;
 use crate::index;
@@ -127,8 +127,9 @@ pub async fn sync(profile_id: &str, reconcile: Option<ReconcileMode>) -> Result<
 }
 
 pub fn query(profile_id: &str, args: QueryArgs) -> Result<Value, QghError> {
-    let filters = QueryFilters::from_args(&args)?;
     let profile = load_profile(profile_id)?;
+    let repo_policy = discover_repo_policy()?;
+    let filters = QueryFilters::from_args(&args, &profile, repo_policy.as_ref())?;
     let store = Store::open(&profile.paths)?;
     if let Some(results) = exact_results(&store, &args.query, &filters)? {
         return Ok(json!({
@@ -169,47 +170,48 @@ struct QueryFilters {
     state: Option<String>,
     author: Option<String>,
     issue: Option<i64>,
+    source_types: Vec<String>,
 }
 
 impl QueryFilters {
-    fn from_args(args: &QueryArgs) -> Result<Self, QghError> {
+    fn from_args(
+        args: &QueryArgs,
+        profile: &Profile,
+        repo_policy: Option<&RepoPolicy>,
+    ) -> Result<Self, QghError> {
         if args.wiki.is_some() {
             return Err(QghError::validation(
                 "validation.unsupported_filter",
                 "Wiki filters are post-MVP and unsupported.",
             ));
         }
-        if let Some(repo) = &args.repo {
-            validate_repo(repo)?;
-        }
-        if let Some(state) = &args.state {
-            if !matches!(state.as_str(), "open" | "closed") {
-                return Err(QghError::validation(
-                    "validation.invalid_state",
-                    "State filter must be `open` or `closed`.",
-                ));
-            }
-        }
+        let repo = effective_repo(args, profile, repo_policy)?;
+        let state = effective_state(args, repo_policy)?;
+        let labels = effective_labels(args, repo_policy);
+        let source_types = effective_source_types(repo_policy);
         Ok(Self {
-            repo: args.repo.clone(),
-            labels: args.label.clone(),
-            state: args.state.clone(),
+            repo,
+            labels,
+            state,
             author: args.author.clone(),
             issue: args.issue,
+            source_types,
         })
     }
 
     fn matches(&self, source: &StoredSource) -> bool {
         match source {
             StoredSource::Issue(issue) => {
-                self.repo_matches(&issue.repo)
+                self.source_type_matches("issue")
+                    && self.repo_matches(&issue.repo)
                     && self.issue_matches(issue.number)
                     && self.author_matches(issue.author.as_deref())
                     && self.state_matches(Some(&issue.state))
                     && self.labels.iter().all(|label| issue.labels.contains(label))
             }
             StoredSource::Comment(comment) => {
-                self.repo_matches(&comment.repo)
+                self.source_type_matches("issue_comment")
+                    && self.repo_matches(&comment.repo)
                     && self.issue_matches(comment.issue_number)
                     && self.author_matches(comment.author.as_deref())
                     && self.state.is_none()
@@ -237,6 +239,86 @@ impl QueryFilters {
             .as_ref()
             .is_none_or(|expected| state == Some(expected))
     }
+
+    fn source_type_matches(&self, source_type: &str) -> bool {
+        self.source_types
+            .iter()
+            .any(|allowed| allowed == source_type)
+    }
+}
+
+fn effective_repo(
+    args: &QueryArgs,
+    profile: &Profile,
+    repo_policy: Option<&RepoPolicy>,
+) -> Result<Option<String>, QghError> {
+    if let Some(repo) = &args.repo {
+        validate_repo(repo)?;
+        if !profile.allows_repo(repo) {
+            return Err(QghError::validation(
+                "validation.invalid_repo",
+                format!(
+                    "Repo `{repo}` is outside profile `{}` allowlist.",
+                    profile.id
+                ),
+            )
+            .with_details(json!({
+                "profile_id": profile.id,
+                "repo": repo
+            }))
+            .with_hint("Use a repo from the profile allowlist or update the profile config."));
+        }
+        return Ok(Some(repo.clone()));
+    }
+
+    let Some(repo_policy) = repo_policy else {
+        return Ok(None);
+    };
+    let repo = repo_policy.repo.full_name();
+    if !profile.allows_repo(&repo) {
+        return Err(QghError::invalid_repo_policy(format!(
+            "Repo policy repo `{repo}` is outside profile `{}` allowlist.",
+            profile.id
+        ))
+        .with_details(json!({
+            "profile_id": profile.id,
+            "repo": repo,
+            "repo_policy_path": repo_policy.path
+        }))
+        .with_hint("Update `.qgh.toml` or the profile repo allowlist."));
+    }
+    Ok(Some(repo))
+}
+
+fn effective_state(
+    args: &QueryArgs,
+    repo_policy: Option<&RepoPolicy>,
+) -> Result<Option<String>, QghError> {
+    if let Some(state) = &args.state {
+        if !matches!(state.as_str(), "open" | "closed") {
+            return Err(QghError::validation(
+                "validation.invalid_state",
+                "State filter must be `open` or `closed`.",
+            ));
+        }
+        return Ok(Some(state.clone()));
+    }
+    Ok(repo_policy.and_then(|policy| policy.defaults.state.clone()))
+}
+
+fn effective_labels(args: &QueryArgs, repo_policy: Option<&RepoPolicy>) -> Vec<String> {
+    if !args.label.is_empty() {
+        return args.label.clone();
+    }
+    repo_policy
+        .map(|policy| policy.defaults.labels.clone())
+        .unwrap_or_default()
+}
+
+fn effective_source_types(repo_policy: Option<&RepoPolicy>) -> Vec<String> {
+    repo_policy
+        .map(|policy| policy.defaults.source_types.clone())
+        .unwrap_or_else(|| vec!["issue".to_string(), "issue_comment".to_string()])
 }
 
 fn exact_results(

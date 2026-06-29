@@ -28,6 +28,7 @@ Loops must never auto-edit these without explicit human approval:
 Escalate to human review for any change involving:
 
 - Repo allowlist behavior
+- Repo policy and profile resolution behavior
 - Source identity, locators, Source Version, tombstone, or reconciliation
 - Citation Contract semantics
 - Strict CLI/config/MCP schema validation

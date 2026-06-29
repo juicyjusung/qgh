@@ -11,6 +11,7 @@
 개정: 2026-06-29 — MVP scope reset (GitHub Issues와 issue comments만 포함, Wiki는 post-MVP)
 개정: 2026-06-29 — architecture lock (Rust single-binary CLI, XDG profile store, bundled SQLite authoritative store, Tantivy derived BM25 index)
 개정: 2026-06-29 — grill closure (CLI-only doctor, REST sync scheduler contract, user-facing eval deferral)
+개정: 2026-06-29 — config policy (worktree-root repo policy for query repo scope defaults)
 
 ## 1. 제품 정의
 
@@ -85,6 +86,7 @@ MVP는 작은 범위를 강하게 검증한다.
 - 명시적 repo allowlist
 - Rust single-binary CLI/MCP
 - XDG config/data/cache 기반 explicit profile store (`--profile` required, data path override 없음)
+- current git worktree root의 tracked `.qgh.toml` repo policy로 CLI query/search 기본 repo scope와 safe filters 제공
 - GitHub Issues title/body metadata sync
 - issue comments sync
 - bundled SQLite authoritative store
@@ -103,8 +105,8 @@ MVP는 작은 범위를 강하게 검증한다.
 
 ### MVP에서 반드시 지킬 제약
 
-- repo는 사용자가 명시해야 한다.
-- 모든 command는 명시적 `--profile`을 요구하고 implicit CWD/HOME/env fallback으로 corpus를 선택하지 않는다.
+- repo allowlist는 profile config에 명시해야 한다. CLI query/search는 explicit `--repo`가 없을 때 current git worktree root의 repo policy로 기본 repo scope를 정할 수 있지만 profile allowlist 밖으로 넓힐 수 없다.
+- 모든 command는 명시적 `--profile`을 요구하고 implicit CWD/HOME/env fallback으로 profile corpus를 선택하지 않는다.
 - hosted embedding/rerank는 기본값이 아니다.
 - vector 기능이 없어도 sync/query/get/status는 작동해야 한다.
 - `status`는 local-only snapshot이고, network/auth/schema probe는 CLI-only `doctor`에서만 수행한다.
@@ -134,11 +136,11 @@ MVP에서 제외할 항목은 제품 집중도를 지키기 위한 의도적 결
 
 ### 6.1 초기 설정
 
-사용자는 검색하고 싶은 repo를 `~/.config/qgh/config.toml`의 strict TOML profile에 명시한다. qgh는 token source, GitHub host, repo allowlist를 하나의 profile로 고정하고, SQLite/Tantivy data path는 XDG data dir과 profile id에서 파생한다. CLI와 MCP 모두 `--profile` 없이 실행되면 실패한다.
+사용자는 검색하고 싶은 repo를 `~/.config/qgh/config.toml`의 strict TOML profile에 명시한다. qgh는 token source, GitHub host, repo allowlist를 하나의 profile로 고정하고, SQLite/Tantivy data path는 XDG data dir과 profile id에서 파생한다. Repository는 tracked `.qgh.toml`로 query/search의 기본 repo scope와 safe filters를 정의할 수 있지만 profile id, token source, literal token, profile store path, arbitrary DB path, user-local absolute path는 정의할 수 없다. CLI와 MCP 모두 `--profile` 없이 실행되면 실패한다.
 
 성공 경험:
 
-- 어떤 repo가 인덱싱되는지 명확하다.
+- 어떤 repo가 인덱싱되는지 명확하고, repo worktree에서 query/search 기본 scope가 profile allowlist 안의 current repo로 제한된다.
 - CLI와 MCP가 같은 profile, 같은 SQLite store, 같은 Tantivy index를 본다.
 - 잘못된 repo, 누락된 token, unknown config key는 조용히 무시되지 않고 실패한다.
 
@@ -158,7 +160,7 @@ MVP에서 제외할 항목은 제품 집중도를 지키기 위한 의도적 결
 
 ### 6.3 검색
 
-사용자 또는 agent는 자연어, keyword, issue number, repo/label/state 같은 filter로 검색한다. 결과는 답변이 아니라 source 후보로 표시된다.
+사용자 또는 agent는 자연어, keyword, issue number, repo/label/state 같은 filter로 검색한다. current git worktree root에 repo policy가 있으면 CLI query/search 기본 repo scope는 해당 repository의 Issues/comments다. Explicit `--repo`는 repo policy 기본값을 override할 수 있지만 profile allowlist 밖 repo는 structured error로 실패한다. 결과는 답변이 아니라 source 후보로 표시된다.
 
 성공 경험:
 

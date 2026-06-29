@@ -42,6 +42,10 @@ impl QghError {
         Self::new("config.invalid", message, 2)
     }
 
+    pub fn invalid_repo_policy(message: impl Into<String>) -> Self {
+        Self::new("config.invalid_repo_policy", message, 2)
+    }
+
     pub fn validation(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::new(code, message, 2)
     }
