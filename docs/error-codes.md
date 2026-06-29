@@ -13,6 +13,6 @@ Stable error families:
 - `index.*`: Tantivy index failures.
 - `internal.*`: unexpected internal failures.
 
-Common codes include `config.invalid_repo_policy`, `validation.cli`, `validation.mcp`, `validation.unsupported_filter`, `auth.token_unavailable`, `source.not_found`, and `source.tombstoned`.
+Common codes include `config.no_matching_profile`, `config.ambiguous_profile`, `config.invalid_repo_policy`, `validation.cli`, `validation.mcp`, `validation.unsupported_filter`, `auth.token_unavailable`, `source.not_found`, and `source.tombstoned`.
 
 Human output and JSON output share exit-code classes. Human diagnostics go to stderr; JSON envelopes go to stdout.

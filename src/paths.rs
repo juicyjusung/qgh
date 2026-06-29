@@ -16,14 +16,13 @@ pub struct ProfilePaths {
 
 impl ProfilePaths {
     pub fn resolve(profile_id: &str) -> Result<Self, QghError> {
-        let config_home = xdg_or_home("XDG_CONFIG_HOME", ".config")?;
         let data_home = xdg_or_home("XDG_DATA_HOME", ".local/share")?;
         let cache_home = xdg_or_home("XDG_CACHE_HOME", ".cache")?;
         let profile_dir = data_home.join("qgh").join("profiles").join(profile_id);
         let index_root = profile_dir.join("tantivy");
         let cache_dir = cache_home.join("qgh");
         Ok(Self {
-            config_file: config_home.join("qgh").join("config.toml"),
+            config_file: config_file_path()?,
             profile_dir: profile_dir.clone(),
             log_dir: cache_dir.join("logs"),
             cache_dir,
@@ -32,6 +31,12 @@ impl ProfilePaths {
             index_root,
         })
     }
+}
+
+pub fn config_file_path() -> Result<PathBuf, QghError> {
+    Ok(xdg_or_home("XDG_CONFIG_HOME", ".config")?
+        .join("qgh")
+        .join("config.toml"))
 }
 
 fn xdg_or_home(env_name: &str, suffix: &str) -> Result<PathBuf, QghError> {

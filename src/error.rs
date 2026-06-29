@@ -38,6 +38,32 @@ impl QghError {
             .with_hint("Run qgh with --profile <profile-id>.")
     }
 
+    pub fn no_matching_profile(repo: Option<&str>) -> Self {
+        let details = repo
+            .map(|repo| json!({ "repo": repo }))
+            .unwrap_or_else(|| json!({}));
+        Self::new(
+            "config.no_matching_profile",
+            "No configured profile matches the effective repo scope.",
+            2,
+        )
+        .with_details(details)
+        .with_hint("Run qgh with --profile <profile-id> or configure a matching repo allowlist.")
+    }
+
+    pub fn ambiguous_profile(repo: &str, matching_profile_ids: Vec<String>) -> Self {
+        Self::new(
+            "config.ambiguous_profile",
+            "Multiple configured profiles match the effective repo scope.",
+            2,
+        )
+        .with_details(json!({
+            "repo": repo,
+            "matching_profile_ids": matching_profile_ids
+        }))
+        .with_hint("Run qgh with --profile <profile-id>.")
+    }
+
     pub fn config(message: impl Into<String>) -> Self {
         Self::new("config.invalid", message, 2)
     }

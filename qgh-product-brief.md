@@ -12,6 +12,7 @@
 개정: 2026-06-29 — architecture lock (Rust single-binary CLI, XDG profile store, bundled SQLite authoritative store, Tantivy derived BM25 index)
 개정: 2026-06-29 — grill closure (CLI-only doctor, REST sync scheduler contract, user-facing eval deferral)
 개정: 2026-06-29 — config policy (worktree-root repo policy for query repo scope defaults)
+개정: 2026-06-29 — profile resolution (CLI/env/single-match profile precedence)
 
 ## 1. 제품 정의
 
@@ -85,7 +86,7 @@ MVP는 작은 범위를 강하게 검증한다.
 
 - 명시적 repo allowlist
 - Rust single-binary CLI/MCP
-- XDG config/data/cache 기반 explicit profile store (`--profile` required, data path override 없음)
+- XDG config/data/cache 기반 profile store (`--profile`/`QGH_PROFILE` 우선, repo scope single-match profile resolution 허용, data path override 없음)
 - current git worktree root의 tracked `.qgh.toml` repo policy로 CLI query/search 기본 repo scope와 safe filters 제공
 - GitHub Issues title/body metadata sync
 - issue comments sync
@@ -106,7 +107,7 @@ MVP는 작은 범위를 강하게 검증한다.
 ### MVP에서 반드시 지킬 제약
 
 - repo allowlist는 profile config에 명시해야 한다. CLI query/search는 explicit `--repo`가 없을 때 current git worktree root의 repo policy로 기본 repo scope를 정할 수 있지만 profile allowlist 밖으로 넓힐 수 없다.
-- 모든 command는 명시적 `--profile`을 요구하고 implicit CWD/HOME/env fallback으로 profile corpus를 선택하지 않는다.
+- profile resolution은 CLI `--profile` > `QGH_PROFILE` > repo scope single-match 순서다. Repo scope 없이 configured profile 개수만 보고 profile을 고르지 않는다.
 - hosted embedding/rerank는 기본값이 아니다.
 - vector 기능이 없어도 sync/query/get/status는 작동해야 한다.
 - `status`는 local-only snapshot이고, network/auth/schema probe는 CLI-only `doctor`에서만 수행한다.
@@ -136,13 +137,13 @@ MVP에서 제외할 항목은 제품 집중도를 지키기 위한 의도적 결
 
 ### 6.1 초기 설정
 
-사용자는 검색하고 싶은 repo를 `~/.config/qgh/config.toml`의 strict TOML profile에 명시한다. qgh는 token source, GitHub host, repo allowlist를 하나의 profile로 고정하고, SQLite/Tantivy data path는 XDG data dir과 profile id에서 파생한다. Repository는 tracked `.qgh.toml`로 query/search의 기본 repo scope와 safe filters를 정의할 수 있지만 profile id, token source, literal token, profile store path, arbitrary DB path, user-local absolute path는 정의할 수 없다. CLI와 MCP 모두 `--profile` 없이 실행되면 실패한다.
+사용자는 검색하고 싶은 repo를 `~/.config/qgh/config.toml`의 strict TOML profile에 명시한다. qgh는 token source, GitHub host, repo allowlist를 하나의 profile로 고정하고, SQLite/Tantivy data path는 XDG data dir과 profile id에서 파생한다. Repository는 tracked `.qgh.toml`로 query/search의 기본 repo scope와 safe filters를 정의할 수 있지만 profile id, token source, literal token, profile store path, arbitrary DB path, user-local absolute path는 정의할 수 없다. CLI `--profile`과 `QGH_PROFILE`이 없으면 effective repo scope를 allowlist에 포함하는 profile이 정확히 하나일 때만 profile을 자동 선택한다.
 
 성공 경험:
 
 - 어떤 repo가 인덱싱되는지 명확하고, repo worktree에서 query/search 기본 scope가 profile allowlist 안의 current repo로 제한된다.
 - CLI와 MCP가 같은 profile, 같은 SQLite store, 같은 Tantivy index를 본다.
-- 잘못된 repo, 누락된 token, unknown config key는 조용히 무시되지 않고 실패한다.
+- 잘못된 repo, 누락된 token, unknown config key, no matching profile, ambiguous profile은 조용히 무시되지 않고 실패한다.
 
 ### 6.2 동기화
 
@@ -217,7 +218,7 @@ MCP client는 `query -> get -> cite` 순서로 qgh를 사용한다. MCP v1은 re
 
 - 검색 결과가 좋아 보여도 `get`으로 원문을 확인할 수 없다.
 - hosted embedding을 켜야만 쓸 만하다.
-- implicit repo/profile fallback 때문에 CLI와 MCP가 다른 corpus를 검색한다.
+- repo scope 없는 implicit profile fallback 때문에 CLI와 MCP가 다른 corpus를 검색한다.
 - shared server/ACL 문제를 풀기 전에 MVP가 조직형 플랫폼으로 커진다.
 
 ## 8. 주요 리스크

@@ -1282,9 +1282,111 @@ fn missing_profile_is_a_structured_usage_error() {
 
     let json = stdout_json(&output);
     assert_eq!(json["ok"], false);
-    assert_eq!(json["error"]["code"], "config.missing_profile");
+    assert_eq!(json["error"]["code"], "config.no_matching_profile");
     assert_eq!(json["error"]["exit_code"], 2);
     assert!(stderr_text(&output).is_empty());
+}
+
+#[test]
+fn profile_resolution_uses_cli_then_env_then_repo_scope_single_match() {
+    let fixture = TestFixture::new("profile-resolution-precedence");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_work_and_alt_profiles(&server.base_url);
+    let nested_worktree_dir = fixture.init_git_worktree_with_repo_policy("owner/repo");
+
+    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--json"]));
+
+    let mut cli_over_env = fixture.base_command();
+    let cli_over_env = cli_over_env
+        .current_dir(&nested_worktree_dir)
+        .env("QGH_PROFILE", "alt")
+        .args(["--profile", "work", "status", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&cli_over_env);
+    assert_eq!(stdout_json(&cli_over_env)["data"]["profile_id"], "work");
+
+    let mut env_profile = fixture.base_command();
+    let env_profile = env_profile
+        .current_dir(&nested_worktree_dir)
+        .env("QGH_PROFILE", "alt")
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&env_profile);
+    assert_eq!(stdout_json(&env_profile)["data"]["profile_id"], "alt");
+
+    let single_match_query = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        ["query", "shared repo policy tracer", "--json"],
+    );
+    assert_success(&single_match_query);
+    let single_match_json = stdout_json(&single_match_query);
+    assert_eq!(single_match_json["data"]["profile_id"], "work");
+    assert_eq!(
+        single_match_json["data"]["results"][0]["repo"],
+        "owner/repo"
+    );
+
+    let status = fixture.qgh_without_profile_in(&nested_worktree_dir, ["status", "--json"]);
+    assert_success(&status);
+    assert_eq!(stdout_json(&status)["data"]["profile_id"], "work");
+
+    let get = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        ["get", "qgh://github.com/issue/I_POLICY_OWNER", "--json"],
+    );
+    assert_success(&get);
+    assert_eq!(stdout_json(&get)["data"]["profile_id"], "work");
+}
+
+#[test]
+fn profile_resolution_reports_no_match_and_ambiguous_match() {
+    let fixture = TestFixture::new("profile-resolution-errors");
+    fixture.write_config_with_repos("http://127.0.0.1:1", &["other/repo"]);
+    let nested_worktree_dir = fixture.init_git_worktree_with_repo_policy("owner/repo");
+
+    let no_match =
+        fixture.qgh_without_profile_in(&nested_worktree_dir, ["query", "anything", "--json"]);
+    assert_eq!(no_match.status.code(), Some(2));
+    let no_match_json = stdout_json(&no_match);
+    assert_eq!(no_match_json["error"]["code"], "config.no_matching_profile");
+    assert_eq!(no_match_json["error"]["details"]["repo"], "owner/repo");
+    assert!(no_match_json["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .contains("--profile"));
+
+    fixture.write_config_with_duplicate_owner_profiles("http://127.0.0.1:1");
+    let ambiguous =
+        fixture.qgh_without_profile_in(&nested_worktree_dir, ["query", "anything", "--json"]);
+    assert_eq!(ambiguous.status.code(), Some(2));
+    let ambiguous_json = stdout_json(&ambiguous);
+    assert_eq!(ambiguous_json["error"]["code"], "config.ambiguous_profile");
+    assert_eq!(ambiguous_json["error"]["details"]["repo"], "owner/repo");
+    assert_eq!(
+        ambiguous_json["error"]["details"]["matching_profile_ids"],
+        json!(["other", "work"])
+    );
+}
+
+#[test]
+fn env_profile_resolution_preserves_token_source_strictness() {
+    let fixture = TestFixture::new("profile-resolution-token-source");
+    fixture.write_config_with_missing_token_profile("http://127.0.0.1:1");
+
+    let mut sync = fixture.base_command();
+    let sync = sync
+        .env("QGH_PROFILE", "strict")
+        .env_remove("QGH_MISSING_TOKEN")
+        .args(["sync", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(sync.status.code(), Some(3));
+    assert_eq!(
+        stdout_json(&sync)["error"]["code"],
+        "auth.token_unavailable"
+    );
 }
 
 #[test]
@@ -1542,6 +1644,83 @@ env = "QGH_TEST_TOKEN"
         fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
     }
 
+    fn write_config_with_work_and_alt_profiles(&self, api_base_url: &str) {
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+
+[profiles.alt]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["other/repo"]
+
+[profiles.alt.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
+    }
+
+    fn write_config_with_duplicate_owner_profiles(&self, api_base_url: &str) {
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[profiles.other]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.other.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
+    }
+
+    fn write_config_with_missing_token_profile(&self, api_base_url: &str) {
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[profiles.strict]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.strict.token_source]
+type = "env"
+env = "QGH_MISSING_TOKEN"
+"#
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
+    }
+
     fn write_config_with_reconcile_after(
         &self,
         api_base_url: &str,
@@ -1621,6 +1800,12 @@ limit = 10
         cmd.output().unwrap()
     }
 
+    fn qgh_without_profile_in<const N: usize>(&self, cwd: &Path, args: [&str; N]) -> Output {
+        let mut cmd = self.base_command();
+        cmd.current_dir(cwd).args(args);
+        cmd.output().unwrap()
+    }
+
     fn mcp<const N: usize>(&self, messages: [Value; N]) -> Output {
         let mut cmd = self.base_command();
         cmd.args(["--profile", "work", "mcp"])
@@ -1652,6 +1837,7 @@ limit = 10
             .env("XDG_DATA_HOME", &self.data_home)
             .env("XDG_CACHE_HOME", &self.cache_home)
             .env("QGH_TEST_TOKEN", "fixture-token")
+            .env_remove("QGH_PROFILE")
             .env_remove("RUST_LOG")
             .current_dir(&self.root);
         cmd
@@ -1915,12 +2101,16 @@ fn handle_multi_repo_connection(mut stream: TcpStream) {
         ("200 OK", multi_repo_owner_issue_payload())
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?") {
         ("200 OK", "[]")
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/42 ") {
+        ("200 OK", multi_repo_owner_issue_object_payload())
     } else if request_line.starts_with("GET /repos/other/repo/issues?")
         && request_line.contains("state=all")
     {
         ("200 OK", multi_repo_other_issue_payload())
     } else if request_line.starts_with("GET /repos/other/repo/issues/7/comments?") {
         ("200 OK", "[]")
+    } else if request_line.starts_with("GET /repos/other/repo/issues/7 ") {
+        ("200 OK", multi_repo_other_issue_object_payload())
     } else {
         ("404 Not Found", r#"{"message":"not found"}"#)
     };
@@ -1954,6 +2144,27 @@ fn multi_repo_owner_issue_payload() -> &'static str {
     ]"#
 }
 
+fn multi_repo_owner_issue_object_payload() -> &'static str {
+    r#"{
+        "id": 3001,
+        "node_id": "I_POLICY_OWNER",
+        "number": 42,
+        "title": "Owner repo policy issue",
+        "body": "shared repo policy tracer from the owner repository.",
+        "state": "open",
+        "locked": false,
+        "comments": 0,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:05Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}],
+        "milestone": null,
+        "assignees": []
+    }"#
+}
+
 fn multi_repo_other_issue_payload() -> &'static str {
     r#"[
       {
@@ -1975,6 +2186,27 @@ fn multi_repo_other_issue_payload() -> &'static str {
         "assignees": []
       }
     ]"#
+}
+
+fn multi_repo_other_issue_object_payload() -> &'static str {
+    r#"{
+        "id": 3002,
+        "node_id": "I_POLICY_OTHER",
+        "number": 7,
+        "title": "Other repo policy issue",
+        "body": "shared repo policy tracer from the other repository.",
+        "state": "open",
+        "locked": false,
+        "comments": 0,
+        "html_url": "https://github.com/other/repo/issues/7",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:05Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}],
+        "milestone": null,
+        "assignees": []
+    }"#
 }
 
 fn handle_connection(

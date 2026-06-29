@@ -1,5 +1,5 @@
 use crate::error::QghError;
-use crate::paths::ProfilePaths;
+use crate::paths::{config_file_path, ProfilePaths};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -121,11 +121,48 @@ struct RawRepoPolicyQuery {
 
 pub fn load_profile(profile_id: &str) -> Result<Profile, QghError> {
     validate_profile_id(profile_id)?;
-    let paths = ProfilePaths::resolve(profile_id)?;
-    let text = fs::read_to_string(&paths.config_file).map_err(|error| {
+    let config = load_config_file()?;
+    let Some(raw) = config.profiles.get(profile_id) else {
+        return Err(QghError::config(format!(
+            "Profile `{profile_id}` is not defined."
+        )));
+    };
+    profile_from_raw(profile_id, raw)
+}
+
+pub fn single_matching_profile_id(repo_scope: Option<&str>) -> Result<String, QghError> {
+    let Some(repo_scope) = repo_scope else {
+        return Err(QghError::no_matching_profile(None));
+    };
+    let config = load_config_file()?;
+    let mut matches = Vec::new();
+    for (profile_id, raw) in &config.profiles {
+        validate_profile_id(profile_id)?;
+        if raw
+            .repos
+            .iter()
+            .map(|repo| parse_repo(repo))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|message| QghError::config(format!("Profile `{profile_id}` {message}")))?
+            .iter()
+            .any(|repo| repo.full_name() == repo_scope)
+        {
+            matches.push(profile_id.clone());
+        }
+    }
+    match matches.len() {
+        0 => Err(QghError::no_matching_profile(Some(repo_scope))),
+        1 => Ok(matches.remove(0)),
+        _ => Err(QghError::ambiguous_profile(repo_scope, matches)),
+    }
+}
+
+fn load_config_file() -> Result<ConfigFile, QghError> {
+    let config_file = config_file_path()?;
+    let text = fs::read_to_string(&config_file).map_err(|error| {
         QghError::config(format!(
             "Failed to read config at {}: {error}",
-            paths.config_file.display()
+            config_file.display()
         ))
     })?;
     let config: ConfigFile = toml::from_str(&text)
@@ -133,11 +170,11 @@ pub fn load_profile(profile_id: &str) -> Result<Profile, QghError> {
     if config.schema_version != "qgh.config.v1" {
         return Err(QghError::config("Unsupported config schema_version."));
     }
-    let Some(raw) = config.profiles.get(profile_id) else {
-        return Err(QghError::config(format!(
-            "Profile `{profile_id}` is not defined."
-        )));
-    };
+    Ok(config)
+}
+
+fn profile_from_raw(profile_id: &str, raw: &RawProfile) -> Result<Profile, QghError> {
+    let paths = ProfilePaths::resolve(profile_id)?;
     if raw.repos.is_empty() {
         return Err(QghError::config("Profile repos must not be empty."));
     }

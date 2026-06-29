@@ -32,6 +32,8 @@
       "enum": [
         "config.invalid",
         "config.missing_profile",
+        "config.no_matching_profile",
+        "config.ambiguous_profile",
         "config.invalid_repo_policy",
         "validation.cli",
         "validation.invalid_query",

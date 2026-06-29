@@ -12,6 +12,10 @@ _Avoid_: workspace, project, implicit repo
 The explicit list of GitHub repositories a profile may sync and query.
 _Avoid_: org discovery, fallback repo, current-directory inference
 
+**Profile Resolution**:
+The process that selects a profile from an explicit CLI input, explicit environment input, or exactly one profile whose repo allowlist contains the requested repo scope.
+_Avoid_: default profile, account fallback
+
 **Repo Policy**:
 A repository-owned retrieval policy that defines safe default query scope and filters for that repository without defining credentials, token source, or local storage.
 _Avoid_: profile, token config, personal binding
