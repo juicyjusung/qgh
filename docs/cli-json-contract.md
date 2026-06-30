@@ -19,6 +19,12 @@ summary to stdout. `sync --json` and `sync --quiet` suppress progress
 diagnostics. Progress lines and human summaries are not a stable
 machine-readable API; use `--json` for automation.
 
+`sync issue <number>` is the explicit targeted refresh path for one issue and
+its complete per-issue comment list. Its `sync` envelope includes `target`,
+`lifecycle`, and comment diff counts (`added`, `updated`, `deleted`) in addition
+to the normal sync/index summary fields. Transfer, delete, and permission-loss
+lifecycle changes are reported as distinct reason codes.
+
 Success:
 
 - `schema_version`: `qgh.v1`
@@ -74,8 +80,9 @@ it is optimized for a person reading the terminal:
 
 - `init`: profile id/action, repo allowlist action, token source reference,
   config path, repo policy action/path, and next commands.
-- `sync`: synced repo scope, fetched/upserted issue and comment counts, backoff
-  state, active index generation, and next query command.
+- `sync`: synced repo scope, fetched/upserted issue and comment counts, targeted
+  comment diff counts when present, backoff state, active index generation, and
+  next query command.
 - `query`/`search`: source-candidate list, not answers. It states that snippets
   are previews, not citation evidence, and shows `qgh get <source_id>
   --profile-id <profile_id>` for each result.

@@ -193,6 +193,21 @@ fn render_sync(data: &Value, meta: &Value) -> String {
                 display_at(data, &["comments", "upserted"])
             ),
         );
+        if data
+            .get("comments")
+            .and_then(|comments| comments.get("added"))
+            .is_some()
+        {
+            line(
+                &mut out,
+                format_args!(
+                    "comment changes: added {}, updated {}, deleted {}",
+                    display_at(data, &["comments", "added"]),
+                    display_at(data, &["comments", "updated"]),
+                    display_at(data, &["comments", "deleted"])
+                ),
+            );
+        }
     }
     line(
         &mut out,

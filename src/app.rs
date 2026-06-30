@@ -96,14 +96,27 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
 
     let mut data = match command {
         crate::cli::Command::Sync(args) => {
-            let show_progress = !args.json && !args.quiet;
-            commands::sync(
-                &profile_id,
-                args.reconcile,
-                context.repo_scope.as_ref(),
-                show_progress,
-            )
-            .await
+            let show_progress = !args.wants_json() && !args.quiet();
+            match &args.target {
+                Some(crate::cli::SyncTarget::Issue(issue_args)) => {
+                    commands::sync_issue(
+                        &profile_id,
+                        issue_args.number,
+                        context.repo_scope.as_ref(),
+                        show_progress,
+                    )
+                    .await
+                }
+                None => {
+                    commands::sync(
+                        &profile_id,
+                        args.reconcile,
+                        context.repo_scope.as_ref(),
+                        show_progress,
+                    )
+                    .await
+                }
+            }
         }
         crate::cli::Command::Query(args) | crate::cli::Command::Search(args) => {
             commands::query(&profile_id, args, context.repo_scope.as_ref())
@@ -210,6 +223,12 @@ fn effective_repo_scope_for_command(
         | crate::cli::Command::Status { .. }
         | crate::cli::Command::Doctor { .. } => repo_scope_from_worktree(),
         crate::cli::Command::Sync(args) => {
+            if let Some(crate::cli::SyncTarget::Issue(issue_args)) = &args.target {
+                if let Some(repo) = &issue_args.repo {
+                    return repo_scope_from_cli_arg(repo).map(Some);
+                }
+                return repo_scope_from_worktree();
+            }
             if args.all {
                 Ok(None)
             } else {

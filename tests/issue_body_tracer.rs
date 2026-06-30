@@ -1621,17 +1621,16 @@ fn init_fails_for_missing_malformed_or_non_github_origin() {
     );
     assert!(!missing.root.join(".qgh.toml").exists());
 
-    for (case, remote) in [("malformed", "not a github remote")] {
-        let fixture = TestFixture::new(&format!("init-bad-origin-{case}"));
-        let nested = fixture.init_git_worktree_with_origin(remote);
-        let output = fixture.qgh_without_profile_in(&nested, ["init", "repo", "--json"]);
-        assert_eq!(output.status.code(), Some(2));
-        assert_eq!(
-            stdout_json(&output)["error"]["code"],
-            "config.unsupported_git_remote"
-        );
-        assert!(!fixture.root.join(".qgh.toml").exists());
-    }
+    let malformed = TestFixture::new("init-bad-origin-malformed");
+    let malformed_nested = malformed.init_git_worktree_with_origin("not a github remote");
+    let malformed_output =
+        malformed.qgh_without_profile_in(&malformed_nested, ["init", "repo", "--json"]);
+    assert_eq!(malformed_output.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&malformed_output)["error"]["code"],
+        "config.unsupported_git_remote"
+    );
+    assert!(!malformed.root.join(".qgh.toml").exists());
 }
 
 #[test]
@@ -3194,7 +3193,7 @@ fn incremental_sync_records_new_versions_and_uses_since_overlap_and_etag() {
     assert_eq!(first_issue_version["lifecycle_state"], "active");
     assert!(first_issue_version["sync_run_id"].as_str().is_some());
 
-    server.set_mode(2);
+    server.set_mode(TARGET_REFRESH_DIFF);
     let second_sync = fixture.qgh(["sync", "--json"]);
     assert_success(&second_sync);
     let second_sync_json = stdout_json(&second_sync);
@@ -3284,6 +3283,224 @@ fn incremental_sync_records_new_versions_and_uses_since_overlap_and_etag() {
     );
     fixture.assert_source_version_count(issue_id, 2);
     fixture.assert_source_version_count(comment_id, 2);
+}
+
+#[test]
+fn sync_issue_refreshes_target_issue_and_reconciles_comment_diff() {
+    let fixture = TestFixture::new("targeted-refresh-comment-diff");
+    let server = TargetedRefreshFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let issue_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    let updated_comment_id = "qgh://github.com/issue-comment/IC_TARGET_1";
+    let added_comment_id = "qgh://github.com/issue-comment/IC_TARGET_2";
+    let deleted_comment_id = "qgh://github.com/issue-comment/IC_TARGET_3";
+    assert_success(&fixture.qgh(["query", "deleteonlysentinel", "--json"]));
+
+    server.set_mode(2);
+    let refresh = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_success(&refresh);
+    let refresh_json = stdout_json(&refresh);
+    assert_eq!(refresh_json["data"]["sync_state"], "ok");
+    assert_eq!(refresh_json["data"]["target"]["kind"], "issue");
+    assert_eq!(refresh_json["data"]["target"]["repo"], "owner/repo");
+    assert_eq!(refresh_json["data"]["target"]["issue_number"], 42);
+    assert_eq!(refresh_json["data"]["lifecycle"]["status"], "active");
+    assert_eq!(refresh_json["data"]["issues"]["fetched"], 1);
+    assert_eq!(refresh_json["data"]["issues"]["upserted"], 1);
+    assert_eq!(refresh_json["data"]["comments"]["fetched"], 2);
+    assert_eq!(refresh_json["data"]["comments"]["added"], 1);
+    assert_eq!(refresh_json["data"]["comments"]["updated"], 1);
+    assert_eq!(refresh_json["data"]["comments"]["deleted"], 1);
+    assert_eq!(refresh_json["data"]["comments"]["upserted"], 2);
+    assert_eq!(refresh_json["data"]["index"]["dirty_task_count"], 0);
+
+    let refreshed_issue = stdout_json(&fixture.qgh(["get", issue_id, "--json"]));
+    assert!(refreshed_issue["data"]["source"]["body"]
+        .as_str()
+        .unwrap()
+        .contains("targeted refresh issue body"));
+    fixture.assert_source_version_count(issue_id, 2);
+    fixture.assert_source_version_count(updated_comment_id, 2);
+    fixture.assert_source_version_count(added_comment_id, 1);
+    fixture.assert_tombstone_reason(deleted_comment_id, "deleted");
+
+    let updated_comment = stdout_json(&fixture.qgh(["get", updated_comment_id, "--json"]));
+    assert!(updated_comment["data"]["source"]["body"]
+        .as_str()
+        .unwrap()
+        .contains("targeted refresh updated comment"));
+    let added_comment = stdout_json(&fixture.qgh(["get", added_comment_id, "--json"]));
+    assert!(added_comment["data"]["source"]["body"]
+        .as_str()
+        .unwrap()
+        .contains("targeted refresh added comment"));
+
+    let deleted_get = fixture.qgh(["get", deleted_comment_id, "--json"]);
+    assert_eq!(deleted_get.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&deleted_get)["error"]["details"]["reason"],
+        "deleted"
+    );
+    let deleted_query = fixture.qgh(["query", "deleteonlysentinel", "--json"]);
+    assert_success(&deleted_query);
+    assert_eq!(
+        stdout_json(&deleted_query)["data"]["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    let requests = server.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.starts_with("GET /repos/owner/repo/issues/42 ")),
+        "targeted refresh must fetch the issue object directly: {requests:#?}"
+    );
+    assert!(
+        requests.iter().any(|request| request
+            .starts_with("GET /repos/owner/repo/issues/42/comments?per_page=100 ")),
+        "targeted refresh must fetch the complete per-issue comment list without since: {requests:#?}"
+    );
+}
+
+#[test]
+fn sync_issue_human_output_reports_comment_diff_on_stdout_and_stderr() {
+    let fixture = TestFixture::new("targeted-refresh-human-output");
+    let server = TargetedRefreshFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    server.set_mode(TARGET_REFRESH_DIFF);
+    let refresh = fixture.qgh(["sync", "issue", "42"]);
+    assert_success(&refresh);
+    let stdout = stdout_text(&refresh);
+    assert!(!stdout.starts_with('{'));
+    assert!(stdout.contains("qgh sync complete"));
+    assert!(stdout.contains("comments: fetched 2, upserted 2"));
+    assert!(stdout.contains("comment changes: added 1, updated 1, deleted 1"));
+    let stderr = stderr_text(&refresh);
+    assert!(stderr.contains("qgh sync issue: fetching repo=owner/repo issue_number=42"));
+    assert!(stderr.contains("qgh sync issue: stored comments added=1 updated=1 deleted=1"));
+}
+
+#[test]
+fn sync_issue_marks_deleted_issue_with_lifecycle_reason() {
+    let fixture = TestFixture::new("targeted-refresh-deleted");
+    let server = TargetedRefreshFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    server.set_mode(TARGET_REFRESH_DELETED);
+    let refresh = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_success(&refresh);
+    let refresh_json = stdout_json(&refresh);
+    assert_eq!(refresh_json["data"]["lifecycle"]["status"], "deleted");
+    assert_eq!(refresh_json["data"]["lifecycle"]["reason"], "deleted");
+    assert_eq!(refresh_json["data"]["lifecycle"]["http_status"], 404);
+    assert_eq!(refresh_json["data"]["issues"]["tombstoned"], 1);
+    assert_eq!(refresh_json["data"]["comments"]["deleted"], 2);
+    assert_eq!(refresh_json["data"]["comments"]["tombstoned"], 2);
+
+    let issue_get = fixture.qgh(["get", "qgh://github.com/issue/I_kwDOISSUE1", "--json"]);
+    assert_eq!(issue_get.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&issue_get)["error"]["details"]["reason"],
+        "deleted"
+    );
+}
+
+#[test]
+fn sync_issue_marks_permission_loss_with_distinct_reason() {
+    let fixture = TestFixture::new("targeted-refresh-permission");
+    let server = TargetedRefreshFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    server.set_mode(TARGET_REFRESH_PERMISSION_LOSS);
+    let refresh = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_success(&refresh);
+    let refresh_json = stdout_json(&refresh);
+    assert_eq!(
+        refresh_json["data"]["lifecycle"]["status"],
+        "permission_loss"
+    );
+    assert_eq!(
+        refresh_json["data"]["lifecycle"]["reason"],
+        "permission_loss"
+    );
+    assert_eq!(refresh_json["data"]["lifecycle"]["http_status"], 403);
+    assert_eq!(refresh_json["data"]["issues"]["tombstoned"], 1);
+
+    let issue_get = fixture.qgh(["get", "qgh://github.com/issue/I_kwDOISSUE1", "--json"]);
+    assert_eq!(issue_get.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&issue_get)["error"]["details"]["reason"],
+        "permission_loss"
+    );
+}
+
+#[test]
+fn sync_issue_follows_transfer_alias_and_tombstones_old_issue() {
+    let fixture = TestFixture::new("targeted-refresh-transfer");
+    let server = TargetedRefreshFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    server.set_mode(TARGET_REFRESH_TRANSFER);
+    let refresh = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_success(&refresh);
+    let refresh_json = stdout_json(&refresh);
+    assert_eq!(refresh_json["data"]["lifecycle"]["status"], "transferred");
+    assert_eq!(refresh_json["data"]["lifecycle"]["reason"], "transferred");
+    assert_eq!(
+        refresh_json["data"]["lifecycle"]["alias_chain"][0],
+        "/repos/owner/repo/issues/43"
+    );
+    assert_eq!(refresh_json["data"]["issues"]["upserted"], 1);
+    assert_eq!(refresh_json["data"]["issues"]["tombstoned"], 1);
+    assert_eq!(refresh_json["data"]["comments"]["added"], 1);
+    assert_eq!(refresh_json["data"]["comments"]["deleted"], 2);
+
+    let old_issue_get = fixture.qgh(["get", "qgh://github.com/issue/I_kwDOISSUE1", "--json"]);
+    assert_eq!(old_issue_get.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&old_issue_get)["error"]["details"]["reason"],
+        "transferred"
+    );
+
+    let transferred_query = fixture.qgh(["query", "transferredtargetsentinel", "--json"]);
+    assert_success(&transferred_query);
+    let transferred_json = stdout_json(&transferred_query);
+    assert!(transferred_json["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|result| result["source_id"] == "qgh://github.com/issue/I_TARGET_TRANSFER"));
+}
+
+#[test]
+fn sync_issue_transfer_alias_cycle_is_guarded() {
+    let fixture = TestFixture::new("targeted-refresh-transfer-cycle");
+    let server = TargetedRefreshFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    server.set_mode(TARGET_REFRESH_TRANSFER_CYCLE);
+    let refresh = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_eq!(refresh.status.code(), Some(2));
+    let refresh_json = stdout_json(&refresh);
+    assert_eq!(refresh_json["error"]["code"], "sync.transfer_cycle");
+    assert!(
+        refresh_json["error"]["details"]["alias_chain"]
+            .as_array()
+            .unwrap()
+            .len()
+            >= 2
+    );
 }
 
 fn issue_payload_with_pr() -> &'static str {
@@ -3908,6 +4125,19 @@ limit = {limit}
             )
             .unwrap();
         assert_eq!(count, expected);
+    }
+
+    fn assert_tombstone_reason(&self, source_id: &str, expected: &str) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let reason: String = conn
+            .query_row(
+                "SELECT reason FROM tombstones WHERE source_id = ?1",
+                [source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, expected);
     }
 
     fn assert_private_local_data_permissions(&self) {
@@ -4795,5 +5025,380 @@ fn edited_issue_comment_object_payload() -> &'static str {
         "created_at": "2026-01-03T00:00:00Z",
         "updated_at": "2026-01-04T00:01:00Z",
         "user": {"login": "carol"}
+    }"#
+}
+
+const TARGET_REFRESH_ACTIVE: usize = 1;
+const TARGET_REFRESH_DIFF: usize = 2;
+const TARGET_REFRESH_DELETED: usize = 3;
+const TARGET_REFRESH_PERMISSION_LOSS: usize = 4;
+const TARGET_REFRESH_TRANSFER: usize = 5;
+const TARGET_REFRESH_TRANSFER_CYCLE: usize = 6;
+
+struct TargetedRefreshFakeGitHub {
+    base_url: String,
+    mode: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl TargetedRefreshFakeGitHub {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        let mode = Arc::new(AtomicUsize::new(TARGET_REFRESH_ACTIVE));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_mode = Arc::clone(&mode);
+        let thread_requests = Arc::clone(&requests);
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                match stream {
+                    Ok(stream) => {
+                        handle_targeted_refresh_connection(stream, &thread_mode, &thread_requests)
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            base_url,
+            mode,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn set_mode(&self, mode: usize) {
+        self.mode.store(mode, Ordering::SeqCst);
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for TargetedRefreshFakeGitHub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.base_url.strip_prefix("http://").unwrap());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn handle_targeted_refresh_connection(
+    mut stream: TcpStream,
+    mode: &Arc<AtomicUsize>,
+    requests: &Arc<Mutex<Vec<String>>>,
+) {
+    let mut buffer = [0_u8; 8192];
+    let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+    let request_line = request.lines().next().unwrap_or("").to_string();
+    requests.lock().unwrap().push(request_line.clone());
+    let mode = mode.load(Ordering::SeqCst);
+
+    let (status, body, location) = if request_line.starts_with("GET /repos/owner/repo/issues?")
+        && request_line.contains("state=all")
+    {
+        ("200 OK", targeted_initial_issue_list_payload(), None)
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?")
+        && request_line.contains("per_page=100")
+    {
+        if mode == TARGET_REFRESH_DIFF {
+            ("200 OK", targeted_refreshed_comments_payload(), None)
+        } else {
+            ("200 OK", targeted_initial_comments_payload(), None)
+        }
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/42 ") {
+        if mode == TARGET_REFRESH_DIFF {
+            ("200 OK", targeted_refreshed_issue_object_payload(), None)
+        } else if mode == TARGET_REFRESH_DELETED {
+            ("404 Not Found", r#"{"message":"not found"}"#, None)
+        } else if mode == TARGET_REFRESH_PERMISSION_LOSS {
+            (
+                "403 Forbidden",
+                r#"{"message":"resource not accessible"}"#,
+                None,
+            )
+        } else if matches!(
+            mode,
+            TARGET_REFRESH_TRANSFER | TARGET_REFRESH_TRANSFER_CYCLE
+        ) {
+            (
+                "301 Moved Permanently",
+                r#"{"message":"moved"}"#,
+                Some("/repos/owner/repo/issues/43"),
+            )
+        } else {
+            ("200 OK", targeted_initial_issue_object_payload(), None)
+        }
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/43/comments?")
+        && request_line.contains("per_page=100")
+    {
+        ("200 OK", targeted_transferred_comments_payload(), None)
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/43 ") {
+        if mode == TARGET_REFRESH_TRANSFER_CYCLE {
+            (
+                "301 Moved Permanently",
+                r#"{"message":"moved"}"#,
+                Some("/repos/owner/repo/issues/42"),
+            )
+        } else {
+            ("200 OK", targeted_transferred_issue_object_payload(), None)
+        }
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/comments/7001 ") {
+        if mode == TARGET_REFRESH_DIFF {
+            (
+                "200 OK",
+                targeted_refreshed_comment_one_object_payload(),
+                None,
+            )
+        } else {
+            (
+                "200 OK",
+                targeted_initial_comment_one_object_payload(),
+                None,
+            )
+        }
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/comments/7002 ") {
+        ("200 OK", targeted_added_comment_object_payload(), None)
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/comments/7003 ") {
+        if mode == TARGET_REFRESH_DIFF {
+            ("404 Not Found", r#"{"message":"not found"}"#, None)
+        } else {
+            ("200 OK", targeted_deleted_comment_object_payload(), None)
+        }
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/comments/7043 ") {
+        (
+            "200 OK",
+            targeted_transferred_comment_object_payload(),
+            None,
+        )
+    } else {
+        ("404 Not Found", r#"{"message":"not found"}"#, None)
+    };
+    let location_header = location
+        .map(|location| format!("location: {location}\r\n"))
+        .unwrap_or_default();
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{location_header}x-ratelimit-remaining: 4999\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
+fn targeted_initial_issue_list_payload() -> &'static str {
+    r#"[
+      {
+        "id": 1001,
+        "node_id": "I_kwDOISSUE1",
+        "number": 42,
+        "title": "Cache sync bug",
+        "body": "The BM25 issue body tracer must round-trip through get before citation.",
+        "state": "open",
+        "locked": false,
+        "comments": 2,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:05Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}, {"name": "mvp"}],
+        "milestone": {"title": "MVP"},
+        "assignees": [{"login": "alice"}]
+      }
+    ]"#
+}
+
+fn targeted_initial_issue_object_payload() -> &'static str {
+    r#"{
+        "id": 1001,
+        "node_id": "I_kwDOISSUE1",
+        "number": 42,
+        "title": "Cache sync bug",
+        "body": "The BM25 issue body tracer must round-trip through get before citation.",
+        "state": "open",
+        "locked": false,
+        "comments": 2,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:05Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}, {"name": "mvp"}],
+        "milestone": {"title": "MVP"},
+        "assignees": [{"login": "alice"}]
+    }"#
+}
+
+fn targeted_refreshed_issue_object_payload() -> &'static str {
+    r#"{
+        "id": 1001,
+        "node_id": "I_kwDOISSUE1",
+        "number": 42,
+        "title": "Cache sync bug refreshed",
+        "body": "The targeted refresh issue body must replace stale local content.",
+        "state": "open",
+        "locked": false,
+        "comments": 2,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-05T00:00:00Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}, {"name": "mvp"}],
+        "milestone": {"title": "MVP"},
+        "assignees": [{"login": "alice"}]
+    }"#
+}
+
+fn targeted_initial_comments_payload() -> &'static str {
+    r#"[
+      {
+        "id": 7001,
+        "node_id": "IC_TARGET_1",
+        "body": "The stale targeted comment body should be updated.",
+        "html_url": "https://github.com/owner/repo/issues/42#issuecomment-7001",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-03T04:05:06Z",
+        "user": {"login": "carol"}
+      },
+      {
+        "id": 7003,
+        "node_id": "IC_TARGET_3",
+        "body": "This deleteonlysentinel comment is initially indexed.",
+        "html_url": "https://github.com/owner/repo/issues/42#issuecomment-7003",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-03T04:06:06Z",
+        "user": {"login": "dave"}
+      }
+    ]"#
+}
+
+fn targeted_refreshed_comments_payload() -> &'static str {
+    r#"[
+      {
+        "id": 7001,
+        "node_id": "IC_TARGET_1",
+        "body": "The targeted refresh updated comment should replace the stale body.",
+        "html_url": "https://github.com/owner/repo/issues/42#issuecomment-7001",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-05T00:01:00Z",
+        "user": {"login": "carol"}
+      },
+      {
+        "id": 7002,
+        "node_id": "IC_TARGET_2",
+        "body": "The targeted refresh added comment should be indexed.",
+        "html_url": "https://github.com/owner/repo/issues/42#issuecomment-7002",
+        "created_at": "2026-01-05T00:02:00Z",
+        "updated_at": "2026-01-05T00:02:00Z",
+        "user": {"login": "erin"}
+      }
+    ]"#
+}
+
+fn targeted_initial_comment_one_object_payload() -> &'static str {
+    r#"{
+        "id": 7001,
+        "node_id": "IC_TARGET_1",
+        "body": "The stale targeted comment body should be updated.",
+        "html_url": "https://github.com/owner/repo/issues/42#issuecomment-7001",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-03T04:05:06Z",
+        "user": {"login": "carol"}
+    }"#
+}
+
+fn targeted_refreshed_comment_one_object_payload() -> &'static str {
+    r#"{
+        "id": 7001,
+        "node_id": "IC_TARGET_1",
+        "body": "The targeted refresh updated comment should replace the stale body.",
+        "html_url": "https://github.com/owner/repo/issues/42#issuecomment-7001",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-05T00:01:00Z",
+        "user": {"login": "carol"}
+    }"#
+}
+
+fn targeted_added_comment_object_payload() -> &'static str {
+    r#"{
+        "id": 7002,
+        "node_id": "IC_TARGET_2",
+        "body": "The targeted refresh added comment should be indexed.",
+        "html_url": "https://github.com/owner/repo/issues/42#issuecomment-7002",
+        "created_at": "2026-01-05T00:02:00Z",
+        "updated_at": "2026-01-05T00:02:00Z",
+        "user": {"login": "erin"}
+    }"#
+}
+
+fn targeted_deleted_comment_object_payload() -> &'static str {
+    r#"{
+        "id": 7003,
+        "node_id": "IC_TARGET_3",
+        "body": "This deleteonlysentinel comment is initially indexed.",
+        "html_url": "https://github.com/owner/repo/issues/42#issuecomment-7003",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-03T04:06:06Z",
+        "user": {"login": "dave"}
+    }"#
+}
+
+fn targeted_transferred_issue_object_payload() -> &'static str {
+    r#"{
+        "id": 1043,
+        "node_id": "I_TARGET_TRANSFER",
+        "number": 43,
+        "title": "Transferred target issue",
+        "body": "The transferredtargetsentinel issue body should be indexed at the final alias.",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://github.com/owner/repo/issues/43",
+        "created_at": "2026-01-05T00:00:00Z",
+        "updated_at": "2026-01-05T00:03:00Z",
+        "closed_at": null,
+        "user": {"login": "frank"},
+        "labels": [{"name": "transfer"}],
+        "milestone": null,
+        "assignees": []
+    }"#
+}
+
+fn targeted_transferred_comments_payload() -> &'static str {
+    r#"[
+      {
+        "id": 7043,
+        "node_id": "IC_TARGET_TRANSFER",
+        "body": "The transferredtargetsentinel comment should also be indexed.",
+        "html_url": "https://github.com/owner/repo/issues/43#issuecomment-7043",
+        "created_at": "2026-01-05T00:04:00Z",
+        "updated_at": "2026-01-05T00:04:00Z",
+        "user": {"login": "gina"}
+      }
+    ]"#
+}
+
+fn targeted_transferred_comment_object_payload() -> &'static str {
+    r#"{
+        "id": 7043,
+        "node_id": "IC_TARGET_TRANSFER",
+        "body": "The transferredtargetsentinel comment should also be indexed.",
+        "html_url": "https://github.com/owner/repo/issues/43#issuecomment-7043",
+        "created_at": "2026-01-05T00:04:00Z",
+        "updated_at": "2026-01-05T00:04:00Z",
+        "user": {"login": "gina"}
     }"#
 }

@@ -6,11 +6,12 @@ use crate::model::{
 use crate::time::now_rfc3339;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use reqwest::header::{HeaderMap, ETAG, IF_NONE_MATCH, LINK, RETRY_AFTER};
+use reqwest::header::{HeaderMap, ETAG, IF_NONE_MATCH, LINK, LOCATION, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde::Deserialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const SOURCE_ID_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -56,6 +57,25 @@ pub struct BackoffPlan {
     pub scope: String,
     pub retry_after_seconds: i64,
     pub reset_at: Option<String>,
+}
+
+pub struct TargetIssueFetch {
+    pub issue: IssueRecord,
+    pub comments: Vec<CommentRecord>,
+    pub lifecycle: TargetIssueLifecycle,
+}
+
+pub enum TargetIssueFetchOutcome {
+    Fetched(Box<TargetIssueFetch>),
+    Unavailable(TargetIssueLifecycle),
+    Backoff(BackoffPlan),
+}
+
+pub struct TargetIssueLifecycle {
+    pub status: String,
+    pub reason: Option<String>,
+    pub http_status: Option<u16>,
+    pub alias_chain: Vec<String>,
 }
 
 pub struct ReconciliationResult {
@@ -261,6 +281,191 @@ pub async fn fetch_issues(
     }))
 }
 
+pub async fn fetch_target_issue(
+    profile: &Profile,
+    token: &str,
+    repo: &RepoRef,
+    issue_number: i64,
+    progress: Option<&dyn ProgressReporter>,
+) -> Result<TargetIssueFetchOutcome, QghError> {
+    const TRANSFER_FOLLOW_LIMIT: usize = 8;
+
+    let client = lifecycle_client()?;
+    let mut current_repo = repo.clone();
+    let mut current_issue_number = issue_number;
+    let mut alias_chain = Vec::new();
+    let mut visited = BTreeSet::new();
+
+    loop {
+        let url = issue_object_url(profile, &current_repo, current_issue_number);
+        if !visited.insert(url.clone()) {
+            return Err(QghError::validation(
+                "sync.transfer_cycle",
+                "Issue transfer alias chain contains a cycle.",
+            )
+            .with_details(json!({
+                "repo": repo.full_name(),
+                "issue_number": issue_number,
+                "alias_chain": alias_chain
+            }))
+            .with_hint("Run targeted refresh for the final issue location after the transfer is corrected upstream."));
+        }
+        if visited.len() > TRANSFER_FOLLOW_LIMIT {
+            return Err(QghError::validation(
+                "sync.transfer_chain_too_long",
+                "Issue transfer alias chain exceeded the follow limit.",
+            )
+            .with_details(json!({
+                "repo": repo.full_name(),
+                "issue_number": issue_number,
+                "alias_chain": alias_chain,
+                "limit": TRANSFER_FOLLOW_LIMIT
+            }))
+            .with_hint("Run targeted refresh for the final issue location directly."));
+        }
+
+        let response = github_get(&client, &url, token)
+            .send()
+            .await
+            .map_err(|error| QghError::github(error.to_string()))?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let scope = format!(
+            "issue:{}#{}",
+            current_repo.full_name(),
+            current_issue_number
+        );
+        if let Some(backoff) = targeted_backoff_from_response(status, &headers, &scope) {
+            emit_backoff(progress, &backoff);
+            wait_for_backoff(&backoff);
+            return Ok(TargetIssueFetchOutcome::Backoff(backoff));
+        }
+
+        match status {
+            StatusCode::OK => {
+                let indexed_at = now_rfc3339();
+                let issue = response.json::<ApiIssue>().await.map_err(|error| {
+                    QghError::github(format!("Invalid GitHub issue JSON: {error}"))
+                })?;
+                if issue.pull_request.is_some() {
+                    return Err(QghError::validation(
+                        "validation.unsupported_source_type",
+                        "Targeted sync issue refresh does not index pull requests.",
+                    )
+                    .with_details(json!({
+                        "repo": current_repo.full_name(),
+                        "issue_number": current_issue_number
+                    }))
+                    .with_hint("Use a GitHub Issue number, not a pull request number."));
+                }
+                let issue = issue.into_record(profile, &current_repo, &indexed_at);
+                let mut cursor_updates = Vec::new();
+                let empty_cursors = BTreeMap::new();
+                let comments = match fetch_issue_comments(
+                    &client,
+                    profile,
+                    token,
+                    &empty_cursors,
+                    &mut cursor_updates,
+                    &current_repo,
+                    &issue,
+                    progress,
+                )
+                .await?
+                {
+                    CommentFetchOutcome::Fetched(comments) => comments,
+                    CommentFetchOutcome::Backoff(backoff) => {
+                        wait_for_backoff(&backoff);
+                        return Ok(TargetIssueFetchOutcome::Backoff(backoff));
+                    }
+                };
+                let lifecycle = if alias_chain.is_empty() {
+                    TargetIssueLifecycle {
+                        status: "active".to_string(),
+                        reason: None,
+                        http_status: None,
+                        alias_chain,
+                    }
+                } else {
+                    TargetIssueLifecycle {
+                        status: "transferred".to_string(),
+                        reason: Some("transferred".to_string()),
+                        http_status: Some(301),
+                        alias_chain,
+                    }
+                };
+                return Ok(TargetIssueFetchOutcome::Fetched(Box::new(
+                    TargetIssueFetch {
+                        issue,
+                        comments,
+                        lifecycle,
+                    },
+                )));
+            }
+            StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT => {
+                let Some(location) = header_string(&headers, LOCATION) else {
+                    return Ok(TargetIssueFetchOutcome::Unavailable(unavailable_lifecycle(
+                        "transferred",
+                        status,
+                        alias_chain,
+                    )));
+                };
+                alias_chain.push(location.clone());
+                let Some((next_repo, next_issue_number)) = parse_issue_location(profile, &location)
+                else {
+                    return Ok(TargetIssueFetchOutcome::Unavailable(unavailable_lifecycle(
+                        "transferred",
+                        status,
+                        alias_chain,
+                    )));
+                };
+                if !profile.allows_repo(&next_repo.full_name()) {
+                    return Err(QghError::validation(
+                        "validation.invalid_repo",
+                        "Transferred issue target is outside the selected profile allowlist.",
+                    )
+                    .with_details(json!({
+                        "requested_repo": repo.full_name(),
+                        "requested_issue_number": issue_number,
+                        "transferred_repo": next_repo.full_name(),
+                        "transferred_issue_number": next_issue_number
+                    }))
+                    .with_hint("Add the transferred target repo to the profile allowlist before refreshing it."));
+                }
+                current_repo = next_repo;
+                current_issue_number = next_issue_number;
+            }
+            StatusCode::NOT_FOUND | StatusCode::GONE => {
+                return Ok(TargetIssueFetchOutcome::Unavailable(unavailable_lifecycle(
+                    "deleted",
+                    status,
+                    alias_chain,
+                )));
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                return Ok(TargetIssueFetchOutcome::Unavailable(unavailable_lifecycle(
+                    "permission_loss",
+                    status,
+                    alias_chain,
+                )));
+            }
+            status if status.is_success() => {
+                return Err(QghError::github(format!(
+                    "GitHub targeted issue refresh returned unsupported HTTP {status}."
+                )));
+            }
+            status => {
+                return Err(QghError::github(format!(
+                    "GitHub targeted issue refresh failed with HTTP {status}."
+                )));
+            }
+        }
+    }
+}
+
 pub async fn reconcile_sources(
     profile: &Profile,
     token: &str,
@@ -303,6 +508,7 @@ pub async fn check_source_lifecycle(
     check_candidate_lifecycle(&client, profile, token, candidate).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_issue_comments(
     client: &reqwest::Client,
     profile: &Profile,
@@ -396,11 +602,11 @@ fn emit_backoff(progress: Option<&dyn ProgressReporter>, backoff: &BackoffPlan) 
 }
 
 fn should_report_repo_progress(issue_count: usize) -> bool {
-    issue_count == 1 || issue_count % 25 == 0
+    issue_count == 1 || issue_count.is_multiple_of(25)
 }
 
 fn should_report_reconciliation_progress(checked: usize, total: usize) -> bool {
-    checked == 1 || checked == total || checked % 25 == 0
+    checked == 1 || checked == total || checked.is_multiple_of(25)
 }
 
 enum CommentFetchOutcome {
@@ -452,10 +658,43 @@ fn backoff_from_response(
     })
 }
 
+fn targeted_backoff_from_response(
+    status: StatusCode,
+    headers: &HeaderMap,
+    scope: &str,
+) -> Option<BackoffPlan> {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return backoff_from_response(status, headers, scope);
+    }
+    if status != StatusCode::FORBIDDEN {
+        return None;
+    }
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok());
+    if remaining == Some("0") || headers.get(RETRY_AFTER).is_some() {
+        return backoff_from_response(status, headers, scope);
+    }
+    None
+}
+
 fn wait_for_backoff(backoff: &BackoffPlan) {
     let seconds = backoff.retry_after_seconds.clamp(0, 1);
     if seconds > 0 {
         std::thread::sleep(std::time::Duration::from_secs(seconds as u64));
+    }
+}
+
+fn unavailable_lifecycle(
+    reason: &str,
+    status: StatusCode,
+    alias_chain: Vec<String>,
+) -> TargetIssueLifecycle {
+    TargetIssueLifecycle {
+        status: reason.to_string(),
+        reason: Some(reason.to_string()),
+        http_status: Some(status.as_u16()),
+        alias_chain,
     }
 }
 
@@ -536,6 +775,28 @@ fn source_check_url(
             "Unsupported source type for lifecycle check.",
         )),
     }
+}
+
+fn parse_issue_location(profile: &Profile, location: &str) -> Option<(RepoRef, i64)> {
+    let base = reqwest::Url::parse(&profile.api_base_url).ok()?;
+    let url = reqwest::Url::parse(location)
+        .ok()
+        .or_else(|| base.join(location).ok())?;
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    let repos_index = segments.iter().position(|segment| *segment == "repos")?;
+    let owner = segments.get(repos_index + 1)?;
+    let name = segments.get(repos_index + 2)?;
+    if segments.get(repos_index + 3) != Some(&"issues") {
+        return None;
+    }
+    let issue_number = segments.get(repos_index + 4)?.parse::<i64>().ok()?;
+    Some((
+        RepoRef {
+            owner: owner.to_string(),
+            name: name.to_string(),
+        },
+        issue_number,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -688,6 +949,13 @@ fn issue_url(profile: &Profile, repo: &RepoRef, cursor: Option<&StoredCursor>) -
         url.push_str(&utf8_percent_encode(&since, SOURCE_ID_ENCODE_SET).to_string());
     }
     url
+}
+
+fn issue_object_url(profile: &Profile, repo: &RepoRef, issue_number: i64) -> String {
+    format!(
+        "{}/repos/{}/{}/issues/{issue_number}",
+        profile.api_base_url, repo.owner, repo.name
+    )
 }
 
 fn comment_url(
