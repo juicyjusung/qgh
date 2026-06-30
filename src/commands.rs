@@ -12,6 +12,7 @@ use crate::resolution::ResolvedRepoScope;
 use crate::store::Store;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
+use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -26,56 +27,88 @@ pub async fn sync(
     profile_id: &str,
     reconcile: Option<ReconcileMode>,
     repo_scope: Option<&ResolvedRepoScope>,
+    show_progress: bool,
 ) -> Result<Value, QghError> {
+    let progress = StderrSyncProgress::new(show_progress);
+    progress.line(format_args!(
+        "qgh sync: loading profile profile={profile_id}"
+    ));
     let profile = load_profile(profile_id)?;
     let token = resolve_token(&profile)?;
     let mut store = Store::open(&profile.paths)?;
     let cursors = store.sync_cursors()?;
     let fetch_profile = profile_scoped_to_repo(&profile, repo_scope)?;
-    let fetched = match github::fetch_issues(&fetch_profile, &token, &cursors).await? {
-        github::FetchOutcome::Fetched(fetched) => fetched,
-        github::FetchOutcome::Backoff(backoff) => {
-            let backoff = store.record_backoff_state(
-                &backoff.reason,
-                &backoff.scope,
-                backoff.retry_after_seconds,
-                backoff.reset_at.as_deref(),
-            )?;
-            let status = store.status()?;
-            return Ok(json!({
-                "profile_id": profile.id,
-                "sync_state": "backoff",
-                "backoff": backoff,
-                "sync": {
-                    "last_successful_sync": status.last_sync_at,
-                    "scheduler": {
-                        "max_in_flight_requests": profile.max_in_flight_requests,
-                        "hard_cap": 16
+    progress.line(format_args!(
+        "qgh sync: fetching GitHub issues/comments repos={}",
+        fetch_profile.repos.len()
+    ));
+    let fetched =
+        match github::fetch_issues(&fetch_profile, &token, &cursors, Some(&progress)).await? {
+            github::FetchOutcome::Fetched(fetched) => fetched,
+            github::FetchOutcome::Backoff(backoff) => {
+                progress.line(format_args!(
+                    "qgh sync: backoff reason={} scope={} retry_after_seconds={}",
+                    backoff.reason, backoff.scope, backoff.retry_after_seconds
+                ));
+                let backoff = store.record_backoff_state(
+                    &backoff.reason,
+                    &backoff.scope,
+                    backoff.retry_after_seconds,
+                    backoff.reset_at.as_deref(),
+                )?;
+                let status = store.status()?;
+                return Ok(json!({
+                    "profile_id": profile.id,
+                    "sync_state": "backoff",
+                    "backoff": backoff,
+                    "sync": {
+                        "last_successful_sync": status.last_sync_at,
+                        "scheduler": {
+                            "max_in_flight_requests": profile.max_in_flight_requests,
+                            "hard_cap": 16
+                        }
+                    },
+                    "sources": {
+                        "issue_count": status.issue_count,
+                        "comment_count": status.comment_count,
+                        "tombstone_count": status.tombstone_count
+                    },
+                    "index": {
+                        "active_generation": status.active_generation,
+                        "dirty_task_count": status.dirty_task_count
                     }
-                },
-                "sources": {
-                    "issue_count": status.issue_count,
-                    "comment_count": status.comment_count,
-                    "tombstone_count": status.tombstone_count
-                },
-                "index": {
-                    "active_generation": status.active_generation,
-                    "dirty_task_count": status.dirty_task_count
-                }
-            }));
-        }
-    };
+                }));
+            }
+        };
+    progress.line(format_args!(
+        "qgh sync: fetched issues={} comments={} skipped_pull_requests={}",
+        fetched.issues.len(),
+        fetched.comments.len(),
+        fetched.skipped_pull_requests
+    ));
+    progress.line(format_args!("qgh sync: writing SQLite store"));
     let summary = store.upsert_sources(
         &fetched.issues,
         &fetched.comments,
         fetched.skipped_pull_requests,
         &fetched.cursor_updates,
     )?;
+    progress.line(format_args!(
+        "qgh sync: stored upserted_issues={} upserted_comments={} cursor_updates={}",
+        summary.upserted_issues,
+        summary.upserted_comments,
+        summary.cursor_updates.len()
+    ));
     let reconciliation = if reconcile == Some(ReconcileMode::Full) {
         let candidates = store.active_reconciliation_candidates()?;
         let candidates = reconciliation_candidates_scoped_to_repo(candidates, repo_scope);
         let estimated_api_cost_class = estimate_api_cost_class(candidates.len());
-        let result = github::reconcile_sources(&fetch_profile, &token, &candidates).await?;
+        progress.line(format_args!(
+            "qgh sync: reconciling sources={} mode=full",
+            candidates.len()
+        ));
+        let result =
+            github::reconcile_sources(&fetch_profile, &token, &candidates, Some(&progress)).await?;
         let mut tombstoned_sources = 0;
         for unavailable in result.unavailable_sources {
             store.tombstone_source(&unavailable.source_id, &unavailable.reason)?;
@@ -100,6 +133,10 @@ pub async fn sync(
     };
     store.clear_backoff_state()?;
     let sources = store.active_index_sources()?;
+    progress.line(format_args!(
+        "qgh sync: rebuilding BM25 index sources={}",
+        sources.len()
+    ));
     let (generation, reserved_generation_path) =
         store.reserve_index_generation(&profile.paths.index_root, sources.len())?;
     let generation_path = index::rebuild(&profile.paths.index_root, generation, &sources)?;
@@ -109,12 +146,21 @@ pub async fn sync(
         &generation_path.to_string_lossy(),
         sources.len(),
     )?;
+    progress.line(format_args!(
+        "qgh sync: published BM25 index generation={} sources={}",
+        generation,
+        sources.len()
+    ));
     let status = store.status()?;
     let watermarks = summary
         .cursor_updates
         .iter()
         .map(|cursor| (cursor.endpoint.clone(), json!(cursor.watermark)))
         .collect::<serde_json::Map<_, _>>();
+    progress.line(format_args!(
+        "qgh sync: complete sync_run_id={}",
+        summary.sync_run_id
+    ));
     Ok(json!({
         "profile_id": profile.id,
         "sync_state": "ok",
@@ -143,6 +189,73 @@ pub async fn sync(
         },
         "reconciliation": reconciliation
     }))
+}
+
+struct StderrSyncProgress {
+    enabled: bool,
+}
+
+impl StderrSyncProgress {
+    fn new(enabled: bool) -> Self {
+        Self { enabled }
+    }
+
+    fn line(&self, args: fmt::Arguments<'_>) {
+        if self.enabled {
+            eprintln!("{args}");
+        }
+    }
+}
+
+impl github::ProgressReporter for StderrSyncProgress {
+    fn report(&self, event: github::ProgressEvent) {
+        match event {
+            github::ProgressEvent::RepoStarted { repo } => {
+                self.line(format_args!("qgh sync: fetching repo={repo}"));
+            }
+            github::ProgressEvent::IssuePageFetched { repo, item_count } => {
+                self.line(format_args!(
+                    "qgh sync: received issue page repo={repo} items={item_count}"
+                ));
+            }
+            github::ProgressEvent::RepoProgress {
+                repo,
+                issues,
+                comments,
+                skipped_pull_requests,
+            } => {
+                self.line(format_args!(
+                    "qgh sync: processed repo={repo} issues={issues} comments={comments} skipped_pull_requests={skipped_pull_requests}"
+                ));
+            }
+            github::ProgressEvent::IssueEndpointNotModified { repo } => {
+                self.line(format_args!("qgh sync: issues unchanged repo={repo}"));
+            }
+            github::ProgressEvent::CommentPageFetched {
+                repo,
+                issue_number,
+                item_count,
+            } => {
+                self.line(format_args!(
+                    "qgh sync: received comment page repo={repo} issue=#{issue_number} items={item_count}"
+                ));
+            }
+            github::ProgressEvent::Backoff {
+                reason,
+                scope,
+                retry_after_seconds,
+            } => {
+                self.line(format_args!(
+                    "qgh sync: GitHub backoff reason={reason} scope={scope} retry_after_seconds={retry_after_seconds}"
+                ));
+            }
+            github::ProgressEvent::ReconciliationProgress { checked, total } => {
+                self.line(format_args!(
+                    "qgh sync: reconciled checked_sources={checked}/{total}"
+                ));
+            }
+        }
+    }
 }
 
 fn profile_scoped_to_repo(

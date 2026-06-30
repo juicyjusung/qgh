@@ -54,6 +54,8 @@ pub struct SyncArgs {
     #[arg(long)]
     pub all: bool,
     #[arg(long)]
+    pub quiet: bool,
+    #[arg(long)]
     pub json: bool,
 }
 

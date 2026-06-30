@@ -81,7 +81,14 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
 
     let mut data = match command {
         crate::cli::Command::Sync(args) => {
-            commands::sync(&profile_id, args.reconcile, context.repo_scope.as_ref()).await
+            let show_progress = !args.json && !args.quiet;
+            commands::sync(
+                &profile_id,
+                args.reconcile,
+                context.repo_scope.as_ref(),
+                show_progress,
+            )
+            .await
         }
         crate::cli::Command::Query(args) | crate::cli::Command::Search(args) => {
             commands::query(&profile_id, args, context.repo_scope.as_ref())

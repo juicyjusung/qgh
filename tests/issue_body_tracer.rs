@@ -303,6 +303,35 @@ fn sync_sends_github_rest_headers_required_by_real_api() {
 }
 
 #[test]
+fn sync_reports_human_progress_on_stderr_without_polluting_stdout() {
+    let fixture = TestFixture::new("sync-progress");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+
+    let sync = fixture.qgh(["sync"]);
+    assert_success(&sync);
+    let sync_json = stdout_json(&sync);
+    assert_eq!(sync_json["ok"], true);
+    assert_eq!(sync_json["data"]["sync_state"], "ok");
+    let stderr = stderr_text(&sync);
+    assert!(stderr.contains("qgh sync: fetching GitHub issues/comments repos=1"));
+    assert!(stderr.contains("qgh sync: fetching repo=owner/repo"));
+    assert!(stderr.contains("qgh sync: received issue page repo=owner/repo items=2"));
+    assert!(stderr.contains("qgh sync: received comment page repo=owner/repo issue=#42 items=1"));
+    assert!(stderr.contains("qgh sync: complete sync_run_id="));
+
+    let quiet = fixture.qgh(["sync", "--quiet"]);
+    assert_success(&quiet);
+    assert!(stderr_text(&quiet).is_empty());
+    assert_eq!(stdout_json(&quiet)["data"]["sync_state"], "ok");
+
+    let json = fixture.qgh(["sync", "--json"]);
+    assert_success(&json);
+    assert!(stderr_text(&json).is_empty());
+    assert_eq!(stdout_json(&json)["data"]["sync_state"], "ok");
+}
+
+#[test]
 fn exact_lookup_uses_typed_ranking_without_non_finite_scores() {
     let fixture = TestFixture::new("exact-ranking");
     let server = FakeGitHub::start(issue_payload_with_pr());

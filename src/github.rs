@@ -63,6 +63,43 @@ pub struct ReconciliationResult {
     pub unavailable_sources: Vec<LifecycleFailure>,
 }
 
+pub trait ProgressReporter {
+    fn report(&self, event: ProgressEvent);
+}
+
+pub enum ProgressEvent {
+    RepoStarted {
+        repo: String,
+    },
+    IssuePageFetched {
+        repo: String,
+        item_count: usize,
+    },
+    RepoProgress {
+        repo: String,
+        issues: usize,
+        comments: usize,
+        skipped_pull_requests: usize,
+    },
+    IssueEndpointNotModified {
+        repo: String,
+    },
+    CommentPageFetched {
+        repo: String,
+        issue_number: i64,
+        item_count: usize,
+    },
+    Backoff {
+        reason: String,
+        scope: String,
+        retry_after_seconds: i64,
+    },
+    ReconciliationProgress {
+        checked: usize,
+        total: usize,
+    },
+}
+
 pub struct LifecycleFailure {
     pub source_id: String,
     pub reason: String,
@@ -77,6 +114,7 @@ pub async fn fetch_issues(
     profile: &Profile,
     token: &str,
     cursors: &[StoredCursor],
+    progress: Option<&dyn ProgressReporter>,
 ) -> Result<FetchOutcome, QghError> {
     let client = reqwest::Client::new();
     let cursor_map = cursor_map(cursors);
@@ -86,12 +124,23 @@ pub async fn fetch_issues(
     let mut skipped_pull_requests = 0;
 
     for repo in &profile.repos {
+        let repo_name = repo.full_name();
+        emit(
+            progress,
+            ProgressEvent::RepoStarted {
+                repo: repo_name.clone(),
+            },
+        );
         let endpoint = issue_endpoint(repo);
         let stored_cursor = cursor_map.get(&endpoint);
         let mut max_watermark = stored_cursor.and_then(|cursor| cursor.cursor.clone());
         let mut next_url = Some(issue_url(profile, repo, stored_cursor));
         let mut endpoint_not_modified = false;
         let mut response_etag = stored_cursor.and_then(|cursor| cursor.etag.clone());
+        let mut repo_issue_count = 0;
+        let mut repo_comment_count = 0;
+        let mut repo_skipped_pull_requests = 0;
+        let mut last_progress_issue_count = 0;
         while let Some(url) = next_url.take() {
             let mut request = github_get(&client, &url, token);
             if let Some(etag) = stored_cursor.and_then(|cursor| cursor.etag.as_ref()) {
@@ -104,6 +153,7 @@ pub async fn fetch_issues(
             let status = response.status();
             let headers = response.headers().clone();
             if let Some(backoff) = backoff_from_response(status, &headers, &endpoint) {
+                emit_backoff(progress, &backoff);
                 wait_for_backoff(&backoff);
                 return Ok(FetchOutcome::Backoff(backoff));
             }
@@ -112,6 +162,12 @@ pub async fn fetch_issues(
             }
             if status == StatusCode::NOT_MODIFIED {
                 endpoint_not_modified = true;
+                emit(
+                    progress,
+                    ProgressEvent::IssueEndpointNotModified {
+                        repo: repo_name.clone(),
+                    },
+                );
                 break;
             }
             if !status.is_success() {
@@ -124,10 +180,18 @@ pub async fn fetch_issues(
                 .json()
                 .await
                 .map_err(|error| QghError::github(format!("Invalid GitHub issue JSON: {error}")))?;
+            emit(
+                progress,
+                ProgressEvent::IssuePageFetched {
+                    repo: repo_name.clone(),
+                    item_count: page.len(),
+                },
+            );
             let indexed_at = now_rfc3339();
             for item in page {
                 if item.pull_request.is_some() {
                     skipped_pull_requests += 1;
+                    repo_skipped_pull_requests += 1;
                     continue;
                 }
                 let issue = item.into_record(profile, repo, &indexed_at);
@@ -140,10 +204,12 @@ pub async fn fetch_issues(
                     &mut cursor_updates,
                     repo,
                     &issue,
+                    progress,
                 )
                 .await?
                 {
                     CommentFetchOutcome::Fetched(fetched_comments) => {
+                        repo_comment_count += fetched_comments.len();
                         comments.extend(fetched_comments);
                     }
                     CommentFetchOutcome::Backoff(backoff) => {
@@ -152,8 +218,32 @@ pub async fn fetch_issues(
                     }
                 }
                 issues.push(issue);
+                repo_issue_count += 1;
+                if should_report_repo_progress(repo_issue_count) {
+                    emit(
+                        progress,
+                        ProgressEvent::RepoProgress {
+                            repo: repo_name.clone(),
+                            issues: repo_issue_count,
+                            comments: repo_comment_count,
+                            skipped_pull_requests: repo_skipped_pull_requests,
+                        },
+                    );
+                    last_progress_issue_count = repo_issue_count;
+                }
             }
             next_url = next_link(&headers);
+        }
+        if repo_issue_count != last_progress_issue_count || repo_skipped_pull_requests > 0 {
+            emit(
+                progress,
+                ProgressEvent::RepoProgress {
+                    repo: repo_name,
+                    issues: repo_issue_count,
+                    comments: repo_comment_count,
+                    skipped_pull_requests: repo_skipped_pull_requests,
+                },
+            );
         }
         cursor_updates.push(CursorUpdate {
             endpoint,
@@ -175,10 +265,12 @@ pub async fn reconcile_sources(
     profile: &Profile,
     token: &str,
     candidates: &[ReconciliationCandidate],
+    progress: Option<&dyn ProgressReporter>,
 ) -> Result<ReconciliationResult, QghError> {
     let client = lifecycle_client()?;
     let mut unavailable_sources = Vec::new();
-    for candidate in candidates {
+    let total = candidates.len();
+    for (index, candidate) in candidates.iter().enumerate() {
         match check_candidate_lifecycle(&client, profile, token, candidate).await? {
             LifecycleCheck::Active => {}
             LifecycleCheck::Unavailable { reason } => {
@@ -187,6 +279,13 @@ pub async fn reconcile_sources(
                     reason,
                 });
             }
+        }
+        let checked = index + 1;
+        if should_report_reconciliation_progress(checked, total) {
+            emit(
+                progress,
+                ProgressEvent::ReconciliationProgress { checked, total },
+            );
         }
     }
     Ok(ReconciliationResult {
@@ -212,6 +311,7 @@ async fn fetch_issue_comments(
     cursor_updates: &mut Vec<CursorUpdate>,
     repo: &RepoRef,
     issue: &IssueRecord,
+    progress: Option<&dyn ProgressReporter>,
 ) -> Result<CommentFetchOutcome, QghError> {
     let mut comments = Vec::new();
     let endpoint = comment_endpoint(repo, issue.number);
@@ -232,6 +332,7 @@ async fn fetch_issue_comments(
         let status = response.status();
         let headers = response.headers().clone();
         if let Some(backoff) = backoff_from_response(status, &headers, &endpoint) {
+            emit_backoff(progress, &backoff);
             return Ok(CommentFetchOutcome::Backoff(backoff));
         }
         if status == StatusCode::NO_CONTENT {
@@ -251,6 +352,16 @@ async fn fetch_issue_comments(
             .json()
             .await
             .map_err(|error| QghError::github(format!("Invalid GitHub comment JSON: {error}")))?;
+        if !page.is_empty() {
+            emit(
+                progress,
+                ProgressEvent::CommentPageFetched {
+                    repo: repo.full_name(),
+                    issue_number: issue.number,
+                    item_count: page.len(),
+                },
+            );
+        }
         let indexed_at = now_rfc3339();
         for comment in page {
             max_watermark = max_timestamp(max_watermark, &comment.updated_at);
@@ -265,6 +376,31 @@ async fn fetch_issue_comments(
         not_modified: endpoint_not_modified,
     });
     Ok(CommentFetchOutcome::Fetched(comments))
+}
+
+fn emit(progress: Option<&dyn ProgressReporter>, event: ProgressEvent) {
+    if let Some(progress) = progress {
+        progress.report(event);
+    }
+}
+
+fn emit_backoff(progress: Option<&dyn ProgressReporter>, backoff: &BackoffPlan) {
+    emit(
+        progress,
+        ProgressEvent::Backoff {
+            reason: backoff.reason.clone(),
+            scope: backoff.scope.clone(),
+            retry_after_seconds: backoff.retry_after_seconds,
+        },
+    );
+}
+
+fn should_report_repo_progress(issue_count: usize) -> bool {
+    issue_count == 1 || issue_count % 25 == 0
+}
+
+fn should_report_reconciliation_progress(checked: usize, total: usize) -> bool {
+    checked == 1 || checked == total || checked % 25 == 0
 }
 
 enum CommentFetchOutcome {

@@ -5,6 +5,11 @@
 Machine-readable CLI output uses one versioned `qgh.v1` envelope on stdout.
 Diagnostics and human-readable failures go to stderr.
 
+`sync` without `--json` emits human-readable progress diagnostics to stderr so
+long GitHub fetch/index runs do not look stalled. `sync --json` and `sync
+--quiet` suppress progress diagnostics. Progress lines are not a stable
+machine-readable API; use the final stdout envelope for automation.
+
 Success:
 
 - `schema_version`: `qgh.v1`
