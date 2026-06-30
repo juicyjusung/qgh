@@ -32,6 +32,18 @@ _Avoid_: implicit repo, guessed context
 The set of source entities and source versions currently indexed for one profile.
 _Avoid_: knowledge base, dataset
 
+**Freshness**:
+How current a corpus is with respect to recently changed GitHub issue and issue comment sources.
+_Avoid_: live check, remote truth, coverage
+
+**Coverage**:
+How much of the intended GitHub issue and issue comment history is represented in a corpus.
+_Avoid_: freshness, snapshot age, search quality
+
+**Partial Corpus**:
+A corpus whose intended source history is not fully represented yet, even if its recently changed sources may be fresh.
+_Avoid_: stale corpus, failed sync, recent-only corpus
+
 **Profile Store**:
 The XDG data directory for one profile, containing the authoritative SQLite store and derived Tantivy index.
 _Avoid_: project folder, global DB, cwd index
@@ -71,6 +83,42 @@ _Avoid_: inactive flag
 **Reconciliation**:
 A bounded sync pass that compares known source identities against GitHub state to detect deletes, transfers, and stale ghosts.
 _Avoid_: refresh, cleanup
+
+**Live Incremental Sync**:
+A sync pass focused on recently changed source entities so freshness can advance without rescanning all history.
+_Avoid_: full sync, historical backfill
+
+**Open Issue Sweep**:
+A coverage pass that prioritizes currently open issues regardless of age.
+_Avoid_: recent bootstrap, live incremental sync
+
+**Historical Backfill**:
+A coverage pass that fills older issue and issue comment history after higher-priority current work is represented.
+_Avoid_: freshness check, hidden sync
+
+**Recent All-State Bootstrap**:
+A bootstrap pass that seeds open and closed sources updated within the lookback window to accelerate initial coverage. It is acceleration, not a corpus boundary.
+_Avoid_: corpus boundary, recent-only corpus, lookback cutoff
+
+**Bootstrap Floor**:
+The fixed `bootstrap_start - lookback` timestamp stored at bootstrap time. Historical backfill is complete once the history cursor reaches this floor; it must not drift with current time.
+_Avoid_: moving cutoff, now-relative window
+
+**Historical Comment Backfill**:
+A per-issue comment fetch performed while backfilling an older issue, because repo-level `since` comment listing returns only recently changed comments and cannot recover historical comment coverage.
+_Avoid_: repo-level since listing, fresh-only comments
+
+**Lifecycle Verification**:
+An explicit opt-in network check on `get` that confirms a source is active, transferred, or unavailable. It is off by default and behaves identically on CLI and MCP; default `get` is local-only.
+_Avoid_: implicit get probe, hidden lifecycle check, CLI-only behavior
+
+**Snapshot Age**:
+The local time since the last successful sync, the only basis for a freshness decision. It is not a claim about remote truth, which is never probed at query time.
+_Avoid_: remote freshness, live check, true currency
+
+**Targeted Refresh**:
+An explicit sync pass for a named source entity, independent of age or scheduled coverage priority.
+_Avoid_: hidden auto-sync, live probe
 
 **Status Snapshot**:
 A local-only report of profile, store, index, sync, and reconciliation state. It does not perform network or model probes.
