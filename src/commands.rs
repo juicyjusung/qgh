@@ -2,13 +2,14 @@ use crate::cli::{InitArgs, InitRepoArgs, InitTokenSourceArg, QueryArgs, Reconcil
 use crate::config::{
     bootstrap_profile_repo, current_git_worktree_root, discover_repo_policy,
     git_remote_defaults_for_root, load_profile, load_repo_policy_at, parse_repo, resolve_token,
-    GitRemote, Profile, ProfileBootstrapInput, RepoPolicy, TokenSource,
+    GitRemote, Profile, ProfileBootstrapInput, RepoPolicy, RepoRef, TokenSource,
 };
 use crate::error::QghError;
 use crate::github;
 use crate::index;
 use crate::model::{
     ReconciliationCandidate, StoredComment, StoredIssue, StoredSource, SyncSummary,
+    TargetedSyncSummary,
 };
 use crate::paths::ProfilePaths;
 use crate::resolution::ResolvedRepoScope;
@@ -154,27 +155,8 @@ pub async fn sync(
         })
     };
     store.clear_backoff_state()?;
-    let sources = store.active_index_sources()?;
-    progress.line(format_args!(
-        "qgh sync: rebuilding BM25 index sources={}",
-        sources.len()
-    ));
-    let (generation, reserved_generation_path) =
-        store.reserve_index_generation(&profile.paths.index_root, sources.len())?;
-    let generation_path = index::rebuild(&profile.paths.index_root, generation, &sources)?;
-    debug_assert_eq!(generation_path, reserved_generation_path);
-    store.mark_index_published(
-        generation,
-        &generation_path.to_string_lossy(),
-        sources.len(),
-    )?;
+    let (generation, dirty_task_count) = rebuild_bm25_index(&profile, &mut store, &progress)?;
     store.mark_sync_run_completed(&summary.sync_run_id)?;
-    progress.line(format_args!(
-        "qgh sync: published BM25 index generation={} sources={}",
-        generation,
-        sources.len()
-    ));
-    let status = store.status()?;
     let watermarks = summary
         .cursor_updates
         .iter()
@@ -208,7 +190,7 @@ pub async fn sync(
         },
         "index": {
             "active_generation": generation,
-            "dirty_task_count": status.dirty_task_count
+            "dirty_task_count": dirty_task_count
         },
         "reconciliation": reconciliation
     }))
@@ -227,6 +209,144 @@ fn merge_sync_summary(total: &mut Option<SyncSummary>, page: SyncSummary) {
             total.not_modified_endpoints += page.not_modified_endpoints;
         }
         None => *total = Some(page),
+    }
+}
+
+pub async fn sync_issue(
+    profile_id: &str,
+    issue_number: i64,
+    repo_scope: Option<&ResolvedRepoScope>,
+    show_progress: bool,
+) -> Result<Value, QghError> {
+    if issue_number < 1 {
+        return Err(QghError::validation(
+            "validation.invalid_issue_number",
+            "Issue number must be a positive integer.",
+        )
+        .with_details(json!({ "issue_number": issue_number })));
+    }
+
+    let progress = StderrSyncProgress::new(show_progress);
+    progress.line(format_args!(
+        "qgh sync issue: loading profile profile={profile_id}"
+    ));
+    let profile = load_profile(profile_id)?;
+    let repo = target_issue_repo(&profile, repo_scope)?;
+    let token = resolve_token(&profile)?;
+    let mut store = Store::open(&profile.paths)?;
+    progress.line(format_args!(
+        "qgh sync issue: fetching repo={} issue_number={issue_number}",
+        repo.full_name()
+    ));
+
+    let outcome =
+        github::fetch_target_issue(&profile, &token, &repo, issue_number, Some(&progress)).await?;
+    match outcome {
+        github::TargetIssueFetchOutcome::Backoff(backoff) => {
+            progress.line(format_args!(
+                "qgh sync issue: backoff reason={} scope={} retry_after_seconds={}",
+                backoff.reason, backoff.scope, backoff.retry_after_seconds
+            ));
+            let backoff = store.record_backoff_state(
+                &backoff.reason,
+                &backoff.scope,
+                backoff.retry_after_seconds,
+                backoff.reset_at.as_deref(),
+            )?;
+            let status = store.status()?;
+            Ok(json!({
+                "profile_id": profile.id,
+                "sync_state": "backoff",
+                "target": {
+                    "kind": "issue",
+                    "repo": repo.full_name(),
+                    "issue_number": issue_number
+                },
+                "backoff": backoff,
+                "sync": {
+                    "last_successful_sync": status.last_sync_at,
+                    "scheduler": {
+                        "max_in_flight_requests": profile.max_in_flight_requests,
+                        "hard_cap": 16
+                    }
+                },
+                "sources": {
+                    "issue_count": status.issue_count,
+                    "comment_count": status.comment_count,
+                    "tombstone_count": status.tombstone_count
+                },
+                "index": {
+                    "active_generation": status.active_generation,
+                    "dirty_task_count": status.dirty_task_count
+                }
+            }))
+        }
+        github::TargetIssueFetchOutcome::Fetched(fetched) => {
+            progress.line(format_args!(
+                "qgh sync issue: fetched issue=1 comments={}",
+                fetched.comments.len()
+            ));
+            let mut summary =
+                store.upsert_target_issue_refresh(&fetched.issue, &fetched.comments)?;
+            if fetched.lifecycle.reason.as_deref() == Some("transferred")
+                && (fetched.issue.repo != repo.full_name() || fetched.issue.number != issue_number)
+            {
+                let (tombstoned_issues, tombstoned_comments) = store
+                    .tombstone_target_issue_sources(
+                        &repo.full_name(),
+                        issue_number,
+                        "transferred",
+                    )?;
+                summary.tombstoned_issues += tombstoned_issues;
+                summary.tombstoned_comments += tombstoned_comments;
+                summary.deleted_comments += tombstoned_comments;
+            }
+            progress.line(format_args!(
+                "qgh sync issue: stored comments added={} updated={} deleted={}",
+                summary.added_comments, summary.updated_comments, summary.deleted_comments
+            ));
+            store.clear_backoff_state()?;
+            let (generation, dirty_task_count) =
+                rebuild_bm25_index(&profile, &mut store, &progress)?;
+            progress.line(format_args!(
+                "qgh sync issue: complete sync_run_id={}",
+                summary.sync_run_id
+            ));
+            Ok(target_issue_sync_json(
+                &profile,
+                &repo,
+                issue_number,
+                &summary,
+                &fetched.lifecycle,
+                generation,
+                dirty_task_count,
+            ))
+        }
+        github::TargetIssueFetchOutcome::Unavailable(lifecycle) => {
+            let reason = lifecycle.reason.as_deref().unwrap_or("unavailable");
+            progress.line(format_args!(
+                "qgh sync issue: lifecycle status={} reason={}",
+                lifecycle.status, reason
+            ));
+            let summary =
+                store.tombstone_target_issue_refresh(&repo.full_name(), issue_number, reason)?;
+            store.clear_backoff_state()?;
+            let (generation, dirty_task_count) =
+                rebuild_bm25_index(&profile, &mut store, &progress)?;
+            progress.line(format_args!(
+                "qgh sync issue: complete sync_run_id={}",
+                summary.sync_run_id
+            ));
+            Ok(target_issue_sync_json(
+                &profile,
+                &repo,
+                issue_number,
+                &summary,
+                &lifecycle,
+                generation,
+                dirty_task_count,
+            ))
+        }
     }
 }
 
@@ -295,6 +415,126 @@ impl github::ProgressReporter for StderrSyncProgress {
             }
         }
     }
+}
+
+fn rebuild_bm25_index(
+    profile: &Profile,
+    store: &mut Store,
+    progress: &StderrSyncProgress,
+) -> Result<(i64, i64), QghError> {
+    let sources = store.active_index_sources()?;
+    progress.line(format_args!(
+        "qgh sync: rebuilding BM25 index sources={}",
+        sources.len()
+    ));
+    let (generation, reserved_generation_path) =
+        store.reserve_index_generation(&profile.paths.index_root, sources.len())?;
+    let generation_path = index::rebuild(&profile.paths.index_root, generation, &sources)?;
+    debug_assert_eq!(generation_path, reserved_generation_path);
+    store.mark_index_published(
+        generation,
+        &generation_path.to_string_lossy(),
+        sources.len(),
+    )?;
+    progress.line(format_args!(
+        "qgh sync: published BM25 index generation={} sources={}",
+        generation,
+        sources.len()
+    ));
+    let status = store.status()?;
+    Ok((generation, status.dirty_task_count))
+}
+
+fn target_issue_repo(
+    profile: &Profile,
+    repo_scope: Option<&ResolvedRepoScope>,
+) -> Result<RepoRef, QghError> {
+    if let Some(repo_scope) = repo_scope {
+        return profile
+            .repos
+            .iter()
+            .find(|repo| repo.full_name() == repo_scope.repo)
+            .cloned()
+            .ok_or_else(|| {
+                QghError::validation(
+                    "validation.invalid_repo",
+                    format!(
+                        "Repo `{}` is outside profile `{}` allowlist.",
+                        repo_scope.repo, profile.id
+                    ),
+                )
+                .with_details(json!({
+                    "profile_id": &profile.id,
+                    "repo": &repo_scope.repo
+                }))
+                .with_hint("Use a repo from the profile allowlist or update the profile config.")
+            });
+    }
+    if profile.repos.len() == 1 {
+        return Ok(profile.repos[0].clone());
+    }
+    Err(QghError::validation(
+        "validation.repo_required",
+        "sync issue requires a single repo scope.",
+    )
+    .with_details(json!({
+        "profile_id": profile.id,
+        "repo_count": profile.repos.len()
+    }))
+    .with_hint("Run from a repo worktree, create .qgh.toml with qgh init repo, or pass sync issue --repo owner/repo."))
+}
+
+fn target_issue_sync_json(
+    profile: &Profile,
+    repo: &RepoRef,
+    issue_number: i64,
+    summary: &TargetedSyncSummary,
+    lifecycle: &github::TargetIssueLifecycle,
+    generation: i64,
+    dirty_task_count: i64,
+) -> Value {
+    json!({
+        "profile_id": &profile.id,
+        "sync_state": "ok",
+        "sync_run_id": &summary.sync_run_id,
+        "target": {
+            "kind": "issue",
+            "repo": repo.full_name(),
+            "issue_number": issue_number
+        },
+        "lifecycle": {
+            "status": &lifecycle.status,
+            "reason": &lifecycle.reason,
+            "http_status": lifecycle.http_status,
+            "alias_chain": &lifecycle.alias_chain
+        },
+        "issues": {
+            "fetched": summary.fetched_issues,
+            "upserted": summary.upserted_issues,
+            "tombstoned": summary.tombstoned_issues,
+            "skipped_pull_requests": 0
+        },
+        "comments": {
+            "fetched": summary.fetched_comments,
+            "upserted": summary.upserted_comments,
+            "added": summary.added_comments,
+            "updated": summary.updated_comments,
+            "deleted": summary.deleted_comments,
+            "tombstoned": summary.tombstoned_comments
+        },
+        "cursors": {
+            "updated": 0,
+            "not_modified_endpoints": 0,
+            "watermarks": {}
+        },
+        "index": {
+            "active_generation": generation,
+            "dirty_task_count": dirty_task_count
+        },
+        "reconciliation": {
+            "mode": "targeted_issue"
+        }
+    })
 }
 
 fn profile_scoped_to_repo(
@@ -553,7 +793,7 @@ fn init_custom_interactive(
     };
     let write_repo_policy = prompt_bool("create .qgh.toml", true)?;
     finish_profile_init(
-        &root,
+        root,
         ProfileInitPlan {
             profile_id,
             repo,
@@ -1372,10 +1612,10 @@ async fn get_source_with_lifecycle(
         StoredSource::Issue(issue) => issue_source(issue),
         StoredSource::Comment(comment) => comment_source(comment),
     };
-    source_json["lifecycle_check"] = match resolve_token(&profile) {
+    source_json["lifecycle_check"] = match resolve_token(profile) {
         Ok(token) => {
             if let Some(candidate) = store.get_reconciliation_candidate(source_id)? {
-                match github::check_source_lifecycle(&profile, &token, &candidate).await {
+                match github::check_source_lifecycle(profile, &token, &candidate).await {
                     Ok(github::LifecycleCheck::Active) => json!({ "status": "active" }),
                     Ok(github::LifecycleCheck::Unavailable { reason }) => {
                         let tombstone = store.tombstone_source(source_id, &reason)?;

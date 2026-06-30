@@ -3,12 +3,13 @@ use crate::model::{
     BackoffView, CommentRecord, CursorUpdate, CursorView, IndexSource, IssueRecord,
     ParentIssueView, ReconciliationCandidate, ReconciliationRunView, SourceVersionView,
     StatusSnapshot, StoredComment, StoredCursor, StoredIssue, StoredSource, SyncSummary,
-    TombstoneView,
+    TargetedSyncSummary, TombstoneView,
 };
 use crate::paths::ProfilePaths;
 use crate::paths::{ensure_private_dir, set_private_file};
 use crate::time::{now_rfc3339, now_run_id_suffix};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub struct Store {
@@ -305,6 +306,99 @@ impl Store {
             )));
         }
         Ok(())
+    }
+
+    pub fn upsert_target_issue_refresh(
+        &mut self,
+        issue: &IssueRecord,
+        comments: &[CommentRecord],
+    ) -> Result<TargetedSyncSummary, QghError> {
+        let existing_comments =
+            self.active_comment_versions_for_issue(&issue.repo, issue.number)?;
+        let incoming_source_ids = comments
+            .iter()
+            .map(|comment| comment.source_id.clone())
+            .collect::<BTreeSet<_>>();
+        let added_comments = comments
+            .iter()
+            .filter(|comment| !existing_comments.contains_key(&comment.source_id))
+            .count();
+        let updated_comments = comments
+            .iter()
+            .filter(|comment| {
+                existing_comments
+                    .get(&comment.source_id)
+                    .is_some_and(|body_hash| body_hash != &comment.body_hash)
+            })
+            .count();
+        let deleted_source_ids = existing_comments
+            .keys()
+            .filter(|source_id| !incoming_source_ids.contains(*source_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let summary = self.upsert_sources(std::slice::from_ref(issue), comments, 0, &[])?;
+        let mut deleted_comments = 0;
+        for source_id in deleted_source_ids {
+            self.tombstone_source(&source_id, "deleted")?;
+            deleted_comments += 1;
+        }
+
+        Ok(TargetedSyncSummary {
+            sync_run_id: summary.sync_run_id,
+            fetched_issues: 1,
+            upserted_issues: 1,
+            fetched_comments: comments.len(),
+            upserted_comments: comments.len(),
+            added_comments,
+            updated_comments,
+            deleted_comments,
+            tombstoned_issues: 0,
+            tombstoned_comments: deleted_comments,
+        })
+    }
+
+    pub fn tombstone_target_issue_refresh(
+        &mut self,
+        repo: &str,
+        issue_number: i64,
+        reason: &str,
+    ) -> Result<TargetedSyncSummary, QghError> {
+        let (tombstoned_issues, tombstoned_comments) =
+            self.tombstone_target_issue_sources(repo, issue_number, reason)?;
+        let sync_run_id = self.record_empty_sync_run()?;
+        Ok(TargetedSyncSummary {
+            sync_run_id,
+            fetched_issues: 0,
+            upserted_issues: 0,
+            fetched_comments: 0,
+            upserted_comments: 0,
+            added_comments: 0,
+            updated_comments: 0,
+            deleted_comments: tombstoned_comments,
+            tombstoned_issues,
+            tombstoned_comments,
+        })
+    }
+
+    pub fn tombstone_target_issue_sources(
+        &mut self,
+        repo: &str,
+        issue_number: i64,
+        reason: &str,
+    ) -> Result<(usize, usize), QghError> {
+        let mut tombstoned_issues = 0;
+        if let Some(issue) = self.find_issue_by_repo_number(repo, issue_number)? {
+            self.tombstone_source(&issue.source_id, reason)?;
+            tombstoned_issues += 1;
+        }
+        let comment_source_ids = self.active_comment_source_ids_for_issue(repo, issue_number)?;
+        let mut tombstoned_comments = 0;
+        for source_id in comment_source_ids {
+            self.tombstone_source(&source_id, reason)?;
+            tombstoned_comments += 1;
+        }
+        Ok((tombstoned_issues, tombstoned_comments))
     }
 
     pub fn active_issues(&self) -> Result<Vec<StoredIssue>, QghError> {
@@ -619,6 +713,41 @@ impl Store {
             .collect())
     }
 
+    pub fn active_comment_source_ids_for_issue(
+        &self,
+        repo: &str,
+        issue_number: i64,
+    ) -> Result<Vec<String>, QghError> {
+        Ok(self
+            .active_comment_versions_for_issue(repo, issue_number)?
+            .into_keys()
+            .collect())
+    }
+
+    fn active_comment_versions_for_issue(
+        &self,
+        repo: &str,
+        issue_number: i64,
+    ) -> Result<BTreeMap<String, String>, QghError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cm.source_id, sv.body_hash
+             FROM comment_metadata cm
+             JOIN source_entities se ON se.source_id = cm.source_id
+             JOIN source_versions sv ON sv.id = cm.latest_version_id
+             WHERE cm.repo = ?1 AND cm.issue_number = ?2 AND se.lifecycle_state = 'active'
+             ORDER BY cm.source_id",
+        )?;
+        let rows = stmt.query_map(params![repo, issue_number], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut comments = BTreeMap::new();
+        for row in rows {
+            let (source_id, body_hash) = row?;
+            comments.insert(source_id, body_hash);
+        }
+        Ok(comments)
+    }
+
     pub fn mark_index_published(
         &mut self,
         generation: i64,
@@ -734,6 +863,18 @@ impl Store {
     pub fn clear_backoff_state(&self) -> Result<(), QghError> {
         self.conn.execute("DELETE FROM sync_backoff_state", [])?;
         Ok(())
+    }
+
+    fn record_empty_sync_run(&self) -> Result<String, QghError> {
+        let sync_run_id = format!("sync-{}", now_run_id_suffix());
+        let now = now_rfc3339();
+        self.conn.execute(
+            "INSERT INTO sync_runs
+                (id, started_at, completed_at, fetched_issue_count, upserted_issue_count, fetched_comment_count, upserted_comment_count, skipped_pull_request_count)
+             VALUES (?1, ?2, ?2, 0, 0, 0, 0, 0)",
+            params![sync_run_id, now],
+        )?;
+        Ok(sync_run_id)
     }
 
     pub fn reserve_index_generation(

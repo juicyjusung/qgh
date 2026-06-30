@@ -17,7 +17,7 @@ pub struct Cli {
 impl Cli {
     pub fn wants_json(&self) -> bool {
         match &self.command {
-            Command::Sync(args) => args.json,
+            Command::Sync(args) => args.wants_json(),
             Command::Init(args) => args.wants_json(),
             Command::Status { json } | Command::Doctor { json } => *json,
             Command::Query(args) | Command::Search(args) => args.json,
@@ -58,6 +58,52 @@ pub struct SyncArgs {
     pub reconcile: Option<ReconcileMode>,
     #[arg(long)]
     pub all: bool,
+    #[arg(long)]
+    pub quiet: bool,
+    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    pub json: bool,
+    #[command(subcommand)]
+    pub target: Option<SyncTarget>,
+}
+
+impl SyncArgs {
+    pub fn wants_json(&self) -> bool {
+        self.json
+            || self
+                .target
+                .as_ref()
+                .is_some_and(|target| target.wants_json())
+    }
+
+    pub fn quiet(&self) -> bool {
+        self.quiet || self.target.as_ref().is_some_and(|target| target.quiet())
+    }
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum SyncTarget {
+    Issue(SyncIssueArgs),
+}
+
+impl SyncTarget {
+    fn wants_json(&self) -> bool {
+        match self {
+            SyncTarget::Issue(args) => args.json,
+        }
+    }
+
+    fn quiet(&self) -> bool {
+        match self {
+            SyncTarget::Issue(args) => args.quiet,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SyncIssueArgs {
+    pub number: i64,
+    #[arg(long)]
+    pub repo: Option<String>,
     #[arg(long)]
     pub quiet: bool,
     #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]

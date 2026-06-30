@@ -156,6 +156,20 @@ pub struct SyncSummary {
 }
 
 #[derive(Debug, Clone)]
+pub struct TargetedSyncSummary {
+    pub sync_run_id: String,
+    pub fetched_issues: usize,
+    pub upserted_issues: usize,
+    pub fetched_comments: usize,
+    pub upserted_comments: usize,
+    pub added_comments: usize,
+    pub updated_comments: usize,
+    pub deleted_comments: usize,
+    pub tombstoned_issues: usize,
+    pub tombstoned_comments: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct StatusSnapshot {
     pub issue_count: i64,
     pub comment_count: i64,
