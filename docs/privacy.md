@@ -11,6 +11,6 @@ Local paths reported by `status` include:
 
 SQLite files are hardened as single-user files where the platform supports it. Profile data, Tantivy index directories, logs, and cache directories are hardened as single-user directories where the platform supports it.
 
-Default network egress is limited to the configured GitHub host for sync, get lifecycle checks, and explicit `doctor` probes. Hosted provider paths are disabled unless a future policy adds an explicit opt-in.
+Default network egress is limited to the configured GitHub host for sync and explicit `doctor` probes. `get` is local-only by default; CLI `qgh get --verify-lifecycle` explicitly opts in to a configured GitHub host lifecycle check. MCP `get` remains local-only/read-only and rejects lifecycle verification parameters. Hosted provider paths are disabled unless a future policy adds an explicit opt-in.
 
 Tracked repo policy config is project policy, not personal credential config. It may define repo scope and safe default filters, but must not contain literal tokens, token source references, profile store paths, arbitrary database paths, or user-local absolute paths.

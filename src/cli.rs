@@ -38,6 +38,11 @@ pub enum Command {
         source_ids: Vec<String>,
         #[arg(long)]
         profile_id: Option<String>,
+        #[arg(
+            long,
+            help = "Opt in to a GitHub lifecycle check for active/transferred/unavailable state"
+        )]
+        verify_lifecycle: bool,
         #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
         json: bool,
     },

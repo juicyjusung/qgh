@@ -49,6 +49,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     let get_help = stdout_text(&qgh(&["get", "--help"]));
     assert!(get_help.contains("One to 20 qgh source_id values"));
+    assert!(get_help.contains("--verify-lifecycle"));
 
     let mcp = mcp([
         json!({
@@ -124,7 +125,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         artifact["contract"]["get_batch"]["lifecycle_check_policy"],
-        "sequential max_in_flight_requests=1"
+        "CLI opt-in verify_lifecycle; sequential max_in_flight_requests=1 when enabled; MCP get remains local-only"
     );
     assert_eq!(
         artifact["contract"]["human_output"],
@@ -207,9 +208,14 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         20
     );
     assert_eq!(
+        get_schema["oneOf"][1]["properties"]["lifecycle_check_policy"]["properties"]
+            ["verify_lifecycle"]["type"],
+        "boolean"
+    );
+    assert_eq!(
         get_schema["oneOf"][1]["properties"]["lifecycle_check_policy"]["properties"]["mode"]
-            ["const"],
-        "sequential"
+            ["enum"],
+        json!(["not_requested", "sequential"])
     );
     let included = artifact["acceptance_snapshot"]["included_in_mvp_gate"]
         .as_array()
