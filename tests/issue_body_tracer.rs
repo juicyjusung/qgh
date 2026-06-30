@@ -873,6 +873,33 @@ fn init_yes_bootstraps_profile_config_and_repo_policy_without_secret_or_store_pa
 }
 
 #[test]
+fn credential_store_token_source_fails_config_validation_before_auth_resolution() {
+    let fixture = TestFixture::new("credential-store-token-source");
+    fixture.write_config_with_credential_store("http://127.0.0.1:1");
+
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_eq!(sync.status.code(), Some(2));
+    let sync_json = stdout_json(&sync);
+    assert_eq!(
+        sync_json["error"]["code"],
+        "validation.invalid_token_source"
+    );
+    assert!(sync_json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("github_cli"));
+    assert!(!stdout_text(&sync).contains("auth.token_unavailable"));
+    assert!(!stdout_text(&sync).contains("credential_store token resolution"));
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_eq!(status.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&status)["error"]["code"],
+        "validation.invalid_token_source"
+    );
+}
+
+#[test]
 fn init_yes_with_explicit_values_does_not_require_origin_remote() {
     let fixture = TestFixture::new("init-yes-no-origin");
     let nested_worktree_dir = fixture.init_git_worktree();
@@ -3128,6 +3155,26 @@ repos = ["owner/repo"]
 [profiles.strict.token_source]
 type = "env"
 env = "QGH_MISSING_TOKEN"
+"#
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
+    }
+
+    fn write_config_with_credential_store(&self, api_base_url: &str) {
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.work.token_source]
+type = "credential_store"
+service = "qgh"
+account = "work"
 "#
         );
         fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();

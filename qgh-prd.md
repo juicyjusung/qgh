@@ -16,6 +16,7 @@
 개정: 2026-06-29 KST (MCP repo policy/profile resolution — read-only tools share CLI scope contract)
 개정: 2026-06-29 KST (repo policy bootstrap — CLI-only `init` creates tracked `.qgh.toml`)
 개정: 2026-06-30 KST (first-run init wizard and git-origin Command Resolution)
+개정: 2026-06-30 KST (MVP token source contract — `github_cli`/`env` only, `credential_store` post-MVP)
 제품명: qgh
 문서 목적: GitHub Issues와 issue comments용 local-first read-only CLI/MCP 검색 도구의 MVP 요구사항을 정의한다.
 
@@ -215,7 +216,7 @@ MVP에서 제외한다.
 | FR-12 | MCP v1은 read-only `query`, `get`, `status`만 제공하고, CLI와 같은 profile/repo policy resolution, Effective Scope metadata, structured tool errors를 사용해야 한다. | agent가 sync, write-back, embedding job, external egress를 임의로 유발하지 않게 하면서 current worktree repo scope를 벗어난 retrieval을 막는다. | AC-12 |
 | FR-13 | (post-MVP) optional vector/hybrid path는 fingerprint와 partial coverage 상태를 추적해야 하며 BM25 path를 깨뜨리면 안 된다. MVP release gate 아님. | semantic quality 개선은 필요하지만 mixed model/vector state는 잘못된 ranking을 만든다. | AC-13 |
 | FR-14 | qgh는 no result, validation error, auth error, rate-limit/backoff state, stale index warning을 JSON schema상 구분해야 한다. | agent와 shell automation이 실패를 성공 결과로 오인하지 않아야 한다. | AC-11, AC-14 |
-| FR-15 | qgh는 GitHub config에 token 평문을 저장하지 않고 source reference(`github_cli`, `env`, `credential_store`; GitHub App token은 post-MVP/server capability)로만 다뤄야 한다. Runtime source fallback은 금지한다. | local config leak가 private repo access leak로 이어지지 않고 wrong-account fallback이 생기지 않아야 한다. | AC-26 |
+| FR-15 | qgh는 GitHub config에 token 평문을 저장하지 않고 MVP supported source reference(`github_cli`, `env`)로만 다뤄야 한다. `credential_store`와 GitHub App token은 post-MVP capability다. Runtime source fallback은 금지한다. | local config leak가 private repo access leak로 이어지지 않고 wrong-account fallback이 생기지 않아야 한다. | AC-26 |
 | FR-16 | qgh는 CLI-only `doctor` command를 제공해 repo policy, profile resolution, allowlist match count, config/profile, local permissions, SQLite/Tantivy consistency, GitHub auth/reachability, and rate-limit headers를 명시적 probe로 점검해야 한다. MCP에는 `doctor`를 노출하지 않는다. | `status`를 local snapshot으로 유지하면서 설치/인증/권한 문제를 진단할 수 있어야 한다. | AC-28 |
 
 ### 8.1 REST Sync Scheduler Contract
@@ -349,8 +350,8 @@ Rules:
 
 - Profile id must match `[a-z0-9][a-z0-9._-]{0,63}`.
 - `repos` is a non-empty explicit allowlist of `owner/repo` strings. Wildcards, org discovery, current Git remote inference, and empty repo lists are invalid.
-- Token source is a discriminated table. MVP supported types are `github_cli`, `env`, and `credential_store`.
-- `github_cli` does not fallback to `env`; `env` must name exactly one environment variable; `credential_store` must name service/account fields.
+- Token source is a discriminated table. MVP supported types are `github_cli` and `env`.
+- `github_cli` does not fallback to `env`; `env` must name exactly one environment variable. `credential_store` is post-MVP and must fail MVP config validation instead of passing as a supported path.
 - GitHub.com uses `host = "github.com"`, `api_base_url = "https://api.github.com"`, and `web_base_url = "https://github.com"`. GHES may override API/web base URLs but remains best-effort and outside release gate.
 - Profile data path is not configured in MVP. It is derived as `${XDG_DATA_HOME:-~/.local/share}/qgh/profiles/<profile-id>`.
 - Cache path is derived as `${XDG_CACHE_HOME:-~/.cache}/qgh`.
@@ -391,7 +392,7 @@ Repo policy rules:
 | PSR-01 | Default configuration은 hosted embedding, hosted rerank, telemetry upload, shared server를 비활성화해야 한다. | private repo content와 derived data의 third-party egress를 기본적으로 막는다. | AC-15 |
 | PSR-02 | Hosted provider는 future option으로만 남기고 repo/profile policy와 explicit opt-in 없이는 사용할 수 없어야 한다. opt-in 없이는 코드 경로가 활성화되지 않아야 한다. | 보안 검토 없이 “품질 개선”이 private data transfer로 바뀌는 것을 막는다. | AC-15 |
 | PSR-03 | Local DB, snippets, embeddings, logs는 sensitive derivative data로 취급해야 한다. | vector/snippet도 원문 재구성이 어렵더라도 private content를 반영한다. | AC-15, AC-23 |
-| PSR-04 | Token은 qgh config에 평문 저장하지 않고 `github_cli`, `env`, `credential_store` 같은 explicit source reference로 다뤄야 한다. GitHub App token은 post-MVP/server capability다. | local config leak와 wrong-account fallback이 private repo access leak로 이어지지 않아야 한다. | AC-24, AC-26 |
+| PSR-04 | Token은 qgh config에 평문 저장하지 않고 MVP에서는 `github_cli` 또는 `env` explicit source reference로 다뤄야 한다. `credential_store`와 GitHub App token은 post-MVP/server capability다. | local config leak와 wrong-account fallback이 private repo access leak로 이어지지 않아야 한다. | AC-24, AC-26 |
 | PSR-05 | MCP v1은 read-only이고 GitHub write permission 없이 사용할 수 있어야 한다. | 최소 권한으로 agent integration을 가능하게 한다. | AC-12, AC-24 |
 
 ## 13. Search Quality Requirements
@@ -483,7 +484,7 @@ Repo policy rules:
 이 PRD는 MVP planning에 필요한 제품 결정을 닫은 상태다. 남은 것은 구현 중 검증할 empirical uncertainty다.
 
 1. MVP first-class target은 GitHub.com이다. GHES는 best-effort profile capability이며 release gate(AC-20)에서 제외한다.
-2. Token source default는 `github_cli`다. 단, profile에는 explicit source reference가 저장되어야 하며 runtime fallback은 금지한다. `env`와 `credential_store`는 profile에서 명시할 때만 사용한다. GitHub App token은 post-MVP/server capability다.
+2. Token source default는 `github_cli`다. 단, profile에는 explicit source reference가 저장되어야 하며 runtime fallback은 금지한다. MVP supported source는 `github_cli`와 `env`뿐이다. `credential_store`와 GitHub App token은 post-MVP/server capability다.
 3. 초기 curated eval corpus는 synthetic fixture repo로 시작한다. 실제 private repo 익명화 corpus는 user validation 보조 자료이며 release gate가 아니다. Gold source set은 fixture source ids로 라벨링하고 ambiguous query는 제외 규칙을 문서화한다.
 4. CJK baseline은 Tantivy tokenizer baseline + CJK n-gram fallback field다. 형태소 tokenizer는 CJK/mixed target 미달 또는 false-positive 분석에서 n-gram 한계가 확인될 때 optional tier로 올린다.
 5. Full reconciliation은 hidden background work가 아니다. 일반 `sync`는 cheap lifecycle checks를 수행하고, full reconciliation은 explicit `qgh sync --reconcile full`로 시작한다. Optional `reconcile_after_days`는 자동 실행보다 status warning을 우선한다.

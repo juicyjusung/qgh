@@ -12,6 +12,8 @@ This release artifact is for the qgh MVP contract. It does not define new produc
 - MCP read-only tools only: no `init`, `sync`, `doctor`, `eval`, mutation, hosted-provider, or write-back tools.
 - Machine output schema version: `qgh.v1`.
 - Release artifact schema version: `qgh.release.v1`.
+- Supported MVP token sources: `github_cli`, `env`; `credential_store` is
+  post-MVP and fails with `validation.invalid_token_source`.
 
 ## MVP Gate Snapshot
 

@@ -63,8 +63,11 @@ pub struct RepoPolicyQuery {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TokenSource {
     GithubCli,
-    Env { env: String },
-    CredentialStore { service: String, account: String },
+    Env {
+        env: String,
+    },
+    #[serde(other)]
+    Unsupported,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -307,6 +310,7 @@ fn load_config_file() -> Result<ConfigFile, QghError> {
     if config.schema_version != "qgh.config.v1" {
         return Err(QghError::config("Unsupported config schema_version."));
     }
+    validate_config_token_sources(&config)?;
     Ok(config)
 }
 
@@ -607,7 +611,10 @@ fn validate_token_source(token_source: &TokenSource) -> Result<(), QghError> {
             }
             Ok(())
         }
-        TokenSource::CredentialStore { .. } => Ok(()),
+        TokenSource::Unsupported => Err(QghError::validation(
+            "validation.invalid_token_source",
+            "Token source must be `github_cli` or `env`.",
+        )),
     }
 }
 
@@ -615,7 +622,7 @@ fn token_source_kind(token_source: &TokenSource) -> &'static str {
     match token_source {
         TokenSource::GithubCli => "github_cli",
         TokenSource::Env { .. } => "env",
-        TokenSource::CredentialStore { .. } => "credential_store",
+        TokenSource::Unsupported => "unsupported",
     }
 }
 
@@ -650,10 +657,18 @@ pub fn resolve_token(profile: &Profile) -> Result<String, QghError> {
             }
             Ok(token)
         }
-        TokenSource::CredentialStore { service, account } => Err(QghError::auth(format!(
-            "credential_store token resolution is not implemented in this tracer for service `{service}` and account `{account}`."
-        ))),
+        TokenSource::Unsupported => Err(QghError::validation(
+            "validation.invalid_token_source",
+            "Token source must be `github_cli` or `env`.",
+        )),
     }
+}
+
+fn validate_config_token_sources(config: &ConfigFile) -> Result<(), QghError> {
+    for raw in config.profiles.values() {
+        validate_token_source(&raw.token_source)?;
+    }
+    Ok(())
 }
 
 fn validate_profile_id(profile_id: &str) -> Result<(), QghError> {

@@ -36,6 +36,13 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         let output = qgh(args);
         assert_success(&output);
     }
+    let init_help = stdout_text(&qgh(&["init", "--help"]));
+    assert!(init_help.contains("github_cli"));
+    assert!(init_help.contains("env"));
+    assert!(
+        !init_help.contains("credential"),
+        "init help must not present credential_store as supported"
+    );
 
     let mcp = mcp([
         json!({
@@ -80,6 +87,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         artifact["contract"]["cli_only_commands"],
         json!(["init", "sync", "doctor"])
     );
+    assert_eq!(
+        artifact["contract"]["supported_token_sources"],
+        json!(["github_cli", "env"])
+    );
     assert!(artifact["contract"]["not_exposed_to_mcp"]
         .as_array()
         .unwrap()
@@ -116,6 +127,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         init_schema["properties"]["repo_policy_action"]["enum"],
         json!(["created", "overwritten", "already_exists", "skipped"])
     );
+    assert_eq!(
+        init_schema["properties"]["token_source"]["properties"]["kind"]["enum"],
+        json!(["github_cli", "env"])
+    );
     let included = artifact["acceptance_snapshot"]["included_in_mvp_gate"]
         .as_array()
         .unwrap();
@@ -142,6 +157,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "DB/index permissions",
         "doctor output",
         "search eval result",
+        "Supported MVP token sources",
         "Wiki",
         "vector",
         "shared server",
@@ -153,6 +169,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "missing release checklist phrase: {required}"
         );
     }
+    assert!(checklist.contains("credential_store"));
+    assert!(checklist.contains("validation.invalid_token_source"));
 }
 
 fn qgh(args: &[&str]) -> Output {

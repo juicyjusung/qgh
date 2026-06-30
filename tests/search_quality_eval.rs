@@ -169,7 +169,7 @@ fn eval_cases() -> Vec<EvalCase> {
         ),
         keyword(
             "token body",
-            "credential store token source reference",
+            "env token source reference",
             &["qgh://github.com/issue/I_EVAL_104"],
         ),
         keyword(
@@ -588,7 +588,7 @@ fn eval_issues() -> Vec<EvalIssue> {
             104,
             "I_EVAL_104",
             "Token source env fallback",
-            "Credential store token source reference must not persist literal tokens in config or logs.",
+            "Env token source reference must not persist literal tokens in config or logs.",
             vec!["privacy"],
             vec![comment(
                 204,
