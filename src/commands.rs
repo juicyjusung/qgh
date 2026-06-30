@@ -25,6 +25,10 @@ use std::path::PathBuf;
 
 const GET_BATCH_SIZE_CAP: usize = 20;
 
+/// Default `--if-stale` threshold when neither the flag nor `[sync].max_age`
+/// provides one: 30 minutes.
+const DEFAULT_SYNC_MAX_AGE_SECONDS: i64 = 30 * 60;
+
 pub struct InitCommandOutcome {
     pub data: Value,
     pub warnings: Vec<Value>,
@@ -39,6 +43,8 @@ pub struct LocalReadOutcome {
 pub async fn sync(
     profile_id: &str,
     reconcile: Option<ReconcileMode>,
+    if_stale: bool,
+    max_age: Option<&str>,
     repo_scope: Option<&ResolvedRepoScope>,
     show_progress: bool,
 ) -> Result<Value, QghError> {
@@ -49,6 +55,36 @@ pub async fn sync(
     let profile = load_profile(profile_id)?;
     let token = resolve_token(&profile)?;
     let mut store = Store::open(&profile.paths)?;
+
+    // `--if-stale`: skip the network sync entirely when the local snapshot is
+    // still within max-age. Never-synced always proceeds.
+    if if_stale {
+        let max_age_seconds = match max_age {
+            Some(value) => freshness::parse_duration_seconds("max_age", value)?,
+            None => profile
+                .sync_max_age_seconds
+                .unwrap_or(DEFAULT_SYNC_MAX_AGE_SECONDS),
+        };
+        let last_sync = store.status()?.last_sync_at;
+        if let Some(last_sync_at) = last_sync.as_deref() {
+            let snapshot_age_seconds = freshness::snapshot_age_seconds(last_sync_at)?;
+            if snapshot_age_seconds <= max_age_seconds {
+                progress.line(format_args!(
+                    "qgh sync: skipped, snapshot fresh age={snapshot_age_seconds}s max_age={max_age_seconds}s"
+                ));
+                return Ok(json!({
+                    "profile_id": profile.id,
+                    "sync_state": "skipped_fresh",
+                    "sync": {
+                        "last_successful_sync": last_sync,
+                        "snapshot_age_seconds": snapshot_age_seconds,
+                        "max_age_seconds": max_age_seconds
+                    }
+                }));
+            }
+        }
+    }
+
     let cursors = store.sync_cursors()?;
     let fetch_profile = profile_scoped_to_repo(&profile, repo_scope)?;
     progress.line(format_args!(

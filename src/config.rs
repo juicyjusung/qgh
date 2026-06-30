@@ -17,6 +17,7 @@ pub struct Profile {
     pub reconcile_after_seconds: Option<i64>,
     pub freshness: FreshnessSettings,
     pub bootstrap: BootstrapSettings,
+    pub sync_max_age_seconds: Option<i64>,
     pub max_in_flight_requests: usize,
     pub token_source: TokenSource,
     pub paths: ProfilePaths,
@@ -150,6 +151,8 @@ struct RawProfile {
     max_in_flight_requests: Option<usize>,
     #[serde(default)]
     bootstrap_lookback: Option<String>,
+    #[serde(default)]
+    sync_max_age: Option<String>,
     token_source: TokenSource,
 }
 
@@ -282,6 +285,7 @@ pub fn bootstrap_profile_repo(
                     reconcile_after_days: None,
                     max_in_flight_requests: None,
                     bootstrap_lookback: None,
+                    sync_max_age: None,
                     token_source: input.token_source.clone(),
                 },
             );
@@ -402,6 +406,11 @@ fn profile_from_raw(profile_id: &str, raw: &RawProfile) -> Result<Profile, QghEr
     }
     let freshness = parse_profile_freshness(raw)?;
     let bootstrap = parse_profile_bootstrap(raw)?;
+    let sync_max_age_seconds = raw
+        .sync_max_age
+        .as_deref()
+        .map(|value| parse_duration_seconds("sync_max_age", value))
+        .transpose()?;
     let reconcile_after_seconds = parse_reconcile_after(raw)?;
     let max_in_flight_requests = raw.max_in_flight_requests.unwrap_or(4);
     if !(1..=16).contains(&max_in_flight_requests) {
@@ -426,6 +435,7 @@ fn profile_from_raw(profile_id: &str, raw: &RawProfile) -> Result<Profile, QghEr
         reconcile_after_seconds,
         freshness,
         bootstrap,
+        sync_max_age_seconds,
         max_in_flight_requests,
         token_source: raw.token_source.clone(),
         paths,

@@ -115,6 +115,8 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
                     commands::sync(
                         &profile_id,
                         args.reconcile,
+                        args.if_stale,
+                        args.max_age.as_deref(),
                         context.repo_scope.as_ref(),
                         show_progress,
                     )

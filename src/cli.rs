@@ -61,6 +61,13 @@ pub struct SyncArgs {
     pub reconcile: Option<ReconcileMode>,
     #[arg(long)]
     pub all: bool,
+    #[arg(long, help = "Only sync when the local snapshot is older than max-age")]
+    pub if_stale: bool,
+    #[arg(
+        long,
+        help = "Snapshot staleness threshold (e.g. 30m); overrides [sync].max_age"
+    )]
+    pub max_age: Option<String>,
     #[arg(long)]
     pub quiet: bool,
     #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]

@@ -146,7 +146,7 @@ fn split_duration(value: &str) -> Option<(i64, &str)> {
     Some((number, &value[digit_count..]))
 }
 
-fn snapshot_age_seconds(value: &str) -> Result<i64, QghError> {
+pub(crate) fn snapshot_age_seconds(value: &str) -> Result<i64, QghError> {
     let synced_at = DateTime::parse_from_rfc3339(value).map_err(|error| {
         QghError::storage(format!("Invalid stored sync timestamp `{value}`: {error}"))
     })?;

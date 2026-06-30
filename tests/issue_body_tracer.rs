@@ -2223,6 +2223,28 @@ fn full_sync_seeds_coverage_and_fixes_bootstrap_floor() {
 }
 
 #[test]
+fn sync_if_stale_skips_when_fresh_and_runs_when_stale() {
+    let fixture = TestFixture::new("sync-if-stale");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    // Fresh snapshot: --if-stale is a no-op that does not call GitHub.
+    let skipped = fixture.qgh(["sync", "--if-stale", "--max-age", "30m", "--json"]);
+    assert_success(&skipped);
+    let skipped_json = stdout_json(&skipped);
+    assert_eq!(skipped_json["data"]["sync_state"], "skipped_fresh");
+    assert_eq!(skipped_json["data"]["sync"]["max_age_seconds"], 1800);
+
+    // Age the snapshot past max-age: --if-stale now runs a real sync.
+    fixture.set_last_sync_age_seconds(3_600);
+    let ran = fixture.qgh(["sync", "--if-stale", "--max-age", "30m", "--json"]);
+    assert_success(&ran);
+    assert_eq!(stdout_json(&ran)["data"]["sync_state"], "ok");
+}
+
+#[test]
 fn freshness_precedence_is_flag_then_repo_policy_then_profile_config() {
     let fixture = TestFixture::new("freshness-precedence");
     let server = FakeGitHub::start(issue_payload_with_pr());
