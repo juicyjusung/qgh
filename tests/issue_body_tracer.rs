@@ -2114,14 +2114,16 @@ fn coverage_metadata_surfaces_partial_and_warns_on_no_result() {
 
     assert_success(&fixture.qgh(["sync", "--json"]));
 
-    // status exposes the coverage component block; partial until backfill completes.
+    // status exposes the coverage component block. A completed full-profile sync
+    // covers open issues, so open_backfill_complete is set, but historical
+    // backfill is still pending so the corpus stays partial.
     let status = fixture.qgh(["status", "--json"]);
     assert_success(&status);
     let status_json = stdout_json(&status);
     assert_eq!(status_json["data"]["coverage"]["mode"], "partial");
     assert_eq!(
         status_json["data"]["coverage"]["open_backfill_complete"],
-        false
+        true
     );
     assert_eq!(
         status_json["data"]["coverage"]["historical_backfill_complete"],
@@ -2131,6 +2133,7 @@ fn coverage_metadata_surfaces_partial_and_warns_on_no_result() {
         status_json["data"]["coverage"]["history_cursor"],
         Value::Null
     );
+    assert!(status_json["data"]["coverage"]["recent_bootstrap_floor"].is_string());
 
     // a no-result query on a partial corpus gets a strong coverage warning.
     let empty = fixture.qgh(["query", "zzznomatchqgh", "--json"]);
@@ -2184,6 +2187,39 @@ fn coverage_metadata_surfaces_partial_and_warns_on_no_result() {
         .unwrap()
         .iter()
         .all(|warning| warning["code"] != "coverage.partial_no_result"));
+}
+
+#[test]
+fn full_sync_seeds_coverage_and_fixes_bootstrap_floor() {
+    let fixture = TestFixture::new("coverage-bootstrap-floor");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["coverage"]["open_backfill_complete"], true);
+    assert!(status["data"]["coverage"]["oldest_synced_updated_at"].is_string());
+    assert!(status["data"]["coverage"]["recent_bootstrap_floor"].is_string());
+    assert!(status["data"]["coverage"]["open_cursor"].is_string());
+
+    // The bootstrap floor is fixed at first seed and must not be re-derived from
+    // `now` on later syncs. Set a distinctive past floor, re-sync, confirm it
+    // survives unchanged.
+    let db_path = fixture.data_home.join("qgh/profiles/work/qgh.sqlite3");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE coverage_state SET recent_bootstrap_floor = '2020-01-01T00:00:00Z'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let status_after = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(
+        status_after["data"]["coverage"]["recent_bootstrap_floor"],
+        "2020-01-01T00:00:00Z"
+    );
 }
 
 #[test]

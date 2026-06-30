@@ -16,6 +16,7 @@ pub struct Profile {
     pub repos: Vec<RepoRef>,
     pub reconcile_after_seconds: Option<i64>,
     pub freshness: FreshnessSettings,
+    pub bootstrap: BootstrapSettings,
     pub max_in_flight_requests: usize,
     pub token_source: TokenSource,
     pub paths: ProfilePaths,
@@ -87,6 +88,15 @@ pub struct FreshnessSettings {
     pub active_issue_max_age_seconds: Option<i64>,
 }
 
+/// Default recent-bootstrap lookback: 12 months. The lookback fixes the
+/// bootstrap floor recorded in coverage metadata; it is not a corpus boundary.
+pub const DEFAULT_BOOTSTRAP_LOOKBACK_SECONDS: i64 = 12 * 30 * 24 * 60 * 60;
+
+#[derive(Debug, Clone, Copy)]
+pub struct BootstrapSettings {
+    pub lookback_seconds: i64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RepoPolicyFreshness {
     pub query_max_age_seconds: Option<i64>,
@@ -138,6 +148,8 @@ struct RawProfile {
     reconcile_after_days: Option<i64>,
     #[serde(default)]
     max_in_flight_requests: Option<usize>,
+    #[serde(default)]
+    bootstrap_lookback: Option<String>,
     token_source: TokenSource,
 }
 
@@ -269,6 +281,7 @@ pub fn bootstrap_profile_repo(
                     reconcile_after: None,
                     reconcile_after_days: None,
                     max_in_flight_requests: None,
+                    bootstrap_lookback: None,
                     token_source: input.token_source.clone(),
                 },
             );
@@ -388,6 +401,7 @@ fn profile_from_raw(profile_id: &str, raw: &RawProfile) -> Result<Profile, QghEr
         return Err(QghError::config("Profile repos must not be empty."));
     }
     let freshness = parse_profile_freshness(raw)?;
+    let bootstrap = parse_profile_bootstrap(raw)?;
     let reconcile_after_seconds = parse_reconcile_after(raw)?;
     let max_in_flight_requests = raw.max_in_flight_requests.unwrap_or(4);
     if !(1..=16).contains(&max_in_flight_requests) {
@@ -411,6 +425,7 @@ fn profile_from_raw(profile_id: &str, raw: &RawProfile) -> Result<Profile, QghEr
         repos,
         reconcile_after_seconds,
         freshness,
+        bootstrap,
         max_in_flight_requests,
         token_source: raw.token_source.clone(),
         paths,
@@ -661,6 +676,16 @@ fn parse_profile_freshness(raw: &RawProfile) -> Result<FreshnessSettings, QghErr
             .map(|value| parse_duration_seconds("active_issue_max_age", value))
             .transpose()?,
     })
+}
+
+fn parse_profile_bootstrap(raw: &RawProfile) -> Result<BootstrapSettings, QghError> {
+    let lookback_seconds = raw
+        .bootstrap_lookback
+        .as_deref()
+        .map(|value| parse_duration_seconds("bootstrap_lookback", value))
+        .transpose()?
+        .unwrap_or(DEFAULT_BOOTSTRAP_LOOKBACK_SECONDS);
+    Ok(BootstrapSettings { lookback_seconds })
 }
 
 fn parse_reconcile_after(raw: &RawProfile) -> Result<Option<i64>, QghError> {

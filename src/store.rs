@@ -1060,6 +1060,48 @@ impl Store {
         Ok(snapshot.unwrap_or_default())
     }
 
+    /// Persist the full coverage row (singleton). Callers read the current
+    /// snapshot, mutate the fields they own, and write it back so phases that
+    /// own different fields don't clobber each other.
+    pub fn update_coverage(&self, coverage: &CoverageSnapshot) -> Result<(), QghError> {
+        self.conn.execute(
+            "INSERT INTO coverage_state
+                (id, open_cursor, history_cursor, open_backfill_complete,
+                 historical_backfill_complete, oldest_synced_updated_at,
+                 recent_bootstrap_floor, next_backfill_window_hint)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                open_cursor = excluded.open_cursor,
+                history_cursor = excluded.history_cursor,
+                open_backfill_complete = excluded.open_backfill_complete,
+                historical_backfill_complete = excluded.historical_backfill_complete,
+                oldest_synced_updated_at = excluded.oldest_synced_updated_at,
+                recent_bootstrap_floor = excluded.recent_bootstrap_floor,
+                next_backfill_window_hint = excluded.next_backfill_window_hint",
+            params![
+                coverage.open_cursor,
+                coverage.history_cursor,
+                coverage.open_backfill_complete as i64,
+                coverage.historical_backfill_complete as i64,
+                coverage.oldest_synced_updated_at,
+                coverage.recent_bootstrap_floor,
+                coverage.next_backfill_window_hint,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Oldest `updated_at` across active issues. NULL (empty corpus) maps to None.
+    pub fn oldest_active_issue_updated_at(&self) -> Result<Option<String>, QghError> {
+        let oldest: Option<String> = self.conn.query_row(
+            "SELECT min(updated_at) FROM source_entities
+             WHERE entity_type = 'issue' AND lifecycle_state = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(oldest)
+    }
+
     fn migrate(&mut self) -> Result<(), QghError> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = self.migrate_inner();

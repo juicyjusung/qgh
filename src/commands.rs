@@ -129,6 +129,43 @@ pub async fn sync(
         summary.upserted_comments,
         summary.cursor_updates.len()
     ));
+
+    // Seed corpus coverage metadata from a full-profile sync only. A repo-scoped
+    // sync must not claim corpus-wide completion for repos it never touched.
+    if repo_scope.is_none() {
+        let mut coverage = store.coverage_snapshot()?;
+        if coverage.recent_bootstrap_floor.is_none() {
+            // Fixed once at first seed; never re-derived from `now`. checked_sub
+            // avoids a panic on an absurdly large configured lookback.
+            coverage.recent_bootstrap_floor = Utc::now()
+                .checked_sub_signed(chrono::Duration::seconds(
+                    profile.bootstrap.lookback_seconds,
+                ))
+                .map(|floor| floor.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        }
+        // Oldest reach only extends backward: tombstoning the oldest issue must
+        // not make coverage report a more recent floor than was actually synced.
+        if let Some(corpus_oldest) = store.oldest_active_issue_updated_at()? {
+            coverage.oldest_synced_updated_at = Some(match coverage.oldest_synced_updated_at {
+                Some(existing) => existing.min(corpus_oldest),
+                None => corpus_oldest,
+            });
+        }
+        // A full-profile Fetched sync paginated every repo to the end (a mid-pass
+        // backoff returns early), so open issues are covered up to now.
+        coverage.open_backfill_complete = true;
+        if let Some(watermark) = summary
+            .cursor_updates
+            .iter()
+            .filter(|cursor| cursor.endpoint.starts_with("issues:"))
+            .filter_map(|cursor| cursor.watermark.clone())
+            .max()
+        {
+            coverage.open_cursor = Some(watermark);
+        }
+        store.update_coverage(&coverage)?;
+    }
+
     let reconciliation = if reconcile == Some(ReconcileMode::Full) {
         let candidates = store.active_reconciliation_candidates()?;
         let candidates = reconciliation_candidates_scoped_to_repo(candidates, repo_scope);
