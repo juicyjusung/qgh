@@ -445,12 +445,41 @@ pub async fn fetch_target_issue(
                     alias_chain,
                 )));
             }
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                return Ok(TargetIssueFetchOutcome::Unavailable(unavailable_lifecycle(
-                    "permission_loss",
-                    status,
-                    alias_chain,
-                )));
+            StatusCode::UNAUTHORIZED => {
+                return Err(QghError::auth(
+                    "GitHub authentication failed during targeted issue refresh.",
+                )
+                .with_details(json!({
+                    "http_status": status.as_u16(),
+                    "scope": scope
+                }))
+                .with_hint("Refresh the configured GitHub token source, then retry sync issue."));
+            }
+            StatusCode::FORBIDDEN => {
+                let body = response.text().await.unwrap_or_default();
+                if response_body_looks_rate_limited(&body) {
+                    return Ok(TargetIssueFetchOutcome::Backoff(BackoffPlan {
+                        reason: "secondary_rate_limit".to_string(),
+                        scope,
+                        retry_after_seconds: 60,
+                        reset_at: None,
+                    }));
+                }
+                if response_body_confirms_permission_loss(&body) {
+                    return Ok(TargetIssueFetchOutcome::Unavailable(unavailable_lifecycle(
+                        "permission_loss",
+                        status,
+                        alias_chain,
+                    )));
+                }
+                return Err(QghError::github(
+                    "GitHub targeted issue refresh failed with ambiguous HTTP 403.",
+                )
+                .with_details(json!({
+                    "http_status": status.as_u16(),
+                    "scope": scope
+                }))
+                .with_hint("Retry later or run qgh doctor to distinguish authorization from GitHub throttling."));
             }
             status if status.is_success() => {
                 return Err(QghError::github(format!(
@@ -676,6 +705,18 @@ fn targeted_backoff_from_response(
         return backoff_from_response(status, headers, scope);
     }
     None
+}
+
+fn response_body_looks_rate_limited(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("rate limit") || lower.contains("abuse detection")
+}
+
+fn response_body_confirms_permission_loss(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("resource not accessible")
+        || lower.contains("permission")
+        || lower.contains("must have")
 }
 
 fn wait_for_backoff(backoff: &BackoffPlan) {

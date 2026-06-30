@@ -3444,6 +3444,53 @@ fn sync_issue_marks_permission_loss_with_distinct_reason() {
 }
 
 #[test]
+fn sync_issue_auth_failure_does_not_tombstone_local_sources() {
+    let fixture = TestFixture::new("targeted-refresh-auth-failed");
+    let server = TargetedRefreshFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    server.set_mode(TARGET_REFRESH_AUTH_FAILED);
+    let refresh = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_eq!(refresh.status.code(), Some(3));
+    assert_eq!(
+        stdout_json(&refresh)["error"]["code"],
+        "auth.token_unavailable"
+    );
+    fixture.assert_no_tombstone("qgh://github.com/issue/I_kwDOISSUE1");
+
+    let local_query = fixture.qgh(["query", "BM25 issue body tracer", "--json"]);
+    assert_success(&local_query);
+    assert_eq!(
+        stdout_json(&local_query)["data"]["results"][0]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+}
+
+#[test]
+fn sync_issue_secondary_rate_limit_without_retry_after_does_not_tombstone() {
+    let fixture = TestFixture::new("targeted-refresh-ambiguous-rate-limit");
+    let server = TargetedRefreshFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    server.set_mode(TARGET_REFRESH_SECONDARY_RATE_LIMIT_NO_RETRY_AFTER);
+    let refresh = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_success(&refresh);
+    let refresh_json = stdout_json(&refresh);
+    assert_eq!(refresh_json["data"]["sync_state"], "backoff");
+    assert_eq!(
+        refresh_json["data"]["backoff"]["reason"],
+        "secondary_rate_limit"
+    );
+    assert_eq!(
+        refresh_json["data"]["backoff"]["scope"],
+        "issue:owner/repo#42"
+    );
+    fixture.assert_no_tombstone("qgh://github.com/issue/I_kwDOISSUE1");
+}
+
+#[test]
 fn sync_issue_follows_transfer_alias_and_tombstones_old_issue() {
     let fixture = TestFixture::new("targeted-refresh-transfer");
     let server = TargetedRefreshFakeGitHub::start();
@@ -4138,6 +4185,19 @@ limit = {limit}
             )
             .unwrap();
         assert_eq!(reason, expected);
+    }
+
+    fn assert_no_tombstone(&self, source_id: &str) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM tombstones WHERE source_id = ?1",
+                [source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     fn assert_private_local_data_permissions(&self) {
@@ -5034,6 +5094,8 @@ const TARGET_REFRESH_DELETED: usize = 3;
 const TARGET_REFRESH_PERMISSION_LOSS: usize = 4;
 const TARGET_REFRESH_TRANSFER: usize = 5;
 const TARGET_REFRESH_TRANSFER_CYCLE: usize = 6;
+const TARGET_REFRESH_AUTH_FAILED: usize = 7;
+const TARGET_REFRESH_SECONDARY_RATE_LIMIT_NO_RETRY_AFTER: usize = 8;
 
 struct TargetedRefreshFakeGitHub {
     base_url: String,
@@ -5128,6 +5190,14 @@ fn handle_targeted_refresh_connection(
             (
                 "403 Forbidden",
                 r#"{"message":"resource not accessible"}"#,
+                None,
+            )
+        } else if mode == TARGET_REFRESH_AUTH_FAILED {
+            ("401 Unauthorized", r#"{"message":"Bad credentials"}"#, None)
+        } else if mode == TARGET_REFRESH_SECONDARY_RATE_LIMIT_NO_RETRY_AFTER {
+            (
+                "403 Forbidden",
+                r#"{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}"#,
                 None,
             )
         } else if matches!(
