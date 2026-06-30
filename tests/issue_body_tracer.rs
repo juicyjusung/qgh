@@ -650,7 +650,7 @@ fn get_batch_defaults_to_local_reads_and_only_tombstones_with_lifecycle_opt_in()
     assert_eq!(items[1]["source_id"], comment_id);
     assert_eq!(items[1]["ok"], false);
     assert_eq!(items[1]["error"]["code"], "source.tombstoned");
-    assert_eq!(items[1]["error"]["details"]["reason"], "not_found");
+    assert_eq!(items[1]["error"]["details"]["reason"], "deleted");
 }
 
 #[test]
@@ -1835,7 +1835,7 @@ fn full_reconciliation_tombstones_deleted_comments_and_updates_status() {
         deleted_get_json["error"]["details"]["source_id"],
         comment_source_id
     );
-    assert_eq!(deleted_get_json["error"]["details"]["reason"], "not_found");
+    assert_eq!(deleted_get_json["error"]["details"]["reason"], "deleted");
 
     let status = fixture.qgh(["status", "--json"]);
     assert_success(&status);
@@ -1883,7 +1883,7 @@ fn get_tombstones_unavailable_issue_and_filters_active_query() {
     let get_json = stdout_json(&get);
     assert_eq!(get_json["error"]["code"], "source.tombstoned");
     assert_eq!(get_json["error"]["details"]["source_id"], issue_source_id);
-    assert_eq!(get_json["error"]["details"]["reason"], "not_found");
+    assert_eq!(get_json["error"]["details"]["reason"], "deleted");
     assert!(get_json["error"]["details"]["observed_at"]
         .as_str()
         .is_some());
@@ -1920,7 +1920,7 @@ fn get_tombstones_moved_issue_as_structured_lifecycle_state() {
     let get_json = stdout_json(&get);
     assert_eq!(get_json["error"]["code"], "source.tombstoned");
     assert_eq!(get_json["error"]["details"]["source_id"], issue_source_id);
-    assert_eq!(get_json["error"]["details"]["reason"], "moved");
+    assert_eq!(get_json["error"]["details"]["reason"], "transferred");
     assert_eq!(
         get_json["error"]["details"]["lifecycle_state"],
         "tombstoned"
@@ -2242,6 +2242,71 @@ fn sync_if_stale_skips_when_fresh_and_runs_when_stale() {
     let ran = fixture.qgh(["sync", "--if-stale", "--max-age", "30m", "--json"]);
     assert_success(&ran);
     assert_eq!(stdout_json(&ran)["data"]["sync_state"], "ok");
+}
+
+#[test]
+fn reconcile_recent_window_tombstones_with_unified_reason_code() {
+    let fixture = TestFixture::new("recent-reconciliation");
+    let server = LifecycleFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let comment_source_id = "qgh://github.com/issue-comment/IC_kwDOCOMMENT1";
+
+    server.set_mode(LIFECYCLE_DELETED_COMMENT);
+    let reconcile = fixture.qgh([
+        "sync",
+        "--reconcile",
+        "recent",
+        "--window",
+        "120mo",
+        "--json",
+    ]);
+    assert_success(&reconcile);
+    let reconcile_json = stdout_json(&reconcile);
+    assert_eq!(reconcile_json["data"]["reconciliation"]["mode"], "recent");
+    assert_eq!(
+        reconcile_json["data"]["reconciliation"]["tombstoned_sources"],
+        1
+    );
+
+    // Reason code is unified with full reconcile and targeted refresh.
+    let deleted_get = fixture.qgh(["get", comment_source_id, "--json"]);
+    assert_eq!(deleted_get.status.code(), Some(4));
+    let deleted_get_json = stdout_json(&deleted_get);
+    assert_eq!(deleted_get_json["error"]["code"], "source.tombstoned");
+    assert_eq!(deleted_get_json["error"]["details"]["reason"], "deleted");
+}
+
+#[test]
+fn reconcile_recent_window_excludes_old_sources_and_validates_flag() {
+    let fixture = TestFixture::new("recent-window-exclusion");
+    let server = LifecycleFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let comment_source_id = "qgh://github.com/issue-comment/IC_kwDOCOMMENT1";
+
+    server.set_mode(LIFECYCLE_DELETED_COMMENT);
+    // Synced sources carry past GitHub updated_at; a 1-second window excludes
+    // them, so the deleted comment is never rechecked or tombstoned by recent.
+    let narrow = fixture.qgh(["sync", "--reconcile", "recent", "--window", "1s", "--json"]);
+    assert_success(&narrow);
+    let narrow_json = stdout_json(&narrow);
+    assert_eq!(narrow_json["data"]["reconciliation"]["mode"], "recent");
+    assert_eq!(
+        narrow_json["data"]["reconciliation"]["tombstoned_sources"],
+        0
+    );
+    // The comment is still an active local source (excluded from the recheck).
+    assert_success(&fixture.qgh(["get", comment_source_id, "--json"]));
+
+    // --window is only valid with --reconcile recent.
+    let rejected = fixture.qgh(["sync", "--window", "7d", "--json"]);
+    assert_eq!(rejected.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&rejected)["error"]["code"],
+        "validation.window_requires_recent"
+    );
 }
 
 #[test]

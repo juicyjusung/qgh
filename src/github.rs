@@ -799,22 +799,23 @@ async fn check_candidate_lifecycle(
         .send()
         .await
         .map_err(|error| QghError::github(error.to_string()))?;
+    // Reason *strings* are unified with the targeted-refresh path
+    // (transferred / deleted / permission_loss). The control flow still differs:
+    // fetch_target_issue disambiguates 403 (rate-limit vs permission) and backs
+    // off, whereas this reconcile probe maps 401/403 straight to permission_loss.
     Ok(match response.status() {
         StatusCode::OK => LifecycleCheck::Active,
-        StatusCode::NOT_FOUND => LifecycleCheck::Unavailable {
-            reason: "not_found".to_string(),
-        },
-        StatusCode::GONE => LifecycleCheck::Unavailable {
-            reason: "gone".to_string(),
+        StatusCode::NOT_FOUND | StatusCode::GONE => LifecycleCheck::Unavailable {
+            reason: "deleted".to_string(),
         },
         StatusCode::MOVED_PERMANENTLY
         | StatusCode::FOUND
         | StatusCode::TEMPORARY_REDIRECT
         | StatusCode::PERMANENT_REDIRECT => LifecycleCheck::Unavailable {
-            reason: "moved".to_string(),
+            reason: "transferred".to_string(),
         },
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => LifecycleCheck::Unavailable {
-            reason: "permission_denied".to_string(),
+            reason: "permission_loss".to_string(),
         },
         status if status.is_success() => LifecycleCheck::Active,
         status => {

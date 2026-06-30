@@ -29,6 +29,10 @@ const GET_BATCH_SIZE_CAP: usize = 20;
 /// provides one: 30 minutes.
 const DEFAULT_SYNC_MAX_AGE_SECONDS: i64 = 30 * 60;
 
+/// Default `--reconcile recent` window when neither `--window` nor
+/// `[profile].reconcile_after` provides one: 7 days.
+const DEFAULT_RECONCILE_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
+
 pub struct InitCommandOutcome {
     pub data: Value,
     pub warnings: Vec<Value>,
@@ -43,6 +47,7 @@ pub struct LocalReadOutcome {
 pub async fn sync(
     profile_id: &str,
     reconcile: Option<ReconcileMode>,
+    window: Option<&str>,
     if_stale: bool,
     max_age: Option<&str>,
     repo_scope: Option<&ResolvedRepoScope>,
@@ -55,6 +60,13 @@ pub async fn sync(
     let profile = load_profile(profile_id)?;
     let token = resolve_token(&profile)?;
     let mut store = Store::open(&profile.paths)?;
+
+    if window.is_some() && reconcile != Some(ReconcileMode::Recent) {
+        return Err(QghError::validation(
+            "validation.window_requires_recent",
+            "--window is only valid with --reconcile recent.",
+        ));
+    }
 
     // `--if-stale`: skip the network sync entirely when the local snapshot is
     // still within max-age. Never-synced always proceeds.
@@ -202,37 +214,55 @@ pub async fn sync(
         store.update_coverage(&coverage)?;
     }
 
-    let reconciliation = if reconcile == Some(ReconcileMode::Full) {
-        let candidates = store.active_reconciliation_candidates()?;
-        let candidates = reconciliation_candidates_scoped_to_repo(candidates, repo_scope);
-        let estimated_api_cost_class = estimate_api_cost_class(candidates.len());
-        progress.line(format_args!(
-            "qgh sync: reconciling sources={} mode=full",
-            candidates.len()
-        ));
-        let result =
-            github::reconcile_sources(&fetch_profile, &token, &candidates, Some(&progress)).await?;
-        let mut tombstoned_sources = 0;
-        for unavailable in result.unavailable_sources {
-            store.tombstone_source(&unavailable.source_id, &unavailable.reason)?;
-            tombstoned_sources += 1;
+    let reconciliation = match reconcile {
+        Some(mode) => {
+            let (mode_str, candidates) = match mode {
+                ReconcileMode::Full => ("full", store.active_reconciliation_candidates()?),
+                ReconcileMode::Recent => {
+                    // Default to a dedicated window constant, not reconcile_after
+                    // (which is the status staleness threshold, a different axis).
+                    let window_seconds = match window {
+                        Some(value) => freshness::parse_duration_seconds("window", value)?,
+                        None => DEFAULT_RECONCILE_WINDOW_SECONDS,
+                    };
+                    let updated_since = Utc::now()
+                        .checked_sub_signed(chrono::Duration::seconds(window_seconds))
+                        .map(|floor| floor.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+                    (
+                        "recent",
+                        store.recent_reconciliation_candidates(&updated_since)?,
+                    )
+                }
+            };
+            let candidates = reconciliation_candidates_scoped_to_repo(candidates, repo_scope);
+            let estimated_api_cost_class = estimate_api_cost_class(candidates.len());
+            progress.line(format_args!(
+                "qgh sync: reconciling sources={} mode={mode_str}",
+                candidates.len()
+            ));
+            let result =
+                github::reconcile_sources(&fetch_profile, &token, &candidates, Some(&progress))
+                    .await?;
+            let mut tombstoned_sources = 0;
+            for unavailable in result.unavailable_sources {
+                store.tombstone_source(&unavailable.source_id, &unavailable.reason)?;
+                tombstoned_sources += 1;
+            }
+            store.record_reconciliation_run(
+                mode_str,
+                result.checked_sources,
+                tombstoned_sources,
+                estimated_api_cost_class,
+            )?;
+            json!({
+                "mode": mode_str,
+                "checked_sources": result.checked_sources,
+                "tombstoned_sources": tombstoned_sources,
+                "estimated_api_cost_class": estimated_api_cost_class
+            })
         }
-        store.record_reconciliation_run(
-            "full",
-            result.checked_sources,
-            tombstoned_sources,
-            estimated_api_cost_class,
-        )?;
-        json!({
-            "mode": "full",
-            "checked_sources": result.checked_sources,
-            "tombstoned_sources": tombstoned_sources,
-            "estimated_api_cost_class": estimated_api_cost_class
-        })
-    } else {
-        json!({
-            "mode": "none"
-        })
+        None => json!({ "mode": "none" }),
     };
     store.clear_backoff_state()?;
     let (generation, dirty_task_count) = rebuild_bm25_index(&profile, &mut store, &progress)?;

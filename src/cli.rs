@@ -59,6 +59,11 @@ pub enum Command {
 pub struct SyncArgs {
     #[arg(long)]
     pub reconcile: Option<ReconcileMode>,
+    #[arg(
+        long,
+        help = "Window for --reconcile recent (e.g. 7d); default [profile].reconcile_after"
+    )]
+    pub window: Option<String>,
     #[arg(long)]
     pub all: bool,
     #[arg(long, help = "Only sync when the local snapshot is older than max-age")]
@@ -186,6 +191,7 @@ pub enum InitTokenSourceArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ReconcileMode {
     Full,
+    Recent,
 }
 
 #[derive(Debug, Clone, Args)]

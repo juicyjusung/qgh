@@ -557,17 +557,40 @@ impl Store {
     pub fn active_reconciliation_candidates(
         &self,
     ) -> Result<Vec<ReconciliationCandidate>, QghError> {
-        let mut stmt = self.conn.prepare(
+        self.reconciliation_candidates(None)
+    }
+
+    /// Active sources updated at or after `updated_since`, for window-bounded
+    /// `--reconcile recent`.
+    pub fn recent_reconciliation_candidates(
+        &self,
+        updated_since: &str,
+    ) -> Result<Vec<ReconciliationCandidate>, QghError> {
+        self.reconciliation_candidates(Some(updated_since))
+    }
+
+    fn reconciliation_candidates(
+        &self,
+        updated_since: Option<&str>,
+    ) -> Result<Vec<ReconciliationCandidate>, QghError> {
+        let mut sql = String::from(
             "SELECT se.source_id, se.entity_type, se.repo,
                     coalesce(im.issue_number, cm.issue_number) AS issue_number,
                     se.github_id
              FROM source_entities se
              LEFT JOIN issue_metadata im ON im.source_id = se.source_id
              LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
-             WHERE se.lifecycle_state = 'active'
-             ORDER BY se.repo, issue_number, se.entity_type, se.source_id",
-        )?;
-        let rows = stmt.query_map([], reconciliation_candidate_from_row)?;
+             WHERE se.lifecycle_state = 'active'",
+        );
+        if updated_since.is_some() {
+            sql.push_str(" AND se.updated_at >= ?1");
+        }
+        sql.push_str(" ORDER BY se.repo, issue_number, se.entity_type, se.source_id");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = match updated_since {
+            Some(since) => stmt.query_map(params![since], reconciliation_candidate_from_row)?,
+            None => stmt.query_map([], reconciliation_candidate_from_row)?,
+        };
         rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
     }
 
@@ -1367,6 +1390,18 @@ impl Store {
              SELECT DISTINCT repo, (SELECT max(completed_at) FROM sync_runs)
              FROM source_entities
              WHERE (SELECT max(completed_at) FROM sync_runs) IS NOT NULL",
+            [],
+        )?;
+        // Remap legacy lifecycle/reconcile tombstone reasons to the unified
+        // vocabulary so pre-existing tombstones match the documented contract.
+        self.conn.execute(
+            "UPDATE tombstones SET reason = CASE reason
+                WHEN 'not_found' THEN 'deleted'
+                WHEN 'gone' THEN 'deleted'
+                WHEN 'moved' THEN 'transferred'
+                WHEN 'permission_denied' THEN 'permission_loss'
+                ELSE reason END
+             WHERE reason IN ('not_found', 'gone', 'moved', 'permission_denied')",
             [],
         )?;
         self.conn.execute(
