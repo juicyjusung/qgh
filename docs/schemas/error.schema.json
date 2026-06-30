@@ -54,6 +54,7 @@
         "validation.unsupported_filter",
         "validation.unsupported_source_type",
         "validation.ambiguous_locator",
+        "freshness.stale",
         "auth.token_unavailable",
         "github.request_failed",
         "source.not_found",

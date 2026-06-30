@@ -19,7 +19,8 @@ impl Cli {
         match &self.command {
             Command::Sync(args) => args.wants_json(),
             Command::Init(args) => args.wants_json(),
-            Command::Status { json } | Command::Doctor { json } => *json,
+            Command::Status(args) => args.json,
+            Command::Doctor { json } => *json,
             Command::Query(args) | Command::Search(args) => args.json,
             Command::Get { json, .. } => *json,
             Command::Mcp => false,
@@ -41,10 +42,7 @@ pub enum Command {
         #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
         json: bool,
     },
-    Status {
-        #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
-        json: bool,
-    },
+    Status(StatusArgs),
     Doctor {
         #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
         json: bool,
@@ -195,6 +193,28 @@ pub struct QueryArgs {
     pub issue: Option<i64>,
     #[arg(long)]
     pub wiki: Option<String>,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        help = "Override query snapshot max age for this run, e.g. 90s, 30m, 7d, 12mo"
+    )]
+    pub max_age: Option<String>,
+    #[arg(long, help = "Fail this run if the local snapshot is stale")]
+    pub require_fresh: bool,
+    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct StatusArgs {
+    #[arg(
+        long,
+        value_name = "DURATION",
+        help = "Override status snapshot max age for this run, e.g. 90s, 30m, 7d, 12mo"
+    )]
+    pub max_age: Option<String>,
+    #[arg(long, help = "Fail this run if the local snapshot is stale")]
+    pub require_fresh: bool,
     #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
     pub json: bool,
 }

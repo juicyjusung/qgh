@@ -3,10 +3,13 @@
   "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/query-result.schema.json",
   "title": "qgh query response",
   "type": "object",
-  "required": ["profile_id", "result_filtering", "results"],
+  "required": ["profile_id", "freshness", "result_filtering", "results"],
   "properties": {
     "profile_id": {
       "type": "string"
+    },
+    "freshness": {
+      "$ref": "#/$defs/freshness"
     },
     "result_filtering": {
       "type": "object",
@@ -105,6 +108,33 @@
         },
         "ranking": {
           "$ref": "#/$defs/ranking"
+        }
+      },
+      "additionalProperties": false
+    },
+    "freshness": {
+      "type": "object",
+      "required": [
+        "decision",
+        "remote_checked",
+        "snapshot_age_seconds",
+        "max_age_seconds"
+      ],
+      "properties": {
+        "decision": {
+          "type": "string",
+          "enum": ["fresh", "stale_warn", "stale_fail", "never_synced"]
+        },
+        "remote_checked": {
+          "const": false
+        },
+        "snapshot_age_seconds": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "max_age_seconds": {
+          "type": "integer",
+          "minimum": 1
         }
       },
       "additionalProperties": false

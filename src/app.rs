@@ -2,7 +2,9 @@ use crate::cli::Cli;
 use crate::commands;
 use crate::error::QghError;
 use crate::mcp;
-use crate::output::{print_error, print_human_success, print_success, SuccessOutputKind};
+use crate::output::{
+    print_error, print_human_success, print_human_warnings, print_success, SuccessOutputKind,
+};
 use crate::resolution::{
     repo_scope_from_cli_arg, repo_scope_from_worktree, resolve_context, resolve_explicit_context,
     ResolvedCommandContext, ResolvedRepoScope,
@@ -44,6 +46,9 @@ pub async fn run_from_env() -> i32 {
                     &outcome.warnings,
                     &outcome.meta,
                 );
+                if !matches!(outcome.output_kind, SuccessOutputKind::Init) {
+                    print_human_warnings(&outcome.warnings);
+                }
             }
             0
         }
@@ -91,13 +96,12 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
     let profile_id = context.profile_id.clone();
     let command = cli.command;
     let output_kind = success_output_kind(&command);
-    let is_status = matches!(command, crate::cli::Command::Status { .. });
     let is_doctor = matches!(command, crate::cli::Command::Doctor { .. });
 
-    let mut data = match command {
+    let (mut data, warnings) = match command {
         crate::cli::Command::Sync(args) => {
             let show_progress = !args.wants_json() && !args.quiet();
-            match &args.target {
+            let data = match &args.target {
                 Some(crate::cli::SyncTarget::Issue(issue_args)) => {
                     commands::sync_issue(
                         &profile_id,
@@ -105,7 +109,7 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
                         context.repo_scope.as_ref(),
                         show_progress,
                     )
-                    .await
+                    .await?
                 }
                 None => {
                     commands::sync(
@@ -114,23 +118,33 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
                         context.repo_scope.as_ref(),
                         show_progress,
                     )
-                    .await
+                    .await?
                 }
-            }
+            };
+            (data, Vec::new())
         }
         crate::cli::Command::Query(args) | crate::cli::Command::Search(args) => {
-            commands::query(&profile_id, args, context.repo_scope.as_ref())
+            let outcome = commands::query(&profile_id, args, context.repo_scope.as_ref())?;
+            (outcome.data, outcome.warnings)
         }
         crate::cli::Command::Get { source_ids, .. } => {
-            commands::get_cli(&profile_id, &source_ids, context.repo_scope.as_ref()).await
+            let data =
+                commands::get_cli(&profile_id, &source_ids, context.repo_scope.as_ref()).await?;
+            (data, Vec::new())
         }
-        crate::cli::Command::Status { .. } => commands::status(&profile_id),
-        crate::cli::Command::Doctor { .. } => commands::doctor(&profile_id).await,
+        crate::cli::Command::Status(args) => {
+            let outcome = commands::status(&profile_id, &args)?;
+            (outcome.data, outcome.warnings)
+        }
+        crate::cli::Command::Doctor { .. } => {
+            let data = commands::doctor(&profile_id).await?;
+            (data, Vec::new())
+        }
         crate::cli::Command::Init(_) => unreachable!("init is handled before normal resolution"),
         crate::cli::Command::Mcp => unreachable!("MCP is handled before normal CLI output"),
-    }?;
+    };
 
-    if is_status {
+    if matches!(output_kind, SuccessOutputKind::Status) {
         data["resolution"] = context.resolution_json();
     }
     if is_doctor {
@@ -141,7 +155,7 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
         output_kind,
         json_mode,
         data,
-        warnings: Vec::new(),
+        warnings,
         meta: context.meta_json(),
     })
 }
@@ -151,7 +165,7 @@ fn success_output_kind(command: &crate::cli::Command) -> SuccessOutputKind {
         crate::cli::Command::Sync(_) => SuccessOutputKind::Sync,
         crate::cli::Command::Query(_) | crate::cli::Command::Search(_) => SuccessOutputKind::Query,
         crate::cli::Command::Get { .. } => SuccessOutputKind::Get,
-        crate::cli::Command::Status { .. } => SuccessOutputKind::Status,
+        crate::cli::Command::Status(_) => SuccessOutputKind::Status,
         crate::cli::Command::Doctor { .. } => SuccessOutputKind::Doctor,
         crate::cli::Command::Init(_) => SuccessOutputKind::Init,
         crate::cli::Command::Mcp => unreachable!("MCP is handled before normal CLI output"),
@@ -220,7 +234,7 @@ fn effective_repo_scope_for_command(
         crate::cli::Command::Get {
             profile_id: None, ..
         }
-        | crate::cli::Command::Status { .. }
+        | crate::cli::Command::Status(_)
         | crate::cli::Command::Doctor { .. } => repo_scope_from_worktree(),
         crate::cli::Command::Sync(args) => {
             if let Some(crate::cli::SyncTarget::Issue(issue_args)) = &args.target {

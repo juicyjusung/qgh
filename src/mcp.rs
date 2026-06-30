@@ -1,7 +1,8 @@
 use crate::cli::QueryArgs;
 use crate::commands;
 use crate::error::QghError;
-use crate::output::{error_envelope, success_envelope_with_meta};
+use crate::freshness;
+use crate::output::{error_envelope, success_envelope_with_meta_and_warnings};
 use crate::resolution::{
     repo_scope_from_command_arg, repo_scope_from_worktree, resolve_context,
     resolve_explicit_context, ResolvedCommandContext, ResolvedRepoScope,
@@ -101,8 +102,12 @@ fn tool_query(session: &McpSession, arguments: &Value) -> Result<Value, QghError
     let args = parse_query_args(arguments)?;
     let repo_scope = effective_query_repo_scope(&args)?;
     let context = resolve_mcp_context(session, repo_scope)?;
-    let data = commands::query(&context.profile_id, args, context.repo_scope.as_ref())?;
-    Ok(tool_success(data, context.meta_json()))
+    let outcome = commands::query(&context.profile_id, args, context.repo_scope.as_ref())?;
+    Ok(tool_success(
+        outcome.data,
+        outcome.warnings,
+        context.meta_json(),
+    ))
 }
 
 fn tool_get(session: &McpSession, arguments: &Value) -> Result<Value, QghError> {
@@ -113,15 +118,20 @@ fn tool_get(session: &McpSession, arguments: &Value) -> Result<Value, QghError> 
         &args.source_id,
         context.repo_scope.as_ref(),
     )?;
-    Ok(tool_success(data, context.meta_json()))
+    Ok(tool_success(data, Vec::new(), context.meta_json()))
 }
 
 fn tool_status(session: &McpSession, arguments: &Value) -> Result<Value, QghError> {
-    parse_empty_args(arguments)?;
+    let args = parse_status_args(arguments)?;
     let context = resolve_mcp_context(session, repo_scope_from_worktree()?)?;
-    let mut data = commands::status(&context.profile_id)?;
+    let mut outcome = commands::status(&context.profile_id, &args)?;
+    let data = &mut outcome.data;
     data["resolution"] = context.resolution_json();
-    Ok(tool_success(data, context.meta_json()))
+    Ok(tool_success(
+        outcome.data,
+        outcome.warnings,
+        context.meta_json(),
+    ))
 }
 
 fn effective_query_repo_scope(args: &QueryArgs) -> Result<Option<ResolvedRepoScope>, QghError> {
@@ -213,7 +223,15 @@ fn parse_query_args(arguments: &Value) -> Result<QueryArgs, QghError> {
     reject_unknown(
         object,
         &[
-            "query", "limit", "repo", "label", "state", "author", "issue",
+            "query",
+            "limit",
+            "repo",
+            "label",
+            "state",
+            "author",
+            "issue",
+            "max_age",
+            "require_fresh",
         ],
     )?;
     Ok(QueryArgs {
@@ -225,6 +243,18 @@ fn parse_query_args(arguments: &Value) -> Result<QueryArgs, QghError> {
         author: optional_string(object, "author")?,
         issue: optional_i64(object, "issue")?,
         wiki: None,
+        max_age: optional_duration_string(object, "max_age")?,
+        require_fresh: optional_bool(object, "require_fresh")?.unwrap_or(false),
+        json: false,
+    })
+}
+
+fn parse_status_args(arguments: &Value) -> Result<crate::cli::StatusArgs, QghError> {
+    let object = argument_object(arguments)?;
+    reject_unknown(object, &["max_age", "require_fresh"])?;
+    Ok(crate::cli::StatusArgs {
+        max_age: optional_duration_string(object, "max_age")?,
+        require_fresh: optional_bool(object, "require_fresh")?.unwrap_or(false),
         json: false,
     })
 }
@@ -236,12 +266,6 @@ fn parse_get_args(arguments: &Value) -> Result<GetArgs, QghError> {
         source_id: required_string(object, "source_id")?,
         profile_id: optional_string(object, "profile_id")?,
     })
-}
-
-fn parse_empty_args(arguments: &Value) -> Result<(), QghError> {
-    let object = argument_object(arguments)?;
-    reject_unknown(object, &[])?;
-    Ok(())
 }
 
 fn argument_object(arguments: &Value) -> Result<&Map<String, Value>, QghError> {
@@ -279,6 +303,18 @@ fn optional_string(object: &Map<String, Value>, key: &str) -> Result<Option<Stri
                 .ok_or_else(|| validation_error(format!("MCP parameter `{key}` must be a string.")))
         })
         .transpose()
+}
+
+fn optional_duration_string(
+    object: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, QghError> {
+    let value = optional_string(object, key)?;
+    if let Some(value) = value.as_deref() {
+        freshness::parse_duration_seconds(key, value)
+            .map_err(|error| validation_error(error.message))?;
+    }
+    Ok(value)
 }
 
 fn optional_string_array(object: &Map<String, Value>, key: &str) -> Result<Vec<String>, QghError> {
@@ -326,8 +362,19 @@ fn optional_usize(object: &Map<String, Value>, key: &str) -> Result<Option<usize
         .transpose()
 }
 
-fn tool_success(data: Value, meta: Value) -> Value {
-    let envelope = success_envelope_with_meta(data, meta);
+fn optional_bool(object: &Map<String, Value>, key: &str) -> Result<Option<bool>, QghError> {
+    object
+        .get(key)
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                validation_error(format!("MCP parameter `{key}` must be a boolean."))
+            })
+        })
+        .transpose()
+}
+
+fn tool_success(data: Value, warnings: Vec<Value>, meta: Value) -> Value {
+    let envelope = success_envelope_with_meta_and_warnings(data, meta, warnings);
     tool_result(envelope, false)
 }
 
@@ -389,7 +436,7 @@ fn tool_list() -> Vec<Value> {
         tool(
             "status",
             "Read local profile, source, database, index, and privacy status.",
-            empty_input_schema(),
+            status_input_schema(),
             envelope_output_schema(),
         ),
     ]
@@ -422,7 +469,21 @@ fn query_input_schema() -> Value {
             },
             "state": { "type": "string", "enum": ["open", "closed"] },
             "author": { "type": "string" },
-            "issue": { "type": "integer", "minimum": 1 }
+            "issue": { "type": "integer", "minimum": 1 },
+            "max_age": { "type": "string", "pattern": "^[1-9][0-9]*(s|m|h|d|mo)$" },
+            "require_fresh": { "type": "boolean" }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn status_input_schema() -> Value {
+    json!({
+        "$schema": JSON_SCHEMA,
+        "type": "object",
+        "properties": {
+            "max_age": { "type": "string", "pattern": "^[1-9][0-9]*(s|m|h|d|mo)$" },
+            "require_fresh": { "type": "boolean" }
         },
         "additionalProperties": false
     })
@@ -441,14 +502,6 @@ fn get_input_schema() -> Value {
     })
 }
 
-fn empty_input_schema() -> Value {
-    json!({
-        "$schema": JSON_SCHEMA,
-        "type": "object",
-        "additionalProperties": false
-    })
-}
-
 fn envelope_output_schema() -> Value {
     json!({
         "$schema": JSON_SCHEMA,
@@ -459,7 +512,22 @@ fn envelope_output_schema() -> Value {
             "ok": { "type": "boolean" },
             "data": { "type": "object" },
             "error": { "type": "object" },
-            "warnings": { "type": "array" },
+            "warnings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["code", "severity", "message"],
+                    "properties": {
+                        "code": { "type": "string" },
+                        "severity": {
+                            "type": "string",
+                            "enum": ["warn", "warn_strong", "fail"]
+                        },
+                        "message": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }
+            },
             "meta": {
                 "type": "object",
                 "properties": {

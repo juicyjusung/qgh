@@ -3,6 +3,7 @@ mod cli;
 mod commands;
 mod config;
 mod error;
+mod freshness;
 mod github;
 mod index;
 mod mcp;

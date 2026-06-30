@@ -30,7 +30,9 @@ Success:
 - `schema_version`: `qgh.v1`
 - `ok`: `true`
 - `data`: command-specific payload
-- `warnings`: array
+- `warnings`: array of `{code, severity, message}` objects. Freshness warnings
+  use the severity ladder `fail > warn_strong > warn`; all triggered warnings
+  are listed even when the envelope decision uses the maximum severity.
 - `meta`: object
 
 Failure:
@@ -58,6 +60,23 @@ are reserved for malformed protocol messages or server faults.
 
 No-result query responses are successful envelopes with `data.results: []`.
 
+`query`/`search` and `status` include `data.freshness`:
+
+- `decision`: `fresh`, `stale_warn`, `stale_fail`, or `never_synced`.
+- `remote_checked`: always `false`; freshness is computed from local sync
+  metadata only.
+- `snapshot_age_seconds`: seconds since the last successful sync, or `null`
+  when no sync has completed.
+- `max_age_seconds`: the effective max-age after applying precedence.
+
+Freshness precedence is `--max-age` flag > repo policy `[query].max_age` >
+profile `query_max_age` > built-in `7d`. `--require-fresh` is a per-run
+stale-to-fail override. Profile config accepts duration strings such as `90s`,
+`30m`, `7d`, and `12mo` for `query_max_age`, `active_issue_max_age`, and
+`reconcile_after`; legacy `reconcile_after_days` remains a deprecated alias.
+Open issue results apply `min(query_max_age, active_issue_max_age)` when the
+active issue max age is configured.
+
 CLI command envelopes and MCP structured tool content include Effective Scope
 metadata when resolution has run:
 
@@ -84,14 +103,14 @@ it is optimized for a person reading the terminal:
   comment diff counts when present, backoff state, active index generation, and
   next query command.
 - `query`/`search`: source-candidate list, not answers. It states that snippets
-  are previews, not citation evidence, and shows `qgh get <source_id>
-  --profile-id <profile_id>` for each result.
+  are previews, not citation evidence, reports local snapshot freshness, and
+  shows `qgh get <source_id> --profile-id <profile_id>` for each result.
 - `get`: full source body, canonical URL, source version/staleness metadata,
   and lifecycle check result. Batch get summaries include requested/returned/
   failed counts and per-item success or error state.
-- `status`: selected profile, effective repo scope and repo source, DB path,
-  Tantivy index path, source counts, default sync scope, and `qgh sync --all`
-  guidance.
+- `status`: selected profile, local snapshot freshness, effective repo scope
+  and repo source, DB path, Tantivy index path, source counts, default sync
+  scope, and `qgh sync --all` guidance.
 - `doctor`: failed checks first with actionable hints, then all checks and MCP
   exposure status.
 

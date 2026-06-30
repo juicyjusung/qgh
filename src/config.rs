@@ -1,4 +1,5 @@
 use crate::error::QghError;
+use crate::freshness::{parse_duration_seconds, DEFAULT_QUERY_MAX_AGE_SECONDS};
 use crate::paths::{config_file_path, ensure_private_dir, set_private_file, ProfilePaths};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -13,7 +14,8 @@ pub struct Profile {
     pub api_base_url: String,
     pub web_base_url: String,
     pub repos: Vec<RepoRef>,
-    pub reconcile_after_days: Option<i64>,
+    pub reconcile_after_seconds: Option<i64>,
+    pub freshness: FreshnessSettings,
     pub max_in_flight_requests: usize,
     pub token_source: TokenSource,
     pub paths: ProfilePaths,
@@ -24,6 +26,24 @@ impl Profile {
         self.repos
             .iter()
             .any(|allowed_repo| allowed_repo.full_name() == repo)
+    }
+
+    pub fn freshness_settings(&self, repo_policy: Option<&RepoPolicy>) -> FreshnessSettings {
+        let mut settings = self.freshness;
+        if let Some(policy_freshness) = repo_policy.map(|policy| policy.query.freshness) {
+            if let Some(query_max_age_seconds) = policy_freshness.query_max_age_seconds {
+                settings.query_max_age_seconds = query_max_age_seconds;
+            }
+            if let Some(query_stale_behavior) = policy_freshness.query_stale_behavior {
+                settings.query_stale_behavior = query_stale_behavior;
+            }
+            if let Some(active_issue_max_age_seconds) =
+                policy_freshness.active_issue_max_age_seconds
+            {
+                settings.active_issue_max_age_seconds = Some(active_issue_max_age_seconds);
+            }
+        }
+        settings
     }
 }
 
@@ -57,6 +77,28 @@ pub struct RepoPolicyDefaults {
 #[derive(Debug, Clone)]
 pub struct RepoPolicyQuery {
     pub limit: Option<usize>,
+    pub freshness: RepoPolicyFreshness,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FreshnessSettings {
+    pub query_max_age_seconds: i64,
+    pub query_stale_behavior: StaleBehavior,
+    pub active_issue_max_age_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RepoPolicyFreshness {
+    pub query_max_age_seconds: Option<i64>,
+    pub query_stale_behavior: Option<StaleBehavior>,
+    pub active_issue_max_age_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StaleBehavior {
+    Warn,
+    Fail,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -84,6 +126,14 @@ struct RawProfile {
     api_base_url: String,
     web_base_url: String,
     repos: Vec<String>,
+    #[serde(default)]
+    query_max_age: Option<String>,
+    #[serde(default)]
+    query_stale_behavior: Option<StaleBehavior>,
+    #[serde(default)]
+    active_issue_max_age: Option<String>,
+    #[serde(default)]
+    reconcile_after: Option<String>,
     #[serde(default)]
     reconcile_after_days: Option<i64>,
     #[serde(default)]
@@ -126,6 +176,12 @@ struct RawRepoPolicyDefaults {
 struct RawRepoPolicyQuery {
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    max_age: Option<String>,
+    #[serde(default)]
+    stale_behavior: Option<StaleBehavior>,
+    #[serde(default)]
+    active_issue_max_age: Option<String>,
 }
 
 pub fn load_profile(profile_id: &str) -> Result<Profile, QghError> {
@@ -207,6 +263,10 @@ pub fn bootstrap_profile_repo(
                     api_base_url: input.api_base_url.trim_end_matches('/').to_string(),
                     web_base_url: input.web_base_url.trim_end_matches('/').to_string(),
                     repos: vec![input.repo.clone()],
+                    query_max_age: None,
+                    query_stale_behavior: None,
+                    active_issue_max_age: None,
+                    reconcile_after: None,
                     reconcile_after_days: None,
                     max_in_flight_requests: None,
                     token_source: input.token_source.clone(),
@@ -327,11 +387,8 @@ fn profile_from_raw(profile_id: &str, raw: &RawProfile) -> Result<Profile, QghEr
     if raw.repos.is_empty() {
         return Err(QghError::config("Profile repos must not be empty."));
     }
-    if raw.reconcile_after_days.is_some_and(|days| days < 0) {
-        return Err(QghError::config(
-            "Profile reconcile_after_days must not be negative.",
-        ));
-    }
+    let freshness = parse_profile_freshness(raw)?;
+    let reconcile_after_seconds = parse_reconcile_after(raw)?;
     let max_in_flight_requests = raw.max_in_flight_requests.unwrap_or(4);
     if !(1..=16).contains(&max_in_flight_requests) {
         return Err(QghError::config(
@@ -352,7 +409,8 @@ fn profile_from_raw(profile_id: &str, raw: &RawProfile) -> Result<Profile, QghEr
         api_base_url: raw.api_base_url.trim_end_matches('/').to_string(),
         web_base_url: raw.web_base_url.trim_end_matches('/').to_string(),
         repos,
-        reconcile_after_days: raw.reconcile_after_days,
+        reconcile_after_seconds,
+        freshness,
         max_in_flight_requests,
         token_source: raw.token_source.clone(),
         paths,
@@ -567,7 +625,62 @@ fn parse_repo_policy_query(raw: RawRepoPolicyQuery) -> Result<RepoPolicyQuery, Q
             "Repo policy query.limit must be greater than zero.",
         ));
     }
-    Ok(RepoPolicyQuery { limit: raw.limit })
+    let freshness = RepoPolicyFreshness {
+        query_max_age_seconds: raw
+            .max_age
+            .as_deref()
+            .map(|value| parse_duration_seconds("query.max_age", value))
+            .transpose()
+            .map_err(|error| QghError::invalid_repo_policy(error.message))?,
+        query_stale_behavior: raw.stale_behavior,
+        active_issue_max_age_seconds: raw
+            .active_issue_max_age
+            .as_deref()
+            .map(|value| parse_duration_seconds("query.active_issue_max_age", value))
+            .transpose()
+            .map_err(|error| QghError::invalid_repo_policy(error.message))?,
+    };
+    Ok(RepoPolicyQuery {
+        limit: raw.limit,
+        freshness,
+    })
+}
+
+fn parse_profile_freshness(raw: &RawProfile) -> Result<FreshnessSettings, QghError> {
+    Ok(FreshnessSettings {
+        query_max_age_seconds: raw
+            .query_max_age
+            .as_deref()
+            .map(|value| parse_duration_seconds("query_max_age", value))
+            .transpose()?
+            .unwrap_or(DEFAULT_QUERY_MAX_AGE_SECONDS),
+        query_stale_behavior: raw.query_stale_behavior.unwrap_or(StaleBehavior::Warn),
+        active_issue_max_age_seconds: raw
+            .active_issue_max_age
+            .as_deref()
+            .map(|value| parse_duration_seconds("active_issue_max_age", value))
+            .transpose()?,
+    })
+}
+
+fn parse_reconcile_after(raw: &RawProfile) -> Result<Option<i64>, QghError> {
+    match (raw.reconcile_after.as_deref(), raw.reconcile_after_days) {
+        (Some(_), Some(_)) => Err(QghError::config(
+            "Use only reconcile_after duration; reconcile_after_days is a deprecated alias.",
+        )),
+        (Some(value), None) => parse_duration_seconds("reconcile_after", value).map(Some),
+        (None, Some(days)) => {
+            if days < 0 {
+                return Err(QghError::config(
+                    "Profile reconcile_after_days must not be negative.",
+                ));
+            }
+            days.checked_mul(24 * 60 * 60).map(Some).ok_or_else(|| {
+                QghError::config("Profile reconcile_after_days duration is too large.")
+            })
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 fn reject_local_path_like(field: &str, value: &str) -> Result<(), QghError> {
