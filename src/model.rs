@@ -169,6 +169,17 @@ pub struct TargetedSyncSummary {
     pub tombstoned_comments: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CoverageSnapshot {
+    pub open_cursor: Option<String>,
+    pub history_cursor: Option<String>,
+    pub open_backfill_complete: bool,
+    pub historical_backfill_complete: bool,
+    pub oldest_synced_updated_at: Option<String>,
+    pub recent_bootstrap_floor: Option<String>,
+    pub next_backfill_window_hint: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct StatusSnapshot {
     pub issue_count: i64,

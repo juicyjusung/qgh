@@ -163,7 +163,7 @@ fn stale_severity(behavior: StaleBehavior, warning_severity: &'static str) -> &'
     }
 }
 
-fn warning(code: &'static str, severity: &'static str, message: &'static str) -> Value {
+pub(crate) fn warning(code: &'static str, severity: &'static str, message: &'static str) -> Value {
     json!({
         "code": code,
         "severity": severity,

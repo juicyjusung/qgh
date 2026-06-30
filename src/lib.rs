@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod commands;
 mod config;
+mod coverage;
 mod error;
 mod freshness;
 mod github;

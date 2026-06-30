@@ -3,13 +3,16 @@
   "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/query-result.schema.json",
   "title": "qgh query response",
   "type": "object",
-  "required": ["profile_id", "freshness", "result_filtering", "results"],
+  "required": ["profile_id", "freshness", "coverage", "result_filtering", "results"],
   "properties": {
     "profile_id": {
       "type": "string"
     },
     "freshness": {
       "$ref": "#/$defs/freshness"
+    },
+    "coverage": {
+      "$ref": "#/$defs/coverage"
     },
     "result_filtering": {
       "type": "object",
@@ -135,6 +138,49 @@
         "max_age_seconds": {
           "type": "integer",
           "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "coverage": {
+      "type": "object",
+      "required": [
+        "mode",
+        "open_cursor",
+        "history_cursor",
+        "open_backfill_complete",
+        "historical_backfill_complete",
+        "oldest_synced_updated_at",
+        "recent_bootstrap_floor",
+        "next_backfill_window_hint"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["partial", "complete"],
+          "description": "Derived from the completion flags; complete iff both backfills are complete. Never set directly."
+        },
+        "open_cursor": {
+          "type": ["string", "null"]
+        },
+        "history_cursor": {
+          "type": ["string", "null"]
+        },
+        "open_backfill_complete": {
+          "type": "boolean"
+        },
+        "historical_backfill_complete": {
+          "type": "boolean"
+        },
+        "oldest_synced_updated_at": {
+          "type": ["string", "null"]
+        },
+        "recent_bootstrap_floor": {
+          "type": ["string", "null"],
+          "description": "Fixed bootstrap_start - lookback boundary. Recent lookback is acceleration, not a corpus boundary."
+        },
+        "next_backfill_window_hint": {
+          "type": ["string", "null"]
         }
       },
       "additionalProperties": false

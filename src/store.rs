@@ -1,9 +1,9 @@
 use crate::error::QghError;
 use crate::model::{
-    BackoffView, CommentRecord, CursorUpdate, CursorView, IndexSource, IssueRecord,
-    ParentIssueView, ReconciliationCandidate, ReconciliationRunView, SourceVersionView,
-    StatusSnapshot, StoredComment, StoredCursor, StoredIssue, StoredSource, SyncSummary,
-    TargetedSyncSummary, TombstoneView,
+    BackoffView, CommentRecord, CoverageSnapshot, CursorUpdate, CursorView, IndexSource,
+    IssueRecord, ParentIssueView, ReconciliationCandidate, ReconciliationRunView,
+    SourceVersionView, StatusSnapshot, StoredComment, StoredCursor, StoredIssue, StoredSource,
+    SyncSummary, TargetedSyncSummary, TombstoneView,
 };
 use crate::paths::ProfilePaths;
 use crate::paths::{ensure_private_dir, set_private_file};
@@ -1034,6 +1034,32 @@ impl Store {
         })
     }
 
+    pub fn coverage_snapshot(&self) -> Result<CoverageSnapshot, QghError> {
+        let snapshot = self
+            .conn
+            .query_row(
+                "SELECT open_cursor, history_cursor, open_backfill_complete,
+                        historical_backfill_complete, oldest_synced_updated_at,
+                        recent_bootstrap_floor, next_backfill_window_hint
+                 FROM coverage_state
+                 WHERE id = 1",
+                [],
+                |row| {
+                    Ok(CoverageSnapshot {
+                        open_cursor: row.get(0)?,
+                        history_cursor: row.get(1)?,
+                        open_backfill_complete: row.get::<_, i64>(2)? != 0,
+                        historical_backfill_complete: row.get::<_, i64>(3)? != 0,
+                        oldest_synced_updated_at: row.get(4)?,
+                        recent_bootstrap_floor: row.get(5)?,
+                        next_backfill_window_hint: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(snapshot.unwrap_or_default())
+    }
+
     fn migrate(&mut self) -> Result<(), QghError> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = self.migrate_inner();
@@ -1160,6 +1186,17 @@ impl Store {
             CREATE TABLE IF NOT EXISTS repository_sync_state (
                 repo TEXT PRIMARY KEY,
                 last_successful_sync_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS coverage_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                open_cursor TEXT,
+                history_cursor TEXT,
+                open_backfill_complete INTEGER NOT NULL DEFAULT 0,
+                historical_backfill_complete INTEGER NOT NULL DEFAULT 0,
+                oldest_synced_updated_at TEXT,
+                recent_bootstrap_floor TEXT,
+                next_backfill_window_hint TEXT
             );
 
             CREATE TABLE IF NOT EXISTS sync_backoff_state (

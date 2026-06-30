@@ -4,6 +4,7 @@ use crate::config::{
     git_remote_defaults_for_root, load_profile, load_repo_policy_at, parse_repo, resolve_token,
     GitRemote, Profile, ProfileBootstrapInput, RepoPolicy, RepoRef, TokenSource,
 };
+use crate::coverage;
 use crate::error::QghError;
 use crate::freshness::{self, FreshnessContext, FreshnessOverrides};
 use crate::github;
@@ -1120,16 +1121,24 @@ pub fn query(
         if freshness.fails {
             return Err(freshness_error(freshness.block, freshness.warnings));
         }
+        // Exact-locator resolution is not an FTS coverage scenario: an empty
+        // result here means the locator was filtered out or did not resolve, not
+        // that historical backfill is incomplete. Expose the coverage block but
+        // do not fire the partial-coverage backfill warning.
+        let coverage = coverage::evaluate(&store.coverage_snapshot()?, false);
+        let mut warnings = freshness.warnings;
+        warnings.extend(coverage.warnings);
         return Ok(LocalReadOutcome {
             data: json!({
             "profile_id": profile.id,
             "freshness": freshness.block,
+            "coverage": coverage.block,
             "result_filtering": {
                 "unresolvable_hits": 0
             },
             "results": results.items
             }),
-            warnings: freshness.warnings,
+            warnings,
         });
     }
     let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
@@ -1158,16 +1167,20 @@ pub fn query(
     if freshness.fails {
         return Err(freshness_error(freshness.block, freshness.warnings));
     }
+    let coverage = coverage::evaluate(&store.coverage_snapshot()?, results.items.is_empty());
+    let mut warnings = freshness.warnings;
+    warnings.extend(coverage.warnings);
     Ok(LocalReadOutcome {
         data: json!({
         "profile_id": profile.id,
         "freshness": freshness.block,
+        "coverage": coverage.block,
         "result_filtering": {
             "unresolvable_hits": unresolvable_hits
         },
         "results": results.items
         }),
-        warnings: freshness.warnings,
+        warnings,
     })
 }
 
@@ -1797,6 +1810,7 @@ pub fn status(
     let repo_policy = discover_repo_policy()?;
     let store = Store::open(&profile.paths)?;
     let status = store.status()?;
+    let coverage = coverage::evaluate(&store.coverage_snapshot()?, false);
     let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
     let freshness = freshness::evaluate(
         profile.freshness_settings(repo_policy.as_ref()),
@@ -1844,6 +1858,7 @@ pub fn status(
         data: json!({
         "profile_id": profile.id,
         "freshness": freshness.block,
+        "coverage": coverage.block,
         "github": {
             "host": profile.host,
             "api_base_url": profile.api_base_url,

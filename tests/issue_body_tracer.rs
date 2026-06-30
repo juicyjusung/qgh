@@ -2107,6 +2107,86 @@ fn active_issue_max_age_tightens_query_freshness_and_lists_all_triggers() {
 }
 
 #[test]
+fn coverage_metadata_surfaces_partial_and_warns_on_no_result() {
+    let fixture = TestFixture::new("coverage-metadata");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    // status exposes the coverage component block; partial until backfill completes.
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["coverage"]["mode"], "partial");
+    assert_eq!(
+        status_json["data"]["coverage"]["open_backfill_complete"],
+        false
+    );
+    assert_eq!(
+        status_json["data"]["coverage"]["historical_backfill_complete"],
+        false
+    );
+    assert_eq!(
+        status_json["data"]["coverage"]["history_cursor"],
+        Value::Null
+    );
+
+    // a no-result query on a partial corpus gets a strong coverage warning.
+    let empty = fixture.qgh(["query", "zzznomatchqgh", "--json"]);
+    assert_success(&empty);
+    let empty_json = stdout_json(&empty);
+    assert_eq!(empty_json["data"]["results"].as_array().unwrap().len(), 0);
+    assert_eq!(empty_json["data"]["coverage"]["mode"], "partial");
+    let coverage_warning = empty_json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|warning| warning["code"] == "coverage.partial_no_result")
+        .expect("partial coverage no-result warning");
+    assert_eq!(coverage_warning["severity"], "warn_strong");
+
+    // an exact-locator no-result on the same partial corpus must NOT fire the
+    // FTS coverage backfill warning: the locator was filtered/unresolved, not a
+    // coverage gap.
+    let locator = fixture.qgh(["query", "999999", "--json"]);
+    assert_success(&locator);
+    let locator_json = stdout_json(&locator);
+    assert_eq!(locator_json["data"]["results"].as_array().unwrap().len(), 0);
+    assert_eq!(locator_json["data"]["coverage"]["mode"], "partial");
+    assert!(locator_json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|warning| warning["code"] != "coverage.partial_no_result"));
+
+    // mode is derived: once both backfills complete, mode flips to complete and
+    // the no-result coverage warning disappears.
+    let db_path = fixture.data_home.join("qgh/profiles/work/qgh.sqlite3");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO coverage_state (id, open_backfill_complete, historical_backfill_complete)
+         VALUES (1, 1, 1)
+         ON CONFLICT(id) DO UPDATE SET
+            open_backfill_complete = 1,
+            historical_backfill_complete = 1",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let complete = fixture.qgh(["query", "zzznomatchqgh", "--json"]);
+    assert_success(&complete);
+    let complete_json = stdout_json(&complete);
+    assert_eq!(complete_json["data"]["coverage"]["mode"], "complete");
+    assert!(complete_json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|warning| warning["code"] != "coverage.partial_no_result"));
+}
+
+#[test]
 fn freshness_precedence_is_flag_then_repo_policy_then_profile_config() {
     let fixture = TestFixture::new("freshness-precedence");
     let server = FakeGitHub::start(issue_payload_with_pr());
