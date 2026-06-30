@@ -40,6 +40,12 @@ pub fn user_agent() -> String {
 }
 
 pub struct FetchResult {
+    pub issues: usize,
+    pub comments: usize,
+    pub skipped_pull_requests: usize,
+}
+
+pub struct FetchPage {
     pub issues: Vec<IssueRecord>,
     pub comments: Vec<CommentRecord>,
     pub skipped_pull_requests: usize,
@@ -115,13 +121,13 @@ pub async fn fetch_issues(
     token: &str,
     cursors: &[StoredCursor],
     progress: Option<&dyn ProgressReporter>,
+    commit_page: &mut dyn FnMut(FetchPage) -> Result<(), QghError>,
 ) -> Result<FetchOutcome, QghError> {
     let client = reqwest::Client::new();
     let cursor_map = cursor_map(cursors);
-    let mut issues = Vec::new();
-    let mut comments = Vec::new();
-    let mut cursor_updates = Vec::new();
-    let mut skipped_pull_requests = 0;
+    let mut total_issues = 0;
+    let mut total_comments = 0;
+    let mut total_skipped_pull_requests = 0;
 
     for repo in &profile.repos {
         let repo_name = repo.full_name();
@@ -158,6 +164,17 @@ pub async fn fetch_issues(
                 return Ok(FetchOutcome::Backoff(backoff));
             }
             if status == StatusCode::NO_CONTENT {
+                commit_page(FetchPage {
+                    issues: Vec::new(),
+                    comments: Vec::new(),
+                    skipped_pull_requests: 0,
+                    cursor_updates: vec![CursorUpdate {
+                        endpoint: endpoint.clone(),
+                        cursor: max_watermark.clone(),
+                        etag: response_etag.clone(),
+                        not_modified: false,
+                    }],
+                })?;
                 break;
             }
             if status == StatusCode::NOT_MODIFIED {
@@ -168,6 +185,17 @@ pub async fn fetch_issues(
                         repo: repo_name.clone(),
                     },
                 );
+                commit_page(FetchPage {
+                    issues: Vec::new(),
+                    comments: Vec::new(),
+                    skipped_pull_requests: 0,
+                    cursor_updates: vec![CursorUpdate {
+                        endpoint: endpoint.clone(),
+                        cursor: max_watermark.clone(),
+                        etag: response_etag.clone(),
+                        not_modified: endpoint_not_modified,
+                    }],
+                })?;
                 break;
             }
             if !status.is_success() {
@@ -175,7 +203,9 @@ pub async fn fetch_issues(
                     "GitHub issues request failed with HTTP {status}."
                 )));
             }
-            response_etag = header_string(&headers, ETAG).or(response_etag);
+            if let Some(etag) = header_string(&headers, ETAG) {
+                response_etag = Some(etag);
+            }
             let page: Vec<ApiIssue> = response
                 .json()
                 .await
@@ -188,20 +218,25 @@ pub async fn fetch_issues(
                 },
             );
             let indexed_at = now_rfc3339();
+            let mut page_issues = Vec::new();
+            let mut page_comments = Vec::new();
+            let mut page_cursor_updates = Vec::new();
+            let mut page_skipped_pull_requests = 0;
             for item in page {
+                max_watermark = max_timestamp(max_watermark, &item.updated_at);
                 if item.pull_request.is_some() {
-                    skipped_pull_requests += 1;
+                    total_skipped_pull_requests += 1;
                     repo_skipped_pull_requests += 1;
+                    page_skipped_pull_requests += 1;
                     continue;
                 }
                 let issue = item.into_record(profile, repo, &indexed_at);
-                max_watermark = max_timestamp(max_watermark, &issue.updated_at);
                 match fetch_issue_comments(
                     &client,
                     profile,
                     token,
                     &cursor_map,
-                    &mut cursor_updates,
+                    &mut page_cursor_updates,
                     repo,
                     &issue,
                     progress,
@@ -210,15 +245,17 @@ pub async fn fetch_issues(
                 {
                     CommentFetchOutcome::Fetched(fetched_comments) => {
                         repo_comment_count += fetched_comments.len();
-                        comments.extend(fetched_comments);
+                        total_comments += fetched_comments.len();
+                        page_comments.extend(fetched_comments);
                     }
                     CommentFetchOutcome::Backoff(backoff) => {
                         wait_for_backoff(&backoff);
                         return Ok(FetchOutcome::Backoff(backoff));
                     }
                 }
-                issues.push(issue);
+                page_issues.push(issue);
                 repo_issue_count += 1;
+                total_issues += 1;
                 if should_report_repo_progress(repo_issue_count) {
                     emit(
                         progress,
@@ -232,6 +269,18 @@ pub async fn fetch_issues(
                     last_progress_issue_count = repo_issue_count;
                 }
             }
+            page_cursor_updates.push(CursorUpdate {
+                endpoint: endpoint.clone(),
+                cursor: max_watermark.clone(),
+                etag: response_etag.clone(),
+                not_modified: false,
+            });
+            commit_page(FetchPage {
+                issues: page_issues,
+                comments: page_comments,
+                skipped_pull_requests: page_skipped_pull_requests,
+                cursor_updates: page_cursor_updates,
+            })?;
             next_url = next_link(&headers);
         }
         if repo_issue_count != last_progress_issue_count || repo_skipped_pull_requests > 0 {
@@ -245,19 +294,12 @@ pub async fn fetch_issues(
                 },
             );
         }
-        cursor_updates.push(CursorUpdate {
-            endpoint,
-            cursor: max_watermark,
-            etag: response_etag,
-            not_modified: endpoint_not_modified,
-        });
     }
 
     Ok(FetchOutcome::Fetched(FetchResult {
-        issues,
-        comments,
-        skipped_pull_requests,
-        cursor_updates,
+        issues: total_issues,
+        comments: total_comments,
+        skipped_pull_requests: total_skipped_pull_requests,
     }))
 }
 

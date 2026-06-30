@@ -16,6 +16,10 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn new_sync_run_id() -> String {
+        format!("sync-{}", now_run_id_suffix())
+    }
+
     pub fn open(paths: &ProfilePaths) -> Result<Self, QghError> {
         ensure_private_dir(&paths.profile_dir)?;
         ensure_private_dir(&paths.cache_dir)?;
@@ -36,13 +40,40 @@ impl Store {
         skipped_pull_requests: usize,
         cursor_updates: &[CursorUpdate],
     ) -> Result<SyncSummary, QghError> {
-        let sync_run_id = format!("sync-{}", now_run_id_suffix());
+        let sync_run_id = Self::new_sync_run_id();
+        let summary = self.upsert_sources_for_run(
+            &sync_run_id,
+            issues,
+            comments,
+            skipped_pull_requests,
+            cursor_updates,
+        )?;
+        self.mark_sync_run_completed(&sync_run_id)?;
+        Ok(summary)
+    }
+
+    pub fn upsert_sources_for_run(
+        &mut self,
+        sync_run_id: &str,
+        issues: &[IssueRecord],
+        comments: &[CommentRecord],
+        skipped_pull_requests: usize,
+        cursor_updates: &[CursorUpdate],
+    ) -> Result<SyncSummary, QghError> {
         let now = now_rfc3339();
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO sync_runs
-                (id, started_at, completed_at, fetched_issue_count, upserted_issue_count, fetched_comment_count, upserted_comment_count, skipped_pull_request_count)
-             VALUES (?1, ?2, ?2, ?3, ?3, ?4, ?4, ?5)",
+                (id, started_at, completed_at, completed_successfully, fetched_issue_count, upserted_issue_count, fetched_comment_count, upserted_comment_count, skipped_pull_request_count)
+             VALUES (?1, ?2, ?2, 0, ?3, ?3, ?4, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                completed_at = excluded.completed_at,
+                completed_successfully = 0,
+                fetched_issue_count = sync_runs.fetched_issue_count + excluded.fetched_issue_count,
+                upserted_issue_count = sync_runs.upserted_issue_count + excluded.upserted_issue_count,
+                fetched_comment_count = sync_runs.fetched_comment_count + excluded.fetched_comment_count,
+                upserted_comment_count = sync_runs.upserted_comment_count + excluded.upserted_comment_count,
+                skipped_pull_request_count = sync_runs.skipped_pull_request_count + excluded.skipped_pull_request_count",
             params![
                 sync_run_id,
                 now,
@@ -247,7 +278,7 @@ impl Store {
             })
             .collect::<Vec<_>>();
         Ok(SyncSummary {
-            sync_run_id,
+            sync_run_id: sync_run_id.to_string(),
             fetched_issues: issues.len(),
             upserted_issues: issues.len(),
             fetched_comments: comments.len(),
@@ -259,6 +290,21 @@ impl Store {
                 .filter(|cursor| cursor.not_modified)
                 .count(),
         })
+    }
+
+    pub fn mark_sync_run_completed(&self, sync_run_id: &str) -> Result<(), QghError> {
+        let changed = self.conn.execute(
+            "UPDATE sync_runs
+             SET completed_at = ?1, completed_successfully = 1
+             WHERE id = ?2",
+            params![now_rfc3339(), sync_run_id],
+        )?;
+        if changed == 0 {
+            return Err(QghError::storage(format!(
+                "Cannot mark missing sync run `{sync_run_id}` completed."
+            )));
+        }
+        Ok(())
     }
 
     pub fn active_issues(&self) -> Result<Vec<StoredIssue>, QghError> {
@@ -646,7 +692,11 @@ impl Store {
         let last_successful_sync: Option<String> = self
             .conn
             .query_row(
-                "SELECT completed_at FROM sync_runs ORDER BY completed_at DESC LIMIT 1",
+                "SELECT completed_at
+                 FROM sync_runs
+                 WHERE completed_successfully = 1
+                 ORDER BY completed_at DESC
+                 LIMIT 1",
                 [],
                 |row| row.get(0),
             )
@@ -745,7 +795,11 @@ impl Store {
         let last_sync_at: Option<String> = self
             .conn
             .query_row(
-                "SELECT completed_at FROM sync_runs ORDER BY completed_at DESC LIMIT 1",
+                "SELECT completed_at
+                 FROM sync_runs
+                 WHERE completed_successfully = 1
+                 ORDER BY completed_at DESC
+                 LIMIT 1",
                 [],
                 |row| row.get(0),
             )
@@ -910,6 +964,7 @@ impl Store {
                 id TEXT PRIMARY KEY,
                 started_at TEXT NOT NULL,
                 completed_at TEXT NOT NULL,
+                completed_successfully INTEGER NOT NULL DEFAULT 1,
                 fetched_issue_count INTEGER NOT NULL,
                 upserted_issue_count INTEGER NOT NULL,
                 fetched_comment_count INTEGER NOT NULL DEFAULT 0,
@@ -1037,6 +1092,12 @@ impl Store {
             "sync_runs",
             "upserted_comment_count",
             "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &self.conn,
+            "sync_runs",
+            "completed_successfully",
+            "INTEGER NOT NULL DEFAULT 1",
         )?;
         self.conn.execute(
             "INSERT INTO schema_migrations (version, applied_at)

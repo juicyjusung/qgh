@@ -7,7 +7,9 @@ use crate::config::{
 use crate::error::QghError;
 use crate::github;
 use crate::index;
-use crate::model::{ReconciliationCandidate, StoredComment, StoredIssue, StoredSource};
+use crate::model::{
+    ReconciliationCandidate, StoredComment, StoredIssue, StoredSource, SyncSummary,
+};
 use crate::paths::ProfilePaths;
 use crate::resolution::ResolvedRepoScope;
 use crate::store::Store;
@@ -45,57 +47,74 @@ pub async fn sync(
         "qgh sync: fetching GitHub issues/comments repos={}",
         fetch_profile.repos.len()
     ));
-    let fetched =
-        match github::fetch_issues(&fetch_profile, &token, &cursors, Some(&progress)).await? {
-            github::FetchOutcome::Fetched(fetched) => fetched,
-            github::FetchOutcome::Backoff(backoff) => {
-                progress.line(format_args!(
-                    "qgh sync: backoff reason={} scope={} retry_after_seconds={}",
-                    backoff.reason, backoff.scope, backoff.retry_after_seconds
-                ));
-                let backoff = store.record_backoff_state(
-                    &backoff.reason,
-                    &backoff.scope,
-                    backoff.retry_after_seconds,
-                    backoff.reset_at.as_deref(),
-                )?;
-                let status = store.status()?;
-                return Ok(json!({
-                    "profile_id": profile.id,
-                    "sync_state": "backoff",
-                    "backoff": backoff,
-                    "sync": {
-                        "last_successful_sync": status.last_sync_at,
-                        "scheduler": {
-                            "max_in_flight_requests": profile.max_in_flight_requests,
-                            "hard_cap": 16
-                        }
-                    },
-                    "sources": {
-                        "issue_count": status.issue_count,
-                        "comment_count": status.comment_count,
-                        "tombstone_count": status.tombstone_count
-                    },
-                    "index": {
-                        "active_generation": status.active_generation,
-                        "dirty_task_count": status.dirty_task_count
-                    }
-                }));
-            }
+    let sync_run_id = Store::new_sync_run_id();
+    let mut summary = None;
+    let fetched = {
+        let mut commit_page = |page: github::FetchPage| -> Result<(), QghError> {
+            let page_summary = store.upsert_sources_for_run(
+                &sync_run_id,
+                &page.issues,
+                &page.comments,
+                page.skipped_pull_requests,
+                &page.cursor_updates,
+            )?;
+            merge_sync_summary(&mut summary, page_summary);
+            Ok(())
         };
+        github::fetch_issues(
+            &fetch_profile,
+            &token,
+            &cursors,
+            Some(&progress),
+            &mut commit_page,
+        )
+        .await?
+    };
+    let fetched = match fetched {
+        github::FetchOutcome::Fetched(fetched) => fetched,
+        github::FetchOutcome::Backoff(backoff) => {
+            progress.line(format_args!(
+                "qgh sync: backoff reason={} scope={} retry_after_seconds={}",
+                backoff.reason, backoff.scope, backoff.retry_after_seconds
+            ));
+            let backoff = store.record_backoff_state(
+                &backoff.reason,
+                &backoff.scope,
+                backoff.retry_after_seconds,
+                backoff.reset_at.as_deref(),
+            )?;
+            let status = store.status()?;
+            return Ok(json!({
+                "profile_id": profile.id,
+                "sync_state": "backoff",
+                "backoff": backoff,
+                "sync": {
+                    "last_successful_sync": status.last_sync_at,
+                    "scheduler": {
+                        "max_in_flight_requests": profile.max_in_flight_requests,
+                        "hard_cap": 16
+                    }
+                },
+                "sources": {
+                    "issue_count": status.issue_count,
+                    "comment_count": status.comment_count,
+                    "tombstone_count": status.tombstone_count
+                },
+                "index": {
+                    "active_generation": status.active_generation,
+                    "dirty_task_count": status.dirty_task_count
+                }
+            }));
+        }
+    };
     progress.line(format_args!(
         "qgh sync: fetched issues={} comments={} skipped_pull_requests={}",
-        fetched.issues.len(),
-        fetched.comments.len(),
-        fetched.skipped_pull_requests
+        fetched.issues, fetched.comments, fetched.skipped_pull_requests
     ));
-    progress.line(format_args!("qgh sync: writing SQLite store"));
-    let summary = store.upsert_sources(
-        &fetched.issues,
-        &fetched.comments,
-        fetched.skipped_pull_requests,
-        &fetched.cursor_updates,
-    )?;
+    let summary = match summary {
+        Some(summary) => summary,
+        None => store.upsert_sources_for_run(&sync_run_id, &[], &[], 0, &[])?,
+    };
     progress.line(format_args!(
         "qgh sync: stored upserted_issues={} upserted_comments={} cursor_updates={}",
         summary.upserted_issues,
@@ -149,6 +168,7 @@ pub async fn sync(
         &generation_path.to_string_lossy(),
         sources.len(),
     )?;
+    store.mark_sync_run_completed(&summary.sync_run_id)?;
     progress.line(format_args!(
         "qgh sync: published BM25 index generation={} sources={}",
         generation,
@@ -192,6 +212,22 @@ pub async fn sync(
         },
         "reconciliation": reconciliation
     }))
+}
+
+fn merge_sync_summary(total: &mut Option<SyncSummary>, page: SyncSummary) {
+    match total {
+        Some(total) => {
+            total.sync_run_id = page.sync_run_id;
+            total.fetched_issues += page.fetched_issues;
+            total.upserted_issues += page.upserted_issues;
+            total.fetched_comments += page.fetched_comments;
+            total.upserted_comments += page.upserted_comments;
+            total.skipped_pull_requests += page.skipped_pull_requests;
+            total.cursor_updates.extend(page.cursor_updates);
+            total.not_modified_endpoints += page.not_modified_endpoints;
+        }
+        None => *total = Some(page),
+    }
 }
 
 struct StderrSyncProgress {

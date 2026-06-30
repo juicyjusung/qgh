@@ -1968,6 +1968,105 @@ fn sync_records_secondary_rate_limit_retry_after_without_generic_failure() {
 }
 
 #[test]
+fn sync_resumes_from_last_committed_issue_page_after_mid_pagination_backoff() {
+    let fixture = TestFixture::new("paginated-backoff-resume");
+    let server = PaginatedBackoffFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    let limited_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&limited_sync);
+    let limited_json = stdout_json(&limited_sync);
+    assert_eq!(limited_json["data"]["sync_state"], "backoff");
+    assert_eq!(
+        limited_json["data"]["backoff"]["reason"],
+        "secondary_rate_limit"
+    );
+    assert_eq!(
+        limited_json["data"]["backoff"]["last_successful_sync"],
+        Value::Null
+    );
+
+    let partial_status = fixture.qgh(["status", "--json"]);
+    assert_success(&partial_status);
+    let partial_status_json = stdout_json(&partial_status);
+    assert_eq!(partial_status_json["data"]["sources"]["issue_count"], 1);
+    assert_eq!(partial_status_json["data"]["index"]["active_generation"], 0);
+    assert_eq!(partial_status_json["data"]["index"]["dirty_task_count"], 1);
+    assert_eq!(
+        partial_status_json["data"]["sync"]["cursors"]["issues:owner/repo"]["watermark"],
+        "2026-01-02T00:01:00Z"
+    );
+    assert_eq!(
+        partial_status_json["data"]["sync"]["last_sync_at"],
+        Value::Null
+    );
+    assert_eq!(
+        partial_status_json["data"]["sync"]["backoff"]["last_successful_sync"],
+        Value::Null
+    );
+
+    server.set_mode(PAGINATED_RESUME);
+    server.clear_requests();
+
+    let resumed_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&resumed_sync);
+    let resumed_json = stdout_json(&resumed_sync);
+    assert_eq!(resumed_json["data"]["sync_state"], "ok");
+    let resumed_run_id = resumed_json["data"]["sync_run_id"].clone();
+    assert_eq!(
+        resumed_json["data"]["cursors"]["watermarks"]["issues:owner/repo"],
+        "2026-01-02T00:02:00Z"
+    );
+
+    let requests = server.requests();
+    assert!(
+        requests.iter().any(|request| request.contains(
+            "GET /repos/owner/repo/issues?state=all&sort=updated&direction=asc&per_page=100&since=2026-01-02T00%3A00%3A00Z"
+        )),
+        "resume must use the page-one cursor with the existing 60-second overlap: {requests:#?}"
+    );
+
+    let final_status = fixture.qgh(["status", "--json"]);
+    assert_success(&final_status);
+    let final_status_json = stdout_json(&final_status);
+    assert_eq!(final_status_json["data"]["sources"]["issue_count"], 2);
+    assert_eq!(final_status_json["data"]["index"]["active_generation"], 1);
+    assert_eq!(final_status_json["data"]["index"]["dirty_task_count"], 0);
+    assert_eq!(final_status_json["data"]["sync"]["backoff"], Value::Null);
+    assert_eq!(
+        final_status_json["data"]["sync"]["cursors"]["issues:owner/repo"]["watermark"],
+        "2026-01-02T00:02:00Z"
+    );
+    assert!(final_status_json["data"]["sync"]["last_sync_at"]
+        .as_str()
+        .is_some());
+
+    let duplicate_id = "qgh://github.com/issue/I_PAGE_ONE";
+    let resumed_id = "qgh://github.com/issue/I_PAGE_TWO";
+    fixture.assert_source_version_count(duplicate_id, 1);
+    fixture.assert_source_version_count(resumed_id, 1);
+    let duplicate_get = fixture.qgh(["get", duplicate_id, "--json"]);
+    assert_success(&duplicate_get);
+    let resumed_get = fixture.qgh(["get", resumed_id, "--json"]);
+    assert_success(&resumed_get);
+    assert_eq!(
+        stdout_json(&duplicate_get)["data"]["source"]["source_version"]["sync_run_id"],
+        resumed_run_id
+    );
+    assert_eq!(
+        stdout_json(&resumed_get)["data"]["source"]["source_version"]["sync_run_id"],
+        resumed_run_id
+    );
+
+    let query = fixture.qgh(["query", "second durable page", "--json"]);
+    assert_success(&query);
+    assert_eq!(
+        stdout_json(&query)["data"]["results"][0]["source_id"],
+        resumed_id
+    );
+}
+
+#[test]
 fn doctor_runs_explicit_checks_and_reports_cli_only_scope() {
     let fixture = TestFixture::new("doctor");
     let server = FakeGitHub::start(issue_payload_with_pr());
@@ -4554,6 +4653,234 @@ fn handle_rate_limit_connection(mut stream: TcpStream, mode: &Arc<AtomicUsize>) 
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();
+}
+
+const PAGINATED_BACKOFF: usize = 1;
+const PAGINATED_RESUME: usize = 2;
+
+struct PaginatedBackoffFakeGitHub {
+    base_url: String,
+    mode: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl PaginatedBackoffFakeGitHub {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        let mode = Arc::new(AtomicUsize::new(PAGINATED_BACKOFF));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_mode = Arc::clone(&mode);
+        let thread_requests = Arc::clone(&requests);
+        let thread_stop = Arc::clone(&stop);
+        let thread_base_url = base_url.clone();
+
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                match stream {
+                    Ok(stream) => handle_paginated_backoff_connection(
+                        stream,
+                        &thread_mode,
+                        &thread_requests,
+                        &thread_base_url,
+                    ),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            base_url,
+            mode,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn set_mode(&self, mode: usize) {
+        self.mode.store(mode, Ordering::SeqCst);
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn clear_requests(&self) {
+        self.requests.lock().unwrap().clear();
+    }
+}
+
+impl Drop for PaginatedBackoffFakeGitHub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.base_url.strip_prefix("http://").unwrap());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn handle_paginated_backoff_connection(
+    mut stream: TcpStream,
+    mode: &Arc<AtomicUsize>,
+    requests: &Arc<Mutex<Vec<String>>>,
+    base_url: &str,
+) {
+    let mut buffer = [0_u8; 8192];
+    let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let request_line = request.lines().next().unwrap_or("").to_string();
+    requests.lock().unwrap().push(request_line.clone());
+
+    let mode = mode.load(Ordering::SeqCst);
+    let page_two_url = format!("{base_url}/repos/owner/repo/issues?page=2");
+    let link_header = format!("link: <{page_two_url}>; rel=\"next\"\r\n");
+
+    if request_line.starts_with("GET /repos/owner/repo/issues?page=2") && mode == PAGINATED_BACKOFF
+    {
+        let body = r#"{"message":"secondary rate limit"}"#;
+        let response = format!(
+            "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nretry-after: 0\r\nx-ratelimit-remaining: 42\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        return;
+    }
+
+    let (status, body, extra_headers) = if request_line.starts_with("GET /repos/owner/repo/issues?")
+        && request_line.contains("state=all")
+        && request_line.contains("sort=updated")
+        && request_line.contains("direction=asc")
+        && request_line.contains("per_page=100")
+    {
+        ("200 OK", paginated_issue_page_one_payload(), link_header)
+    } else if request_line.starts_with("GET /repos/owner/repo/issues?page=2") {
+        ("200 OK", paginated_issue_page_two_payload(), String::new())
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/1/comments?")
+        && request_line.contains("per_page=100")
+    {
+        ("200 OK", "[]", String::new())
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/2/comments?")
+        && request_line.contains("per_page=100")
+    {
+        ("200 OK", "[]", String::new())
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/1 ") {
+        (
+            "200 OK",
+            paginated_issue_one_object_payload(),
+            String::new(),
+        )
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/2 ") {
+        (
+            "200 OK",
+            paginated_issue_two_object_payload(),
+            String::new(),
+        )
+    } else {
+        ("404 Not Found", r#"{"message":"not found"}"#, String::new())
+    };
+
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{extra_headers}x-ratelimit-remaining: 4999\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
+fn paginated_issue_page_one_payload() -> &'static str {
+    r#"[
+      {
+        "id": 5101,
+        "node_id": "I_PAGE_ONE",
+        "number": 1,
+        "title": "First durable page",
+        "body": "first durable page should survive a later pagination backoff.",
+        "state": "open",
+        "locked": false,
+        "comments": 0,
+        "html_url": "https://github.com/owner/repo/issues/1",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:01:00Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [],
+        "milestone": null,
+        "assignees": []
+      }
+    ]"#
+}
+
+fn paginated_issue_page_two_payload() -> &'static str {
+    r#"[
+      {
+        "id": 5102,
+        "node_id": "I_PAGE_TWO",
+        "number": 2,
+        "title": "Second durable page",
+        "body": "second durable page should be found after resume.",
+        "state": "open",
+        "locked": false,
+        "comments": 0,
+        "html_url": "https://github.com/owner/repo/issues/2",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:02:00Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [],
+        "milestone": null,
+        "assignees": []
+      }
+    ]"#
+}
+
+fn paginated_issue_one_object_payload() -> &'static str {
+    r#"{
+        "id": 5101,
+        "node_id": "I_PAGE_ONE",
+        "number": 1,
+        "title": "First durable page",
+        "body": "first durable page should survive a later pagination backoff.",
+        "state": "open",
+        "locked": false,
+        "comments": 0,
+        "html_url": "https://github.com/owner/repo/issues/1",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:01:00Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [],
+        "milestone": null,
+        "assignees": []
+    }"#
+}
+
+fn paginated_issue_two_object_payload() -> &'static str {
+    r#"{
+        "id": 5102,
+        "node_id": "I_PAGE_TWO",
+        "number": 2,
+        "title": "Second durable page",
+        "body": "second durable page should be found after resume.",
+        "state": "open",
+        "locked": false,
+        "comments": 0,
+        "html_url": "https://github.com/owner/repo/issues/2",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:02:00Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [],
+        "milestone": null,
+        "assignees": []
+    }"#
 }
 
 fn unique_temp_dir(name: &str) -> PathBuf {
