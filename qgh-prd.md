@@ -276,7 +276,7 @@ MVP implementation baseline은 다음을 따른다.
 | ID | Requirement | 왜 필요한가 | Acceptance |
 |---|---|---|---|
 | IR-01 | CLI는 `sync`, `query`(canonical), `get`, `status`, `doctor`를 제공하고 `search`는 `query`의 alias로 둔다. | developer가 setup부터 retrieval까지 terminal에서 검증할 수 있어야 하고 canonical 동사가 모호하지 않아야 한다. | AC-01~AC-10, AC-28 |
-| IR-02 | CLI는 machine-readable JSON output과 human-readable output을 구분해야 한다. | shell/agent automation과 사람이 읽는 UX가 서로를 깨지 않게 한다. | AC-11, AC-14 |
+| IR-02 | CLI는 `--json` machine-readable output과 기본 human-readable output을 구분해야 한다. | shell/agent automation과 사람이 읽는 UX가 서로를 깨지 않게 한다. | AC-11, AC-14 |
 | IR-03 | MCP adapter는 `query`, `get`, `status` tools만 expose하고 `readOnlyHint: true` annotation을 가져야 한다. | MCP client가 도구를 안전하게 선택하고 mutation을 기대하지 않게 한다. | AC-12 |
 | IR-04 | MCP adapter tool input/output은 `inputSchema`와 `outputSchema`를 갖고 validation 실패는 successful result처럼 보이지 않는 `isError` structured error로 반환해야 한다. | stale tool call, typoed parameter, broad fallback search를 막는다. | AC-11 |
 | IR-05 | MCP server stdout은 protocol messages로만 사용하고 diagnostics는 stderr/log channel로 보내야 한다. | JSON-RPC framing 오염은 agent integration을 즉시 깨뜨린다. | AC-21 |
@@ -285,7 +285,7 @@ MVP implementation baseline은 다음을 따른다.
 
 ### 11.1 JSON and Error Contract
 
-Machine-readable output uses one versioned envelope:
+Machine-readable output uses one versioned envelope when `--json` is passed:
 
 ```json
 {
@@ -330,6 +330,13 @@ Contract rules:
 - CLI human mode prints human-readable output, but exit code and internal error code mapping must match JSON mode.
 - Exit code classes: `0` success, `2` validation/config usage, `3` auth/permission, `4` source not found/tombstoned, `5` GitHub rate-limit/backoff, `6` storage/index state, `70` internal error.
 - MCP adapter returns the same envelope in structured content. Tool-level errors set `isError: true`; JSON-RPC protocol errors are reserved for malformed protocol messages or server faults.
+
+Without `--json`, successful `init`, `sync`, `query`/`search`, `get`,
+`status`, and `doctor` commands print human-readable summaries on stdout.
+Those summaries explain the selected profile, effective repo scope, local paths,
+source counts, next commands, and the `query -> get -> cite` workflow in user
+terms. Human `query` output must state that results are source candidates, not
+answers, and that snippets are previews rather than citation evidence.
 
 ### 11.2 Config Contract
 

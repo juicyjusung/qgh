@@ -2,7 +2,7 @@ use crate::cli::Cli;
 use crate::commands;
 use crate::error::QghError;
 use crate::mcp;
-use crate::output::{print_error, print_success};
+use crate::output::{print_error, print_human_success, print_success, SuccessOutputKind};
 use crate::resolution::{
     repo_scope_from_cli_arg, repo_scope_from_worktree, resolve_context, resolve_explicit_context,
     ResolvedCommandContext, ResolvedRepoScope,
@@ -35,7 +35,16 @@ pub async fn run_from_env() -> i32 {
     let wants_json = cli.wants_json();
     match run(cli).await {
         Ok(outcome) => {
-            print_success(outcome.data, outcome.warnings, outcome.meta);
+            if outcome.json_mode {
+                print_success(outcome.data, outcome.warnings, outcome.meta);
+            } else {
+                print_human_success(
+                    outcome.output_kind,
+                    &outcome.data,
+                    &outcome.warnings,
+                    &outcome.meta,
+                );
+            }
             0
         }
         Err(error) => {
@@ -58,15 +67,20 @@ async fn run_mcp(cli: Cli) -> i32 {
 }
 
 struct CommandOutcome {
+    output_kind: SuccessOutputKind,
+    json_mode: bool,
     data: Value,
     warnings: Vec<Value>,
     meta: Value,
 }
 
 async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
+    let json_mode = cli.wants_json();
     if let crate::cli::Command::Init(args) = &cli.command {
         let outcome = commands::init(cli.profile.as_deref(), args)?;
         return Ok(CommandOutcome {
+            output_kind: SuccessOutputKind::Init,
+            json_mode,
             data: outcome.data,
             warnings: outcome.warnings,
             meta: outcome.meta,
@@ -76,6 +90,7 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
     let context = resolve_command_context(&cli)?;
     let profile_id = context.profile_id.clone();
     let command = cli.command;
+    let output_kind = success_output_kind(&command);
     let is_status = matches!(command, crate::cli::Command::Status { .. });
     let is_doctor = matches!(command, crate::cli::Command::Doctor { .. });
 
@@ -110,10 +125,24 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
     }
 
     Ok(CommandOutcome {
+        output_kind,
+        json_mode,
         data,
         warnings: Vec::new(),
         meta: context.meta_json(),
     })
+}
+
+fn success_output_kind(command: &crate::cli::Command) -> SuccessOutputKind {
+    match command {
+        crate::cli::Command::Sync(_) => SuccessOutputKind::Sync,
+        crate::cli::Command::Query(_) | crate::cli::Command::Search(_) => SuccessOutputKind::Query,
+        crate::cli::Command::Get { .. } => SuccessOutputKind::Get,
+        crate::cli::Command::Status { .. } => SuccessOutputKind::Status,
+        crate::cli::Command::Doctor { .. } => SuccessOutputKind::Doctor,
+        crate::cli::Command::Init(_) => SuccessOutputKind::Init,
+        crate::cli::Command::Mcp => unreachable!("MCP is handled before normal CLI output"),
+    }
 }
 
 fn resolve_command_context(cli: &Cli) -> Result<ResolvedCommandContext, QghError> {

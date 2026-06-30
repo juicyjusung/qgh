@@ -310,9 +310,14 @@ fn sync_reports_human_progress_on_stderr_without_polluting_stdout() {
 
     let sync = fixture.qgh(["sync"]);
     assert_success(&sync);
-    let sync_json = stdout_json(&sync);
-    assert_eq!(sync_json["ok"], true);
-    assert_eq!(sync_json["data"]["sync_state"], "ok");
+    let stdout = stdout_text(&sync);
+    assert!(stdout.contains("qgh sync complete"));
+    assert!(stdout.contains("synced repo scope: all profile repos"));
+    assert!(stdout.contains("issues: fetched 1, upserted 1, skipped PRs 1"));
+    assert!(stdout.contains("comments: fetched 1, upserted 1"));
+    assert!(stdout.contains("backoff: none"));
+    assert!(stdout.contains("active index generation: 1"));
+    assert!(stdout.contains("next: qgh query <terms> --profile work"));
     let stderr = stderr_text(&sync);
     assert!(stderr.contains("qgh sync: fetching GitHub issues/comments repos=1"));
     assert!(stderr.contains("qgh sync: fetching repo=owner/repo"));
@@ -323,12 +328,72 @@ fn sync_reports_human_progress_on_stderr_without_polluting_stdout() {
     let quiet = fixture.qgh(["sync", "--quiet"]);
     assert_success(&quiet);
     assert!(stderr_text(&quiet).is_empty());
-    assert_eq!(stdout_json(&quiet)["data"]["sync_state"], "ok");
+    assert!(stdout_text(&quiet).contains("qgh sync complete"));
+    assert!(!stdout_text(&quiet).starts_with('{'));
 
     let json = fixture.qgh(["sync", "--json"]);
     assert_success(&json);
     assert!(stderr_text(&json).is_empty());
     assert_eq!(stdout_json(&json)["data"]["sync_state"], "ok");
+}
+
+#[test]
+fn non_json_cli_commands_print_human_summaries_without_weakening_json_contract() {
+    let fixture = TestFixture::new("human-output");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let query = fixture.qgh(["query", "BM25 tracer"]);
+    assert_success(&query);
+    let query_stdout = stdout_text(&query);
+    assert!(!query_stdout.starts_with('{'));
+    assert!(query_stdout.contains("qgh query results"));
+    assert!(query_stdout.contains("These are source candidates, not answers"));
+    assert!(query_stdout.contains("Snippets are previews, not citation evidence"));
+    assert!(
+        query_stdout.contains("get: qgh get qgh://github.com/issue/I_kwDOISSUE1 --profile-id work")
+    );
+
+    let search = fixture.qgh(["search", "BM25 tracer"]);
+    assert_success(&search);
+    assert!(stdout_text(&search).contains("qgh query results"));
+
+    let get = fixture.qgh(["get", "qgh://github.com/issue/I_kwDOISSUE1"]);
+    assert_success(&get);
+    let get_stdout = stdout_text(&get);
+    assert!(get_stdout.contains("qgh source"));
+    assert!(get_stdout.contains("canonical URL: https://github.com/owner/repo/issues/42"));
+    assert!(get_stdout.contains("source version: body_hash="));
+    assert!(get_stdout.contains("staleness metadata: github_updated_at=2026-01-02T03:04:05Z"));
+    assert!(get_stdout.contains("lifecycle check: active"));
+    assert!(get_stdout
+        .contains("The BM25 issue body tracer must round-trip through get before citation."));
+
+    let status = fixture.qgh(["status"]);
+    assert_success(&status);
+    let status_stdout = stdout_text(&status);
+    assert!(status_stdout.contains("qgh status"));
+    assert!(status_stdout.contains("selected profile: work"));
+    assert!(status_stdout.contains("effective repo scope: all profile repos"));
+    assert!(status_stdout.contains("DB path:"));
+    assert!(status_stdout.contains("Tantivy index path:"));
+    assert!(status_stdout.contains("default sync scope: all repos in the selected profile"));
+    assert!(status_stdout.contains("qgh sync --all"));
+
+    let doctor = fixture.qgh(["doctor"]);
+    assert_success(&doctor);
+    let doctor_stdout = stdout_text(&doctor);
+    assert!(doctor_stdout.contains("qgh doctor"));
+    assert!(doctor_stdout.contains("failed checks: 0"));
+    assert!(doctor_stdout.contains("checks:"));
+    assert!(doctor_stdout.contains("OK config"));
+    assert!(doctor_stdout.contains("MCP tools: query, get, status"));
+
+    let json_query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&json_query);
+    assert_eq!(stdout_json(&json_query)["schema_version"], "qgh.v1");
+    assert!(stderr_text(&json_query).is_empty());
 }
 
 #[test]
@@ -940,6 +1005,38 @@ fn init_yes_applies_inferred_preset_without_preview_or_required_flags() {
     assert_eq!(init_json["data"]["repo"], "owner/repo");
     assert_eq!(init_json["data"]["token_source"]["kind"], "github_cli");
     assert_eq!(init_json["data"]["repo_policy_action"], "created");
+}
+
+#[test]
+fn init_without_json_prints_human_summary_for_profile_and_repo_policy_paths() {
+    let fixture = TestFixture::new("init-human-summary");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(&nested_worktree_dir, ["init", "--yes"]);
+    assert_success(&init);
+    assert!(stderr_text(&init).is_empty());
+    let stdout = stdout_text(&init);
+    assert!(!stdout.starts_with('{'));
+    assert!(stdout.contains("qgh init complete"));
+    assert!(stdout.contains("profile: work (created)"));
+    assert!(stdout.contains("repo: owner/repo (allowlist added)"));
+    assert!(stdout.contains("token source: github_cli"));
+    assert!(stdout.contains("config:"));
+    assert!(stdout.contains("repo policy: created at"));
+    assert!(stdout.contains("next: qgh sync"));
+    assert!(stdout.contains("next: qgh query <terms>"));
+
+    let repo_fixture = TestFixture::new("init-repo-human-summary");
+    repo_fixture.write_config("http://127.0.0.1:1");
+    let repo_worktree = repo_fixture.init_git_worktree();
+    let init_repo = repo_fixture.qgh_in(&repo_worktree, ["init", "repo", "--repo", "owner/repo"]);
+    assert_success(&init_repo);
+    let repo_stdout = stdout_text(&init_repo);
+    assert!(repo_stdout.contains("qgh init repo complete"));
+    assert!(repo_stdout.contains("repo: owner/repo (cli)"));
+    assert!(repo_stdout.contains("repo policy:"));
+    assert!(repo_stdout.contains("profile check: validated"));
 }
 
 #[test]

@@ -1,7 +1,11 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
-#[command(name = "qgh", version, about = "Local GitHub Issues retrieval")]
+#[command(
+    name = "qgh",
+    version,
+    about = "Local GitHub Issues retrieval with human output by default; use --json for qgh.v1 envelopes"
+)]
 pub struct Cli {
     #[arg(long, global = true)]
     pub profile: Option<String>,
@@ -33,15 +37,15 @@ pub enum Command {
         source_id: String,
         #[arg(long)]
         profile_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
         json: bool,
     },
     Status {
-        #[arg(long)]
+        #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
         json: bool,
     },
     Doctor {
-        #[arg(long)]
+        #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
         json: bool,
     },
     Mcp,
@@ -55,7 +59,7 @@ pub struct SyncArgs {
     pub all: bool,
     #[arg(long)]
     pub quiet: bool,
-    #[arg(long)]
+    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
     pub json: bool,
 }
 
@@ -79,7 +83,7 @@ pub struct InitArgs {
     pub token_env: Option<String>,
     #[arg(long)]
     pub force: bool,
-    #[arg(long)]
+    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
     pub json: bool,
 }
 
@@ -111,7 +115,7 @@ pub struct InitRepoArgs {
     pub repo: Option<String>,
     #[arg(long)]
     pub force: bool,
-    #[arg(long)]
+    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
     pub json: bool,
 }
 
@@ -144,6 +148,6 @@ pub struct QueryArgs {
     pub issue: Option<i64>,
     #[arg(long)]
     pub wiki: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
     pub json: bool,
 }

@@ -10,6 +10,7 @@
       "search": "query"
     },
     "cli_only_commands": ["init", "sync", "doctor"],
+    "human_output": "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v1 envelopes",
     "init_behavior": "top-level init previews inferred profile/repo defaults before writing; Enter/Y accepts, n customizes, EOF cancels without writes; init --yes and init -y apply the preset non-interactively; init repo is repo-policy-only",
     "init_yes_aliases": ["--yes", "-y"],
     "supported_token_sources": ["github_cli", "env"],
@@ -94,6 +95,7 @@
   "verification": [
     "Tantivy BM25-only path",
     "strict schema/envelope",
+    "human CLI summaries",
     "MCP adapter parity smoke",
     "stdout cleanliness",
     "privacy no-egress",

@@ -9,6 +9,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     let help = qgh(&["--help"]);
     assert_success(&help);
     let help_text = stdout_text(&help);
+    assert!(help_text.contains("human output by default"));
+    assert!(help_text.contains("use --json for qgh.v1 envelopes"));
     for command in [
         "init", "sync", "query", "search", "get", "status", "doctor", "mcp",
     ] {
@@ -109,6 +111,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         artifact["contract"]["init_yes_aliases"],
         json!(["--yes", "-y"])
     );
+    assert_eq!(
+        artifact["contract"]["human_output"],
+        "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v1 envelopes"
+    );
     assert!(artifact["contract"]["init_behavior"]
         .as_str()
         .unwrap()
@@ -184,6 +190,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     for required in [
         "Tantivy BM25-only path",
         "strict schema/envelope",
+        "human CLI summaries",
         "init output",
         "MCP adapter parity smoke",
         "stdout cleanliness",
@@ -197,6 +204,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "qgh init --yes",
         "qgh init -y",
         "validation.init_cancelled",
+        "Human output",
         "MCP role",
         "Wiki",
         "vector",

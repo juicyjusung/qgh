@@ -21,6 +21,8 @@ This release artifact is for the qgh MVP contract. It does not define new produc
 - MCP tools: `query`, `get`, `status`.
 - MCP read-only tools only: no `init`, `sync`, `doctor`, `eval`, mutation, hosted-provider, or write-back tools.
 - Machine output schema version: `qgh.v1`.
+- Human output: default successful CLI stdout is a command summary; `--json`
+  keeps the stable machine envelope.
 - Release artifact schema version: `qgh.release.v1`.
 - Supported MVP token sources: `github_cli`, `env`; `credential_store` is
   post-MVP and fails with `validation.invalid_token_source`.
@@ -40,6 +42,7 @@ Excluded or post-MVP gates:
 | --- | --- |
 | Tantivy BM25-only path | `sync`, `query`, `get`, and `status` pass without vector, model, GPU, or hosted provider dependencies. |
 | strict schema/envelope | CLI JSON and MCP structured content use `qgh.v1`; unknown CLI/MCP adapter/config parameters fail with structured errors. |
+| human CLI summaries | Non-json `init`, `sync`, `query`/`search`, `get`, `status`, and `doctor` output explains profile/repo/path/source/next-step state for people, while `--json` keeps the schema-compatible envelope. |
 | init output | top-level `init` is CLI-only first-run profile/repo bootstrap with preset preview/custom fallback, `--yes`/`-y` bypass prompts, `init repo` is repo-policy-only, both emit `docs/schemas/init-output.schema.json`, and neither appears in MCP `tools/list`. |
 | MCP adapter parity smoke | `tools/list` exposes only `query`, `get`, and `status`, each with `readOnlyHint: true`, and MCP structured content mirrors the CLI JSON envelope. |
 | stdout cleanliness | MCP stdio writes only protocol JSON messages to stdout; CLI JSON envelopes go to stdout and human diagnostics go to stderr. |

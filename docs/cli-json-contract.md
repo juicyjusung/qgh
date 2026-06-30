@@ -2,8 +2,10 @@
 
 ## Envelope
 
-Machine-readable CLI output uses one versioned `qgh.v1` envelope on stdout.
-Diagnostics and human-readable failures go to stderr.
+Machine-readable CLI output uses one versioned `qgh.v1` envelope on stdout
+when `--json` is passed. Without `--json`, successful CLI commands print
+human-readable summaries on stdout. Diagnostics and human-readable failures go
+to stderr.
 
 The product contract is CLI-first. CLI args, the `qgh.v1` JSON envelope,
 released schema snapshots, and local SQLite/Tantivy retrieval behavior are the
@@ -12,9 +14,10 @@ source of truth for new features. Agents can use `qgh query --json`, `qgh get
 over the same local retrieval contract.
 
 `sync` without `--json` emits human-readable progress diagnostics to stderr so
-long GitHub fetch/index runs do not look stalled. `sync --json` and `sync
---quiet` suppress progress diagnostics. Progress lines are not a stable
-machine-readable API; use the final stdout envelope for automation.
+long GitHub fetch/index runs do not look stalled, then prints a final human
+summary to stdout. `sync --json` and `sync --quiet` suppress progress
+diagnostics. Progress lines and human summaries are not a stable
+machine-readable API; use `--json` for automation.
 
 Success:
 
@@ -63,6 +66,29 @@ repo-scope fields. CLI-only `doctor` includes the same diagnostics and is the
 explicit command that may run probes. MCP exposes `status`, but not `doctor`.
 CLI-only top-level `init` bootstraps profile config plus repo scope. `init repo`
 creates tracked repo policy only. Neither command is exposed to MCP.
+
+## Human Output
+
+Human output is generated from the same command data as the JSON envelope, but
+it is optimized for a person reading the terminal:
+
+- `init`: profile id/action, repo allowlist action, token source reference,
+  config path, repo policy action/path, and next commands.
+- `sync`: synced repo scope, fetched/upserted issue and comment counts, backoff
+  state, active index generation, and next query command.
+- `query`/`search`: source-candidate list, not answers. It states that snippets
+  are previews, not citation evidence, and shows `qgh get <source_id>
+  --profile-id <profile_id>` for each result.
+- `get`: full source body, canonical URL, source version/staleness metadata,
+  and lifecycle check result.
+- `status`: selected profile, effective repo scope and repo source, DB path,
+  Tantivy index path, source counts, default sync scope, and `qgh sync --all`
+  guidance.
+- `doctor`: failed checks first with actionable hints, then all checks and MCP
+  exposure status.
+
+Human output is deliberately not schema-stable. `--json` remains the contract
+source for agents, scripts, MCP parity checks, and release schema validation.
 
 ## Init Output
 
