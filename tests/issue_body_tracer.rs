@@ -1011,6 +1011,24 @@ fn init_repo_writes_repo_policy_from_cli_repo_at_current_worktree_root() {
 }
 
 #[test]
+fn init_repo_honors_parent_json_flag() {
+    let fixture = TestFixture::new("init-repo-parent-json");
+    fixture.write_config_with_repos("http://127.0.0.1:1", &["owner/repo"]);
+    let nested_worktree_dir = fixture.init_git_worktree();
+
+    let init = fixture.qgh_in(
+        &nested_worktree_dir,
+        ["init", "--json", "repo", "--repo", "owner/repo"],
+    );
+    assert_success(&init);
+    assert!(stderr_text(&init).is_empty());
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["schema_version"], "qgh.v1");
+    assert_eq!(init_json["data"]["repo"], "owner/repo");
+    assert_eq!(init_json["data"]["repo_source"], "cli");
+}
+
+#[test]
 fn init_yes_bootstraps_profile_config_and_repo_policy_without_secret_or_store_paths() {
     let fixture = TestFixture::new("init-yes-bootstrap");
     let nested_worktree_dir =
@@ -1160,6 +1178,52 @@ fn init_yes_applies_inferred_preset_without_preview_or_required_flags() {
     assert_eq!(init_json["data"]["repo"], "owner/repo");
     assert_eq!(init_json["data"]["token_source"]["kind"], "github_cli");
     assert_eq!(init_json["data"]["repo_policy_action"], "created");
+}
+
+#[test]
+fn init_yes_rejects_token_env_without_token_source() {
+    let fixture = TestFixture::new("init-yes-token-env-without-source");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        ["init", "--yes", "--token-env", "QGH_TEST_TOKEN", "--json"],
+    );
+    assert_eq!(init.status.code(), Some(2));
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["error"]["code"], "validation.missing_init_value");
+    assert!(init_json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("--token-source"));
+    assert!(!fixture.config_home.join("qgh/config.toml").exists());
+    assert!(!fixture.root.join(".qgh.toml").exists());
+}
+
+#[test]
+fn init_interactive_token_source_env_prompts_for_token_env() {
+    let fixture = TestFixture::new("init-token-source-env-prompt");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in_with_stdin(
+        &nested_worktree_dir,
+        ["init", "--token-source", "env", "--json"],
+        "QGH_TEST_TOKEN\n\n",
+    );
+    assert_success(&init);
+    let stderr = stderr_text(&init);
+    assert!(stderr.contains("token env var [GITHUB_TOKEN]"));
+    assert!(stderr.contains("token source: env (QGH_TEST_TOKEN)"));
+    assert!(stderr.contains("Use these defaults? [Y/n]"));
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["data"]["token_source"]["kind"], "env");
+
+    let config_text = fs::read_to_string(fixture.config_home.join("qgh/config.toml")).unwrap();
+    assert!(config_text.contains(r#"type = "env""#));
+    assert!(config_text.contains(r#"env = "QGH_TEST_TOKEN""#));
+    assert!(!config_text.contains(r#"type = "github_cli""#));
 }
 
 #[test]

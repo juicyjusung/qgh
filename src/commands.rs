@@ -863,23 +863,31 @@ fn explicit_profile_for_init(profile_arg: Option<&str>) -> Option<(String, &'sta
         .map(|profile_id| (profile_id, "env"))
 }
 
-fn init_token_source(args: &InitArgs) -> Result<TokenSource, QghError> {
+fn init_token_source_or_default(args: &InitArgs) -> Result<TokenSource, QghError> {
     match args.token_source {
-        Some(InitTokenSourceArg::GithubCli) => Ok(TokenSource::GithubCli),
+        Some(InitTokenSourceArg::GithubCli) => {
+            if args.token_env.is_some() {
+                return Err(QghError::validation(
+                    "validation.invalid_token_source",
+                    "--token-env can only be used with --token-source env.",
+                ));
+            }
+            Ok(TokenSource::GithubCli)
+        }
         Some(InitTokenSourceArg::Env) => {
-            let Some(env) = args.token_env.clone() else {
-                return Err(missing_init_value("--token-env"));
+            let env = match args.token_env.clone() {
+                Some(env) => env,
+                None if args.yes => return Err(missing_init_value("--token-env")),
+                None => prompt_line("token env var", "GITHUB_TOKEN")?,
             };
             Ok(TokenSource::Env { env })
         }
-        None => Err(missing_init_value("--token-source")),
-    }
-}
-
-fn init_token_source_or_default(args: &InitArgs) -> Result<TokenSource, QghError> {
-    match args.token_source {
-        Some(_) => init_token_source(args),
-        None => Ok(TokenSource::GithubCli),
+        None => {
+            if args.token_env.is_some() {
+                return Err(missing_init_value("--token-source"));
+            }
+            Ok(TokenSource::GithubCli)
+        }
     }
 }
 

@@ -101,7 +101,7 @@ impl InitArgs {
     }
 
     fn wants_json(&self) -> bool {
-        self.repo_args().json
+        self.json || self.repo_args().json
     }
 }
 
