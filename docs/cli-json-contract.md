@@ -106,8 +106,11 @@ it is optimized for a person reading the terminal:
   are previews, not citation evidence, reports local snapshot freshness, and
   shows `qgh get <source_id> --profile-id <profile_id>` for each result.
 - `get`: full source body, canonical URL, source version/staleness metadata,
-  and lifecycle check result. Batch get summaries include requested/returned/
-  failed counts and per-item success or error state.
+  and lifecycle check status. Default `get` is local-only and reports
+  `lifecycle_check.status=not_checked` with `reason=not_requested`; pass
+  `--verify-lifecycle` to opt in to a GitHub lifecycle check. Batch get
+  summaries include requested/returned/failed counts and per-item success or
+  error state.
 - `status`: selected profile, local snapshot freshness, effective repo scope
   and repo source, DB path, Tantivy index path, source counts, default sync
   scope, and `qgh sync --all` guidance.
@@ -211,7 +214,10 @@ Batch `qgh get <source_id> <source_id> ... --json` returns:
 - `summary.returned`: number of successful source loads.
 - `summary.failed`: number of item-level failures.
 - `summary.batch_size_cap`: maximum accepted batch size, currently `20`.
-- `lifecycle_check_policy.mode`: `sequential`; batch lifecycle REST probes run
+- `lifecycle_check_policy.verify_lifecycle`: whether the command opted in to
+  GitHub lifecycle verification.
+- `lifecycle_check_policy.mode`: `not_requested` by default, or `sequential`
+  when `--verify-lifecycle` is passed. Verified batch lifecycle REST probes run
   in input order with at most one in-flight request.
 - `lifecycle_check_policy.profile_max_in_flight_requests`: the selected
   profile's configured sync/request cap for visibility.
@@ -224,3 +230,7 @@ Source-local `source.not_found`, `source.tombstoned`, and
 `source.outside_effective_scope` failures are item-level batch errors and do not
 stop the remaining items. Malformed CLI arguments, profile conflicts, and
 `summary.batch_size_cap` violations are command-level structured errors.
+
+MCP `get` is local-only and read-only. It rejects `verify_lifecycle` as an
+unknown parameter; use CLI `qgh get --verify-lifecycle` when a lifecycle check
+may probe GitHub and tombstone local sources.

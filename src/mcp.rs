@@ -87,7 +87,9 @@ async fn call_tool(session: &McpSession, id: Value, params: Option<&Value>) -> V
     let result = match parse_call(params) {
         Ok(call) => match call.name.as_str() {
             "query" => tool_query(session, &call.arguments).unwrap_or_else(tool_error),
-            "get" => tool_get(session, &call.arguments).unwrap_or_else(tool_error),
+            "get" => tool_get(session, &call.arguments)
+                .await
+                .unwrap_or_else(tool_error),
             "status" => tool_status(session, &call.arguments).unwrap_or_else(tool_error),
             _ => {
                 return protocol_error(id, -32601, "Tool not found");
@@ -110,14 +112,16 @@ fn tool_query(session: &McpSession, arguments: &Value) -> Result<Value, QghError
     ))
 }
 
-fn tool_get(session: &McpSession, arguments: &Value) -> Result<Value, QghError> {
+async fn tool_get(session: &McpSession, arguments: &Value) -> Result<Value, QghError> {
     let args = parse_get_args(arguments)?;
     let context = resolve_mcp_get_context(session, args.profile_id.as_deref())?;
-    let data = commands::get_local(
+    let data = commands::get(
         &context.profile_id,
         &args.source_id,
         context.repo_scope.as_ref(),
-    )?;
+        false,
+    )
+    .await?;
     Ok(tool_success(data, Vec::new(), context.meta_json()))
 }
 

@@ -203,6 +203,14 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
         source["source_version"]["github_updated_at"],
         "2026-01-02T03:04:05Z"
     );
+    assert_eq!(source["lifecycle_check"]["status"], "not_checked");
+    assert_eq!(source["lifecycle_check"]["reason"], "not_requested");
+    assert_eq!(source["lifecycle_check"]["remote_checked"], false);
+    assert_eq!(
+        server.request_count(),
+        2,
+        "default get must read local source data without a lifecycle network check"
+    );
 
     let comment_query = fixture.qgh(["query", "comment-only mitigation", "--json"]);
     assert_success(&comment_query);
@@ -295,6 +303,14 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
         comment_source["source_version"]["github_updated_at"],
         "2026-01-03T04:05:06Z"
     );
+    assert_eq!(comment_source["lifecycle_check"]["status"], "not_checked");
+    assert_eq!(comment_source["lifecycle_check"]["reason"], "not_requested");
+    assert_eq!(comment_source["lifecycle_check"]["remote_checked"], false);
+    assert_eq!(
+        server.request_count(),
+        2,
+        "default comment get must not probe GitHub lifecycle"
+    );
 
     let second_sync = fixture.qgh(["sync", "--json"]);
     assert_success(&second_sync);
@@ -380,9 +396,17 @@ fn non_json_cli_commands_print_human_summaries_without_weakening_json_contract()
     assert!(get_stdout.contains("canonical URL: https://github.com/owner/repo/issues/42"));
     assert!(get_stdout.contains("source version: body_hash="));
     assert!(get_stdout.contains("staleness metadata: github_updated_at=2026-01-02T03:04:05Z"));
-    assert!(get_stdout.contains("lifecycle check: active"));
+    assert!(get_stdout.contains("lifecycle check: not_checked (not_requested)"));
     assert!(get_stdout
         .contains("The BM25 issue body tracer must round-trip through get before citation."));
+
+    let verified_get = fixture.qgh([
+        "get",
+        "qgh://github.com/issue/I_kwDOISSUE1",
+        "--verify-lifecycle",
+    ]);
+    assert_success(&verified_get);
+    assert!(stdout_text(&verified_get).contains("lifecycle check: active"));
 
     let status = fixture.qgh(["status"]);
     assert_success(&status);
@@ -490,11 +514,15 @@ fn get_batch_returns_sources_in_input_order_without_changing_single_get_shape() 
     assert_eq!(batch_json["data"]["summary"]["batch_size_cap"], 20);
     assert_eq!(
         batch_json["data"]["lifecycle_check_policy"]["mode"],
-        "sequential"
+        "not_requested"
     );
     assert_eq!(
         batch_json["data"]["lifecycle_check_policy"]["max_in_flight_requests"],
-        1
+        0
+    );
+    assert_eq!(
+        batch_json["data"]["lifecycle_check_policy"]["verify_lifecycle"],
+        false
     );
     let items = batch_json["data"]["items"].as_array().unwrap();
     assert_eq!(items[0]["input_index"], 0);
@@ -570,7 +598,7 @@ fn get_batch_records_scope_violation_as_item_error() {
 }
 
 #[test]
-fn get_batch_records_tombstone_as_item_error() {
+fn get_batch_defaults_to_local_reads_and_only_tombstones_with_lifecycle_opt_in() {
     let fixture = TestFixture::new("get-batch-tombstone-item-error");
     let server = LifecycleFakeGitHub::start();
     fixture.write_config(&server.base_url);
@@ -579,11 +607,43 @@ fn get_batch_records_tombstone_as_item_error() {
     server.set_mode(LIFECYCLE_DELETED_COMMENT);
     let issue_id = "qgh://github.com/issue/I_kwDOISSUE1";
     let comment_id = "qgh://github.com/issue-comment/IC_kwDOCOMMENT1";
+    let request_count_before_default_get = server.request_count();
     let batch = fixture.qgh(["get", issue_id, comment_id, "--json"]);
+    assert_success(&batch);
+    let batch_json = stdout_json(&batch);
+    assert_eq!(batch_json["data"]["summary"]["returned"], 2);
+    assert_eq!(batch_json["data"]["summary"]["failed"], 0);
+    assert_eq!(
+        batch_json["data"]["lifecycle_check_policy"]["verify_lifecycle"],
+        false
+    );
+    assert_eq!(
+        batch_json["data"]["lifecycle_check_policy"]["mode"],
+        "not_requested"
+    );
+    assert_eq!(
+        batch_json["data"]["items"][1]["source"]["lifecycle_check"]["reason"],
+        "not_requested"
+    );
+    assert_eq!(
+        server.request_count(),
+        request_count_before_default_get,
+        "default batch get must not run lifecycle network probes"
+    );
+
+    let batch = fixture.qgh(["get", issue_id, comment_id, "--verify-lifecycle", "--json"]);
     assert_success(&batch);
     let batch_json = stdout_json(&batch);
     assert_eq!(batch_json["data"]["summary"]["returned"], 1);
     assert_eq!(batch_json["data"]["summary"]["failed"], 1);
+    assert_eq!(
+        batch_json["data"]["lifecycle_check_policy"]["verify_lifecycle"],
+        true
+    );
+    assert_eq!(
+        batch_json["data"]["lifecycle_check_policy"]["mode"],
+        "sequential"
+    );
     let items = batch_json["data"]["items"].as_array().unwrap();
     assert_eq!(items[0]["source_id"], issue_id);
     assert_eq!(items[0]["ok"], true);
@@ -1804,7 +1864,21 @@ fn get_tombstones_unavailable_issue_and_filters_active_query() {
     let issue_source_id = "qgh://github.com/issue/I_kwDOISSUE1";
 
     server.set_mode(LIFECYCLE_UNAVAILABLE_ISSUE);
-    let get = fixture.qgh(["get", issue_source_id, "--json"]);
+    let request_count_before_default_get = server.request_count();
+    let default_get = fixture.qgh(["get", issue_source_id, "--json"]);
+    assert_success(&default_get);
+    let default_json = stdout_json(&default_get);
+    assert_eq!(
+        default_json["data"]["source"]["lifecycle_check"]["reason"],
+        "not_requested"
+    );
+    assert_eq!(
+        server.request_count(),
+        request_count_before_default_get,
+        "default get must not discover remote unavailability"
+    );
+
+    let get = fixture.qgh(["get", issue_source_id, "--verify-lifecycle", "--json"]);
     assert_eq!(get.status.code(), Some(4));
     let get_json = stdout_json(&get);
     assert_eq!(get_json["error"]["code"], "source.tombstoned");
@@ -1841,7 +1915,7 @@ fn get_tombstones_moved_issue_as_structured_lifecycle_state() {
     let issue_source_id = "qgh://github.com/issue/I_kwDOISSUE1";
 
     server.set_mode(LIFECYCLE_MOVED_ISSUE);
-    let get = fixture.qgh(["get", issue_source_id, "--json"]);
+    let get = fixture.qgh(["get", issue_source_id, "--verify-lifecycle", "--json"]);
     assert_eq!(get.status.code(), Some(4));
     let get_json = stdout_json(&get);
     assert_eq!(get_json["error"]["code"], "source.tombstoned");
@@ -2464,6 +2538,14 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
                 .get("require_fresh")
                 .is_some());
         }
+        if tool["name"] == "get" {
+            assert!(
+                tool["inputSchema"]["properties"]
+                    .get("verify_lifecycle")
+                    .is_none(),
+                "MCP get must stay local-only/read-only; lifecycle verification is CLI-only"
+            );
+        }
         assert_eq!(tool["outputSchema"]["type"], "object");
         assert!(tool["outputSchema"]["required"]
             .as_array()
@@ -2617,6 +2699,14 @@ fn mcp_query_get_status_round_trips_issue_and_comment_sources() {
     let issue_get = &messages[2]["result"]["structuredContent"];
     assert_eq!(issue_get["ok"], true);
     assert_eq!(issue_get["data"]["source"]["source_id"], issue_source_id);
+    assert_eq!(
+        issue_get["data"]["source"]["lifecycle_check"]["reason"],
+        "not_requested"
+    );
+    assert_eq!(
+        issue_get["data"]["source"]["lifecycle_check"]["remote_checked"],
+        false
+    );
     assert!(issue_get["data"]["source"]["body"]
         .as_str()
         .unwrap()
@@ -2639,6 +2729,10 @@ fn mcp_query_get_status_round_trips_issue_and_comment_sources() {
         comment_get["data"]["source"]["canonical_url"],
         "https://github.com/owner/repo/issues/42#issuecomment-5001"
     );
+    assert_eq!(
+        comment_get["data"]["source"]["lifecycle_check"]["reason"],
+        "not_requested"
+    );
     assert!(comment_get["data"]["source"]["body"]
         .as_str()
         .unwrap()
@@ -2652,6 +2746,71 @@ fn mcp_query_get_status_round_trips_issue_and_comment_sources() {
     assert_eq!(status["data"]["freshness"]["remote_checked"], false);
     assert_eq!(status["data"]["sources"]["issue_count"], 1);
     assert_eq!(status["data"]["sources"]["comment_count"], 1);
+}
+
+#[test]
+fn mcp_get_rejects_lifecycle_verification_to_preserve_read_only_contract() {
+    let fixture = TestFixture::new("mcp-get-lifecycle-read-only");
+    let server = LifecycleFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let issue_source_id = "qgh://github.com/issue/I_kwDOISSUE1";
+
+    server.set_mode(LIFECYCLE_UNAVAILABLE_ISSUE);
+    let request_count_before_mcp_get = server.request_count();
+    let output = fixture.mcp([
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get",
+                "arguments": {
+                    "source_id": issue_source_id
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "get",
+                "arguments": {
+                    "source_id": issue_source_id,
+                    "verify_lifecycle": true
+                }
+            }
+        }),
+    ]);
+    assert_success(&output);
+    assert!(stderr_text(&output).is_empty());
+    let messages = stdout_json_lines(&output);
+    assert_eq!(messages.len(), 2);
+
+    let default_get = &messages[0]["result"]["structuredContent"];
+    assert_eq!(default_get["ok"], true);
+    assert_eq!(default_get["data"]["source"]["source_id"], issue_source_id);
+    assert_eq!(
+        default_get["data"]["source"]["lifecycle_check"]["reason"],
+        "not_requested"
+    );
+
+    let rejected_get = &messages[1]["result"];
+    assert_eq!(rejected_get["isError"], true);
+    assert_eq!(
+        rejected_get["structuredContent"]["error"]["code"],
+        "validation.mcp"
+    );
+    assert!(rejected_get["structuredContent"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown MCP parameter `verify_lifecycle`"));
+    assert_eq!(
+        server.request_count(),
+        request_count_before_mcp_get,
+        "MCP get must reject lifecycle verification before probing GitHub"
+    );
 }
 
 #[test]

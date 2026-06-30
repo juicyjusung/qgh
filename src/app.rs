@@ -127,9 +127,18 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
             let outcome = commands::query(&profile_id, args, context.repo_scope.as_ref())?;
             (outcome.data, outcome.warnings)
         }
-        crate::cli::Command::Get { source_ids, .. } => {
-            let data =
-                commands::get_cli(&profile_id, &source_ids, context.repo_scope.as_ref()).await?;
+        crate::cli::Command::Get {
+            source_ids,
+            verify_lifecycle,
+            ..
+        } => {
+            let data = commands::get_cli(
+                &profile_id,
+                &source_ids,
+                context.repo_scope.as_ref(),
+                verify_lifecycle,
+            )
+            .await?;
             (data, Vec::new())
         }
         crate::cli::Command::Status(args) => {

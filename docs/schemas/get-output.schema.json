@@ -51,19 +51,24 @@
         "lifecycle_check_policy": {
           "type": "object",
           "required": [
+            "verify_lifecycle",
             "mode",
             "max_in_flight_requests",
             "profile_max_in_flight_requests",
             "hard_cap"
           ],
           "properties": {
+            "verify_lifecycle": {
+              "type": "boolean"
+            },
             "mode": {
               "type": "string",
-              "const": "sequential"
+              "enum": ["not_requested", "sequential"]
             },
             "max_in_flight_requests": {
               "type": "integer",
-              "const": 1
+              "minimum": 0,
+              "maximum": 1
             },
             "profile_max_in_flight_requests": {
               "type": "integer",

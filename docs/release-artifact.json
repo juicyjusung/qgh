@@ -18,7 +18,7 @@
       "single_source_output": "backward compatible {profile_id, source}",
       "batch_output": "{profile_id, summary, lifecycle_check_policy, items}",
       "item_errors": ["source.not_found", "source.tombstoned", "source.outside_effective_scope"],
-      "lifecycle_check_policy": "sequential max_in_flight_requests=1"
+      "lifecycle_check_policy": "CLI opt-in verify_lifecycle; sequential max_in_flight_requests=1 when enabled; MCP get remains local-only"
     },
     "supported_token_sources": ["github_cli", "env"],
     "command_resolution_sources": ["explicit", "repo_policy", "git_remote"],

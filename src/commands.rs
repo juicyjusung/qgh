@@ -1601,10 +1601,18 @@ pub async fn get(
     profile_id: &str,
     source_id: &str,
     repo_scope: Option<&ResolvedRepoScope>,
+    verify_lifecycle: bool,
 ) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
     let mut store = Store::open(&profile.paths)?;
-    let source = get_source_with_lifecycle(&profile, &mut store, source_id, repo_scope).await?;
+    let source = get_source_for_get(
+        &profile,
+        &mut store,
+        source_id,
+        repo_scope,
+        verify_lifecycle,
+    )
+    .await?;
     Ok(json!({
         "profile_id": profile.id,
         "source": source
@@ -1615,9 +1623,10 @@ pub async fn get_cli(
     profile_id: &str,
     source_ids: &[String],
     repo_scope: Option<&ResolvedRepoScope>,
+    verify_lifecycle: bool,
 ) -> Result<Value, QghError> {
     if source_ids.len() == 1 {
-        return get(profile_id, &source_ids[0], repo_scope).await;
+        return get(profile_id, &source_ids[0], repo_scope, verify_lifecycle).await;
     }
     if source_ids.len() > GET_BATCH_SIZE_CAP {
         return Err(QghError::validation(
@@ -1637,7 +1646,15 @@ pub async fn get_cli(
     let mut returned = 0;
     let mut failed = 0;
     for (input_index, source_id) in source_ids.iter().enumerate() {
-        match get_source_with_lifecycle(&profile, &mut store, source_id, repo_scope).await {
+        match get_source_for_get(
+            &profile,
+            &mut store,
+            source_id,
+            repo_scope,
+            verify_lifecycle,
+        )
+        .await
+        {
             Ok(source) => {
                 returned += 1;
                 items.push(json!({
@@ -1669,8 +1686,9 @@ pub async fn get_cli(
             "batch_size_cap": GET_BATCH_SIZE_CAP
         },
         "lifecycle_check_policy": {
-            "mode": "sequential",
-            "max_in_flight_requests": 1,
+            "verify_lifecycle": verify_lifecycle,
+            "mode": if verify_lifecycle { "sequential" } else { "not_requested" },
+            "max_in_flight_requests": if verify_lifecycle { 1 } else { 0 },
             "profile_max_in_flight_requests": profile.max_in_flight_requests,
             "hard_cap": 16
         },
@@ -1678,9 +1696,28 @@ pub async fn get_cli(
     }))
 }
 
-async fn get_source_with_lifecycle(
+async fn get_source_for_get(
     profile: &Profile,
     store: &mut Store,
+    source_id: &str,
+    repo_scope: Option<&ResolvedRepoScope>,
+    verify_lifecycle: bool,
+) -> Result<Value, QghError> {
+    let mut source_json = get_source_base(store, source_id, repo_scope)?;
+    source_json["lifecycle_check"] = if verify_lifecycle {
+        lifecycle_check_for_get(profile, store, source_id).await?
+    } else {
+        json!({
+            "status": "not_checked",
+            "reason": "not_requested",
+            "remote_checked": false
+        })
+    };
+    Ok(source_json)
+}
+
+fn get_source_base(
+    store: &Store,
     source_id: &str,
     repo_scope: Option<&ResolvedRepoScope>,
 ) -> Result<Value, QghError> {
@@ -1695,15 +1732,26 @@ async fn get_source_with_lifecycle(
         return Err(QghError::source_not_found(source_id));
     };
     enforce_source_scope(source_id, &source, repo_scope)?;
-    let mut source_json = match source {
+    let source_json = match source {
         StoredSource::Issue(issue) => issue_source(issue),
         StoredSource::Comment(comment) => comment_source(comment),
     };
-    source_json["lifecycle_check"] = match resolve_token(profile) {
+    Ok(source_json)
+}
+
+async fn lifecycle_check_for_get(
+    profile: &Profile,
+    store: &mut Store,
+    source_id: &str,
+) -> Result<Value, QghError> {
+    Ok(match resolve_token(profile) {
         Ok(token) => {
             if let Some(candidate) = store.get_reconciliation_candidate(source_id)? {
                 match github::check_source_lifecycle(profile, &token, &candidate).await {
-                    Ok(github::LifecycleCheck::Active) => json!({ "status": "active" }),
+                    Ok(github::LifecycleCheck::Active) => json!({
+                        "status": "active",
+                        "remote_checked": true
+                    }),
                     Ok(github::LifecycleCheck::Unavailable { reason }) => {
                         let tombstone = store.tombstone_source(source_id, &reason)?;
                         return Err(QghError::source_tombstoned(
@@ -1714,19 +1762,24 @@ async fn get_source_with_lifecycle(
                     }
                     Err(error) => json!({
                         "status": "not_checked",
-                        "error_code": error.code
+                        "error_code": error.code,
+                        "remote_checked": false
                     }),
                 }
             } else {
-                json!({ "status": "not_checked", "reason": "missing_candidate" })
+                json!({
+                    "status": "not_checked",
+                    "reason": "missing_candidate",
+                    "remote_checked": false
+                })
             }
         }
         Err(error) => json!({
             "status": "not_checked",
-            "error_code": error.code
+            "error_code": error.code,
+            "remote_checked": false
         }),
-    };
-    Ok(source_json)
+    })
 }
 
 fn is_get_item_error(error: &QghError) -> bool {
@@ -1734,38 +1787,6 @@ fn is_get_item_error(error: &QghError) -> bool {
         error.code.as_str(),
         "source.not_found" | "source.tombstoned" | "source.outside_effective_scope"
     )
-}
-
-pub fn get_local(
-    profile_id: &str,
-    source_id: &str,
-    repo_scope: Option<&ResolvedRepoScope>,
-) -> Result<Value, QghError> {
-    let profile = load_profile(profile_id)?;
-    let store = Store::open(&profile.paths)?;
-    if let Some(tombstone) = store.get_tombstone(source_id)? {
-        return Err(QghError::source_tombstoned(
-            &tombstone.source_id,
-            &tombstone.reason,
-            &tombstone.observed_at,
-        ));
-    }
-    let Some(source) = store.get_source(source_id)? else {
-        return Err(QghError::source_not_found(source_id));
-    };
-    enforce_source_scope(source_id, &source, repo_scope)?;
-    let mut source_json = match source {
-        StoredSource::Issue(issue) => issue_source(issue),
-        StoredSource::Comment(comment) => comment_source(comment),
-    };
-    source_json["lifecycle_check"] = json!({
-        "status": "not_checked",
-        "reason": "mcp_read_only"
-    });
-    Ok(json!({
-        "profile_id": profile.id,
-        "source": source_json
-    }))
 }
 
 pub fn status(
