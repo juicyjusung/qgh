@@ -47,6 +47,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         !init_help.contains("credential"),
         "init help must not present credential_store as supported"
     );
+    let get_help = stdout_text(&qgh(&["get", "--help"]));
+    assert!(get_help.contains("One to 20 qgh source_id values"));
 
     let mcp = mcp([
         json!({
@@ -111,6 +113,19 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         artifact["contract"]["init_yes_aliases"],
         json!(["--yes", "-y"])
     );
+    assert_eq!(artifact["contract"]["get_batch"]["max_source_ids"], 20);
+    assert_eq!(
+        artifact["contract"]["get_batch"]["item_errors"],
+        json!([
+            "source.not_found",
+            "source.tombstoned",
+            "source.outside_effective_scope"
+        ])
+    );
+    assert_eq!(
+        artifact["contract"]["get_batch"]["lifecycle_check_policy"],
+        "sequential max_in_flight_requests=1"
+    );
     assert_eq!(
         artifact["contract"]["human_output"],
         "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v1 envelopes"
@@ -138,6 +153,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     .unwrap();
     let error_schema: Value = serde_json::from_str(
         &fs::read_to_string(root.join("docs/schemas/error.schema.json")).unwrap(),
+    )
+    .unwrap();
+    let get_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/get-output.schema.json")).unwrap(),
     )
     .unwrap();
     for required in [
@@ -171,6 +190,27 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         .as_array()
         .unwrap()
         .contains(&json!("validation.init_cancelled")));
+    assert!(error_schema["$defs"]["error_code"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("validation.batch_size")));
+    assert_eq!(
+        get_schema["oneOf"][0]["required"],
+        json!(["profile_id", "source"])
+    );
+    assert_eq!(
+        get_schema["oneOf"][1]["properties"]["summary"]["properties"]["batch_size_cap"]["const"],
+        20
+    );
+    assert_eq!(
+        get_schema["oneOf"][1]["properties"]["items"]["maxItems"],
+        20
+    );
+    assert_eq!(
+        get_schema["oneOf"][1]["properties"]["lifecycle_check_policy"]["properties"]["mode"]
+            ["const"],
+        "sequential"
+    );
     let included = artifact["acceptance_snapshot"]["included_in_mvp_gate"]
         .as_array()
         .unwrap();
@@ -191,6 +231,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "Tantivy BM25-only path",
         "strict schema/envelope",
         "human CLI summaries",
+        "get batch output",
         "init output",
         "MCP adapter parity smoke",
         "stdout cleanliness",
@@ -204,6 +245,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "qgh init --yes",
         "qgh init -y",
         "validation.init_cancelled",
+        "validation.batch_size",
+        "qgh get <source_id>... --json",
         "Human output",
         "MCP role",
         "Wiki",

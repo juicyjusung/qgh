@@ -17,6 +17,10 @@ This release artifact is for the qgh MVP contract. It does not define new produc
   `validation.init_cancelled` and no files changed.
 - `qgh init --yes` and `qgh init -y` apply the inferred preset without preview
   or prompts.
+- `qgh get <source_id>... --json` supports up to 20 source ids; single-source
+  output stays backward compatible, batch output uses input-ordered item
+  success/error entries and sequential lifecycle checks.
+- Batch cap violations fail command-level with `validation.batch_size`.
 - MCP role: optional read-only thin adapter over the CLI JSON/local retrieval contract.
 - MCP tools: `query`, `get`, `status`.
 - MCP read-only tools only: no `init`, `sync`, `doctor`, `eval`, mutation, hosted-provider, or write-back tools.
@@ -44,6 +48,7 @@ Excluded or post-MVP gates:
 | strict schema/envelope | CLI JSON and MCP structured content use `qgh.v1`; unknown CLI/MCP adapter/config parameters fail with structured errors. |
 | human CLI summaries | Non-json `init`, `sync`, `query`/`search`, `get`, `status`, and `doctor` output explains profile/repo/path/source/next-step state for people, while `--json` keeps the schema-compatible envelope. |
 | init output | top-level `init` is CLI-only first-run profile/repo bootstrap with preset preview/custom fallback, `--yes`/`-y` bypass prompts, `init repo` is repo-policy-only, both emit `docs/schemas/init-output.schema.json`, and neither appears in MCP `tools/list`. |
+| get batch output | `get` preserves single-source JSON shape, accepts 2-20 `source_id` values for CLI batch retrieval, preserves input order, records item-level source errors, and documents sequential lifecycle checks. |
 | MCP adapter parity smoke | `tools/list` exposes only `query`, `get`, and `status`, each with `readOnlyHint: true`, and MCP structured content mirrors the CLI JSON envelope. |
 | stdout cleanliness | MCP stdio writes only protocol JSON messages to stdout; CLI JSON envelopes go to stdout and human diagnostics go to stderr. |
 | privacy no-egress | Default behavior sends data only to the configured GitHub host for sync, `get` lifecycle checks, and explicit `doctor`; no hosted provider path is enabled. |

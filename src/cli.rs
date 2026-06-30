@@ -34,7 +34,8 @@ pub enum Command {
     Query(QueryArgs),
     Search(QueryArgs),
     Get {
-        source_id: String,
+        #[arg(required = true, num_args = 1.., help = "One to 20 qgh source_id values")]
+        source_ids: Vec<String>,
         #[arg(long)]
         profile_id: Option<String>,
         #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]

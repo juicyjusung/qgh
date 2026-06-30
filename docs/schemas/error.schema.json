@@ -49,6 +49,7 @@
         "validation.invalid_repo",
         "validation.invalid_state",
         "validation.invalid_token_source",
+        "validation.batch_size",
         "validation.mcp",
         "validation.unsupported_filter",
         "validation.unsupported_source_type",

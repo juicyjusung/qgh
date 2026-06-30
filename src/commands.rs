@@ -18,6 +18,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
+const GET_BATCH_SIZE_CAP: usize = 20;
+
 pub struct InitCommandOutcome {
     pub data: Value,
     pub warnings: Vec<Value>,
@@ -1231,6 +1233,86 @@ pub async fn get(
 ) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
     let mut store = Store::open(&profile.paths)?;
+    let source = get_source_with_lifecycle(&profile, &mut store, source_id, repo_scope).await?;
+    Ok(json!({
+        "profile_id": profile.id,
+        "source": source
+    }))
+}
+
+pub async fn get_cli(
+    profile_id: &str,
+    source_ids: &[String],
+    repo_scope: Option<&ResolvedRepoScope>,
+) -> Result<Value, QghError> {
+    if source_ids.len() == 1 {
+        return get(profile_id, &source_ids[0], repo_scope).await;
+    }
+    if source_ids.len() > GET_BATCH_SIZE_CAP {
+        return Err(QghError::validation(
+            "validation.batch_size",
+            format!("get accepts at most {GET_BATCH_SIZE_CAP} source_id values per batch."),
+        )
+        .with_details(json!({
+            "requested": source_ids.len(),
+            "batch_size_cap": GET_BATCH_SIZE_CAP
+        }))
+        .with_hint("Split the source_id list into smaller qgh get batches."));
+    }
+
+    let profile = load_profile(profile_id)?;
+    let mut store = Store::open(&profile.paths)?;
+    let mut items = Vec::with_capacity(source_ids.len());
+    let mut returned = 0;
+    let mut failed = 0;
+    for (input_index, source_id) in source_ids.iter().enumerate() {
+        match get_source_with_lifecycle(&profile, &mut store, source_id, repo_scope).await {
+            Ok(source) => {
+                returned += 1;
+                items.push(json!({
+                    "input_index": input_index,
+                    "source_id": source_id,
+                    "ok": true,
+                    "source": source
+                }));
+            }
+            Err(error) if is_get_item_error(&error) => {
+                failed += 1;
+                items.push(json!({
+                    "input_index": input_index,
+                    "source_id": source_id,
+                    "ok": false,
+                    "error": error
+                }));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(json!({
+        "profile_id": profile.id,
+        "summary": {
+            "requested": source_ids.len(),
+            "returned": returned,
+            "failed": failed,
+            "batch_size_cap": GET_BATCH_SIZE_CAP
+        },
+        "lifecycle_check_policy": {
+            "mode": "sequential",
+            "max_in_flight_requests": 1,
+            "profile_max_in_flight_requests": profile.max_in_flight_requests,
+            "hard_cap": 16
+        },
+        "items": items
+    }))
+}
+
+async fn get_source_with_lifecycle(
+    profile: &Profile,
+    store: &mut Store,
+    source_id: &str,
+    repo_scope: Option<&ResolvedRepoScope>,
+) -> Result<Value, QghError> {
     if let Some(tombstone) = store.get_tombstone(source_id)? {
         return Err(QghError::source_tombstoned(
             &tombstone.source_id,
@@ -1273,10 +1355,14 @@ pub async fn get(
             "error_code": error.code
         }),
     };
-    Ok(json!({
-        "profile_id": profile.id,
-        "source": source_json
-    }))
+    Ok(source_json)
+}
+
+fn is_get_item_error(error: &QghError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "source.not_found" | "source.tombstoned" | "source.outside_effective_scope"
+    )
 }
 
 pub fn get_local(

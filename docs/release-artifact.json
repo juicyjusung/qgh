@@ -13,6 +13,13 @@
     "human_output": "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v1 envelopes",
     "init_behavior": "top-level init previews inferred profile/repo defaults before writing; Enter/Y accepts, n customizes, EOF cancels without writes; init --yes and init -y apply the preset non-interactively; init repo is repo-policy-only",
     "init_yes_aliases": ["--yes", "-y"],
+    "get_batch": {
+      "max_source_ids": 20,
+      "single_source_output": "backward compatible {profile_id, source}",
+      "batch_output": "{profile_id, summary, lifecycle_check_policy, items}",
+      "item_errors": ["source.not_found", "source.tombstoned", "source.outside_effective_scope"],
+      "lifecycle_check_policy": "sequential max_in_flight_requests=1"
+    },
     "supported_token_sources": ["github_cli", "env"],
     "command_resolution_sources": ["explicit", "repo_policy", "git_remote"],
     "sync_default_scope": "effective_repo_scope_when_available",
@@ -96,6 +103,7 @@
     "Tantivy BM25-only path",
     "strict schema/envelope",
     "human CLI summaries",
+    "get batch output",
     "MCP adapter parity smoke",
     "stdout cleanliness",
     "privacy no-egress",

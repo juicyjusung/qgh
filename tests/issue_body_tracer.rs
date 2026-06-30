@@ -451,6 +451,161 @@ fn query_filters_unresolvable_index_hits_before_returning_results() {
 }
 
 #[test]
+fn get_batch_returns_sources_in_input_order_without_changing_single_get_shape() {
+    let fixture = TestFixture::new("get-batch-success");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let issue_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    let comment_id = "qgh://github.com/issue-comment/IC_kwDOCOMMENT1";
+    let single = fixture.qgh(["get", issue_id, "--json"]);
+    assert_success(&single);
+    let single_json = stdout_json(&single);
+    assert_eq!(single_json["data"]["source"]["source_id"], issue_id);
+    assert!(single_json["data"].get("items").is_none());
+    assert!(single_json["data"].get("summary").is_none());
+
+    let batch = fixture.qgh(["get", issue_id, comment_id, "--json"]);
+    assert_success(&batch);
+    let batch_json = stdout_json(&batch);
+    assert_eq!(batch_json["data"]["profile_id"], "work");
+    assert_eq!(batch_json["data"]["summary"]["requested"], 2);
+    assert_eq!(batch_json["data"]["summary"]["returned"], 2);
+    assert_eq!(batch_json["data"]["summary"]["failed"], 0);
+    assert_eq!(batch_json["data"]["summary"]["batch_size_cap"], 20);
+    assert_eq!(
+        batch_json["data"]["lifecycle_check_policy"]["mode"],
+        "sequential"
+    );
+    assert_eq!(
+        batch_json["data"]["lifecycle_check_policy"]["max_in_flight_requests"],
+        1
+    );
+    let items = batch_json["data"]["items"].as_array().unwrap();
+    assert_eq!(items[0]["input_index"], 0);
+    assert_eq!(items[0]["source_id"], issue_id);
+    assert_eq!(items[0]["ok"], true);
+    assert!(items[0]["source"]["body"]
+        .as_str()
+        .unwrap()
+        .contains("BM25 issue body tracer"));
+    assert_eq!(items[1]["input_index"], 1);
+    assert_eq!(items[1]["source_id"], comment_id);
+    assert_eq!(items[1]["ok"], true);
+    assert!(items[1]["source"]["body"]
+        .as_str()
+        .unwrap()
+        .contains("comment-only mitigation"));
+}
+
+#[test]
+fn get_batch_records_not_found_as_item_error_and_continues() {
+    let fixture = TestFixture::new("get-batch-not-found");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let issue_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    let missing_id = "qgh://github.com/issue/MISSING";
+    let comment_id = "qgh://github.com/issue-comment/IC_kwDOCOMMENT1";
+    let batch = fixture.qgh(["get", issue_id, missing_id, comment_id, "--json"]);
+    assert_success(&batch);
+    let batch_json = stdout_json(&batch);
+    assert_eq!(batch_json["data"]["summary"]["requested"], 3);
+    assert_eq!(batch_json["data"]["summary"]["returned"], 2);
+    assert_eq!(batch_json["data"]["summary"]["failed"], 1);
+    let items = batch_json["data"]["items"].as_array().unwrap();
+    assert_eq!(items[0]["ok"], true);
+    assert_eq!(items[1]["source_id"], missing_id);
+    assert_eq!(items[1]["ok"], false);
+    assert_eq!(items[1]["error"]["code"], "source.not_found");
+    assert_eq!(items[1]["error"]["details"]["source_id"], missing_id);
+    assert_eq!(items[2]["ok"], true);
+}
+
+#[test]
+fn get_batch_records_scope_violation_as_item_error() {
+    let fixture = TestFixture::new("get-batch-scope-item-error");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--all", "--json"]));
+
+    let owner_id = "qgh://github.com/issue/I_POLICY_OWNER";
+    let other_id = "qgh://github.com/issue/I_POLICY_OTHER";
+    let batch =
+        fixture.qgh_without_profile_in(&nested_worktree_dir, ["get", owner_id, other_id, "--json"]);
+    assert_success(&batch);
+    let batch_json = stdout_json(&batch);
+    assert_eq!(batch_json["meta"]["profile_source"], "single_match");
+    assert_eq!(batch_json["meta"]["repo"], "owner/repo");
+    assert_eq!(batch_json["data"]["summary"]["returned"], 1);
+    assert_eq!(batch_json["data"]["summary"]["failed"], 1);
+    let items = batch_json["data"]["items"].as_array().unwrap();
+    assert_eq!(items[0]["source_id"], owner_id);
+    assert_eq!(items[0]["ok"], true);
+    assert_eq!(items[1]["source_id"], other_id);
+    assert_eq!(items[1]["ok"], false);
+    assert_eq!(items[1]["error"]["code"], "source.outside_effective_scope");
+    assert_eq!(
+        items[1]["error"]["details"]["effective_repo_scope"],
+        "owner/repo"
+    );
+}
+
+#[test]
+fn get_batch_records_tombstone_as_item_error() {
+    let fixture = TestFixture::new("get-batch-tombstone-item-error");
+    let server = LifecycleFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    server.set_mode(LIFECYCLE_DELETED_COMMENT);
+    let issue_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    let comment_id = "qgh://github.com/issue-comment/IC_kwDOCOMMENT1";
+    let batch = fixture.qgh(["get", issue_id, comment_id, "--json"]);
+    assert_success(&batch);
+    let batch_json = stdout_json(&batch);
+    assert_eq!(batch_json["data"]["summary"]["returned"], 1);
+    assert_eq!(batch_json["data"]["summary"]["failed"], 1);
+    let items = batch_json["data"]["items"].as_array().unwrap();
+    assert_eq!(items[0]["source_id"], issue_id);
+    assert_eq!(items[0]["ok"], true);
+    assert_eq!(items[1]["source_id"], comment_id);
+    assert_eq!(items[1]["ok"], false);
+    assert_eq!(items[1]["error"]["code"], "source.tombstoned");
+    assert_eq!(items[1]["error"]["details"]["reason"], "not_found");
+}
+
+#[test]
+fn get_batch_size_cap_and_missing_source_ids_are_command_level_errors() {
+    let fixture = TestFixture::new("get-batch-cap");
+    fixture.write_config("http://127.0.0.1:1");
+
+    let source_ids = (0..21)
+        .map(|index| format!("qgh://github.com/issue/I_CAP_{index}"))
+        .collect::<Vec<_>>();
+    let mut cap_cmd = fixture.base_command();
+    let cap = cap_cmd
+        .args(["--profile", "work", "get"])
+        .args(source_ids.iter().map(String::as_str))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(cap.status.code(), Some(2));
+    let cap_json = stdout_json(&cap);
+    assert_eq!(cap_json["error"]["code"], "validation.batch_size");
+    assert_eq!(cap_json["error"]["details"]["requested"], 21);
+    assert_eq!(cap_json["error"]["details"]["batch_size_cap"], 20);
+
+    let missing = fixture.qgh(["get", "--json"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert_eq!(stdout_json(&missing)["error"]["code"], "validation.cli");
+}
+
+#[test]
 fn repo_policy_defaults_cli_query_to_current_worktree_repo_scope() {
     let fixture = TestFixture::new("repo-policy-default-scope");
     let server = MultiRepoFakeGitHub::start();
@@ -2291,6 +2446,27 @@ fn query_get_args_carry_profile_for_no_profile_repo_override_round_trip() {
     assert_success(&cli_get);
     assert_eq!(
         stdout_json(&cli_get)["data"]["source"]["source_id"],
+        cli_result["source_id"]
+    );
+
+    let cli_batch_get = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        [
+            "get",
+            cli_result["get_args"]["source_id"].as_str().unwrap(),
+            cli_result["get_args"]["source_id"].as_str().unwrap(),
+            "--profile-id",
+            cli_result["get_args"]["profile_id"].as_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_success(&cli_batch_get);
+    let cli_batch_json = stdout_json(&cli_batch_get);
+    assert_eq!(cli_batch_json["meta"]["profile_source"], "get_args");
+    assert_eq!(cli_batch_json["data"]["profile_id"], "alt");
+    assert_eq!(cli_batch_json["data"]["summary"]["requested"], 2);
+    assert_eq!(
+        cli_batch_json["data"]["items"][0]["source"]["source_id"],
         cli_result["source_id"]
     );
 

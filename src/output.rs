@@ -283,6 +283,9 @@ fn render_query(data: &Value) -> String {
 }
 
 fn render_get(data: &Value) -> String {
+    if data.get("items").is_some() {
+        return render_get_batch(data);
+    }
     let mut out = String::new();
     let source = data.get("source").unwrap_or(&Value::Null);
     line(&mut out, format_args!("qgh source"));
@@ -338,6 +341,62 @@ fn render_get(data: &Value) -> String {
     );
     line(&mut out, format_args!("body:"));
     line(&mut out, format_args!("{}", display_at(source, &["body"])));
+    out
+}
+
+fn render_get_batch(data: &Value) -> String {
+    let mut out = String::new();
+    let items = data
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    line(&mut out, format_args!("qgh get batch"));
+    line(
+        &mut out,
+        format_args!("profile: {}", display_at(data, &["profile_id"])),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "summary: requested {}, returned {}, failed {}",
+            display_at(data, &["summary", "requested"]),
+            display_at(data, &["summary", "returned"]),
+            display_at(data, &["summary", "failed"])
+        ),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "lifecycle checks: {} max_in_flight={}",
+            display_at(data, &["lifecycle_check_policy", "mode"]),
+            display_at(data, &["lifecycle_check_policy", "max_in_flight_requests"])
+        ),
+    );
+    for item in items {
+        if item.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            let source = item.get("source").unwrap_or(&Value::Null);
+            line(
+                &mut out,
+                format_args!(
+                    "{}. OK {} {}",
+                    display_at(item, &["input_index"]),
+                    display_at(item, &["source_id"]),
+                    display_at(source, &["canonical_url"])
+                ),
+            );
+        } else {
+            line(
+                &mut out,
+                format_args!(
+                    "{}. FAIL {} {}",
+                    display_at(item, &["input_index"]),
+                    display_at(item, &["source_id"]),
+                    display_at(item, &["error", "code"])
+                ),
+            );
+        }
+    }
     out
 }
 

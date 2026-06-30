@@ -2,12 +2,134 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/get-output.schema.json",
   "title": "qgh get data",
-  "type": "object",
-  "required": ["profile_id", "source"],
-  "properties": {
-    "profile_id": {
-      "type": "string"
+  "oneOf": [
+    {
+      "title": "single source get output",
+      "type": "object",
+      "required": ["profile_id", "source"],
+      "properties": {
+        "profile_id": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/source"
+        }
+      },
+      "additionalProperties": false
     },
+    {
+      "title": "batch get output",
+      "type": "object",
+      "required": ["profile_id", "summary", "lifecycle_check_policy", "items"],
+      "properties": {
+        "profile_id": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "object",
+          "required": ["requested", "returned", "failed", "batch_size_cap"],
+          "properties": {
+            "requested": {
+              "type": "integer",
+              "minimum": 2
+            },
+            "returned": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "failed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "batch_size_cap": {
+              "type": "integer",
+              "const": 20
+            }
+          },
+          "additionalProperties": false
+        },
+        "lifecycle_check_policy": {
+          "type": "object",
+          "required": [
+            "mode",
+            "max_in_flight_requests",
+            "profile_max_in_flight_requests",
+            "hard_cap"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "sequential"
+            },
+            "max_in_flight_requests": {
+              "type": "integer",
+              "const": 1
+            },
+            "profile_max_in_flight_requests": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "hard_cap": {
+              "type": "integer",
+              "const": 16
+            }
+          },
+          "additionalProperties": false
+        },
+        "items": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 20,
+          "items": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": ["input_index", "source_id", "ok", "source"],
+                "properties": {
+                  "input_index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "source_id": {
+                    "type": "string"
+                  },
+                  "ok": {
+                    "const": true
+                  },
+                  "source": {
+                    "$ref": "#/$defs/source"
+                  }
+                },
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "required": ["input_index", "source_id", "ok", "error"],
+                "properties": {
+                  "input_index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "source_id": {
+                    "type": "string"
+                  },
+                  "ok": {
+                    "const": false
+                  },
+                  "error": {
+                    "$ref": "error.schema.json"
+                  }
+                },
+                "additionalProperties": false
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "$defs": {
     "source": {
       "type": "object",
       "required": ["source_id", "entity_type", "canonical_url", "body", "source_version"],
@@ -34,6 +156,5 @@
       },
       "additionalProperties": true
     }
-  },
-  "additionalProperties": false
+  }
 }

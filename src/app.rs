@@ -108,8 +108,8 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
         crate::cli::Command::Query(args) | crate::cli::Command::Search(args) => {
             commands::query(&profile_id, args, context.repo_scope.as_ref())
         }
-        crate::cli::Command::Get { source_id, .. } => {
-            commands::get(&profile_id, &source_id, context.repo_scope.as_ref()).await
+        crate::cli::Command::Get { source_ids, .. } => {
+            commands::get_cli(&profile_id, &source_ids, context.repo_scope.as_ref()).await
         }
         crate::cli::Command::Status { .. } => commands::status(&profile_id),
         crate::cli::Command::Doctor { .. } => commands::doctor(&profile_id).await,

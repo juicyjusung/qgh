@@ -13,7 +13,7 @@ Stable error families:
 - `index.*`: Tantivy index failures.
 - `internal.*`: unexpected internal failures.
 
-Common codes include `config.no_matching_profile`, `config.ambiguous_profile`, `config.invalid_repo_policy`, `validation.cli`, `validation.mcp`, `validation.unsupported_filter`, `auth.token_unavailable`, `source.not_found`, `source.tombstoned`, and `source.outside_effective_scope`.
+Common codes include `config.no_matching_profile`, `config.ambiguous_profile`, `config.invalid_repo_policy`, `validation.cli`, `validation.mcp`, `validation.unsupported_filter`, `validation.batch_size`, `auth.token_unavailable`, `source.not_found`, `source.tombstoned`, and `source.outside_effective_scope`.
 
 `init` may additionally return:
 
@@ -29,5 +29,10 @@ Common codes include `config.no_matching_profile`, `config.ambiguous_profile`, `
 `init repo` success without an explicit profile includes a warning object with
 code `config.profile_not_checked`; later `status/query` commands still perform
 normal profile resolution and allowlist checks.
+
+`get` may additionally return `validation.batch_size` when more than 20
+`source_id` values are passed. In `get` batch output, source-local
+`source.not_found`, `source.tombstoned`, and `source.outside_effective_scope`
+failures are represented as item-level errors without failing the whole batch.
 
 Human output and JSON output share exit-code classes. Human diagnostics go to stderr; JSON envelopes go to stdout.

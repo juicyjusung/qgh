@@ -80,7 +80,8 @@ it is optimized for a person reading the terminal:
   are previews, not citation evidence, and shows `qgh get <source_id>
   --profile-id <profile_id>` for each result.
 - `get`: full source body, canonical URL, source version/staleness metadata,
-  and lifecycle check result.
+  and lifecycle check result. Batch get summaries include requested/returned/
+  failed counts and per-item success or error state.
 - `status`: selected profile, effective repo scope and repo source, DB path,
   Tantivy index path, source counts, default sync scope, and `qgh sync --all`
   guidance.
@@ -167,3 +168,33 @@ Citation example from a `get` response:
 - Canonical URL: `https://github.com/owner/repo/issues/42`
 
 If a local index hit cannot be resolved through `get`, qgh filters it out of successful results and reports it in `data.result_filtering.unresolvable_hits`.
+
+## Get Output
+
+Single-source `qgh get <source_id> --json` remains backward compatible and
+returns:
+
+- `profile_id`: profile store used to resolve the source.
+- `source`: full authoritative source object with `source_id`, `entity_type`,
+  `canonical_url`, `body`, `source_version`, and `lifecycle_check`.
+
+Batch `qgh get <source_id> <source_id> ... --json` returns:
+
+- `profile_id`: profile store used for every item.
+- `summary.requested`: number of input source ids.
+- `summary.returned`: number of successful source loads.
+- `summary.failed`: number of item-level failures.
+- `summary.batch_size_cap`: maximum accepted batch size, currently `20`.
+- `lifecycle_check_policy.mode`: `sequential`; batch lifecycle REST probes run
+  in input order with at most one in-flight request.
+- `lifecycle_check_policy.profile_max_in_flight_requests`: the selected
+  profile's configured sync/request cap for visibility.
+- `lifecycle_check_policy.hard_cap`: global hard cap, currently `16`.
+- `items`: one item per input source id, in input order. Successful items carry
+  `ok: true` and `source`; source-local failures carry `ok: false` and a
+  structured `error`.
+
+Source-local `source.not_found`, `source.tombstoned`, and
+`source.outside_effective_scope` failures are item-level batch errors and do not
+stop the remaining items. Malformed CLI arguments, profile conflicts, and
+`summary.batch_size_cap` violations are command-level structured errors.
