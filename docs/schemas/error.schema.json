@@ -41,6 +41,7 @@
         "validation.cli",
         "validation.missing_init_value",
         "validation.init_requires_input",
+        "validation.init_cancelled",
         "validation.invalid_init_answer",
         "validation.invalid_query",
         "validation.invalid_host",

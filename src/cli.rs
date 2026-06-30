@@ -65,7 +65,7 @@ pub struct InitArgs {
     pub target: Option<InitTarget>,
     #[arg(long)]
     pub repo: Option<String>,
-    #[arg(long)]
+    #[arg(short = 'y', long)]
     pub yes: bool,
     #[arg(long)]
     pub host: Option<String>,

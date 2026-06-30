@@ -8,6 +8,7 @@ use crate::error::QghError;
 use crate::github;
 use crate::index;
 use crate::model::{ReconciliationCandidate, StoredComment, StoredIssue, StoredSource};
+use crate::paths::ProfilePaths;
 use crate::resolution::ResolvedRepoScope;
 use crate::store::Store;
 use chrono::{DateTime, Utc};
@@ -306,12 +307,6 @@ pub fn init(profile_arg: Option<&str>, args: &InitArgs) -> Result<InitCommandOut
     if let Some(crate::cli::InitTarget::Repo(repo_args)) = &args.target {
         return init_repo_policy(profile_arg, repo_args.clone());
     }
-    if !args.yes {
-        return init_interactive(profile_arg, args);
-    }
-    let Some(profile_id) = profile_arg else {
-        return Err(missing_init_value("--profile"));
-    };
     let Some(root) = current_git_worktree_root() else {
         return Err(QghError::validation(
             "config.no_git_worktree",
@@ -320,50 +315,16 @@ pub fn init(profile_arg: Option<&str>, args: &InitArgs) -> Result<InitCommandOut
         .with_hint("Run qgh init from a git worktree."));
     };
     let remote = optional_git_remote_defaults(&root, args)?;
-    let repo = match args.repo.as_deref() {
-        Some(repo) => {
-            parse_repo(repo).map_err(|message| {
-                QghError::validation(
-                    "validation.invalid_repo",
-                    format!("Repo `{repo}` {message}"),
-                )
-            })?;
-            repo.to_string()
-        }
-        None => remote
-            .as_ref()
-            .map(|remote| remote.repo.clone())
-            .ok_or_else(|| missing_init_value("--repo"))?,
-    };
-    let host = args
-        .host
-        .clone()
-        .or_else(|| remote.as_ref().map(|remote| remote.host.clone()))
-        .ok_or_else(|| missing_init_value("--host"))?;
-    let api_base_url = args
-        .api_base_url
-        .clone()
-        .or_else(|| remote.as_ref().map(|remote| remote.api_base_url.clone()))
-        .unwrap_or_else(|| default_api_base_url(&host));
-    let web_base_url = args
-        .web_base_url
-        .clone()
-        .or_else(|| remote.as_ref().map(|remote| remote.web_base_url.clone()))
-        .unwrap_or_else(|| default_web_base_url(&host));
-    let token_source = init_token_source(args)?;
-    finish_profile_init(
-        &root,
-        ProfileInitPlan {
-            profile_id: profile_id.to_string(),
-            repo,
-            host,
-            api_base_url,
-            web_base_url,
-            token_source,
-            write_repo_policy: true,
-            force_repo_policy: args.force,
-        },
-    )
+    let preset = init_preset(profile_arg, args, &root, remote.as_ref())?;
+    if args.yes {
+        return finish_init_preset(&root, preset);
+    }
+    write_init_preset_preview(&preset)?;
+    if prompt_use_defaults()? {
+        finish_init_preset(&root, preset)
+    } else {
+        init_custom_interactive(&root, remote.as_ref(), profile_arg, args)
+    }
 }
 
 pub fn init_repo_policy(
@@ -485,18 +446,12 @@ pub fn init_repo_policy(
     })
 }
 
-fn init_interactive(
+fn init_custom_interactive(
+    root: &std::path::Path,
+    remote: Option<&GitRemote>,
     profile_arg: Option<&str>,
     args: &InitArgs,
 ) -> Result<InitCommandOutcome, QghError> {
-    let Some(root) = current_git_worktree_root() else {
-        return Err(QghError::validation(
-            "config.no_git_worktree",
-            "qgh init must be run inside a git worktree.",
-        )
-        .with_hint("Run qgh init from a git worktree."));
-    };
-    let remote = optional_git_remote_defaults(&root, args)?;
     let repo = match args.repo.as_deref() {
         Some(repo) => {
             parse_repo(repo).map_err(|message| {
@@ -508,7 +463,6 @@ fn init_interactive(
             repo.to_string()
         }
         None => remote
-            .as_ref()
             .map(|remote| remote.repo.clone())
             .ok_or_else(|| missing_init_value("--repo"))?,
     };
@@ -517,13 +471,13 @@ fn init_interactive(
     let host_default = args
         .host
         .clone()
-        .or_else(|| remote.as_ref().map(|remote| remote.host.clone()))
+        .or_else(|| remote.map(|remote| remote.host.clone()))
         .ok_or_else(|| missing_init_value("--host"))?;
     let host = prompt_line("host", &host_default)?;
     let api_default = args
         .api_base_url
         .clone()
-        .or_else(|| remote.as_ref().map(|remote| remote.api_base_url.clone()))
+        .or_else(|| remote.map(|remote| remote.api_base_url.clone()))
         .unwrap_or_else(|| default_api_base_url(&host));
     let api_base_url = prompt_line(
         "api base url",
@@ -532,7 +486,7 @@ fn init_interactive(
     let web_default = args
         .web_base_url
         .clone()
-        .or_else(|| remote.as_ref().map(|remote| remote.web_base_url.clone()))
+        .or_else(|| remote.map(|remote| remote.web_base_url.clone()))
         .unwrap_or_else(|| default_web_base_url(&host));
     let web_base_url = prompt_line(
         "web base url",
@@ -573,6 +527,114 @@ fn init_interactive(
             force_repo_policy: args.force,
         },
     )
+}
+
+struct InitPreset {
+    profile_id: String,
+    repo: String,
+    host: String,
+    api_base_url: String,
+    web_base_url: String,
+    token_source: TokenSource,
+    write_repo_policy: bool,
+    force_repo_policy: bool,
+    config_path: PathBuf,
+    repo_policy_path: PathBuf,
+    db_path: PathBuf,
+}
+
+fn init_preset(
+    profile_arg: Option<&str>,
+    args: &InitArgs,
+    root: &std::path::Path,
+    remote: Option<&GitRemote>,
+) -> Result<InitPreset, QghError> {
+    let repo = match args.repo.as_deref() {
+        Some(repo) => {
+            parse_repo(repo).map_err(|message| {
+                QghError::validation(
+                    "validation.invalid_repo",
+                    format!("Repo `{repo}` {message}"),
+                )
+            })?;
+            repo.to_string()
+        }
+        None => remote
+            .map(|remote| remote.repo.clone())
+            .ok_or_else(|| missing_init_value("--repo"))?,
+    };
+    let profile_id = profile_arg.unwrap_or("work").to_string();
+    let host = args
+        .host
+        .clone()
+        .or_else(|| remote.map(|remote| remote.host.clone()))
+        .ok_or_else(|| missing_init_value("--host"))?;
+    let api_base_url = args
+        .api_base_url
+        .clone()
+        .or_else(|| remote.map(|remote| remote.api_base_url.clone()))
+        .unwrap_or_else(|| default_api_base_url(&host));
+    let web_base_url = args
+        .web_base_url
+        .clone()
+        .or_else(|| remote.map(|remote| remote.web_base_url.clone()))
+        .unwrap_or_else(|| default_web_base_url(&host));
+    let token_source = init_token_source_or_default(args)?;
+    let paths = ProfilePaths::resolve(&profile_id)?;
+    Ok(InitPreset {
+        profile_id,
+        repo,
+        host,
+        api_base_url,
+        web_base_url,
+        token_source,
+        write_repo_policy: true,
+        force_repo_policy: args.force,
+        config_path: paths.config_file,
+        repo_policy_path: root.join(".qgh.toml"),
+        db_path: paths.db_path,
+    })
+}
+
+fn finish_init_preset(
+    root: &std::path::Path,
+    preset: InitPreset,
+) -> Result<InitCommandOutcome, QghError> {
+    finish_profile_init(
+        root,
+        ProfileInitPlan {
+            profile_id: preset.profile_id,
+            repo: preset.repo,
+            host: preset.host,
+            api_base_url: preset.api_base_url,
+            web_base_url: preset.web_base_url,
+            token_source: preset.token_source,
+            write_repo_policy: preset.write_repo_policy,
+            force_repo_policy: preset.force_repo_policy,
+        },
+    )
+}
+
+fn write_init_preset_preview(preset: &InitPreset) -> Result<(), QghError> {
+    let mut stderr = io::stderr();
+    writeln!(stderr, "Detected qgh init defaults:")?;
+    writeln!(stderr, "  repo: {}", preset.repo)?;
+    writeln!(stderr, "  host: {}", preset.host)?;
+    writeln!(stderr, "  profile id: {}", preset.profile_id)?;
+    writeln!(
+        stderr,
+        "  token source: {}",
+        token_source_display(&preset.token_source)
+    )?;
+    writeln!(stderr, "  config path: {}", preset.config_path.display())?;
+    writeln!(stderr, "  repo policy: create")?;
+    writeln!(
+        stderr,
+        "  repo policy path: {}",
+        preset.repo_policy_path.display()
+    )?;
+    writeln!(stderr, "  db path: {}", preset.db_path.display())?;
+    Ok(())
 }
 
 struct ProfileInitPlan {
@@ -698,17 +760,29 @@ fn prompt_line(label: &str, default: &str) -> Result<String, QghError> {
     let mut line = String::new();
     let bytes = io::stdin().read_line(&mut line)?;
     if bytes == 0 {
-        return Err(QghError::validation(
-            "validation.init_requires_input",
-            format!("Missing interactive input for {label}."),
-        )
-        .with_hint("Use --yes with explicit flags for non-interactive setup."));
+        writeln!(stderr, "\nqgh init canceled; no files changed.")?;
+        return Err(init_cancelled());
     }
     let value = line.trim();
     if value.is_empty() {
         Ok(default.to_string())
     } else {
         Ok(value.to_string())
+    }
+}
+
+fn prompt_use_defaults() -> Result<bool, QghError> {
+    let answer = prompt_line("Use these defaults?", "Y/n")?;
+    if answer == "Y/n" {
+        return Ok(true);
+    }
+    match answer.to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => Err(QghError::validation(
+            "validation.invalid_init_answer",
+            "Use these defaults? expects yes or no.",
+        )),
     }
 }
 
@@ -726,6 +800,14 @@ fn prompt_bool(label: &str, default: bool) -> Result<bool, QghError> {
             format!("{label} expects yes or no."),
         )),
     }
+}
+
+fn init_cancelled() -> QghError {
+    QghError::validation(
+        "validation.init_cancelled",
+        "qgh init canceled before writing files.",
+    )
+    .with_hint("Run qgh init again, or use qgh init -y for non-interactive setup.")
 }
 
 pub fn query(
@@ -789,6 +871,21 @@ fn init_token_source(args: &InitArgs) -> Result<TokenSource, QghError> {
             Ok(TokenSource::Env { env })
         }
         None => Err(missing_init_value("--token-source")),
+    }
+}
+
+fn init_token_source_or_default(args: &InitArgs) -> Result<TokenSource, QghError> {
+    match args.token_source {
+        Some(_) => init_token_source(args),
+        None => Ok(TokenSource::GithubCli),
+    }
+}
+
+fn token_source_display(token_source: &TokenSource) -> String {
+    match token_source {
+        TokenSource::GithubCli => "github_cli".to_string(),
+        TokenSource::Env { env } => format!("env ({env})"),
+        TokenSource::Unsupported => "unsupported".to_string(),
     }
 }
 

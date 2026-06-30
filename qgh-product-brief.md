@@ -18,6 +18,7 @@
 개정: 2026-06-29 — repo policy bootstrap (`qgh init` CLI-only tracked `.qgh.toml` creation)
 개정: 2026-06-30 — first-run init wizard and git-origin Command Resolution
 개정: 2026-06-30 — CLI-first contract and MCP thin-adapter positioning
+개정: 2026-06-30 — init preset preview, customize fallback, and `-y` alias
 
 ## 1. 제품 정의
 
@@ -143,7 +144,7 @@ MVP에서 제외할 항목은 제품 집중도를 지키기 위한 의도적 결
 
 ### 6.1 초기 설정
 
-사용자는 `qgh init` first-run wizard 또는 `~/.config/qgh/config.toml`의 strict TOML profile로 검색하고 싶은 repo를 명시한다. qgh는 token source, GitHub host, repo allowlist를 하나의 profile로 고정하고, SQLite/Tantivy data path는 XDG data dir과 profile id에서 파생한다. Repository는 tracked `.qgh.toml`로 query/search의 기본 repo scope와 safe filters를 정의할 수 있지만 profile id, token source, literal token, profile store path, arbitrary DB path, user-local absolute path는 정의할 수 없다. CLI-only `qgh init repo`는 current git worktree root에 이 repo policy만 생성하는 bootstrap command이며 MCP에는 노출되지 않는다. CLI `--profile`과 `QGH_PROFILE`이 없으면 repo policy 또는 Git `origin` remote에서 얻은 effective repo scope를 allowlist에 포함하는 profile이 정확히 하나일 때만 profile을 자동 선택한다.
+사용자는 `qgh init` first-run wizard 또는 `~/.config/qgh/config.toml`의 strict TOML profile로 검색하고 싶은 repo를 명시한다. qgh는 token source, GitHub host, repo allowlist를 하나의 profile로 고정하고, SQLite/Tantivy data path는 XDG data dir과 profile id에서 파생한다. Top-level `qgh init`은 current git worktree `origin`에서 repo/host defaults를 감지하고, 기본 profile id `work`, token source `github_cli`, config path, repo policy path, profile DB path를 preview한 뒤 Enter/`Y`면 preset을 적용하고 `n`이면 customize prompt로 들어간다. EOF 취소는 파일을 쓰지 않고 `validation.init_cancelled`로 종료한다. `qgh init --yes`와 `qgh init -y`는 preview/prompt 없이 같은 inferred preset을 적용한다. Repository는 tracked `.qgh.toml`로 query/search의 기본 repo scope와 safe filters를 정의할 수 있지만 profile id, token source, literal token, profile store path, arbitrary DB path, user-local absolute path는 정의할 수 없다. CLI-only `qgh init repo`는 current git worktree root에 이 repo policy만 생성하는 bootstrap command이며 MCP에는 노출되지 않는다. CLI `--profile`과 `QGH_PROFILE`이 없으면 repo policy 또는 Git `origin` remote에서 얻은 effective repo scope를 allowlist에 포함하는 profile이 정확히 하나일 때만 profile을 자동 선택한다.
 
 성공 경험:
 

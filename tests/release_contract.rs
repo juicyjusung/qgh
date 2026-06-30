@@ -37,6 +37,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         assert_success(&output);
     }
     let init_help = stdout_text(&qgh(&["init", "--help"]));
+    assert!(init_help.contains("-y"));
+    assert!(init_help.contains("--yes"));
     assert!(init_help.contains("github_cli"));
     assert!(init_help.contains("env"));
     assert!(
@@ -104,6 +106,14 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         json!(["github_cli", "env"])
     );
     assert_eq!(
+        artifact["contract"]["init_yes_aliases"],
+        json!(["--yes", "-y"])
+    );
+    assert!(artifact["contract"]["init_behavior"]
+        .as_str()
+        .unwrap()
+        .contains("previews inferred profile/repo defaults"));
+    assert_eq!(
         artifact["contract"]["mcp_role"],
         "optional read-only thin adapter over the CLI JSON/local retrieval contract"
     );
@@ -118,6 +128,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     }
     let init_schema: Value = serde_json::from_str(
         &fs::read_to_string(root.join("docs/schemas/init-output.schema.json")).unwrap(),
+    )
+    .unwrap();
+    let error_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/error.schema.json")).unwrap(),
     )
     .unwrap();
     for required in [
@@ -147,6 +161,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         init_schema["properties"]["token_source"]["properties"]["kind"]["enum"],
         json!(["github_cli", "env"])
     );
+    assert!(error_schema["$defs"]["error_code"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("validation.init_cancelled")));
     let included = artifact["acceptance_snapshot"]["included_in_mvp_gate"]
         .as_array()
         .unwrap();
@@ -176,6 +194,9 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "Supported MVP token sources",
         "Product contract source of truth",
         "qgh query --json",
+        "qgh init --yes",
+        "qgh init -y",
+        "validation.init_cancelled",
         "MCP role",
         "Wiki",
         "vector",

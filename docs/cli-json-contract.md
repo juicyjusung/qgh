@@ -67,11 +67,12 @@ creates tracked repo policy only. Neither command is exposed to MCP.
 ## Init Output
 
 Top-level `init` is the first-run wizard. It reads the current git worktree
-`origin` remote, proposes GitHub.com or GHES host defaults, creates or updates
-`${XDG_CONFIG_HOME:-~/.config}/qgh/config.toml`, adds the current repo to the
-selected profile allowlist without duplicates, and creates `.qgh.toml` as a
-default-on repo policy convenience file. It stores token source references only,
-never literal token values.
+`origin` remote, builds a preset from GitHub.com or GHES host defaults,
+default profile id `work`, token source `github_cli`, XDG config/profile DB
+paths, and the default-on `.qgh.toml` repo policy path. Interactive `qgh init`
+prints that preview before writing. Enter/`Y` applies the preset; `n` enters
+the customize prompts; EOF cancels with `validation.init_cancelled` and no files
+changed. It stores token source references only, never literal token values.
 
 `init repo` creates or overwrites only the current git worktree root `.qgh.toml`
 repo policy. It never creates profile config, token source config, profile store
@@ -89,7 +90,8 @@ Top-level `init --json` returns:
 - `token_source.kind`: `github_cli` or `env`.
 - `next_steps`: short command suggestions.
 
-`init --yes` is the non-interactive automation path. Missing required values fail
+`init --yes` and `init -y` are the non-interactive automation paths. They apply
+the inferred preset without preview or prompts. Missing required values fail
 with structured validation errors instead of falling back to prompts.
 
 `init repo --json` returns:

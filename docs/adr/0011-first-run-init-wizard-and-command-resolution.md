@@ -1,11 +1,13 @@
 # First-Run Init Wizard and Command Resolution
 
 Top-level `qgh init` is the first-run bootstrap command. It reads the current
-git worktree `origin` remote, proposes GitHub.com or GHES host defaults, creates
-or updates the XDG profile config, adds the current repo to the profile
-allowlist without duplicates, and may create `.qgh.toml` as a default-on repo
-policy convenience file. `qgh init repo` remains repo-policy-only for projects
-that want tracked policy without personal profile mutation.
+git worktree `origin` remote, previews GitHub.com or GHES host defaults, default
+profile id `work`, `github_cli` token source, XDG config/profile DB paths, and
+the default-on `.qgh.toml` repo policy path before writing. Enter or `Y` applies
+that preset, `n` enters customize prompts, and EOF cancels before writes. `qgh
+init --yes` and `qgh init -y` apply the same preset without preview or prompts.
+`qgh init repo` remains repo-policy-only for projects that want tracked policy
+without personal profile mutation.
 
 Operational CLI commands define the Command Resolution pipeline, and MCP tools
 mirror that same pipeline as a thin adapter:
