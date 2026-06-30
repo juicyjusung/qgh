@@ -88,8 +88,24 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         json!(["init", "sync", "doctor"])
     );
     assert_eq!(
+        artifact["contract"]["product_core"],
+        "CLI-first local retrieval with strict --json envelopes and SQLite/Tantivy behavior"
+    );
+    assert_eq!(
+        artifact["contract"]["contract_source_of_truth"],
+        json!([
+            "CLI args",
+            "docs/schemas/*.schema.json",
+            "local SQLite/Tantivy retrieval behavior"
+        ])
+    );
+    assert_eq!(
         artifact["contract"]["supported_token_sources"],
         json!(["github_cli", "env"])
+    );
+    assert_eq!(
+        artifact["contract"]["mcp_role"],
+        "optional read-only thin adapter over the CLI JSON/local retrieval contract"
     );
     assert!(artifact["contract"]["not_exposed_to_mcp"]
         .as_array()
@@ -151,13 +167,16 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "Tantivy BM25-only path",
         "strict schema/envelope",
         "init output",
-        "MCP read-only tools",
+        "MCP adapter parity smoke",
         "stdout cleanliness",
         "privacy no-egress",
         "DB/index permissions",
         "doctor output",
         "search eval result",
         "Supported MVP token sources",
+        "Product contract source of truth",
+        "qgh query --json",
+        "MCP role",
         "Wiki",
         "vector",
         "shared server",

@@ -5,6 +5,12 @@
 Machine-readable CLI output uses one versioned `qgh.v1` envelope on stdout.
 Diagnostics and human-readable failures go to stderr.
 
+The product contract is CLI-first. CLI args, the `qgh.v1` JSON envelope,
+released schema snapshots, and local SQLite/Tantivy retrieval behavior are the
+source of truth for new features. Agents can use `qgh query --json`, `qgh get
+--json`, and `qgh status --json` without MCP. MCP is a read-only thin adapter
+over the same local retrieval contract.
+
 `sync` without `--json` emits human-readable progress diagnostics to stderr so
 long GitHub fetch/index runs do not look stalled. `sync --json` and `sync
 --quiet` suppress progress diagnostics. Progress lines are not a stable
@@ -37,9 +43,9 @@ Released schema snapshots:
 - `docs/schemas/status-output.schema.json`: `status` data payload.
 - `docs/schemas/doctor-output.schema.json`: CLI-only `doctor` data payload.
 
-MCP uses the same envelope in structured tool content. Tool-level validation
-failures set `isError: true`; JSON-RPC protocol errors are reserved for malformed
-protocol messages or server faults.
+MCP uses the same envelope in structured tool content to mirror CLI behavior.
+Tool-level validation failures set `isError: true`; JSON-RPC protocol errors
+are reserved for malformed protocol messages or server faults.
 
 No-result query responses are successful envelopes with `data.results: []`.
 
@@ -120,8 +126,8 @@ Query results intentionally omit `body`. Use the `get` response when source text
 
 ## Citation Flow
 
-1. Run `query` to find source candidates.
-2. Run `get` with the result's `get_args.source_id` and
+1. Run `qgh query --json` to find source candidates.
+2. Run `qgh get --json` with the result's `get_args.source_id` and
    `get_args.profile_id`. For CLI automation, pass `get_args.profile_id` as
    `get --profile-id <profile_id>`; for MCP, pass it as the `profile_id`
    argument.

@@ -7,7 +7,8 @@ allowlist without duplicates, and may create `.qgh.toml` as a default-on repo
 policy convenience file. `qgh init repo` remains repo-policy-only for projects
 that want tracked policy without personal profile mutation.
 
-Operational CLI commands and MCP tools share one Command Resolution pipeline:
+Operational CLI commands define the Command Resolution pipeline, and MCP tools
+mirror that same pipeline as a thin adapter:
 explicit input, then current worktree repo policy, then current worktree Git
 `origin` remote. Help and version output are parser-only surfaces and do not run
 resolution.

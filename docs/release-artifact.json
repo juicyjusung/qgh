@@ -2,6 +2,8 @@
   "schema_version": "qgh.release.v1",
   "contract": {
     "envelope_schema_version": "qgh.v1",
+    "product_core": "CLI-first local retrieval with strict --json envelopes and SQLite/Tantivy behavior",
+    "contract_source_of_truth": ["CLI args", "docs/schemas/*.schema.json", "local SQLite/Tantivy retrieval behavior"],
     "cli_commands": ["init", "sync", "query", "search", "get", "status", "doctor", "mcp"],
     "canonical_cli_commands": ["init", "sync", "query", "get", "status", "doctor"],
     "cli_aliases": {
@@ -13,6 +15,7 @@
     "command_resolution_sources": ["explicit", "repo_policy", "git_remote"],
     "sync_default_scope": "effective_repo_scope_when_available",
     "mcp_protocol_version": "2025-11-25",
+    "mcp_role": "optional read-only thin adapter over the CLI JSON/local retrieval contract",
     "mcp_tools": ["query", "get", "status"],
     "mcp_read_only": true,
     "not_exposed_to_mcp": [
@@ -90,7 +93,7 @@
   "verification": [
     "Tantivy BM25-only path",
     "strict schema/envelope",
-    "MCP read-only tools",
+    "MCP adapter parity smoke",
     "stdout cleanliness",
     "privacy no-egress",
     "DB/index permissions",

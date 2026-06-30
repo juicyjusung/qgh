@@ -5,9 +5,14 @@ This release artifact is for the qgh MVP contract. It does not define new produc
 ## Contract Surface
 
 - CLI commands: `init`, `sync`, `query`, `search`, `get`, `status`, `doctor`, `mcp`.
+- Product contract source of truth: CLI args, `qgh.v1` JSON schemas, and
+  local SQLite/Tantivy retrieval behavior.
 - Canonical CLI workflow: `init -> sync -> query -> get -> cite -> status`.
+- Agents can perform the workflow without MCP via `qgh query --json`,
+  `qgh get --json`, and `qgh status --json`.
 - `search` is a CLI alias for `query`.
 - CLI-only commands: `init`, `sync`, `doctor`.
+- MCP role: optional read-only thin adapter over the CLI JSON/local retrieval contract.
 - MCP tools: `query`, `get`, `status`.
 - MCP read-only tools only: no `init`, `sync`, `doctor`, `eval`, mutation, hosted-provider, or write-back tools.
 - Machine output schema version: `qgh.v1`.
@@ -29,9 +34,9 @@ Excluded or post-MVP gates:
 | Area | Release check |
 | --- | --- |
 | Tantivy BM25-only path | `sync`, `query`, `get`, and `status` pass without vector, model, GPU, or hosted provider dependencies. |
-| strict schema/envelope | CLI JSON and MCP structured content use `qgh.v1`; unknown CLI/MCP/config parameters fail with structured errors. |
+| strict schema/envelope | CLI JSON and MCP structured content use `qgh.v1`; unknown CLI/MCP adapter/config parameters fail with structured errors. |
 | init output | top-level `init` is CLI-only first-run profile/repo bootstrap, `init repo` is repo-policy-only, both emit `docs/schemas/init-output.schema.json`, and neither appears in MCP `tools/list`. |
-| MCP read-only tools | `tools/list` exposes only `query`, `get`, and `status`, each with `readOnlyHint: true`. |
+| MCP adapter parity smoke | `tools/list` exposes only `query`, `get`, and `status`, each with `readOnlyHint: true`, and MCP structured content mirrors the CLI JSON envelope. |
 | stdout cleanliness | MCP stdio writes only protocol JSON messages to stdout; CLI JSON envelopes go to stdout and human diagnostics go to stderr. |
 | privacy no-egress | Default behavior sends data only to the configured GitHub host for sync, `get` lifecycle checks, and explicit `doctor`; no hosted provider path is enabled. |
 | DB/index permissions | SQLite profile data, Tantivy generation directories, cache, and logs are single-user where the platform supports it. |
