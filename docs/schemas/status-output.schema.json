@@ -5,6 +5,7 @@
   "type": "object",
   "required": [
     "profile_id",
+    "freshness",
     "github",
     "paths",
     "sources",
@@ -18,6 +19,9 @@
   "properties": {
     "profile_id": {
       "type": "string"
+    },
+    "freshness": {
+      "$ref": "#/$defs/freshness"
     },
     "github": {
       "type": "object"
@@ -49,6 +53,33 @@
   },
   "additionalProperties": false,
   "$defs": {
+    "freshness": {
+      "type": "object",
+      "required": [
+        "decision",
+        "remote_checked",
+        "snapshot_age_seconds",
+        "max_age_seconds"
+      ],
+      "properties": {
+        "decision": {
+          "type": "string",
+          "enum": ["fresh", "stale_warn", "stale_fail", "never_synced"]
+        },
+        "remote_checked": {
+          "const": false
+        },
+        "snapshot_age_seconds": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "max_age_seconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
     "resolution": {
       "type": "object",
       "required": [

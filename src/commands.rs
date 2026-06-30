@@ -5,6 +5,7 @@ use crate::config::{
     GitRemote, Profile, ProfileBootstrapInput, RepoPolicy, TokenSource,
 };
 use crate::error::QghError;
+use crate::freshness::{self, FreshnessContext, FreshnessOverrides};
 use crate::github;
 use crate::index;
 use crate::model::{ReconciliationCandidate, StoredComment, StoredIssue, StoredSource};
@@ -24,6 +25,11 @@ pub struct InitCommandOutcome {
     pub data: Value,
     pub warnings: Vec<Value>,
     pub meta: Value,
+}
+
+pub struct LocalReadOutcome {
+    pub data: Value,
+    pub warnings: Vec<Value>,
 }
 
 pub async fn sync(
@@ -398,6 +404,7 @@ pub fn init_repo_policy(
                 }),
                 vec![json!({
                     "code": "config.profile_not_checked",
+                    "severity": "warn",
                     "message": "Profile allowlist was not checked because no profile was explicit."
                 })],
                 None,
@@ -816,24 +823,42 @@ pub fn query(
     profile_id: &str,
     args: QueryArgs,
     repo_scope: Option<&ResolvedRepoScope>,
-) -> Result<Value, QghError> {
+) -> Result<LocalReadOutcome, QghError> {
     let profile = load_profile(profile_id)?;
     let repo_policy = discover_repo_policy()?;
     let filters = QueryFilters::from_args(&args, &profile, repo_policy.as_ref(), repo_scope)?;
     let limit = effective_limit(&args, repo_policy.as_ref());
     let store = Store::open(&profile.paths)?;
+    let overrides = freshness_overrides(args.max_age.as_deref(), args.require_fresh)?;
     if let Some(results) = exact_results(&store, &args.query, &filters, &profile.id)? {
-        return Ok(json!({
+        let last_successful_sync_at =
+            query_freshness_sync_time(&store, &profile, &filters, &results)?;
+        let freshness = freshness::evaluate(
+            profile.freshness_settings(repo_policy.as_ref()),
+            FreshnessContext {
+                last_successful_sync_at: last_successful_sync_at.as_deref(),
+                includes_open_issue: results.includes_open_issue,
+                overrides,
+            },
+        )?;
+        if freshness.fails {
+            return Err(freshness_error(freshness.block, freshness.warnings));
+        }
+        return Ok(LocalReadOutcome {
+            data: json!({
             "profile_id": profile.id,
+            "freshness": freshness.block,
             "result_filtering": {
                 "unresolvable_hits": 0
             },
-            "results": results
-        }));
+            "results": results.items
+            }),
+            warnings: freshness.warnings,
+        });
     }
     let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
     let hits = index::search(&active_index_path, &args.query, limit)?;
-    let mut results = Vec::new();
+    let mut results = QueryResults::default();
     let mut unresolvable_hits = 0;
     for hit in hits {
         let Some(source) = store.get_source(&hit.source_id)? else {
@@ -843,15 +868,31 @@ pub fn query(
         if !filters.matches(&source) {
             continue;
         }
-        results.push(source_result(source, Ranking::Bm25(hit.score), &profile.id));
+        results.push(source, Ranking::Bm25(hit.score), &profile.id);
     }
-    Ok(json!({
+    let last_successful_sync_at = query_freshness_sync_time(&store, &profile, &filters, &results)?;
+    let freshness = freshness::evaluate(
+        profile.freshness_settings(repo_policy.as_ref()),
+        FreshnessContext {
+            last_successful_sync_at: last_successful_sync_at.as_deref(),
+            includes_open_issue: results.includes_open_issue,
+            overrides,
+        },
+    )?;
+    if freshness.fails {
+        return Err(freshness_error(freshness.block, freshness.warnings));
+    }
+    Ok(LocalReadOutcome {
+        data: json!({
         "profile_id": profile.id,
+        "freshness": freshness.block,
         "result_filtering": {
             "unresolvable_hits": unresolvable_hits
         },
-        "results": results
-    }))
+        "results": results.items
+        }),
+        warnings: freshness.warnings,
+    })
 }
 
 fn explicit_profile_for_init(profile_arg: Option<&str>) -> Option<(String, &'static str)> {
@@ -1133,18 +1174,65 @@ fn effective_limit(args: &QueryArgs, repo_policy: Option<&RepoPolicy>) -> usize 
         .unwrap_or(10)
 }
 
+#[derive(Default)]
+struct QueryResults {
+    items: Vec<Value>,
+    includes_open_issue: bool,
+    repos: Vec<String>,
+}
+
+impl QueryResults {
+    fn push(&mut self, source: StoredSource, ranking: Ranking, profile_id: &str) {
+        if matches!(&source, StoredSource::Issue(issue) if issue.state == "open") {
+            self.includes_open_issue = true;
+        }
+        let repo = match &source {
+            StoredSource::Issue(issue) => &issue.repo,
+            StoredSource::Comment(comment) => &comment.repo,
+        };
+        if !self.repos.contains(repo) {
+            self.repos.push(repo.clone());
+        }
+        self.items.push(source_result(source, ranking, profile_id));
+    }
+}
+
+fn query_freshness_sync_time(
+    store: &Store,
+    profile: &Profile,
+    filters: &QueryFilters,
+    results: &QueryResults,
+) -> Result<Option<String>, QghError> {
+    let repos = query_freshness_repos(profile, filters, results);
+    store.oldest_successful_sync_at_for_repos(&repos)
+}
+
+fn query_freshness_repos(
+    profile: &Profile,
+    filters: &QueryFilters,
+    results: &QueryResults,
+) -> Vec<String> {
+    if let Some(repo) = &filters.repo {
+        return vec![repo.clone()];
+    }
+    if !results.repos.is_empty() {
+        return results.repos.clone();
+    }
+    profile.repos.iter().map(|repo| repo.full_name()).collect()
+}
+
 fn exact_results(
     store: &Store,
     query_text: &str,
     filters: &QueryFilters,
     profile_id: &str,
-) -> Result<Option<Vec<Value>>, QghError> {
+) -> Result<Option<QueryResults>, QghError> {
     if let Some(source) = exact_url_result(store, query_text)? {
-        return Ok(Some(if filters.matches(&source) {
-            vec![source_result(source, Ranking::Exact, profile_id)]
-        } else {
-            Vec::new()
-        }));
+        let mut results = QueryResults::default();
+        if filters.matches(&source) {
+            results.push(source, Ranking::Exact, profile_id);
+        }
+        return Ok(Some(results));
     }
     let issue_number = filters.issue.or_else(|| parse_issue_number(query_text));
     let Some(issue_number) = issue_number else {
@@ -1164,14 +1252,13 @@ fn exact_results(
             "Issue number matches multiple repos; add --repo.",
         ));
     }
-    Ok(Some(
-        matches
-            .into_iter()
-            .map(StoredSource::Issue)
-            .filter(|source| filters.matches(source))
-            .map(|source| source_result(source, Ranking::Exact, profile_id))
-            .collect(),
-    ))
+    let mut results = QueryResults::default();
+    for source in matches.into_iter().map(StoredSource::Issue) {
+        if filters.matches(&source) {
+            results.push(source, Ranking::Exact, profile_id);
+        }
+    }
+    Ok(Some(results))
 }
 
 fn exact_url_result(store: &Store, query_text: &str) -> Result<Option<StoredSource>, QghError> {
@@ -1405,19 +1492,38 @@ pub fn get_local(
     }))
 }
 
-pub fn status(profile_id: &str) -> Result<Value, QghError> {
+pub fn status(
+    profile_id: &str,
+    args: &crate::cli::StatusArgs,
+) -> Result<LocalReadOutcome, QghError> {
     let profile = load_profile(profile_id)?;
+    let repo_policy = discover_repo_policy()?;
     let store = Store::open(&profile.paths)?;
     let status = store.status()?;
     let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
+    let freshness = freshness::evaluate(
+        profile.freshness_settings(repo_policy.as_ref()),
+        FreshnessContext {
+            last_successful_sync_at: status.last_sync_at.as_deref(),
+            includes_open_issue: false,
+            overrides: freshness_overrides(args.max_age.as_deref(), args.require_fresh)?,
+        },
+    )?;
+    if freshness.fails {
+        return Err(freshness_error(freshness.block, freshness.warnings));
+    }
     let source_count = (status.issue_count + status.comment_count) as usize;
     let age_days = status
         .last_reconciliation
         .as_ref()
         .and_then(|run| age_days(&run.completed_at));
+    let age_seconds = status
+        .last_reconciliation
+        .as_ref()
+        .and_then(|run| age_seconds(&run.completed_at));
     let stale = profile
-        .reconcile_after_days
-        .is_some_and(|days| age_days.is_none_or(|age| age > days));
+        .reconcile_after_seconds
+        .is_some_and(|seconds| age_seconds.is_none_or(|age| age > seconds));
     let stale_warning = if stale {
         json!("reconciliation.stale")
     } else {
@@ -1437,8 +1543,10 @@ pub fn status(profile_id: &str) -> Result<Value, QghError> {
             )
         })
         .collect::<serde_json::Map<_, _>>();
-    Ok(json!({
+    Ok(LocalReadOutcome {
+        data: json!({
         "profile_id": profile.id,
+        "freshness": freshness.block,
         "github": {
             "host": profile.host,
             "api_base_url": profile.api_base_url,
@@ -1490,7 +1598,9 @@ pub fn status(profile_id: &str) -> Result<Value, QghError> {
             "local_paths_may_contain_private_content": true,
             "single_user_permissions": "0600_files_0700_dirs_where_supported"
         }
-    }))
+        }),
+        warnings: freshness.warnings,
+    })
 }
 
 pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
@@ -1547,6 +1657,33 @@ fn active_index_path(store: &Store, fallback: &std::path::Path) -> Result<PathBu
         .active_index_path()?
         .map(PathBuf::from)
         .unwrap_or_else(|| fallback.to_path_buf()))
+}
+
+fn freshness_overrides(
+    max_age: Option<&str>,
+    require_fresh: bool,
+) -> Result<FreshnessOverrides, QghError> {
+    Ok(FreshnessOverrides {
+        max_age_seconds: max_age
+            .map(|value| {
+                freshness::parse_duration_seconds("--max-age", value)
+                    .map_err(|error| QghError::validation("validation.cli", error.message))
+            })
+            .transpose()?,
+        require_fresh,
+    })
+}
+
+fn freshness_error(freshness: Value, warnings: Vec<Value>) -> QghError {
+    QghError::validation(
+        "freshness.stale",
+        "Local snapshot is stale under the active freshness policy.",
+    )
+    .with_details(json!({
+        "freshness": freshness,
+        "warnings": warnings
+    }))
+    .with_hint("Run qgh sync, increase --max-age for this run, or omit --require-fresh.")
 }
 
 enum Ranking {
@@ -1628,6 +1765,15 @@ fn age_days(timestamp: &str) -> Option<i64> {
         Utc::now()
             .signed_duration_since(parsed.with_timezone(&Utc))
             .num_days()
+            .max(0)
+    })
+}
+
+fn age_seconds(timestamp: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(timestamp).ok().map(|parsed| {
+        Utc::now()
+            .signed_duration_since(parsed.with_timezone(&Utc))
+            .num_seconds()
             .max(0)
     })
 }

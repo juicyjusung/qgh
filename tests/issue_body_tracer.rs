@@ -1,3 +1,4 @@
+use chrono::{Duration, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
@@ -46,6 +47,12 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     assert!(status_json["data"]["sync"]["last_sync_at"]
         .as_str()
         .is_some());
+    assert_eq!(status_json["data"]["freshness"]["decision"], "fresh");
+    assert_eq!(status_json["data"]["freshness"]["remote_checked"], false);
+    assert!(status_json["data"]["freshness"]["snapshot_age_seconds"]
+        .as_i64()
+        .is_some_and(|age| age >= 0));
+    assert_eq!(status_json["data"]["freshness"]["max_age_seconds"], 604_800);
     assert!(status_json["data"]["paths"]["logs"].as_str().is_some());
     assert_eq!(
         status_json["data"]["privacy"]["classification"],
@@ -64,11 +71,18 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
     assert_success(&query);
     let query_json = stdout_json(&query);
+    assert_eq!(query_json["warnings"], json!([]));
     assert_eq!(query_json["meta"]["profile_id"], "work");
     assert_eq!(query_json["meta"]["profile_source"], "cli");
     assert_eq!(query_json["meta"]["repo"], Value::Null);
     assert_eq!(query_json["meta"]["repo_source"], Value::Null);
     assert_eq!(query_json["meta"]["repo_policy_path"], Value::Null);
+    assert_eq!(query_json["data"]["freshness"]["decision"], "fresh");
+    assert_eq!(query_json["data"]["freshness"]["remote_checked"], false);
+    assert!(query_json["data"]["freshness"]["snapshot_age_seconds"]
+        .as_i64()
+        .is_some_and(|age| age >= 0));
+    assert_eq!(query_json["data"]["freshness"]["max_age_seconds"], 604_800);
     let result = &query_json["data"]["results"][0];
     let source_id = "qgh://github.com/issue/I_kwDOISSUE1";
     assert_eq!(result["source_id"], source_id);
@@ -1593,6 +1607,7 @@ fn init_infers_repo_from_github_origin_remote_without_profile_resolution() {
             init_json["warnings"][0]["code"],
             "config.profile_not_checked"
         );
+        assert_eq!(init_json["warnings"][0]["severity"], "warn");
         assert!(fixture.root.join(".qgh.toml").exists());
     }
 }
@@ -1875,6 +1890,250 @@ fn status_warns_about_stale_reconciliation_without_running_it() {
 }
 
 #[test]
+fn query_and_status_warn_or_fail_from_local_snapshot_age_without_network() {
+    let fixture = TestFixture::new("snapshot-age-freshness");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config_with_freshness(&server.base_url, Some("1s"), Some("warn"), None);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.set_last_sync_age_seconds(3_600);
+    let requests_before_local_reads = server.request_count();
+
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&query);
+    assert_eq!(
+        server.request_count(),
+        requests_before_local_reads,
+        "query freshness must not probe GitHub"
+    );
+    let query_json = stdout_json(&query);
+    assert_eq!(query_json["data"]["freshness"]["decision"], "stale_warn");
+    assert_eq!(query_json["data"]["freshness"]["remote_checked"], false);
+    assert!(query_json["data"]["freshness"]["snapshot_age_seconds"]
+        .as_i64()
+        .is_some_and(|age| age >= 3_600));
+    assert_eq!(query_json["data"]["freshness"]["max_age_seconds"], 1);
+    assert_eq!(
+        query_json["warnings"][0]["code"],
+        "freshness.query_snapshot_stale"
+    );
+    assert_eq!(query_json["warnings"][0]["severity"], "warn");
+
+    let human_query = fixture.qgh(["query", "BM25 tracer"]);
+    assert_success(&human_query);
+    assert!(stdout_text(&human_query).contains("freshness: stale_warn"));
+    assert!(stderr_text(&human_query).contains("freshness.query_snapshot_stale"));
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    assert_eq!(
+        server.request_count(),
+        requests_before_local_reads,
+        "status freshness must remain local-only"
+    );
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["freshness"]["decision"], "stale_warn");
+    assert_eq!(
+        status_json["warnings"][0]["code"],
+        "freshness.query_snapshot_stale"
+    );
+
+    let require_fresh = fixture.qgh(["query", "BM25 tracer", "--require-fresh", "--json"]);
+    assert_eq!(require_fresh.status.code(), Some(2));
+    let require_fresh_json = stdout_json(&require_fresh);
+    assert_eq!(require_fresh_json["error"]["code"], "freshness.stale");
+    assert_eq!(
+        require_fresh_json["error"]["details"]["freshness"]["decision"],
+        "stale_fail"
+    );
+    assert_eq!(
+        require_fresh_json["error"]["details"]["warnings"][0]["severity"],
+        "fail"
+    );
+
+    let relaxed = fixture.qgh(["query", "BM25 tracer", "--max-age", "12mo", "--json"]);
+    assert_success(&relaxed);
+    let relaxed_json = stdout_json(&relaxed);
+    assert_eq!(relaxed_json["data"]["freshness"]["decision"], "fresh");
+    assert_eq!(
+        relaxed_json["data"]["freshness"]["max_age_seconds"],
+        31_104_000
+    );
+    assert_eq!(relaxed_json["warnings"], json!([]));
+}
+
+#[test]
+fn status_reports_never_synced_and_validates_duration_config() {
+    let fixture = TestFixture::new("never-synced-freshness");
+    fixture.write_config("http://127.0.0.1:1");
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["freshness"]["decision"], "never_synced");
+    assert_eq!(status_json["data"]["freshness"]["remote_checked"], false);
+    assert_eq!(
+        status_json["data"]["freshness"]["snapshot_age_seconds"],
+        Value::Null
+    );
+    assert_eq!(status_json["warnings"][0]["code"], "freshness.never_synced");
+
+    let require_fresh = fixture.qgh(["status", "--require-fresh", "--json"]);
+    assert_eq!(require_fresh.status.code(), Some(2));
+    let require_fresh_json = stdout_json(&require_fresh);
+    assert_eq!(require_fresh_json["error"]["code"], "freshness.stale");
+    assert_eq!(
+        require_fresh_json["error"]["details"]["freshness"]["decision"],
+        "never_synced"
+    );
+
+    let valid_duration = TestFixture::new("valid-duration-config");
+    valid_duration.write_config_with_reconcile_after_duration("http://127.0.0.1:1", "30m");
+    assert_success(&valid_duration.qgh(["status", "--json"]));
+
+    let invalid_duration = TestFixture::new("invalid-duration-config");
+    invalid_duration.write_config_with_freshness(
+        "http://127.0.0.1:1",
+        Some("0d"),
+        Some("warn"),
+        None,
+    );
+    let invalid = invalid_duration.qgh(["status", "--json"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert_eq!(stdout_json(&invalid)["error"]["code"], "config.invalid");
+}
+
+#[test]
+fn active_issue_max_age_tightens_query_freshness_and_lists_all_triggers() {
+    let fixture = TestFixture::new("active-issue-freshness");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config_with_freshness(&server.base_url, Some("30m"), Some("warn"), Some("1s"));
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.set_last_sync_age_seconds(3_600);
+
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    assert_eq!(query_json["data"]["freshness"]["decision"], "stale_warn");
+    assert_eq!(query_json["data"]["freshness"]["max_age_seconds"], 1);
+    let warning_codes = query_json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|warning| warning["code"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        warning_codes,
+        [
+            "freshness.query_snapshot_stale",
+            "freshness.active_issue_snapshot_stale"
+        ]
+    );
+    assert_eq!(query_json["warnings"][1]["severity"], "warn_strong");
+}
+
+#[test]
+fn freshness_precedence_is_flag_then_repo_policy_then_profile_config() {
+    let fixture = TestFixture::new("freshness-precedence");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config_with_freshness(&server.base_url, Some("1s"), Some("warn"), None);
+    let nested_worktree_dir = fixture.init_git_worktree_with_repo_policy("owner/repo");
+    fixture.write_repo_policy_with_freshness("owner/repo", Some("12mo"), None, None);
+
+    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--json"]));
+    fixture.set_last_sync_age_seconds(3_600);
+
+    let policy_fresh = fixture.qgh_in(&nested_worktree_dir, ["query", "BM25 tracer", "--json"]);
+    assert_success(&policy_fresh);
+    let policy_json = stdout_json(&policy_fresh);
+    assert_eq!(policy_json["data"]["freshness"]["decision"], "fresh");
+    assert_eq!(
+        policy_json["data"]["freshness"]["max_age_seconds"],
+        31_104_000
+    );
+    assert_eq!(policy_json["warnings"], json!([]));
+
+    let flag_stale = fixture.qgh_in(
+        &nested_worktree_dir,
+        ["query", "BM25 tracer", "--max-age", "1s", "--json"],
+    );
+    assert_success(&flag_stale);
+    let flag_json = stdout_json(&flag_stale);
+    assert_eq!(flag_json["data"]["freshness"]["decision"], "stale_warn");
+    assert_eq!(flag_json["data"]["freshness"]["max_age_seconds"], 1);
+    assert_eq!(
+        flag_json["warnings"][0]["code"],
+        "freshness.query_snapshot_stale"
+    );
+}
+
+#[test]
+fn query_freshness_uses_effective_repo_sync_age_not_profile_latest_sync_run() {
+    let fixture = TestFixture::new("repo-scoped-query-freshness");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_freshness_and_repos(
+        &server.base_url,
+        &["owner/repo", "other/repo"],
+        Some("1s"),
+        Some("warn"),
+        None,
+    );
+    let nested_worktree_dir = fixture.init_git_worktree_with_repo_policy("owner/repo");
+
+    assert_success(&fixture.qgh_in(&nested_worktree_dir, ["sync", "--all", "--json"]));
+    fixture.set_repo_sync_age_seconds("owner/repo", 3_600);
+    fixture.set_repo_sync_age_seconds("other/repo", 0);
+    fixture.insert_profile_sync_run_now("sync-unrelated-other-repo");
+
+    let scoped_query = fixture.qgh_in(
+        &nested_worktree_dir,
+        ["query", "shared repo policy tracer", "--json"],
+    );
+    assert_success(&scoped_query);
+    let scoped_json = stdout_json(&scoped_query);
+    assert_eq!(scoped_json["meta"]["repo"], "owner/repo");
+    assert_eq!(scoped_json["data"]["freshness"]["decision"], "stale_warn");
+    assert!(scoped_json["data"]["freshness"]["snapshot_age_seconds"]
+        .as_i64()
+        .is_some_and(|age| age >= 3_600));
+    assert_eq!(
+        scoped_json["warnings"][0]["code"],
+        "freshness.query_snapshot_stale"
+    );
+
+    let require_fresh = fixture.qgh_in(
+        &nested_worktree_dir,
+        [
+            "query",
+            "shared repo policy tracer",
+            "--require-fresh",
+            "--json",
+        ],
+    );
+    assert_eq!(require_fresh.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&require_fresh)["error"]["code"],
+        "freshness.stale"
+    );
+
+    let other_repo_query = fixture.qgh_in(
+        &nested_worktree_dir,
+        [
+            "query",
+            "shared repo policy tracer",
+            "--repo",
+            "other/repo",
+            "--json",
+        ],
+    );
+    assert_success(&other_repo_query);
+    let other_json = stdout_json(&other_repo_query);
+    assert_eq!(other_json["data"]["freshness"]["decision"], "fresh");
+    assert_eq!(other_json["warnings"], json!([]));
+}
+
+#[test]
 fn sync_records_primary_rate_limit_backoff_and_local_reads_continue() {
     let fixture = TestFixture::new("primary-rate-limit");
     let server = RateLimitFakeGitHub::start();
@@ -2045,11 +2304,34 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
                 }
             }
         }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {
+                    "query": "anything",
+                    "max_age": "0d"
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {
+                    "max_age": "0d"
+                }
+            }
+        }),
     ]);
     assert_success(&output);
     assert!(stderr_text(&output).is_empty());
     let messages = stdout_json_lines(&output);
-    assert_eq!(messages.len(), 3);
+    assert_eq!(messages.len(), 5);
     assert_eq!(messages[0]["id"], 1);
     assert_eq!(messages[0]["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(
@@ -2072,6 +2354,18 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
         assert_eq!(tool["inputSchema"]["type"], "object");
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        if tool["name"] == "query" {
+            assert!(tool["inputSchema"]["properties"].get("max_age").is_some());
+            assert!(tool["inputSchema"]["properties"]
+                .get("require_fresh")
+                .is_some());
+        }
+        if tool["name"] == "status" {
+            assert!(tool["inputSchema"]["properties"].get("max_age").is_some());
+            assert!(tool["inputSchema"]["properties"]
+                .get("require_fresh")
+                .is_some());
+        }
         assert_eq!(tool["outputSchema"]["type"], "object");
         assert!(tool["outputSchema"]["required"]
             .as_array()
@@ -2100,6 +2394,18 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
         .as_str()
         .unwrap()
         .contains("validation.mcp"));
+
+    for validation in [&messages[3]["result"], &messages[4]["result"]] {
+        assert_eq!(validation["isError"], true);
+        assert_eq!(
+            validation["structuredContent"]["error"]["code"],
+            "validation.mcp"
+        );
+        assert!(validation["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("max_age"));
+    }
 }
 
 #[test]
@@ -2198,6 +2504,9 @@ fn mcp_query_get_status_round_trips_issue_and_comment_sources() {
 
     let issue_query = &messages[1]["result"]["structuredContent"];
     assert_eq!(issue_query["ok"], true);
+    assert_eq!(issue_query["warnings"], json!([]));
+    assert_eq!(issue_query["data"]["freshness"]["decision"], "fresh");
+    assert_eq!(issue_query["data"]["freshness"]["remote_checked"], false);
     assert_eq!(
         issue_query["data"]["results"][0]["source_id"],
         issue_source_id
@@ -2240,6 +2549,9 @@ fn mcp_query_get_status_round_trips_issue_and_comment_sources() {
     let status = &messages[5]["result"]["structuredContent"];
     assert_eq!(status["ok"], true);
     assert_eq!(status["data"]["profile_id"], "work");
+    assert_eq!(status["warnings"], json!([]));
+    assert_eq!(status["data"]["freshness"]["decision"], "fresh");
+    assert_eq!(status["data"]["freshness"]["remote_checked"], false);
     assert_eq!(status["data"]["sources"]["issue_count"], 1);
     assert_eq!(status["data"]["sources"]["comment_count"], 1);
 }
@@ -3649,6 +3961,85 @@ env = "QGH_TEST_TOKEN"
         fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
     }
 
+    fn write_config_with_reconcile_after_duration(&self, api_base_url: &str, duration: &str) {
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+reconcile_after = "{duration}"
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
+    }
+
+    fn write_config_with_freshness(
+        &self,
+        api_base_url: &str,
+        query_max_age: Option<&str>,
+        query_stale_behavior: Option<&str>,
+        active_issue_max_age: Option<&str>,
+    ) {
+        self.write_config_with_freshness_and_repos(
+            api_base_url,
+            &["owner/repo"],
+            query_max_age,
+            query_stale_behavior,
+            active_issue_max_age,
+        );
+    }
+
+    fn write_config_with_freshness_and_repos(
+        &self,
+        api_base_url: &str,
+        repos: &[&str],
+        query_max_age: Option<&str>,
+        query_stale_behavior: Option<&str>,
+        active_issue_max_age: Option<&str>,
+    ) {
+        let repos = repos
+            .iter()
+            .map(|repo| format!(r#""{repo}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query_max_age = query_max_age
+            .map(|duration| format!(r#"query_max_age = "{duration}""#))
+            .unwrap_or_default();
+        let query_stale_behavior = query_stale_behavior
+            .map(|behavior| format!(r#"query_stale_behavior = "{behavior}""#))
+            .unwrap_or_default();
+        let active_issue_max_age = active_issue_max_age
+            .map(|duration| format!(r#"active_issue_max_age = "{duration}""#))
+            .unwrap_or_default();
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = [{repos}]
+{query_max_age}
+{query_stale_behavior}
+{active_issue_max_age}
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
+    }
+
     fn init_git_worktree_with_repo_policy(&self, repo: &str) -> PathBuf {
         let nested = self.init_git_worktree();
         self.write_repo_policy(repo);
@@ -3698,6 +4089,45 @@ labels = []
 
 [query]
 limit = {limit}
+"#
+        );
+        fs::write(self.root.join(".qgh.toml"), policy).unwrap();
+    }
+
+    fn write_repo_policy_with_freshness(
+        &self,
+        repo: &str,
+        max_age: Option<&str>,
+        stale_behavior: Option<&str>,
+        active_issue_max_age: Option<&str>,
+    ) {
+        let max_age = max_age
+            .map(|duration| format!(r#"max_age = "{duration}""#))
+            .unwrap_or_default();
+        let stale_behavior = stale_behavior
+            .map(|behavior| format!(r#"stale_behavior = "{behavior}""#))
+            .unwrap_or_default();
+        let active_issue_max_age = active_issue_max_age
+            .map(|duration| format!(r#"active_issue_max_age = "{duration}""#))
+            .unwrap_or_default();
+        let policy = format!(
+            r#"
+schema_version = "qgh.repo.v1"
+
+[repo]
+github = "{repo}"
+
+[defaults]
+scope = "repo"
+state = "all"
+source_types = ["issue", "issue_comment"]
+labels = []
+
+[query]
+limit = 10
+{max_age}
+{stale_behavior}
+{active_issue_max_age}
 "#
         );
         fs::write(self.root.join(".qgh.toml"), policy).unwrap();
@@ -3908,6 +4338,54 @@ limit = {limit}
             )
             .unwrap();
         assert_eq!(count, expected);
+    }
+
+    fn set_last_sync_age_seconds(&self, age_seconds: i64) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let timestamp = (Utc::now() - Duration::seconds(age_seconds))
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        let changed = conn
+            .execute(
+                "UPDATE sync_runs SET started_at = ?1, completed_at = ?1",
+                [&timestamp],
+            )
+            .unwrap();
+        assert!(changed >= 1);
+        let changed = conn
+            .execute(
+                "UPDATE repository_sync_state SET last_successful_sync_at = ?1",
+                [&timestamp],
+            )
+            .unwrap();
+        assert!(changed >= 1);
+    }
+
+    fn set_repo_sync_age_seconds(&self, repo: &str, age_seconds: i64) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let timestamp = (Utc::now() - Duration::seconds(age_seconds))
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        conn.execute(
+            "INSERT INTO repository_sync_state (repo, last_successful_sync_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(repo) DO UPDATE SET last_successful_sync_at = excluded.last_successful_sync_at",
+            (repo, timestamp),
+        )
+        .unwrap();
+    }
+
+    fn insert_profile_sync_run_now(&self, id: &str) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        conn.execute(
+            "INSERT INTO sync_runs
+                (id, started_at, completed_at, fetched_issue_count, upserted_issue_count, fetched_comment_count, upserted_comment_count, skipped_pull_request_count)
+             VALUES (?1, ?2, ?2, 0, 0, 0, 0, 0)",
+            (id, timestamp),
+        )
+        .unwrap();
     }
 
     fn assert_private_local_data_permissions(&self) {

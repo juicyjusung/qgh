@@ -20,7 +20,21 @@
     "warnings": {
       "type": "array",
       "items": {
-        "type": "object"
+        "type": "object",
+        "required": ["code", "severity", "message"],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["warn", "warn_strong", "fail"]
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
       }
     },
     "meta": {

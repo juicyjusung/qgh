@@ -12,10 +12,6 @@ pub enum SuccessOutputKind {
     Doctor,
 }
 
-pub fn success_envelope_with_meta(data: Value, meta: Value) -> Value {
-    success_envelope_with_meta_and_warnings(data, meta, Vec::new())
-}
-
 pub fn success_envelope_with_meta_and_warnings(
     data: Value,
     meta: Value,
@@ -60,6 +56,16 @@ pub fn print_human_success(
         SuccessOutputKind::Doctor => render_doctor(data),
     };
     print!("{rendered}");
+}
+
+pub fn print_human_warnings(warnings: &[Value]) {
+    for warning in warnings {
+        eprintln!(
+            "{}: {}",
+            display_at(warning, &["code"]),
+            display_at(warning, &["message"])
+        );
+    }
 }
 
 pub fn print_error(error: &QghError, json_mode: bool) {
@@ -228,6 +234,16 @@ fn render_query(data: &Value) -> String {
         format_args!("profile: {}", display_at(data, &["profile_id"])),
     );
     line(&mut out, format_args!("results: {}", results.len()));
+    line(
+        &mut out,
+        format_args!(
+            "freshness: {} (age {}, max-age {}, remote_checked {})",
+            display_at(data, &["freshness", "decision"]),
+            display_at(data, &["freshness", "snapshot_age_seconds"]),
+            display_at(data, &["freshness", "max_age_seconds"]),
+            display_at(data, &["freshness", "remote_checked"])
+        ),
+    );
     line(
         &mut out,
         format_args!(
@@ -447,6 +463,16 @@ fn render_status(data: &Value) -> String {
             display_at(data, &["sources", "issue_count"]),
             display_at(data, &["sources", "comment_count"]),
             display_at(data, &["sources", "tombstone_count"])
+        ),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "freshness: {} (age {}, max-age {}, remote_checked {})",
+            display_at(data, &["freshness", "decision"]),
+            display_at(data, &["freshness", "snapshot_age_seconds"]),
+            display_at(data, &["freshness", "max_age_seconds"]),
+            display_at(data, &["freshness", "remote_checked"])
         ),
     );
     line(

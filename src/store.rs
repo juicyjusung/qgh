@@ -235,6 +235,15 @@ impl Store {
                     etag = coalesce(excluded.etag, sync_cursors.etag)",
                 params![cursor.endpoint, cursor.cursor, cursor.etag],
             )?;
+            if let Some(repo) = issue_repo_from_cursor_endpoint(&cursor.endpoint) {
+                tx.execute(
+                    "INSERT INTO repository_sync_state (repo, last_successful_sync_at)
+                     VALUES (?1, ?2)
+                     ON CONFLICT(repo) DO UPDATE SET
+                        last_successful_sync_at = excluded.last_successful_sync_at",
+                    params![repo, now],
+                )?;
+            }
         }
 
         tx.commit()?;
@@ -571,6 +580,35 @@ impl Store {
                 has_etag: cursor.etag.is_some(),
             })
             .collect())
+    }
+
+    pub fn oldest_successful_sync_at_for_repos(
+        &self,
+        repos: &[String],
+    ) -> Result<Option<String>, QghError> {
+        let mut oldest: Option<String> = None;
+        for repo in repos {
+            let repo_sync_at: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT last_successful_sync_at
+                     FROM repository_sync_state
+                     WHERE repo = ?1",
+                    params![repo],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(repo_sync_at) = repo_sync_at else {
+                return Ok(None);
+            };
+            if oldest
+                .as_ref()
+                .is_none_or(|current| repo_sync_at < *current)
+            {
+                oldest = Some(repo_sync_at);
+            }
+        }
+        Ok(oldest)
     }
 
     pub fn mark_index_published(
@@ -923,6 +961,11 @@ impl Store {
                 etag TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS repository_sync_state (
+                repo TEXT PRIMARY KEY,
+                last_successful_sync_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS sync_backoff_state (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 reason TEXT NOT NULL,
@@ -1039,6 +1082,13 @@ impl Store {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         self.conn.execute(
+            "INSERT OR IGNORE INTO repository_sync_state (repo, last_successful_sync_at)
+             SELECT DISTINCT repo, (SELECT max(completed_at) FROM sync_runs)
+             FROM source_entities
+             WHERE (SELECT max(completed_at) FROM sync_runs) IS NOT NULL",
+            [],
+        )?;
+        self.conn.execute(
             "INSERT INTO schema_migrations (version, applied_at)
              VALUES (?1, ?2)
              ON CONFLICT(version) DO NOTHING",
@@ -1093,6 +1143,10 @@ fn upsert_source_version(
         params![source_id, body_hash, github_updated_at],
         |row| row.get(0),
     )
+}
+
+fn issue_repo_from_cursor_endpoint(endpoint: &str) -> Option<&str> {
+    endpoint.strip_prefix("issues:")
 }
 
 fn stored_issue_from_row(row: &rusqlite::Row<'_>) -> Result<StoredIssue, rusqlite::Error> {

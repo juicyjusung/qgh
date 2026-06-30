@@ -6,6 +6,7 @@ Stable error families:
 
 - `config.*`: profile and TOML configuration failures.
 - `validation.*`: CLI/schema/argument validation failures.
+- `freshness.*`: local snapshot freshness failures.
 - `auth.*`: token source failures.
 - `github.*`: GitHub request failures outside structured backoff state.
 - `source.*`: missing or tombstoned source lookups.
@@ -13,7 +14,12 @@ Stable error families:
 - `index.*`: Tantivy index failures.
 - `internal.*`: unexpected internal failures.
 
-Common codes include `config.no_matching_profile`, `config.ambiguous_profile`, `config.invalid_repo_policy`, `validation.cli`, `validation.mcp`, `validation.unsupported_filter`, `validation.batch_size`, `auth.token_unavailable`, `source.not_found`, `source.tombstoned`, and `source.outside_effective_scope`.
+Common codes include `config.no_matching_profile`, `config.ambiguous_profile`, `config.invalid_repo_policy`, `validation.cli`, `validation.mcp`, `validation.unsupported_filter`, `validation.batch_size`, `freshness.stale`, `auth.token_unavailable`, `source.not_found`, `source.tombstoned`, and `source.outside_effective_scope`.
+
+`query`/`search` and `status` may return `freshness.stale` when the local
+snapshot violates a fail-mode freshness policy or `--require-fresh` is passed.
+The error details include the same local-only `freshness` block and triggered
+warning objects.
 
 `init` may additionally return:
 
