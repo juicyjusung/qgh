@@ -140,6 +140,7 @@ pub async fn fetch_issues(
     profile: &Profile,
     token: &str,
     cursors: &[StoredCursor],
+    fetch_comments: bool,
     progress: Option<&dyn ProgressReporter>,
     commit_page: &mut dyn FnMut(FetchPage) -> Result<(), QghError>,
 ) -> Result<FetchOutcome, QghError> {
@@ -251,26 +252,28 @@ pub async fn fetch_issues(
                     continue;
                 }
                 let issue = item.into_record(profile, repo, &indexed_at);
-                match fetch_issue_comments(
-                    &client,
-                    profile,
-                    token,
-                    &cursor_map,
-                    &mut page_cursor_updates,
-                    repo,
-                    &issue,
-                    progress,
-                )
-                .await?
-                {
-                    CommentFetchOutcome::Fetched(fetched_comments) => {
-                        repo_comment_count += fetched_comments.len();
-                        total_comments += fetched_comments.len();
-                        page_comments.extend(fetched_comments);
-                    }
-                    CommentFetchOutcome::Backoff(backoff) => {
-                        wait_for_backoff(&backoff);
-                        return Ok(FetchOutcome::Backoff(backoff));
+                if fetch_comments {
+                    match fetch_issue_comments(
+                        &client,
+                        profile,
+                        token,
+                        &cursor_map,
+                        &mut page_cursor_updates,
+                        repo,
+                        &issue,
+                        progress,
+                    )
+                    .await?
+                    {
+                        CommentFetchOutcome::Fetched(fetched_comments) => {
+                            repo_comment_count += fetched_comments.len();
+                            total_comments += fetched_comments.len();
+                            page_comments.extend(fetched_comments);
+                        }
+                        CommentFetchOutcome::Backoff(backoff) => {
+                            wait_for_backoff(&backoff);
+                            return Ok(FetchOutcome::Backoff(backoff));
+                        }
                     }
                 }
                 page_issues.push(issue);
@@ -655,6 +658,226 @@ async fn fetch_issue_comments(
     Ok(CommentFetchOutcome::Fetched(comments))
 }
 
+pub struct RepoCommentsResult {
+    pub comments: Vec<CommentRecord>,
+    pub cursor_updates: Vec<CursorUpdate>,
+    pub skipped_pr_comments: usize,
+    pub deferred_comments: usize,
+    /// Present when a rate-limit interrupted the run; the caller should commit
+    /// the (partial) comments/cursor_updates above, then surface backoff.
+    pub backoff: Option<BackoffPlan>,
+}
+
+/// Fetch fresh issue comments repo-wide via `/issues/comments?sort=updated&since`
+/// instead of one request per issue. Each comment's parent is resolved locally
+/// via `resolve_parent`; when the parent is not in the local corpus the type is
+/// classified remotely within `parent_resolution_budget` (PR comments are
+/// skipped and cached; genuinely-unknown parents are deferred — never guessed).
+///
+/// The per-repo cursor only advances through comments that were definitively
+/// handled with no preceding deferral, so a deferred comment (e.g. its parent
+/// issue has not synced yet) is re-fetched next run instead of being silently
+/// skipped.
+pub async fn fetch_repo_comments(
+    profile: &Profile,
+    token: &str,
+    cursors: &[StoredCursor],
+    parent_resolution_budget: usize,
+    resolve_parent: &dyn Fn(&str, i64) -> Option<CommentParent>,
+    progress: Option<&dyn ProgressReporter>,
+) -> Result<RepoCommentsResult, QghError> {
+    let client = reqwest::Client::new();
+    let cursor_map = cursor_map(cursors);
+    let mut comments = Vec::new();
+    let mut cursor_updates = Vec::new();
+    let mut skipped_pr_comments = 0;
+    let mut deferred_comments = 0;
+    let mut remote_lookups = 0usize;
+    let mut backoff = None;
+
+    for repo in &profile.repos {
+        let repo_name = repo.full_name();
+        let endpoint = repo_comment_endpoint(repo);
+        let stored_cursor = cursor_map.get(&endpoint);
+        let mut committed_watermark = stored_cursor.and_then(|cursor| cursor.cursor.clone());
+        let mut response_etag = stored_cursor.and_then(|cursor| cursor.etag.clone());
+        let mut conditional_etag = stored_cursor.and_then(|cursor| cursor.etag.clone());
+        let mut known_pull_requests: BTreeSet<i64> = BTreeSet::new();
+        let mut blocked = false;
+        let mut next_url = Some(repo_comment_url(profile, repo, stored_cursor));
+        while let Some(url) = next_url.take() {
+            let mut request = github_get(&client, &url, token);
+            if let Some(etag) = conditional_etag.take() {
+                request = request.header(IF_NONE_MATCH, etag);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|error| QghError::github(error.to_string()))?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            if let Some(plan) = backoff_from_response(status, &headers, &endpoint) {
+                emit_backoff(progress, &plan);
+                wait_for_backoff(&plan);
+                backoff = Some(plan);
+                break;
+            }
+            if status == StatusCode::NOT_MODIFIED || status == StatusCode::NO_CONTENT {
+                break;
+            }
+            if !status.is_success() {
+                return Err(QghError::github(format!(
+                    "GitHub repo comments request failed with HTTP {status}."
+                )));
+            }
+            if let Some(etag) = header_string(&headers, ETAG) {
+                response_etag = Some(etag);
+            }
+            let page: Vec<ApiComment> = response.json().await.map_err(|error| {
+                QghError::github(format!("Invalid GitHub comment JSON: {error}"))
+            })?;
+            let indexed_at = now_rfc3339();
+            for comment in page {
+                let updated_at = comment.updated_at.clone();
+                let mut handled = false;
+                if let Some(number) = parse_issue_number_from_url(&comment.issue_url) {
+                    if known_pull_requests.contains(&number) {
+                        skipped_pr_comments += 1;
+                        handled = true;
+                    } else if let Some(parent) = resolve_parent(&repo_name, number) {
+                        comments.push(comment.into_record_for_parent(
+                            profile,
+                            repo,
+                            &parent,
+                            &indexed_at,
+                        ));
+                        handled = true;
+                    } else if remote_lookups < parent_resolution_budget {
+                        remote_lookups += 1;
+                        match classify_parent(&client, profile, token, repo, number, progress)
+                            .await?
+                        {
+                            ParentClass::PullRequest => {
+                                known_pull_requests.insert(number);
+                                skipped_pr_comments += 1;
+                                handled = true;
+                            }
+                            ParentClass::IssueOrUnknown => {
+                                deferred_comments += 1;
+                            }
+                            ParentClass::Backoff(plan) => {
+                                wait_for_backoff(&plan);
+                                backoff = Some(plan);
+                                break;
+                            }
+                        }
+                    } else {
+                        deferred_comments += 1;
+                    }
+                } else {
+                    deferred_comments += 1;
+                }
+                if handled {
+                    if !blocked {
+                        committed_watermark = max_timestamp(committed_watermark, &updated_at);
+                    }
+                } else {
+                    // A deferred comment holds the cursor so it is retried later.
+                    blocked = true;
+                }
+            }
+            if backoff.is_some() {
+                break;
+            }
+            next_url = next_link(&headers);
+        }
+        cursor_updates.push(CursorUpdate {
+            endpoint,
+            cursor: committed_watermark,
+            etag: response_etag,
+            not_modified: false,
+        });
+        if backoff.is_some() {
+            break;
+        }
+    }
+
+    Ok(RepoCommentsResult {
+        comments,
+        cursor_updates,
+        skipped_pr_comments,
+        deferred_comments,
+        backoff,
+    })
+}
+
+enum ParentClass {
+    PullRequest,
+    IssueOrUnknown,
+    Backoff(BackoffPlan),
+}
+
+async fn classify_parent(
+    client: &reqwest::Client,
+    profile: &Profile,
+    token: &str,
+    repo: &RepoRef,
+    issue_number: i64,
+    progress: Option<&dyn ProgressReporter>,
+) -> Result<ParentClass, QghError> {
+    let url = issue_object_url(profile, repo, issue_number);
+    let response = github_get(client, &url, token)
+        .send()
+        .await
+        .map_err(|error| QghError::github(error.to_string()))?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    if let Some(backoff) = backoff_from_response(status, &headers, &repo_comment_endpoint(repo)) {
+        emit_backoff(progress, &backoff);
+        return Ok(ParentClass::Backoff(backoff));
+    }
+    if !status.is_success() {
+        // Cannot classify (deleted/permission/etc.): defer rather than guess.
+        return Ok(ParentClass::IssueOrUnknown);
+    }
+    let issue: ApiIssue = response
+        .json()
+        .await
+        .map_err(|error| QghError::github(format!("Invalid GitHub issue JSON: {error}")))?;
+    if issue.pull_request.is_some() {
+        Ok(ParentClass::PullRequest)
+    } else {
+        Ok(ParentClass::IssueOrUnknown)
+    }
+}
+
+fn repo_comment_endpoint(repo: &RepoRef) -> String {
+    format!("repo-comments:{}", repo.full_name())
+}
+
+fn repo_comment_url(profile: &Profile, repo: &RepoRef, cursor: Option<&StoredCursor>) -> String {
+    let mut url = format!(
+        "{}/repos/{}/{}/issues/comments?sort=updated&direction=asc&per_page=100",
+        profile.api_base_url, repo.owner, repo.name
+    );
+    if let Some(since) = cursor
+        .and_then(|cursor| cursor.cursor.as_deref())
+        .map(overlapped_since)
+    {
+        url.push_str("&since=");
+        url.push_str(&utf8_percent_encode(&since, SOURCE_ID_ENCODE_SET).to_string());
+    }
+    url
+}
+
+fn parse_issue_number_from_url(issue_url: &str) -> Option<i64> {
+    issue_url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .and_then(|segment| segment.parse::<i64>().ok())
+}
+
 fn emit(progress: Option<&dyn ProgressReporter>, event: ProgressEvent) {
     if let Some(progress) = progress {
         progress.report(event);
@@ -956,6 +1179,8 @@ struct ApiComment {
     created_at: String,
     updated_at: String,
     user: Option<ApiUser>,
+    #[serde(default)]
+    issue_url: String,
 }
 
 impl ApiComment {
@@ -964,6 +1189,22 @@ impl ApiComment {
         profile: &Profile,
         repo: &RepoRef,
         issue: &IssueRecord,
+        indexed_at: &str,
+    ) -> CommentRecord {
+        let parent = CommentParent {
+            source_id: issue.source_id.clone(),
+            number: issue.number,
+            title: issue.title.clone(),
+            canonical_url: issue.canonical_url.clone(),
+        };
+        self.into_record_for_parent(profile, repo, &parent, indexed_at)
+    }
+
+    fn into_record_for_parent(
+        self,
+        profile: &Profile,
+        repo: &RepoRef,
+        parent: &CommentParent,
         indexed_at: &str,
     ) -> CommentRecord {
         let body = self.body.unwrap_or_default();
@@ -982,12 +1223,21 @@ impl ApiComment {
             canonical_url: self.html_url,
             body_hash,
             indexed_at: indexed_at.to_string(),
-            parent_issue_source_id: issue.source_id.clone(),
-            parent_issue_number: issue.number,
-            parent_issue_title: issue.title.clone(),
-            parent_issue_canonical_url: issue.canonical_url.clone(),
+            parent_issue_source_id: parent.source_id.clone(),
+            parent_issue_number: parent.number,
+            parent_issue_title: parent.title.clone(),
+            parent_issue_canonical_url: parent.canonical_url.clone(),
         }
     }
+}
+
+/// Resolved parent issue context for building a comment record from the
+/// repo-level comments listing.
+pub struct CommentParent {
+    pub source_id: String,
+    pub number: i64,
+    pub title: String,
+    pub canonical_url: String,
 }
 
 fn next_link(headers: &HeaderMap) -> Option<String> {

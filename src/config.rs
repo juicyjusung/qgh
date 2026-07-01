@@ -18,6 +18,8 @@ pub struct Profile {
     pub freshness: FreshnessSettings,
     pub bootstrap: BootstrapSettings,
     pub sync_max_age_seconds: Option<i64>,
+    pub comments_mode: CommentsMode,
+    pub comment_parent_resolution_budget: usize,
     pub max_in_flight_requests: usize,
     pub token_source: TokenSource,
     pub paths: ProfilePaths,
@@ -112,6 +114,20 @@ pub enum StaleBehavior {
     Fail,
 }
 
+/// How fresh issue comments are fetched during sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CommentsMode {
+    /// One `/issues/{n}/comments` request per issue (default).
+    #[default]
+    PerIssue,
+    /// One repo-level `/issues/comments?since` listing, cheaper for large repos.
+    RepoListing,
+}
+
+/// Default remote parent-classification budget for repo-level comment listing.
+pub const DEFAULT_PARENT_RESOLUTION_BUDGET: usize = 50;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TokenSource {
@@ -153,6 +169,10 @@ struct RawProfile {
     bootstrap_lookback: Option<String>,
     #[serde(default)]
     sync_max_age: Option<String>,
+    #[serde(default)]
+    comments_mode: Option<CommentsMode>,
+    #[serde(default)]
+    comment_parent_resolution_budget: Option<usize>,
     token_source: TokenSource,
 }
 
@@ -286,6 +306,8 @@ pub fn bootstrap_profile_repo(
                     max_in_flight_requests: None,
                     bootstrap_lookback: None,
                     sync_max_age: None,
+                    comments_mode: None,
+                    comment_parent_resolution_budget: None,
                     token_source: input.token_source.clone(),
                 },
             );
@@ -436,6 +458,10 @@ fn profile_from_raw(profile_id: &str, raw: &RawProfile) -> Result<Profile, QghEr
         freshness,
         bootstrap,
         sync_max_age_seconds,
+        comments_mode: raw.comments_mode.unwrap_or_default(),
+        comment_parent_resolution_budget: raw
+            .comment_parent_resolution_budget
+            .unwrap_or(DEFAULT_PARENT_RESOLUTION_BUDGET),
         max_in_flight_requests,
         token_source: raw.token_source.clone(),
         paths,

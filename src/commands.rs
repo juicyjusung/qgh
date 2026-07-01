@@ -2,7 +2,7 @@ use crate::cli::{InitArgs, InitRepoArgs, InitTokenSourceArg, QueryArgs, Reconcil
 use crate::config::{
     bootstrap_profile_repo, current_git_worktree_root, discover_repo_policy,
     git_remote_defaults_for_root, load_profile, load_repo_policy_at, parse_repo, resolve_token,
-    GitRemote, Profile, ProfileBootstrapInput, RepoPolicy, RepoRef, TokenSource,
+    CommentsMode, GitRemote, Profile, ProfileBootstrapInput, RepoPolicy, RepoRef, TokenSource,
 };
 use crate::coverage;
 use crate::error::QghError;
@@ -98,6 +98,7 @@ pub async fn sync(
     }
 
     let cursors = store.sync_cursors()?;
+    let per_issue_comments = profile.comments_mode == CommentsMode::PerIssue;
     let fetch_profile = profile_scoped_to_repo(&profile, repo_scope)?;
     progress.line(format_args!(
         "qgh sync: fetching GitHub issues/comments repos={}",
@@ -121,6 +122,7 @@ pub async fn sync(
             &fetch_profile,
             &token,
             &cursors,
+            per_issue_comments,
             Some(&progress),
             &mut commit_page,
         )
@@ -167,6 +169,85 @@ pub async fn sync(
         "qgh sync: fetched issues={} comments={} skipped_pull_requests={}",
         fetched.issues, fetched.comments, fetched.skipped_pull_requests
     ));
+
+    // Repo-level comment listing (opt-in). Fetch fresh comments repo-wide, then
+    // upsert the ones whose parent resolves locally; PR-parent comments are
+    // skipped and unresolved parents deferred as a coverage gap.
+    let mut repo_comment_stats = None;
+    if profile.comments_mode == CommentsMode::RepoListing {
+        progress.line(format_args!("qgh sync: repo-level comment listing"));
+        let comment_cursors = store.sync_cursors()?;
+        let budget = profile.comment_parent_resolution_budget;
+        let outcome = {
+            let resolve = |repo_name: &str, number: i64| -> Option<github::CommentParent> {
+                store
+                    .find_issue_by_repo_number(repo_name, number)
+                    .ok()
+                    .flatten()
+                    .map(|issue| github::CommentParent {
+                        source_id: issue.source_id,
+                        number: issue.number,
+                        title: issue.title,
+                        canonical_url: issue.canonical_url,
+                    })
+            };
+            github::fetch_repo_comments(
+                &fetch_profile,
+                &token,
+                &comment_cursors,
+                budget,
+                &resolve,
+                Some(&progress),
+            )
+            .await?
+        };
+        // Commit whatever was fetched (possibly partial) before handling backoff,
+        // so progress is never discarded under rate limiting.
+        let page_summary = store.upsert_sources_for_run(
+            &sync_run_id,
+            &[],
+            &outcome.comments,
+            0,
+            &outcome.cursor_updates,
+        )?;
+        merge_sync_summary(&mut summary, page_summary);
+        repo_comment_stats = Some((outcome.skipped_pr_comments, outcome.deferred_comments));
+        if let Some(backoff) = outcome.backoff {
+            progress.line(format_args!(
+                "qgh sync: comment backoff reason={} scope={} retry_after_seconds={}",
+                backoff.reason, backoff.scope, backoff.retry_after_seconds
+            ));
+            let backoff = store.record_backoff_state(
+                &backoff.reason,
+                &backoff.scope,
+                backoff.retry_after_seconds,
+                backoff.reset_at.as_deref(),
+            )?;
+            let status = store.status()?;
+            return Ok(json!({
+                "profile_id": profile.id,
+                "sync_state": "backoff",
+                "backoff": backoff,
+                "sync": {
+                    "last_successful_sync": status.last_sync_at,
+                    "scheduler": {
+                        "max_in_flight_requests": profile.max_in_flight_requests,
+                        "hard_cap": 16
+                    }
+                },
+                "sources": {
+                    "issue_count": status.issue_count,
+                    "comment_count": status.comment_count,
+                    "tombstone_count": status.tombstone_count
+                },
+                "index": {
+                    "active_generation": status.active_generation,
+                    "dirty_task_count": status.dirty_task_count
+                }
+            }));
+        }
+    }
+
     let summary = match summary {
         Some(summary) => summary,
         None => store.upsert_sources_for_run(&sync_run_id, &[], &[], 0, &[])?,
@@ -267,6 +348,14 @@ pub async fn sync(
     store.clear_backoff_state()?;
     let (generation, dirty_task_count) = rebuild_bm25_index(&profile, &mut store, &progress)?;
     store.mark_sync_run_completed(&summary.sync_run_id)?;
+    let comment_listing = match repo_comment_stats {
+        Some((skipped_pr_comments, deferred_comments)) => json!({
+            "mode": "repo_listing",
+            "skipped_pr_comments": skipped_pr_comments,
+            "deferred_comments": deferred_comments
+        }),
+        None => json!({ "mode": "per_issue" }),
+    };
     let watermarks = summary
         .cursor_updates
         .iter()
@@ -293,6 +382,7 @@ pub async fn sync(
             "fetched": summary.fetched_comments,
             "upserted": summary.upserted_comments
         },
+        "comment_listing": comment_listing,
         "cursors": {
             "updated": summary.cursor_updates.len(),
             "not_modified_endpoints": summary.not_modified_endpoints,

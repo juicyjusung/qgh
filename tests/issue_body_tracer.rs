@@ -2310,6 +2310,46 @@ fn reconcile_recent_window_excludes_old_sources_and_validates_flag() {
 }
 
 #[test]
+fn repo_listing_comments_upsert_issue_comments_and_skip_pull_request_comments() {
+    let fixture = TestFixture::new("repo-listing-comments");
+    let server = RepoCommentListingFakeGitHub::start();
+    fixture.write_config_repo_listing_comments(&server.base_url);
+
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+    let sync_json = stdout_json(&sync);
+    assert_eq!(sync_json["data"]["comment_listing"]["mode"], "repo_listing");
+    assert_eq!(
+        sync_json["data"]["comment_listing"]["skipped_pr_comments"],
+        1
+    );
+    // The comment whose parent issue is not in the local corpus is deferred
+    // (held for retry), not silently dropped or guessed.
+    assert_eq!(sync_json["data"]["comment_listing"]["deferred_comments"], 1);
+    assert_eq!(sync_json["data"]["comments"]["upserted"], 1);
+
+    // The issue-parent comment is indexed; the PR-parent comment was skipped.
+    let query = fixture.qgh(["query", "repo level comment tracer", "--json"]);
+    assert_success(&query);
+    let comment_hits = stdout_json(&query)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|result| result["entity_type"] == "issue_comment")
+        .count();
+    assert_eq!(comment_hits, 1);
+
+    // The repo-level listing endpoint was used instead of per-issue comments.
+    let requests = server.requests();
+    assert!(requests
+        .iter()
+        .any(|line| line.starts_with("GET /repos/owner/repo/issues/comments?")));
+    assert!(requests
+        .iter()
+        .all(|line| !line.starts_with("GET /repos/owner/repo/issues/1/comments?")));
+}
+
+#[test]
 fn freshness_precedence_is_flag_then_repo_policy_then_profile_config() {
     let fixture = TestFixture::new("freshness-precedence");
     let server = FakeGitHub::start(issue_payload_with_pr());
@@ -4562,6 +4602,26 @@ env = "QGH_TEST_TOKEN"
         fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
     }
 
+    fn write_config_repo_listing_comments(&self, api_base_url: &str) {
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+comments_mode = "repo_listing"
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
+    }
+
     fn write_config_with_work_and_alt_profiles(&self, api_base_url: &str) {
         let config = format!(
             r#"
@@ -5327,6 +5387,192 @@ fn handle_multi_repo_connection(mut stream: TcpStream, requests: &Arc<Mutex<Vec<
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();
+}
+
+struct RepoCommentListingFakeGitHub {
+    base_url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RepoCommentListingFakeGitHub {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_requests = Arc::clone(&requests);
+        let thread_stop = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                match stream {
+                    Ok(stream) => handle_repo_comment_listing_connection(stream, &thread_requests),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            base_url,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for RepoCommentListingFakeGitHub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.base_url.strip_prefix("http://").unwrap());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn handle_repo_comment_listing_connection(
+    mut stream: TcpStream,
+    requests: &Arc<Mutex<Vec<String>>>,
+) {
+    let mut buffer = [0_u8; 8192];
+    let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let request_line = request.lines().next().unwrap_or("").to_string();
+    requests.lock().unwrap().push(request_line.clone());
+
+    let (status, body) = if request_line.starts_with("GET /repos/owner/repo/issues/comments?") {
+        ("200 OK", repo_listing_comments_payload())
+    } else if request_line.starts_with("GET /repos/owner/repo/issues?")
+        && request_line.contains("state=all")
+    {
+        ("200 OK", repo_listing_issue_payload())
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/2 ") {
+        ("200 OK", repo_listing_pull_request_object_payload())
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/3 ") {
+        ("200 OK", repo_listing_unsynced_issue_object_payload())
+    } else if request_line.contains("/comments?") {
+        // Per-issue comment endpoint must not be used in repo_listing mode.
+        ("200 OK", "[]")
+    } else {
+        ("404 Not Found", r#"{"message":"not found"}"#)
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
+fn repo_listing_issue_payload() -> &'static str {
+    r#"[
+      {
+        "id": 7001,
+        "node_id": "I_REPO_LISTING_1",
+        "number": 1,
+        "title": "Repo listing parent issue",
+        "body": "parent issue body for repo listing comment tracer.",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://github.com/owner/repo/issues/1",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+        "closed_at": null,
+        "user": {"login": "alice"},
+        "labels": [],
+        "milestone": null,
+        "assignees": []
+      }
+    ]"#
+}
+
+fn repo_listing_comments_payload() -> &'static str {
+    r#"[
+      {
+        "id": 9001,
+        "node_id": "IC_REPO_LISTING_ISSUE",
+        "body": "repo level comment tracer on an issue parent.",
+        "html_url": "https://github.com/owner/repo/issues/1#issuecomment-9001",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-03T00:00:00Z",
+        "user": {"login": "alice"},
+        "issue_url": "https://api.github.com/repos/owner/repo/issues/1"
+      },
+      {
+        "id": 9002,
+        "node_id": "IC_REPO_LISTING_PR",
+        "body": "repo level comment tracer on a pull request parent.",
+        "html_url": "https://github.com/owner/repo/pull/2#issuecomment-9002",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-03T00:00:00Z",
+        "user": {"login": "bob"},
+        "issue_url": "https://api.github.com/repos/owner/repo/issues/2"
+      },
+      {
+        "id": 9003,
+        "node_id": "IC_REPO_LISTING_UNSYNCED",
+        "body": "repo level comment tracer on an unsynced issue parent.",
+        "html_url": "https://github.com/owner/repo/issues/3#issuecomment-9003",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-03T00:00:00Z",
+        "user": {"login": "carol"},
+        "issue_url": "https://api.github.com/repos/owner/repo/issues/3"
+      }
+    ]"#
+}
+
+fn repo_listing_pull_request_object_payload() -> &'static str {
+    r#"{
+        "id": 7002,
+        "node_id": "PR_REPO_LISTING_2",
+        "number": 2,
+        "title": "Repo listing pull request",
+        "body": "a pull request, not an issue.",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://github.com/owner/repo/pull/2",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [],
+        "milestone": null,
+        "assignees": [],
+        "pull_request": {"url": "https://api.github.com/repos/owner/repo/pulls/2"}
+    }"#
+}
+
+fn repo_listing_unsynced_issue_object_payload() -> &'static str {
+    r#"{
+        "id": 7003,
+        "node_id": "I_REPO_LISTING_3",
+        "number": 3,
+        "title": "Unsynced issue parent",
+        "body": "a real issue that is not in the local corpus yet.",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://github.com/owner/repo/issues/3",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+        "closed_at": null,
+        "user": {"login": "carol"},
+        "labels": [],
+        "milestone": null,
+        "assignees": []
+    }"#
 }
 
 fn multi_repo_owner_issue_payload() -> &'static str {
