@@ -118,6 +118,9 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
                         args.window.as_deref(),
                         args.if_stale,
                         args.max_age.as_deref(),
+                        args.backfill,
+                        args.max_requests,
+                        args.max_duration.as_deref(),
                         context.repo_scope.as_ref(),
                         show_progress,
                     )

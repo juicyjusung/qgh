@@ -66,6 +66,18 @@ pub struct SyncArgs {
     pub window: Option<String>,
     #[arg(long)]
     pub all: bool,
+    #[arg(
+        long,
+        help = "Run a budgeted historical backfill pass instead of a live sync"
+    )]
+    pub backfill: bool,
+    #[arg(long, help = "Max issue pages to fetch this backfill run")]
+    pub max_requests: Option<usize>,
+    #[arg(
+        long,
+        help = "Max wall-clock duration for this backfill run (e.g. 90s)"
+    )]
+    pub max_duration: Option<String>,
     #[arg(long, help = "Only sync when the local snapshot is older than max-age")]
     pub if_stale: bool,
     #[arg(

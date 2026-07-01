@@ -326,6 +326,165 @@ pub async fn fetch_issues(
     }))
 }
 
+pub struct BackfillOutcome {
+    pub issues: usize,
+    pub comments: usize,
+    pub skipped_pull_requests: usize,
+    /// True only when every repo paginated its history to the end this run (no
+    /// page/duration budget cutoff and no backoff), i.e. history is complete.
+    pub all_reached_end: bool,
+    pub backoff: Option<BackoffPlan>,
+}
+
+/// Budgeted historical backfill: walk issues older-first from each repo's
+/// history cursor (`state=all&sort=updated&direction=asc`), fetching every
+/// issue's comments so historical comment coverage is filled (repo-level `since`
+/// listing only returns fresh comments). Each repo keeps its OWN `history:<repo>`
+/// cursor committed per page, so a budget/backoff cutoff resumes each repo from
+/// its own watermark without skipping later repos. Bounded by `max_pages`
+/// (issue-list pages) and `max_duration_seconds`. Does not touch the live cursor.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_backfill_issues(
+    profile: &Profile,
+    token: &str,
+    cursors: &[StoredCursor],
+    max_pages: Option<usize>,
+    max_duration_seconds: Option<i64>,
+    progress: Option<&dyn ProgressReporter>,
+    commit_page: &mut dyn FnMut(FetchPage) -> Result<(), QghError>,
+) -> Result<BackfillOutcome, QghError> {
+    const EPOCH: &str = "1970-01-01T00:00:00Z";
+    let client = reqwest::Client::new();
+    let cursor_map = cursor_map(cursors);
+    // Empty so every backfilled issue's comments are fetched in full (historical
+    // comment coverage), not filtered by a stored comment `since`.
+    let comment_cursor_map: BTreeMap<String, StoredCursor> = BTreeMap::new();
+    let started = Utc::now();
+    let mut total_issues = 0;
+    let mut total_comments = 0;
+    let mut total_skipped_pull_requests = 0;
+    let mut all_reached_end = true;
+    let mut pages = 0usize;
+    let mut backoff = None;
+
+    'repos: for repo in &profile.repos {
+        let history_endpoint = backfill_endpoint(repo);
+        let since = cursor_map
+            .get(&history_endpoint)
+            .and_then(|cursor| cursor.cursor.clone())
+            .unwrap_or_else(|| EPOCH.to_string());
+        let mut watermark = Some(since.clone());
+        let synthetic = StoredCursor {
+            endpoint: history_endpoint.clone(),
+            cursor: Some(since),
+            etag: None,
+        };
+        let mut next_url = Some(issue_url(profile, repo, Some(&synthetic)));
+        while let Some(url) = next_url.take() {
+            if max_pages.is_some_and(|max| pages >= max)
+                || max_duration_seconds
+                    .is_some_and(|secs| (Utc::now() - started).num_seconds() >= secs)
+            {
+                all_reached_end = false;
+                break 'repos;
+            }
+            let response = github_get(&client, &url, token)
+                .send()
+                .await
+                .map_err(|error| QghError::github(error.to_string()))?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            if let Some(plan) = backoff_from_response(status, &headers, &history_endpoint) {
+                emit_backoff(progress, &plan);
+                wait_for_backoff(&plan);
+                backoff = Some(plan);
+                all_reached_end = false;
+                break 'repos;
+            }
+            if status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED {
+                break;
+            }
+            if !status.is_success() {
+                return Err(QghError::github(format!(
+                    "GitHub backfill issues request failed with HTTP {status}."
+                )));
+            }
+            let page: Vec<ApiIssue> = response
+                .json()
+                .await
+                .map_err(|error| QghError::github(format!("Invalid GitHub issue JSON: {error}")))?;
+            pages += 1;
+            let indexed_at = now_rfc3339();
+            let mut page_issues = Vec::new();
+            let mut page_comments = Vec::new();
+            let mut page_cursor_updates = Vec::new();
+            let mut page_skipped_pull_requests = 0;
+            for item in page {
+                watermark = max_timestamp(watermark, &item.updated_at);
+                if item.pull_request.is_some() {
+                    total_skipped_pull_requests += 1;
+                    page_skipped_pull_requests += 1;
+                    continue;
+                }
+                let issue = item.into_record(profile, repo, &indexed_at);
+                match fetch_issue_comments(
+                    &client,
+                    profile,
+                    token,
+                    &comment_cursor_map,
+                    &mut page_cursor_updates,
+                    repo,
+                    &issue,
+                    progress,
+                )
+                .await?
+                {
+                    CommentFetchOutcome::Fetched(fetched_comments) => {
+                        total_comments += fetched_comments.len();
+                        page_comments.extend(fetched_comments);
+                    }
+                    CommentFetchOutcome::Backoff(plan) => {
+                        wait_for_backoff(&plan);
+                        backoff = Some(plan);
+                        break;
+                    }
+                }
+                page_issues.push(issue);
+                total_issues += 1;
+            }
+            page_cursor_updates.push(CursorUpdate {
+                endpoint: history_endpoint.clone(),
+                cursor: watermark.clone(),
+                etag: None,
+                not_modified: false,
+            });
+            commit_page(FetchPage {
+                issues: page_issues,
+                comments: page_comments,
+                skipped_pull_requests: page_skipped_pull_requests,
+                cursor_updates: page_cursor_updates,
+            })?;
+            if backoff.is_some() {
+                all_reached_end = false;
+                break 'repos;
+            }
+            next_url = next_link(&headers);
+        }
+    }
+
+    Ok(BackfillOutcome {
+        issues: total_issues,
+        comments: total_comments,
+        skipped_pull_requests: total_skipped_pull_requests,
+        all_reached_end,
+        backoff,
+    })
+}
+
+fn backfill_endpoint(repo: &RepoRef) -> String {
+    format!("history:{}", repo.full_name())
+}
+
 pub async fn fetch_target_issue(
     profile: &Profile,
     token: &str,

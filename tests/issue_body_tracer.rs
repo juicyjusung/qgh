@@ -2350,6 +2350,74 @@ fn repo_listing_comments_upsert_issue_comments_and_skip_pull_request_comments() 
 }
 
 #[test]
+fn backfill_walks_history_and_completes_coverage() {
+    let fixture = TestFixture::new("historical-backfill");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+
+    // Live sync first: records open coverage + the fixed bootstrap floor.
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let after_live = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(
+        after_live["data"]["coverage"]["open_backfill_complete"],
+        true
+    );
+    assert_eq!(
+        after_live["data"]["coverage"]["historical_backfill_complete"],
+        false
+    );
+    assert_eq!(after_live["data"]["coverage"]["mode"], "partial");
+
+    // Backfill walks history to the end and completes historical coverage.
+    let backfill = fixture.qgh(["sync", "--backfill", "--max-requests", "50", "--json"]);
+    assert_success(&backfill);
+    let backfill_json = stdout_json(&backfill);
+    assert_eq!(backfill_json["data"]["backfill"]["reached_end"], true);
+    assert_eq!(
+        backfill_json["data"]["backfill"]["historical_backfill_complete"],
+        true
+    );
+
+    // Coverage now derives to complete (open + historical both done).
+    let after_backfill = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(
+        after_backfill["data"]["coverage"]["historical_backfill_complete"],
+        true
+    );
+    assert_eq!(after_backfill["data"]["coverage"]["mode"], "complete");
+    assert!(after_backfill["data"]["coverage"]["history_cursor"].is_string());
+}
+
+#[test]
+fn backfill_flag_conflicts_are_rejected() {
+    let fixture = TestFixture::new("backfill-flag-conflicts");
+    fixture.write_config("http://127.0.0.1:1");
+
+    // --backfill excludes live-sync modifiers (validated before any network use).
+    let with_reconcile = fixture.qgh(["sync", "--backfill", "--reconcile", "full", "--json"]);
+    assert_eq!(with_reconcile.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&with_reconcile)["error"]["code"],
+        "validation.backfill_conflicts"
+    );
+
+    let with_if_stale = fixture.qgh(["sync", "--backfill", "--if-stale", "--json"]);
+    assert_eq!(with_if_stale.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&with_if_stale)["error"]["code"],
+        "validation.backfill_conflicts"
+    );
+
+    // Budget flags require --backfill rather than being silently ignored.
+    let orphan_budget = fixture.qgh(["sync", "--max-requests", "5", "--json"]);
+    assert_eq!(orphan_budget.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&orphan_budget)["error"]["code"],
+        "validation.requires_backfill"
+    );
+}
+
+#[test]
 fn freshness_precedence_is_flag_then_repo_policy_then_profile_config() {
     let fixture = TestFixture::new("freshness-precedence");
     let server = FakeGitHub::start(issue_payload_with_pr());

@@ -44,12 +44,16 @@ pub struct LocalReadOutcome {
     pub warnings: Vec<Value>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn sync(
     profile_id: &str,
     reconcile: Option<ReconcileMode>,
     window: Option<&str>,
     if_stale: bool,
     max_age: Option<&str>,
+    backfill: bool,
+    max_requests: Option<usize>,
+    max_duration: Option<&str>,
     repo_scope: Option<&ResolvedRepoScope>,
     show_progress: bool,
 ) -> Result<Value, QghError> {
@@ -65,6 +69,18 @@ pub async fn sync(
         return Err(QghError::validation(
             "validation.window_requires_recent",
             "--window is only valid with --reconcile recent.",
+        ));
+    }
+    if backfill && (reconcile.is_some() || window.is_some() || if_stale) {
+        return Err(QghError::validation(
+            "validation.backfill_conflicts",
+            "--backfill cannot be combined with --reconcile, --window, or --if-stale.",
+        ));
+    }
+    if !backfill && (max_requests.is_some() || max_duration.is_some()) {
+        return Err(QghError::validation(
+            "validation.requires_backfill",
+            "--max-requests and --max-duration require --backfill.",
         ));
     }
 
@@ -100,6 +116,20 @@ pub async fn sync(
     let cursors = store.sync_cursors()?;
     let per_issue_comments = profile.comments_mode == CommentsMode::PerIssue;
     let fetch_profile = profile_scoped_to_repo(&profile, repo_scope)?;
+
+    if backfill {
+        return backfill_sync(
+            &profile,
+            &fetch_profile,
+            &token,
+            &mut store,
+            max_requests,
+            max_duration,
+            &progress,
+        )
+        .await;
+    }
+
     progress.line(format_args!(
         "qgh sync: fetching GitHub issues/comments repos={}",
         fetch_profile.repos.len()
@@ -393,6 +423,123 @@ pub async fn sync(
             "dirty_task_count": dirty_task_count
         },
         "reconciliation": reconciliation
+    }))
+}
+
+async fn backfill_sync(
+    profile: &Profile,
+    fetch_profile: &Profile,
+    token: &str,
+    store: &mut Store,
+    max_requests: Option<usize>,
+    max_duration: Option<&str>,
+    progress: &StderrSyncProgress,
+) -> Result<Value, QghError> {
+    progress.line(format_args!("qgh sync: historical backfill"));
+    let max_duration_seconds = max_duration
+        .map(|value| freshness::parse_duration_seconds("max_duration", value))
+        .transpose()?;
+    let backfill_run_id = Store::new_sync_run_id();
+    let cursors = store.sync_cursors()?;
+    let mut summary = None;
+    let outcome = {
+        let mut commit_page = |page: github::FetchPage| -> Result<(), QghError> {
+            let page_summary = store.upsert_sources_for_run(
+                &backfill_run_id,
+                &page.issues,
+                &page.comments,
+                page.skipped_pull_requests,
+                &page.cursor_updates,
+            )?;
+            merge_sync_summary(&mut summary, page_summary);
+            Ok(())
+        };
+        github::fetch_backfill_issues(
+            fetch_profile,
+            token,
+            &cursors,
+            max_requests,
+            max_duration_seconds,
+            Some(progress),
+            &mut commit_page,
+        )
+        .await?
+    };
+
+    // History cursors are per-repo; the coverage envelope reports the
+    // least-advanced (min) one, and historical coverage is complete only when
+    // every repo paginated to the end this run (never on a budget/backoff cut).
+    let mut coverage = store.coverage_snapshot()?;
+    coverage.history_cursor = store
+        .sync_cursors()?
+        .into_iter()
+        .filter(|cursor| cursor.endpoint.starts_with("history:"))
+        .filter_map(|cursor| cursor.cursor)
+        .min();
+    if let Some(corpus_oldest) = store.oldest_active_issue_updated_at()? {
+        coverage.oldest_synced_updated_at = Some(match coverage.oldest_synced_updated_at {
+            Some(existing) => existing.min(corpus_oldest),
+            None => corpus_oldest,
+        });
+    }
+    if outcome.all_reached_end {
+        coverage.historical_backfill_complete = true;
+    }
+    store.update_coverage(&coverage)?;
+
+    if let Some(backoff) = outcome.backoff {
+        progress.line(format_args!(
+            "qgh sync: backfill backoff reason={} scope={} retry_after_seconds={}",
+            backoff.reason, backoff.scope, backoff.retry_after_seconds
+        ));
+        let backoff = store.record_backoff_state(
+            &backoff.reason,
+            &backoff.scope,
+            backoff.retry_after_seconds,
+            backoff.reset_at.as_deref(),
+        )?;
+        rebuild_bm25_index(profile, store, progress)?;
+        let status = store.status()?;
+        return Ok(json!({
+            "profile_id": profile.id,
+            "sync_state": "backoff",
+            "backoff": backoff,
+            "backfill": {
+                "issues": outcome.issues,
+                "comments": outcome.comments,
+                "skipped_pull_requests": outcome.skipped_pull_requests,
+                "reached_end": false,
+                "history_cursor": coverage.history_cursor,
+                "historical_backfill_complete": coverage.historical_backfill_complete
+            },
+            "sources": {
+                "issue_count": status.issue_count,
+                "comment_count": status.comment_count,
+                "tombstone_count": status.tombstone_count
+            }
+        }));
+    }
+
+    store.clear_backoff_state()?;
+    let (generation, dirty_task_count) = rebuild_bm25_index(profile, store, progress)?;
+    if let Some(summary) = &summary {
+        store.mark_sync_run_completed(&summary.sync_run_id)?;
+    }
+    Ok(json!({
+        "profile_id": profile.id,
+        "sync_state": "ok",
+        "backfill": {
+            "issues": outcome.issues,
+            "comments": outcome.comments,
+            "skipped_pull_requests": outcome.skipped_pull_requests,
+            "reached_end": outcome.all_reached_end,
+            "history_cursor": coverage.history_cursor,
+            "historical_backfill_complete": coverage.historical_backfill_complete
+        },
+        "index": {
+            "active_generation": generation,
+            "dirty_task_count": dirty_task_count
+        }
     }))
 }
 
