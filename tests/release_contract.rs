@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -79,6 +80,54 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert_eq!(tool_names, ["query", "get", "status"]);
     for tool in tools {
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        assert_eq!(tool["inputSchema"]["type"], "object");
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        match tool["name"].as_str().unwrap() {
+            "query" => {
+                assert_eq!(
+                    schema_property_names(&tool["inputSchema"]),
+                    BTreeSet::from([
+                        "author".to_string(),
+                        "issue".to_string(),
+                        "label".to_string(),
+                        "limit".to_string(),
+                        "max_age".to_string(),
+                        "query".to_string(),
+                        "repo".to_string(),
+                        "require_fresh".to_string(),
+                        "state".to_string(),
+                    ])
+                );
+                assert_eq!(tool["inputSchema"]["required"], json!(["query"]));
+                assert_eq!(
+                    tool["inputSchema"]["properties"]["state"]["enum"],
+                    json!(["open", "closed"])
+                );
+            }
+            "get" => {
+                assert_eq!(
+                    schema_property_names(&tool["inputSchema"]),
+                    BTreeSet::from(["profile_id".to_string(), "source_id".to_string()])
+                );
+                assert_eq!(tool["inputSchema"]["required"], json!(["source_id"]));
+                assert!(
+                    tool["inputSchema"]["properties"]
+                        .get("verify_lifecycle")
+                        .is_none(),
+                    "MCP get must stay local-only/read-only; lifecycle verification is CLI-only"
+                );
+            }
+            "status" => {
+                assert_eq!(
+                    schema_property_names(&tool["inputSchema"]),
+                    BTreeSet::from(["max_age".to_string(), "require_fresh".to_string()])
+                );
+                assert!(tool["inputSchema"].get("required").is_none());
+            }
+            name => panic!("unexpected MCP tool in release contract: {name}"),
+        }
+        assert_eq!(tool["outputSchema"]["type"], "object");
+        assert_eq!(tool["outputSchema"]["additionalProperties"], false);
     }
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -289,6 +338,15 @@ fn mcp<const N: usize>(messages: [Value; N]) -> Output {
         }
     }
     child.wait_with_output().unwrap()
+}
+
+fn schema_property_names(schema: &Value) -> BTreeSet<String> {
+    schema["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect()
 }
 
 fn binary() -> String {
