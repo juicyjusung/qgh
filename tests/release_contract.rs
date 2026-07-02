@@ -717,6 +717,67 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         status_freshness["properties"]["max_age_seconds"]["minimum"],
         1
     );
+    assert_eq!(
+        status_schema["properties"]["coverage"]["$ref"],
+        "#/$defs/coverage"
+    );
+    let status_coverage = &status_schema["$defs"]["coverage"];
+    assert_eq!(
+        status_coverage["required"],
+        json!([
+            "mode",
+            "open_cursor",
+            "history_cursor",
+            "open_backfill_complete",
+            "historical_backfill_complete",
+            "oldest_synced_updated_at",
+            "recent_bootstrap_floor",
+            "next_backfill_window_hint"
+        ])
+    );
+    assert_eq!(status_coverage["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(status_coverage),
+        BTreeSet::from([
+            "historical_backfill_complete".to_string(),
+            "history_cursor".to_string(),
+            "mode".to_string(),
+            "next_backfill_window_hint".to_string(),
+            "oldest_synced_updated_at".to_string(),
+            "open_backfill_complete".to_string(),
+            "open_cursor".to_string(),
+            "recent_bootstrap_floor".to_string(),
+        ])
+    );
+    assert_eq!(
+        status_coverage["properties"]["mode"]["enum"],
+        json!(["partial", "complete"])
+    );
+    assert!(status_coverage["properties"]["mode"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("Derived from the completion flags"));
+    for field in [
+        "open_cursor",
+        "history_cursor",
+        "oldest_synced_updated_at",
+        "recent_bootstrap_floor",
+        "next_backfill_window_hint",
+    ] {
+        assert_eq!(
+            status_coverage["properties"][field]["type"],
+            json!(["string", "null"])
+        );
+    }
+    for field in ["open_backfill_complete", "historical_backfill_complete"] {
+        assert_eq!(status_coverage["properties"][field]["type"], "boolean");
+    }
+    assert!(
+        status_coverage["properties"]["recent_bootstrap_floor"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Recent lookback is acceleration")
+    );
     let status_github = &status_schema["$defs"]["github"];
     assert_eq!(
         status_github["required"],
