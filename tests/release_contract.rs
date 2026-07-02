@@ -211,6 +211,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         &fs::read_to_string(root.join("docs/schemas/error.schema.json")).unwrap(),
     )
     .unwrap();
+    let sync_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/sync-output.schema.json")).unwrap(),
+    )
+    .unwrap();
     let get_schema: Value = serde_json::from_str(
         &fs::read_to_string(root.join("docs/schemas/get-output.schema.json")).unwrap(),
     )
@@ -259,6 +263,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "released error schema must include {code}"
         );
     }
+    assert_eq!(
+        sync_schema["properties"]["sync_state"]["enum"],
+        json!(["ok", "backoff", "skipped_fresh"])
+    );
     assert_eq!(
         get_schema["oneOf"][0]["required"],
         json!(["profile_id", "source"])

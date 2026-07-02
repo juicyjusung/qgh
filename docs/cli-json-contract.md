@@ -18,6 +18,8 @@ long GitHub fetch/index runs do not look stalled, then prints a final human
 summary to stdout. `sync --json` and `sync --quiet` suppress progress
 diagnostics. Progress lines and human summaries are not a stable
 machine-readable API; use `--json` for automation.
+`sync --if-stale --json` returns `data.sync_state: "skipped_fresh"` when the
+local snapshot is still within the effective max-age and no network sync runs.
 
 `sync issue <number>` is the explicit targeted refresh path for one issue and
 its complete per-issue comment list. Its `sync` envelope includes `target`,

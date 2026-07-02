@@ -10,7 +10,7 @@
     },
     "sync_state": {
       "type": "string",
-      "enum": ["ok", "backoff"]
+      "enum": ["ok", "backoff", "skipped_fresh"]
     },
     "sync_run_id": {
       "type": "string"
