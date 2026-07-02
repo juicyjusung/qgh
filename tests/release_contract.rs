@@ -799,6 +799,114 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         status_schema["$defs"]["coverage"]
     );
     assert_eq!(
+        query_schema["required"],
+        json!([
+            "profile_id",
+            "freshness",
+            "coverage",
+            "result_filtering",
+            "results"
+        ])
+    );
+    assert_eq!(query_schema["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(&query_schema),
+        BTreeSet::from([
+            "coverage".to_string(),
+            "freshness".to_string(),
+            "profile_id".to_string(),
+            "result_filtering".to_string(),
+            "results".to_string(),
+        ])
+    );
+    let query_filtering = &query_schema["properties"]["result_filtering"];
+    assert_eq!(query_filtering["required"], json!(["unresolvable_hits"]));
+    assert_eq!(query_filtering["additionalProperties"], false);
+    assert_eq!(
+        query_filtering["properties"]["unresolvable_hits"]["minimum"],
+        0
+    );
+    assert_eq!(
+        query_schema["properties"]["results"]["items"]["$ref"],
+        "#/$defs/query_result"
+    );
+    let query_result = &query_schema["$defs"]["query_result"];
+    assert_eq!(
+        query_result["required"],
+        json!([
+            "source_id",
+            "entity_type",
+            "repo",
+            "issue_number",
+            "canonical_url",
+            "snippet",
+            "get_args",
+            "parent_issue",
+            "source_version",
+            "ranking"
+        ])
+    );
+    assert_eq!(query_result["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(query_result),
+        BTreeSet::from([
+            "author".to_string(),
+            "canonical_url".to_string(),
+            "entity_type".to_string(),
+            "get_args".to_string(),
+            "issue_number".to_string(),
+            "parent_issue".to_string(),
+            "ranking".to_string(),
+            "repo".to_string(),
+            "snippet".to_string(),
+            "source_id".to_string(),
+            "source_version".to_string(),
+            "title".to_string(),
+        ])
+    );
+    assert_eq!(
+        query_result["properties"]["source_id"]["pattern"],
+        "^qgh://github\\.com/(issue|issue-comment)/"
+    );
+    assert_eq!(
+        query_result["properties"]["entity_type"]["enum"],
+        json!(["issue", "issue_comment"])
+    );
+    assert_eq!(
+        query_result["properties"]["repo"]["pattern"],
+        "^[^/]+/[^/]+$"
+    );
+    assert_eq!(query_result["properties"]["issue_number"]["minimum"], 1);
+    assert_eq!(query_result["properties"]["canonical_url"]["format"], "uri");
+    assert!(query_result["properties"]["snippet"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("not citation evidence"));
+    let query_get_args = &query_result["properties"]["get_args"];
+    assert_eq!(
+        query_get_args["required"],
+        json!(["source_id", "profile_id"])
+    );
+    assert_eq!(query_get_args["additionalProperties"], false);
+    assert_eq!(query_get_args["properties"]["source_id"]["type"], "string");
+    assert_eq!(query_get_args["properties"]["profile_id"]["type"], "string");
+    assert_eq!(
+        query_result["properties"]["parent_issue"]["oneOf"][0]["type"],
+        "null"
+    );
+    assert_eq!(
+        query_result["properties"]["parent_issue"]["oneOf"][1]["$ref"],
+        "#/$defs/parent_issue"
+    );
+    assert_eq!(
+        query_result["properties"]["source_version"]["$ref"],
+        "#/$defs/source_version"
+    );
+    assert_eq!(
+        query_result["properties"]["ranking"]["$ref"],
+        "#/$defs/ranking"
+    );
+    assert_eq!(
         status_schema["properties"]["resolution"]["$ref"],
         "#/$defs/resolution"
     );
