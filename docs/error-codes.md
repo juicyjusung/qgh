@@ -21,6 +21,9 @@ snapshot violates a fail-mode freshness policy or `--require-fresh` is passed.
 The error details include the same local-only `freshness` block and triggered
 warning objects.
 
+`query`/`search` may return `validation.invalid_query` when the query text or
+query arguments are invalid, such as `--limit 0`.
+
 `init` may additionally return:
 
 - `config.no_git_worktree`: `qgh init` was run outside a git worktree.

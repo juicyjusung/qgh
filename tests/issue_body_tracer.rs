@@ -2854,11 +2854,23 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
                 }
             }
         }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {
+                    "query": "anything",
+                    "limit": 0
+                }
+            }
+        }),
     ]);
     assert_success(&output);
     assert!(stderr_text(&output).is_empty());
     let messages = stdout_json_lines(&output);
-    assert_eq!(messages.len(), 5);
+    assert_eq!(messages.len(), 6);
     assert_eq!(messages[0]["id"], 1);
     assert_eq!(messages[0]["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(
@@ -2886,6 +2898,10 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
             assert!(tool["inputSchema"]["properties"]
                 .get("require_fresh")
                 .is_some());
+            assert_eq!(
+                tool["inputSchema"]["properties"]["limit"]["minimum"],
+                json!(1)
+            );
         }
         if tool["name"] == "status" {
             assert!(tool["inputSchema"]["properties"].get("max_age").is_some());
@@ -2930,17 +2946,35 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
         .unwrap()
         .contains("validation.mcp"));
 
-    for validation in [&messages[3]["result"], &messages[4]["result"]] {
+    for validation in [
+        &messages[3]["result"],
+        &messages[4]["result"],
+        &messages[5]["result"],
+    ] {
         assert_eq!(validation["isError"], true);
         assert_eq!(
             validation["structuredContent"]["error"]["code"],
             "validation.mcp"
         );
-        assert!(validation["structuredContent"]["error"]["message"]
+    }
+    assert!(
+        messages[3]["result"]["structuredContent"]["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("max_age"));
-    }
+            .contains("max_age")
+    );
+    assert!(
+        messages[4]["result"]["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("max_age")
+    );
+    assert!(
+        messages[5]["result"]["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("limit")
+    );
 }
 
 #[test]
@@ -3872,6 +3906,13 @@ fn query_filter_errors_are_versioned_json_envelopes() {
     assert_eq!(
         stdout_json(&wiki_filter)["error"]["code"],
         "validation.unsupported_filter"
+    );
+
+    let zero_limit = fixture.qgh(["query", "anything", "--limit", "0", "--json"]);
+    assert_eq!(zero_limit.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&zero_limit)["error"]["code"],
+        "validation.invalid_query"
     );
 
     let unknown_flag = fixture.qgh(["query", "anything", "--bogus", "--json"]);

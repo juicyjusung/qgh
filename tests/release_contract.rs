@@ -103,6 +103,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
                     tool["inputSchema"]["properties"]["state"]["enum"],
                     json!(["open", "closed"])
                 );
+                assert_eq!(tool["inputSchema"]["properties"]["limit"]["minimum"], 1);
             }
             "get" => {
                 assert_eq!(

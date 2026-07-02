@@ -167,6 +167,8 @@ use the policy later still apply normal profile resolution and allowlist checks.
 ## Query Results
 
 `query` and `search` return source candidates, not answers. Each result identifies a GitHub Issue or issue comment that can be fetched through `get`.
+`--limit` must be greater than zero; invalid values fail with a structured
+validation error instead of silently returning an empty result set.
 
 Every result includes:
 

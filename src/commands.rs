@@ -1444,7 +1444,7 @@ pub fn query(
     let profile = load_profile(profile_id)?;
     let repo_policy = discover_repo_policy()?;
     let filters = QueryFilters::from_args(&args, &profile, repo_policy.as_ref(), repo_scope)?;
-    let limit = effective_limit(&args, repo_policy.as_ref());
+    let limit = effective_limit(&args, repo_policy.as_ref())?;
     let store = Store::open(&profile.paths)?;
     let overrides = freshness_overrides(args.max_age.as_deref(), args.require_fresh)?;
     if let Some(results) = exact_results(&store, &args.query, &filters, &profile.id)? {
@@ -1797,10 +1797,18 @@ fn effective_source_types(repo_policy: Option<&RepoPolicy>) -> Vec<String> {
         .unwrap_or_else(|| vec!["issue".to_string(), "issue_comment".to_string()])
 }
 
-fn effective_limit(args: &QueryArgs, repo_policy: Option<&RepoPolicy>) -> usize {
-    args.limit
+fn effective_limit(args: &QueryArgs, repo_policy: Option<&RepoPolicy>) -> Result<usize, QghError> {
+    let limit = args
+        .limit
         .or_else(|| repo_policy.and_then(|policy| policy.query.limit))
-        .unwrap_or(10)
+        .unwrap_or(10);
+    if limit == 0 {
+        return Err(QghError::validation(
+            "validation.invalid_query",
+            "Query limit must be greater than zero.",
+        ));
+    }
+    Ok(limit)
 }
 
 #[derive(Default)]

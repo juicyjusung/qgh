@@ -240,7 +240,7 @@ fn parse_query_args(arguments: &Value) -> Result<QueryArgs, QghError> {
     )?;
     Ok(QueryArgs {
         query: required_string(object, "query")?,
-        limit: optional_usize(object, "limit")?,
+        limit: optional_positive_usize(object, "limit")?,
         repo: optional_string(object, "repo")?,
         label: optional_string_array(object, "label")?,
         state: optional_string(object, "state")?,
@@ -353,13 +353,21 @@ fn optional_i64(object: &Map<String, Value>, key: &str) -> Result<Option<i64>, Q
         .transpose()
 }
 
-fn optional_usize(object: &Map<String, Value>, key: &str) -> Result<Option<usize>, QghError> {
+fn optional_positive_usize(
+    object: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<usize>, QghError> {
     object
         .get(key)
         .map(|value| {
             let value = value.as_u64().ok_or_else(|| {
                 validation_error(format!("MCP parameter `{key}` must be a positive integer."))
             })?;
+            if value == 0 {
+                return Err(validation_error(format!(
+                    "MCP parameter `{key}` must be greater than zero."
+                )));
+            }
             usize::try_from(value)
                 .map_err(|_| validation_error(format!("MCP parameter `{key}` is too large.")))
         })
@@ -465,7 +473,7 @@ fn query_input_schema() -> Value {
         "required": ["query"],
         "properties": {
             "query": { "type": "string" },
-            "limit": { "type": "integer", "minimum": 0 },
+            "limit": { "type": "integer", "minimum": 1 },
             "repo": { "type": "string", "pattern": "^[^/]+/[^/]+$" },
             "label": {
                 "type": "array",
