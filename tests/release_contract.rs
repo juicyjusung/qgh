@@ -255,6 +255,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         &fs::read_to_string(root.join("docs/schemas/status-output.schema.json")).unwrap(),
     )
     .unwrap();
+    let query_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/query-result.schema.json")).unwrap(),
+    )
+    .unwrap();
     let get_schema: Value = serde_json::from_str(
         &fs::read_to_string(root.join("docs/schemas/get-output.schema.json")).unwrap(),
     )
@@ -777,6 +781,22 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             .as_str()
             .unwrap()
             .contains("Recent lookback is acceleration")
+    );
+    assert_eq!(
+        query_schema["properties"]["freshness"]["$ref"],
+        "#/$defs/freshness"
+    );
+    assert_eq!(
+        query_schema["$defs"]["freshness"],
+        status_schema["$defs"]["freshness"]
+    );
+    assert_eq!(
+        query_schema["properties"]["coverage"]["$ref"],
+        "#/$defs/coverage"
+    );
+    assert_eq!(
+        query_schema["$defs"]["coverage"],
+        status_schema["$defs"]["coverage"]
     );
     assert_eq!(
         status_schema["properties"]["resolution"]["$ref"],
