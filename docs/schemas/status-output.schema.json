@@ -37,7 +37,7 @@
       "$ref": "#/$defs/sources"
     },
     "database": {
-      "type": "object"
+      "$ref": "#/$defs/database"
     },
     "index": {
       "type": "object"
@@ -88,6 +88,16 @@
         "tombstone_count": {
           "type": "integer",
           "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "database": {
+      "type": "object",
+      "required": ["schema_version"],
+      "properties": {
+        "schema_version": {
+          "const": "qgh.db.v1"
         }
       },
       "additionalProperties": false

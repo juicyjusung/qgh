@@ -305,6 +305,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         status_schema["properties"]["sources"]["$ref"],
         "#/$defs/sources"
     );
+    assert_eq!(
+        status_schema["properties"]["database"]["$ref"],
+        "#/$defs/database"
+    );
     let status_github = &status_schema["$defs"]["github"];
     assert_eq!(
         status_github["required"],
@@ -332,6 +336,17 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "issue_count".to_string(),
             "tombstone_count".to_string(),
         ])
+    );
+    let status_database = &status_schema["$defs"]["database"];
+    assert_eq!(status_database["required"], json!(["schema_version"]));
+    assert_eq!(status_database["additionalProperties"], false);
+    assert_eq!(
+        status_database["properties"]["schema_version"]["const"],
+        "qgh.db.v1"
+    );
+    assert_eq!(
+        schema_property_names(status_database),
+        BTreeSet::from(["schema_version".to_string()])
     );
     let status_privacy = &status_schema["$defs"]["privacy"];
     assert_eq!(
