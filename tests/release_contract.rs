@@ -438,6 +438,35 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "boolean"
     );
     assert_eq!(
+        sync_schema["properties"]["backoff"]["$ref"],
+        "#/$defs/backoff"
+    );
+    let sync_backoff = &sync_schema["$defs"]["backoff"];
+    assert_eq!(
+        sync_backoff["required"],
+        json!([
+            "reason",
+            "scope",
+            "retry_after_seconds",
+            "reset_at",
+            "observed_at",
+            "last_successful_sync"
+        ])
+    );
+    assert_eq!(sync_backoff["additionalProperties"], false);
+    assert_eq!(
+        sync_backoff["properties"]["retry_after_seconds"]["minimum"],
+        0
+    );
+    assert_eq!(
+        sync_backoff["properties"]["reset_at"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        sync_backoff["properties"]["last_successful_sync"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
         sync_schema["properties"]["cursors"]["$ref"],
         "#/$defs/cursors"
     );

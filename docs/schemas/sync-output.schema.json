@@ -37,7 +37,7 @@
       "$ref": "#/$defs/reconciliation"
     },
     "backoff": {
-      "type": "object"
+      "$ref": "#/$defs/backoff"
     },
     "backfill": {
       "$ref": "#/$defs/backfill"
@@ -198,6 +198,39 @@
         },
         "historical_backfill_complete": {
           "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "backoff": {
+      "type": "object",
+      "required": [
+        "reason",
+        "scope",
+        "retry_after_seconds",
+        "reset_at",
+        "observed_at",
+        "last_successful_sync"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "retry_after_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reset_at": {
+          "type": ["string", "null"]
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "last_successful_sync": {
+          "type": ["string", "null"]
         }
       },
       "additionalProperties": false
