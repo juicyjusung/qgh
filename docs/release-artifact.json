@@ -104,6 +104,7 @@
     "Tantivy BM25-only path",
     "strict schema/envelope",
     "human CLI summaries",
+    "init output",
     "get batch output",
     "MCP adapter parity smoke",
     "stdout cleanliness",

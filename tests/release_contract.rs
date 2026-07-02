@@ -190,6 +190,22 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         artifact["contract"]["human_output"],
         "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v1 envelopes"
     );
+    assert_eq!(
+        artifact["verification"],
+        json!([
+            "Tantivy BM25-only path",
+            "strict schema/envelope",
+            "human CLI summaries",
+            "init output",
+            "get batch output",
+            "MCP adapter parity smoke",
+            "stdout cleanliness",
+            "privacy no-egress",
+            "DB/index permissions",
+            "doctor output",
+            "search eval result"
+        ])
+    );
     assert!(artifact["contract"]["init_behavior"]
         .as_str()
         .unwrap()
