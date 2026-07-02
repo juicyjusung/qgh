@@ -104,6 +104,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
                     json!(["open", "closed"])
                 );
                 assert_eq!(tool["inputSchema"]["properties"]["limit"]["minimum"], 1);
+                assert_eq!(tool["inputSchema"]["properties"]["issue"]["minimum"], 1);
             }
             "get" => {
                 assert_eq!(
@@ -245,6 +246,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         .as_array()
         .unwrap()
         .contains(&json!("validation.batch_size")));
+    assert!(error_schema["$defs"]["error_code"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("validation.invalid_issue_number")));
     assert_eq!(
         get_schema["oneOf"][0]["required"],
         json!(["profile_id", "source"])

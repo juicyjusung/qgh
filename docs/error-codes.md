@@ -23,6 +23,9 @@ warning objects.
 
 `query`/`search` may return `validation.invalid_query` when the query text or
 query arguments are invalid, such as `--limit 0`.
+`query`/`search --issue` and `sync issue` may return
+`validation.invalid_issue_number` when the requested issue number is less than
+one.
 
 `init` may additionally return:
 

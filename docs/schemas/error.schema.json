@@ -44,6 +44,7 @@
         "validation.init_cancelled",
         "validation.invalid_init_answer",
         "validation.invalid_query",
+        "validation.invalid_issue_number",
         "validation.invalid_host",
         "validation.invalid_url",
         "validation.invalid_repo",

@@ -245,7 +245,7 @@ fn parse_query_args(arguments: &Value) -> Result<QueryArgs, QghError> {
         label: optional_string_array(object, "label")?,
         state: optional_string(object, "state")?,
         author: optional_string(object, "author")?,
-        issue: optional_i64(object, "issue")?,
+        issue: optional_positive_i64(object, "issue")?,
         wiki: None,
         max_age: optional_duration_string(object, "max_age")?,
         require_fresh: optional_bool(object, "require_fresh")?.unwrap_or(false),
@@ -342,13 +342,19 @@ fn optional_string_array(object: &Map<String, Value>, key: &str) -> Result<Vec<S
         .collect()
 }
 
-fn optional_i64(object: &Map<String, Value>, key: &str) -> Result<Option<i64>, QghError> {
+fn optional_positive_i64(object: &Map<String, Value>, key: &str) -> Result<Option<i64>, QghError> {
     object
         .get(key)
         .map(|value| {
-            value.as_i64().ok_or_else(|| {
+            let value = value.as_i64().ok_or_else(|| {
                 validation_error(format!("MCP parameter `{key}` must be an integer."))
-            })
+            })?;
+            if value < 1 {
+                return Err(validation_error(format!(
+                    "MCP parameter `{key}` must be greater than zero."
+                )));
+            }
+            Ok(value)
         })
         .transpose()
 }

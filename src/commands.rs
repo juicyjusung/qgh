@@ -1648,6 +1648,7 @@ impl QueryFilters {
         }
         let repo = effective_repo(args, profile, repo_policy, repo_scope)?;
         let state = effective_state(args, repo_policy)?;
+        let issue = effective_issue(args.issue)?;
         let labels = effective_labels(args, repo_policy);
         let source_types = effective_source_types(repo_policy);
         Ok(Self {
@@ -1655,7 +1656,7 @@ impl QueryFilters {
             labels,
             state,
             author: args.author.clone(),
-            issue: args.issue,
+            issue,
             source_types,
         })
     }
@@ -1780,6 +1781,17 @@ fn effective_state(
         return Ok(Some(state.clone()));
     }
     Ok(repo_policy.and_then(|policy| policy.defaults.state.clone()))
+}
+
+fn effective_issue(issue: Option<i64>) -> Result<Option<i64>, QghError> {
+    if issue.is_some_and(|issue| issue < 1) {
+        return Err(QghError::validation(
+            "validation.invalid_issue_number",
+            "Issue number must be a positive integer.",
+        )
+        .with_details(json!({ "issue_number": issue })));
+    }
+    Ok(issue)
 }
 
 fn effective_labels(args: &QueryArgs, repo_policy: Option<&RepoPolicy>) -> Vec<String> {

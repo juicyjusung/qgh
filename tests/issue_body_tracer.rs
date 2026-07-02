@@ -2866,11 +2866,23 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
                 }
             }
         }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {
+                    "query": "anything",
+                    "issue": 0
+                }
+            }
+        }),
     ]);
     assert_success(&output);
     assert!(stderr_text(&output).is_empty());
     let messages = stdout_json_lines(&output);
-    assert_eq!(messages.len(), 6);
+    assert_eq!(messages.len(), 7);
     assert_eq!(messages[0]["id"], 1);
     assert_eq!(messages[0]["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(
@@ -2900,6 +2912,10 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
                 .is_some());
             assert_eq!(
                 tool["inputSchema"]["properties"]["limit"]["minimum"],
+                json!(1)
+            );
+            assert_eq!(
+                tool["inputSchema"]["properties"]["issue"]["minimum"],
                 json!(1)
             );
         }
@@ -2950,6 +2966,7 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
         &messages[3]["result"],
         &messages[4]["result"],
         &messages[5]["result"],
+        &messages[6]["result"],
     ] {
         assert_eq!(validation["isError"], true);
         assert_eq!(
@@ -2974,6 +2991,12 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
             .as_str()
             .unwrap()
             .contains("limit")
+    );
+    assert!(
+        messages[6]["result"]["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("issue")
     );
 }
 
@@ -3914,6 +3937,15 @@ fn query_filter_errors_are_versioned_json_envelopes() {
         stdout_json(&zero_limit)["error"]["code"],
         "validation.invalid_query"
     );
+
+    let zero_issue = fixture.qgh(["query", "anything", "--issue", "0", "--json"]);
+    assert_eq!(zero_issue.status.code(), Some(2));
+    let zero_issue_json = stdout_json(&zero_issue);
+    assert_eq!(
+        zero_issue_json["error"]["code"],
+        "validation.invalid_issue_number"
+    );
+    assert_eq!(zero_issue_json["error"]["details"]["issue_number"], 0);
 
     let unknown_flag = fixture.qgh(["query", "anything", "--bogus", "--json"]);
     assert_eq!(unknown_flag.status.code(), Some(2));
