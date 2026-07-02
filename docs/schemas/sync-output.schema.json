@@ -31,7 +31,7 @@
       "type": "object"
     },
     "index": {
-      "type": "object"
+      "$ref": "#/$defs/index"
     },
     "reconciliation": {
       "type": "object"
@@ -55,5 +55,22 @@
       "type": "object"
     }
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "$defs": {
+    "index": {
+      "type": "object",
+      "required": ["active_generation", "dirty_task_count"],
+      "properties": {
+        "active_generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dirty_task_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
 }

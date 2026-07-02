@@ -293,6 +293,22 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "target".to_string(),
         ])
     );
+    assert_eq!(sync_schema["properties"]["index"]["$ref"], "#/$defs/index");
+    let sync_index = &sync_schema["$defs"]["index"];
+    assert_eq!(
+        sync_index["required"],
+        json!(["active_generation", "dirty_task_count"])
+    );
+    assert_eq!(sync_index["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(sync_index),
+        BTreeSet::from([
+            "active_generation".to_string(),
+            "dirty_task_count".to_string()
+        ])
+    );
+    assert_eq!(sync_index["properties"]["active_generation"]["minimum"], 0);
+    assert_eq!(sync_index["properties"]["dirty_task_count"]["minimum"], 0);
     assert_eq!(
         status_schema["properties"]["privacy"]["$ref"],
         "#/$defs/privacy"
