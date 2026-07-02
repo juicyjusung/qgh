@@ -342,6 +342,32 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "title".to_string(),
         ])
     );
+    assert_eq!(
+        get_source["properties"]["source_version"]["$ref"],
+        "#/$defs/source_version"
+    );
+    let get_source_version = &get_schema["$defs"]["source_version"];
+    assert_eq!(
+        get_source_version["required"],
+        json!([
+            "body_hash",
+            "github_updated_at",
+            "indexed_at",
+            "sync_run_id",
+            "lifecycle_state"
+        ])
+    );
+    assert_eq!(get_source_version["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(get_source_version),
+        BTreeSet::from([
+            "body_hash".to_string(),
+            "github_updated_at".to_string(),
+            "indexed_at".to_string(),
+            "lifecycle_state".to_string(),
+            "sync_run_id".to_string(),
+        ])
+    );
     let included = artifact["acceptance_snapshot"]["included_in_mvp_gate"]
         .as_array()
         .unwrap();

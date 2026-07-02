@@ -176,13 +176,44 @@
           "type": "string"
         },
         "source_version": {
-          "type": "object"
+          "$ref": "#/$defs/source_version"
         },
         "lifecycle_check": {
           "type": "object"
         },
         "parent_issue": {
           "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
+    "source_version": {
+      "type": "object",
+      "required": [
+        "body_hash",
+        "github_updated_at",
+        "indexed_at",
+        "sync_run_id",
+        "lifecycle_state"
+      ],
+      "properties": {
+        "body_hash": {
+          "type": "string"
+        },
+        "github_updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "indexed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "sync_run_id": {
+          "type": "string"
+        },
+        "lifecycle_state": {
+          "type": "string",
+          "enum": ["active"]
         }
       },
       "additionalProperties": false
