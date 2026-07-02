@@ -190,13 +190,16 @@
       "required": ["source_id", "repo", "number", "title", "canonical_url"],
       "properties": {
         "source_id": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^qgh://github\\.com/issue/"
         },
         "repo": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^[^/]+/[^/]+$"
         },
         "number": {
-          "type": "integer"
+          "type": "integer",
+          "minimum": 1
         },
         "title": {
           "type": "string"

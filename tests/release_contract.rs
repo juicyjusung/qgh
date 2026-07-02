@@ -927,6 +927,15 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "uri"
     );
     assert_eq!(
+        query_parent_issue["properties"]["source_id"]["pattern"],
+        "^qgh://github\\.com/issue/"
+    );
+    assert_eq!(
+        query_parent_issue["properties"]["repo"]["pattern"],
+        "^[^/]+/[^/]+$"
+    );
+    assert_eq!(query_parent_issue["properties"]["number"]["minimum"], 1);
+    assert_eq!(
         query_schema["$defs"]["source_version"],
         get_schema["$defs"]["source_version"]
     );
@@ -1367,6 +1376,19 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "source_id".to_string(),
             "title".to_string(),
         ])
+    );
+    assert_eq!(
+        get_parent_issue["properties"]["source_id"]["pattern"],
+        "^qgh://github\\.com/issue/"
+    );
+    assert_eq!(
+        get_parent_issue["properties"]["repo"]["pattern"],
+        "^[^/]+/[^/]+$"
+    );
+    assert_eq!(get_parent_issue["properties"]["number"]["minimum"], 1);
+    assert_eq!(
+        get_parent_issue["properties"]["canonical_url"]["format"],
+        "uri"
     );
     let get_lifecycle_check = &get_schema["$defs"]["lifecycle_check"];
     assert_eq!(
