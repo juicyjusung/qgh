@@ -179,10 +179,30 @@
           "$ref": "#/$defs/source_version"
         },
         "lifecycle_check": {
-          "type": "object"
+          "$ref": "#/$defs/lifecycle_check"
         },
         "parent_issue": {
           "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
+    "lifecycle_check": {
+      "type": "object",
+      "required": ["status", "remote_checked"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["active", "not_checked"]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "error_code": {
+          "type": "string"
+        },
+        "remote_checked": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false
