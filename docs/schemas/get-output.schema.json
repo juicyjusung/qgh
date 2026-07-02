@@ -137,7 +137,16 @@
   "$defs": {
     "source": {
       "type": "object",
-      "required": ["source_id", "entity_type", "canonical_url", "body", "source_version"],
+      "required": [
+        "source_id",
+        "entity_type",
+        "repo",
+        "issue_number",
+        "canonical_url",
+        "body",
+        "source_version",
+        "lifecycle_check"
+      ],
       "properties": {
         "source_id": {
           "type": "string"
@@ -145,6 +154,20 @@
         "entity_type": {
           "type": "string",
           "enum": ["issue", "issue_comment"]
+        },
+        "repo": {
+          "type": "string",
+          "pattern": "^[^/]+/[^/]+$"
+        },
+        "issue_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "title": {
+          "type": "string"
+        },
+        "author": {
+          "type": ["string", "null"]
         },
         "canonical_url": {
           "type": "string"
@@ -157,9 +180,12 @@
         },
         "lifecycle_check": {
           "type": "object"
+        },
+        "parent_issue": {
+          "type": "object"
         }
       },
-      "additionalProperties": true
+      "additionalProperties": false
     }
   }
 }

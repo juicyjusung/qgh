@@ -311,6 +311,37 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             ["enum"],
         json!(["not_requested", "sequential"])
     );
+    let get_source = &get_schema["$defs"]["source"];
+    assert_eq!(
+        get_source["required"],
+        json!([
+            "source_id",
+            "entity_type",
+            "repo",
+            "issue_number",
+            "canonical_url",
+            "body",
+            "source_version",
+            "lifecycle_check"
+        ])
+    );
+    assert_eq!(get_source["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(get_source),
+        BTreeSet::from([
+            "author".to_string(),
+            "body".to_string(),
+            "canonical_url".to_string(),
+            "entity_type".to_string(),
+            "issue_number".to_string(),
+            "lifecycle_check".to_string(),
+            "parent_issue".to_string(),
+            "repo".to_string(),
+            "source_id".to_string(),
+            "source_version".to_string(),
+            "title".to_string(),
+        ])
+    );
     let included = artifact["acceptance_snapshot"]["included_in_mvp_gate"]
         .as_array()
         .unwrap();
