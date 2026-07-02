@@ -301,6 +301,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         status_schema["properties"]["github"]["$ref"],
         "#/$defs/github"
     );
+    assert_eq!(
+        status_schema["properties"]["sources"]["$ref"],
+        "#/$defs/sources"
+    );
     let status_github = &status_schema["$defs"]["github"];
     assert_eq!(
         status_github["required"],
@@ -313,6 +317,20 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "api_base_url".to_string(),
             "host".to_string(),
             "web_base_url".to_string(),
+        ])
+    );
+    let status_sources = &status_schema["$defs"]["sources"];
+    assert_eq!(
+        status_sources["required"],
+        json!(["issue_count", "comment_count", "tombstone_count"])
+    );
+    assert_eq!(status_sources["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(status_sources),
+        BTreeSet::from([
+            "comment_count".to_string(),
+            "issue_count".to_string(),
+            "tombstone_count".to_string(),
         ])
     );
     let status_privacy = &status_schema["$defs"]["privacy"];

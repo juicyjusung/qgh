@@ -34,7 +34,7 @@
       "type": "object"
     },
     "sources": {
-      "type": "object"
+      "$ref": "#/$defs/sources"
     },
     "database": {
       "type": "object"
@@ -69,6 +69,25 @@
         },
         "web_base_url": {
           "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "sources": {
+      "type": "object",
+      "required": ["issue_count", "comment_count", "tombstone_count"],
+      "properties": {
+        "issue_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "comment_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tombstone_count": {
+          "type": "integer",
+          "minimum": 0
         }
       },
       "additionalProperties": false
