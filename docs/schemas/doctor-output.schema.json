@@ -11,17 +11,7 @@
     "checks": {
       "type": "array",
       "items": {
-        "type": "object",
-        "required": ["name", "ok"],
-        "properties": {
-          "name": {
-            "type": "string"
-          },
-          "ok": {
-            "type": "boolean"
-          }
-        },
-        "additionalProperties": true
+        "$ref": "#/$defs/check"
       }
     },
     "mcp": {
@@ -47,6 +37,63 @@
   },
   "additionalProperties": false,
   "$defs": {
+    "check": {
+      "type": "object",
+      "required": ["name", "ok"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "enum": [
+            "config",
+            "file_permissions",
+            "sqlite",
+            "tantivy",
+            "github_auth_reachability",
+            "rate_limit_headers",
+            "repo_policy",
+            "profile_resolution"
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "headers": {
+          "$ref": "#/$defs/rate_limit_headers"
+        },
+        "path": {
+          "type": ["string", "null"]
+        },
+        "repo": {
+          "type": ["string", "null"],
+          "pattern": "^[^/]+/[^/]+$"
+        },
+        "profile_id": {
+          "type": "string"
+        },
+        "profile_source": {
+          "type": "string",
+          "enum": ["cli", "env", "single_match"]
+        },
+        "allowlist_match_count": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "rate_limit_headers": {
+      "type": "object",
+      "required": ["x-ratelimit-remaining", "x-ratelimit-reset"],
+      "properties": {
+        "x-ratelimit-remaining": {
+          "type": ["string", "null"]
+        },
+        "x-ratelimit-reset": {
+          "type": ["string", "null"]
+        }
+      },
+      "additionalProperties": false
+    },
     "resolution": {
       "type": "object",
       "required": [

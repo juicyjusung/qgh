@@ -223,6 +223,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         &fs::read_to_string(root.join("docs/schemas/get-output.schema.json")).unwrap(),
     )
     .unwrap();
+    let doctor_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/doctor-output.schema.json")).unwrap(),
+    )
+    .unwrap();
     for required in [
         "profile_config_path",
         "profile_id",
@@ -1032,6 +1036,78 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "lifecycle_state".to_string(),
             "sync_run_id".to_string(),
         ])
+    );
+    assert_eq!(
+        doctor_schema["properties"]["checks"]["items"]["$ref"],
+        "#/$defs/check"
+    );
+    let doctor_check = &doctor_schema["$defs"]["check"];
+    assert_eq!(doctor_check["required"], json!(["name", "ok"]));
+    assert_eq!(doctor_check["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(doctor_check),
+        BTreeSet::from([
+            "allowlist_match_count".to_string(),
+            "headers".to_string(),
+            "name".to_string(),
+            "ok".to_string(),
+            "path".to_string(),
+            "profile_id".to_string(),
+            "profile_source".to_string(),
+            "repo".to_string(),
+        ])
+    );
+    assert_eq!(
+        doctor_check["properties"]["name"]["enum"],
+        json!([
+            "config",
+            "file_permissions",
+            "sqlite",
+            "tantivy",
+            "github_auth_reachability",
+            "rate_limit_headers",
+            "repo_policy",
+            "profile_resolution"
+        ])
+    );
+    assert_eq!(
+        doctor_check["properties"]["headers"]["$ref"],
+        "#/$defs/rate_limit_headers"
+    );
+    let doctor_rate_limit_headers = &doctor_schema["$defs"]["rate_limit_headers"];
+    assert_eq!(
+        doctor_rate_limit_headers["required"],
+        json!(["x-ratelimit-remaining", "x-ratelimit-reset"])
+    );
+    assert_eq!(doctor_rate_limit_headers["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(doctor_rate_limit_headers),
+        BTreeSet::from([
+            "x-ratelimit-remaining".to_string(),
+            "x-ratelimit-reset".to_string()
+        ])
+    );
+    for header in ["x-ratelimit-remaining", "x-ratelimit-reset"] {
+        assert_eq!(
+            doctor_rate_limit_headers["properties"][header]["type"],
+            json!(["string", "null"])
+        );
+    }
+    assert_eq!(
+        doctor_check["properties"]["repo"]["pattern"],
+        "^[^/]+/[^/]+$"
+    );
+    assert_eq!(
+        doctor_check["properties"]["profile_source"]["enum"],
+        json!(["cli", "env", "single_match"])
+    );
+    assert_eq!(
+        doctor_check["properties"]["allowlist_match_count"]["type"],
+        json!(["integer", "null"])
+    );
+    assert_eq!(
+        doctor_check["properties"]["allowlist_match_count"]["minimum"],
+        0
     );
     let included = artifact["acceptance_snapshot"]["included_in_mvp_gate"]
         .as_array()
