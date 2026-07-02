@@ -379,6 +379,33 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         0
     );
     assert_eq!(
+        sync_schema["properties"]["reconciliation"]["$ref"],
+        "#/$defs/reconciliation"
+    );
+    let sync_reconciliation = &sync_schema["$defs"]["reconciliation"];
+    assert_eq!(sync_reconciliation["required"], json!(["mode"]));
+    assert_eq!(sync_reconciliation["additionalProperties"], false);
+    assert_eq!(
+        sync_reconciliation["properties"]["mode"]["enum"],
+        json!(["none", "full", "recent", "targeted_issue"])
+    );
+    assert_eq!(
+        sync_reconciliation["properties"]["checked_sources"]["minimum"],
+        0
+    );
+    assert_eq!(
+        sync_reconciliation["properties"]["tombstoned_sources"]["minimum"],
+        0
+    );
+    assert_eq!(
+        sync_reconciliation["properties"]["estimated_api_cost_class"]["$ref"],
+        "#/$defs/api_cost_class"
+    );
+    assert_eq!(
+        sync_schema["$defs"]["api_cost_class"]["enum"],
+        json!(["none", "low", "medium", "high"])
+    );
+    assert_eq!(
         sync_schema["properties"]["cursors"]["$ref"],
         "#/$defs/cursors"
     );

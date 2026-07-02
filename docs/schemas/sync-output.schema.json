@@ -34,7 +34,7 @@
       "$ref": "#/$defs/index"
     },
     "reconciliation": {
-      "type": "object"
+      "$ref": "#/$defs/reconciliation"
     },
     "backoff": {
       "type": "object"
@@ -145,6 +145,28 @@
       },
       "additionalProperties": false
     },
+    "reconciliation": {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["none", "full", "recent", "targeted_issue"]
+        },
+        "checked_sources": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tombstoned_sources": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "estimated_api_cost_class": {
+          "$ref": "#/$defs/api_cost_class"
+        }
+      },
+      "additionalProperties": false
+    },
     "cursors": {
       "type": "object",
       "required": ["updated", "not_modified_endpoints", "watermarks"],
@@ -241,6 +263,10 @@
         }
       },
       "additionalProperties": false
+    },
+    "api_cost_class": {
+      "type": "string",
+      "enum": ["none", "low", "medium", "high"]
     }
   }
 }
