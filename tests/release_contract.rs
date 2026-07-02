@@ -219,6 +219,19 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         .unwrap()
         .iter()
         .any(|command| command == "init"));
+    assert_eq!(
+        artifact["schema_snapshots"],
+        json!([
+            "docs/schemas/envelope.schema.json",
+            "docs/schemas/error.schema.json",
+            "docs/schemas/init-output.schema.json",
+            "docs/schemas/sync-output.schema.json",
+            "docs/schemas/query-result.schema.json",
+            "docs/schemas/get-output.schema.json",
+            "docs/schemas/status-output.schema.json",
+            "docs/schemas/doctor-output.schema.json"
+        ])
+    );
     for path in artifact["schema_snapshots"].as_array().unwrap() {
         let path = path.as_str().unwrap();
         assert!(root.join(path).exists(), "missing schema snapshot: {path}");

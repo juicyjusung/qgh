@@ -50,8 +50,8 @@ Released schema snapshots:
 - `docs/schemas/envelope.schema.json`: common success/error envelope.
 - `docs/schemas/error.schema.json`: stable error taxonomy and exit-code classes.
 - `docs/schemas/init-output.schema.json`: CLI-only `init` data payload.
-- `docs/schemas/query-result.schema.json`: `query`/`search` data payload.
 - `docs/schemas/sync-output.schema.json`: `sync` data payload.
+- `docs/schemas/query-result.schema.json`: `query`/`search` data payload.
 - `docs/schemas/get-output.schema.json`: `get` data payload.
 - `docs/schemas/status-output.schema.json`: `status` data payload.
 - `docs/schemas/doctor-output.schema.json`: CLI-only `doctor` data payload.
