@@ -2878,11 +2878,23 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
                 }
             }
         }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {
+                    "query": "anything",
+                    "state": "merged"
+                }
+            }
+        }),
     ]);
     assert_success(&output);
     assert!(stderr_text(&output).is_empty());
     let messages = stdout_json_lines(&output);
-    assert_eq!(messages.len(), 7);
+    assert_eq!(messages.len(), 8);
     assert_eq!(messages[0]["id"], 1);
     assert_eq!(messages[0]["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(
@@ -2967,6 +2979,7 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
         &messages[4]["result"],
         &messages[5]["result"],
         &messages[6]["result"],
+        &messages[7]["result"],
     ] {
         assert_eq!(validation["isError"], true);
         assert_eq!(
@@ -2997,6 +3010,12 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
             .as_str()
             .unwrap()
             .contains("issue")
+    );
+    assert!(
+        messages[7]["result"]["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("state")
     );
 }
 

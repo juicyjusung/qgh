@@ -243,7 +243,7 @@ fn parse_query_args(arguments: &Value) -> Result<QueryArgs, QghError> {
         limit: optional_positive_usize(object, "limit")?,
         repo: optional_string(object, "repo")?,
         label: optional_string_array(object, "label")?,
-        state: optional_string(object, "state")?,
+        state: optional_query_state(object)?,
         author: optional_string(object, "author")?,
         issue: optional_positive_i64(object, "issue")?,
         wiki: None,
@@ -307,6 +307,19 @@ fn optional_string(object: &Map<String, Value>, key: &str) -> Result<Option<Stri
                 .ok_or_else(|| validation_error(format!("MCP parameter `{key}` must be a string.")))
         })
         .transpose()
+}
+
+fn optional_query_state(object: &Map<String, Value>) -> Result<Option<String>, QghError> {
+    let state = optional_string(object, "state")?;
+    if state
+        .as_deref()
+        .is_some_and(|state| !matches!(state, "open" | "closed"))
+    {
+        return Err(validation_error(
+            "MCP parameter `state` must be `open` or `closed`.",
+        ));
+    }
+    Ok(state)
 }
 
 fn optional_duration_string(
