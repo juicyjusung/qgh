@@ -28,7 +28,7 @@
       "type": "object"
     },
     "cursors": {
-      "type": "object"
+      "$ref": "#/$defs/cursors"
     },
     "index": {
       "$ref": "#/$defs/index"
@@ -122,6 +122,27 @@
         "tombstoned": {
           "type": "integer",
           "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "cursors": {
+      "type": "object",
+      "required": ["updated", "not_modified_endpoints", "watermarks"],
+      "properties": {
+        "updated": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "not_modified_endpoints": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "watermarks": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "null"]
+          }
         }
       },
       "additionalProperties": false

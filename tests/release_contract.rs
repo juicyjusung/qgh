@@ -360,6 +360,33 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         assert_eq!(sync_comments["properties"][field]["minimum"], 0);
     }
     assert_eq!(
+        sync_schema["properties"]["cursors"]["$ref"],
+        "#/$defs/cursors"
+    );
+    let sync_cursors = &sync_schema["$defs"]["cursors"];
+    assert_eq!(
+        sync_cursors["required"],
+        json!(["updated", "not_modified_endpoints", "watermarks"])
+    );
+    assert_eq!(sync_cursors["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(sync_cursors),
+        BTreeSet::from([
+            "not_modified_endpoints".to_string(),
+            "updated".to_string(),
+            "watermarks".to_string(),
+        ])
+    );
+    assert_eq!(sync_cursors["properties"]["updated"]["minimum"], 0);
+    assert_eq!(
+        sync_cursors["properties"]["not_modified_endpoints"]["minimum"],
+        0
+    );
+    assert_eq!(
+        sync_cursors["properties"]["watermarks"]["additionalProperties"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
         sync_schema["properties"]["sources"]["$ref"],
         "#/$defs/sources"
     );
