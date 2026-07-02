@@ -43,7 +43,7 @@
       "type": "object"
     },
     "sources": {
-      "type": "object"
+      "$ref": "#/$defs/sources"
     },
     "scheduler": {
       "type": "object"
@@ -66,6 +66,25 @@
           "minimum": 0
         },
         "dirty_task_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "sources": {
+      "type": "object",
+      "required": ["issue_count", "comment_count", "tombstone_count"],
+      "properties": {
+        "issue_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "comment_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tombstone_count": {
           "type": "integer",
           "minimum": 0
         }

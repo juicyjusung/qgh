@@ -310,6 +310,27 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert_eq!(sync_index["properties"]["active_generation"]["minimum"], 0);
     assert_eq!(sync_index["properties"]["dirty_task_count"]["minimum"], 0);
     assert_eq!(
+        sync_schema["properties"]["sources"]["$ref"],
+        "#/$defs/sources"
+    );
+    let sync_sources = &sync_schema["$defs"]["sources"];
+    assert_eq!(
+        sync_sources["required"],
+        json!(["issue_count", "comment_count", "tombstone_count"])
+    );
+    assert_eq!(sync_sources["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(sync_sources),
+        BTreeSet::from([
+            "comment_count".to_string(),
+            "issue_count".to_string(),
+            "tombstone_count".to_string(),
+        ])
+    );
+    assert_eq!(sync_sources["properties"]["issue_count"]["minimum"], 0);
+    assert_eq!(sync_sources["properties"]["comment_count"]["minimum"], 0);
+    assert_eq!(sync_sources["properties"]["tombstone_count"]["minimum"], 0);
+    assert_eq!(
         status_schema["properties"]["privacy"]["$ref"],
         "#/$defs/privacy"
     );
