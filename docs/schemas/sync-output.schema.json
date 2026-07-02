@@ -46,7 +46,7 @@
       "$ref": "#/$defs/sources"
     },
     "scheduler": {
-      "type": "object"
+      "$ref": "#/$defs/scheduler"
     },
     "target": {
       "type": "object"
@@ -87,6 +87,21 @@
         "tombstone_count": {
           "type": "integer",
           "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "scheduler": {
+      "type": "object",
+      "required": ["max_in_flight_requests", "hard_cap"],
+      "properties": {
+        "max_in_flight_requests": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "hard_cap": {
+          "const": 16
         }
       },
       "additionalProperties": false

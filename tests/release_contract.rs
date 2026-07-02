@@ -331,6 +331,25 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert_eq!(sync_sources["properties"]["comment_count"]["minimum"], 0);
     assert_eq!(sync_sources["properties"]["tombstone_count"]["minimum"], 0);
     assert_eq!(
+        sync_schema["properties"]["scheduler"]["$ref"],
+        "#/$defs/scheduler"
+    );
+    let sync_scheduler = &sync_schema["$defs"]["scheduler"];
+    assert_eq!(
+        sync_scheduler["required"],
+        json!(["max_in_flight_requests", "hard_cap"])
+    );
+    assert_eq!(sync_scheduler["additionalProperties"], false);
+    assert_eq!(
+        sync_scheduler["properties"]["max_in_flight_requests"]["minimum"],
+        1
+    );
+    assert_eq!(
+        sync_scheduler["properties"]["max_in_flight_requests"]["maximum"],
+        16
+    );
+    assert_eq!(sync_scheduler["properties"]["hard_cap"]["const"], 16);
+    assert_eq!(
         status_schema["properties"]["privacy"]["$ref"],
         "#/$defs/privacy"
     );
