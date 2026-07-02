@@ -182,7 +182,30 @@
           "$ref": "#/$defs/lifecycle_check"
         },
         "parent_issue": {
-          "type": "object"
+          "$ref": "#/$defs/parent_issue"
+        }
+      },
+      "additionalProperties": false
+    },
+    "parent_issue": {
+      "type": "object",
+      "required": ["source_id", "repo", "number", "title", "canonical_url"],
+      "properties": {
+        "source_id": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "number": {
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        },
+        "canonical_url": {
+          "type": "string",
+          "format": "uri"
         }
       },
       "additionalProperties": false

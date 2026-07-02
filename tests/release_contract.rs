@@ -350,6 +350,26 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         get_source["properties"]["lifecycle_check"]["$ref"],
         "#/$defs/lifecycle_check"
     );
+    assert_eq!(
+        get_source["properties"]["parent_issue"]["$ref"],
+        "#/$defs/parent_issue"
+    );
+    let get_parent_issue = &get_schema["$defs"]["parent_issue"];
+    assert_eq!(
+        get_parent_issue["required"],
+        json!(["source_id", "repo", "number", "title", "canonical_url"])
+    );
+    assert_eq!(get_parent_issue["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(get_parent_issue),
+        BTreeSet::from([
+            "canonical_url".to_string(),
+            "number".to_string(),
+            "repo".to_string(),
+            "source_id".to_string(),
+            "title".to_string(),
+        ])
+    );
     let get_lifecycle_check = &get_schema["$defs"]["lifecycle_check"];
     assert_eq!(
         get_lifecycle_check["required"],
