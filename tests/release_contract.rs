@@ -267,6 +267,28 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         sync_schema["properties"]["sync_state"]["enum"],
         json!(["ok", "backoff", "skipped_fresh"])
     );
+    assert_eq!(sync_schema["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(&sync_schema),
+        BTreeSet::from([
+            "backfill".to_string(),
+            "backoff".to_string(),
+            "comment_listing".to_string(),
+            "comments".to_string(),
+            "cursors".to_string(),
+            "index".to_string(),
+            "issues".to_string(),
+            "lifecycle".to_string(),
+            "profile_id".to_string(),
+            "reconciliation".to_string(),
+            "scheduler".to_string(),
+            "sources".to_string(),
+            "sync".to_string(),
+            "sync_run_id".to_string(),
+            "sync_state".to_string(),
+            "target".to_string(),
+        ])
+    );
     assert_eq!(
         get_schema["oneOf"][0]["required"],
         json!(["profile_id", "source"])

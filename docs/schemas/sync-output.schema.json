@@ -15,10 +15,16 @@
     "sync_run_id": {
       "type": "string"
     },
+    "sync": {
+      "type": "object"
+    },
     "issues": {
       "type": "object"
     },
     "comments": {
+      "type": "object"
+    },
+    "comment_listing": {
       "type": "object"
     },
     "cursors": {
@@ -33,9 +39,21 @@
     "backoff": {
       "type": "object"
     },
+    "backfill": {
+      "type": "object"
+    },
+    "sources": {
+      "type": "object"
+    },
     "scheduler": {
+      "type": "object"
+    },
+    "target": {
+      "type": "object"
+    },
+    "lifecycle": {
       "type": "object"
     }
   },
-  "additionalProperties": true
+  "additionalProperties": false
 }
