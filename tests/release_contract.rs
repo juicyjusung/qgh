@@ -669,6 +669,54 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         status_schema["properties"]["reconciliation"]["$ref"],
         "#/$defs/reconciliation"
     );
+    assert_eq!(
+        status_schema["properties"]["freshness"]["$ref"],
+        "#/$defs/freshness"
+    );
+    let status_freshness = &status_schema["$defs"]["freshness"];
+    assert_eq!(
+        status_freshness["required"],
+        json!([
+            "decision",
+            "remote_checked",
+            "snapshot_age_seconds",
+            "max_age_seconds"
+        ])
+    );
+    assert_eq!(status_freshness["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(status_freshness),
+        BTreeSet::from([
+            "decision".to_string(),
+            "max_age_seconds".to_string(),
+            "remote_checked".to_string(),
+            "snapshot_age_seconds".to_string(),
+        ])
+    );
+    assert_eq!(
+        status_freshness["properties"]["decision"]["enum"],
+        json!(["fresh", "stale_warn", "stale_fail", "never_synced"])
+    );
+    assert_eq!(
+        status_freshness["properties"]["remote_checked"]["const"],
+        false
+    );
+    assert_eq!(
+        status_freshness["properties"]["snapshot_age_seconds"]["type"],
+        json!(["integer", "null"])
+    );
+    assert_eq!(
+        status_freshness["properties"]["snapshot_age_seconds"]["minimum"],
+        0
+    );
+    assert_eq!(
+        status_freshness["properties"]["max_age_seconds"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        status_freshness["properties"]["max_age_seconds"]["minimum"],
+        1
+    );
     let status_github = &status_schema["$defs"]["github"];
     assert_eq!(
         status_github["required"],
