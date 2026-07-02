@@ -31,7 +31,7 @@
       "$ref": "#/$defs/github"
     },
     "paths": {
-      "type": "object"
+      "$ref": "#/$defs/paths"
     },
     "sources": {
       "$ref": "#/$defs/sources"
@@ -68,6 +68,38 @@
           "type": "string"
         },
         "web_base_url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "paths": {
+      "type": "object",
+      "required": [
+        "config",
+        "profile_data",
+        "database",
+        "tantivy_index",
+        "cache",
+        "logs"
+      ],
+      "properties": {
+        "config": {
+          "type": "string"
+        },
+        "profile_data": {
+          "type": "string"
+        },
+        "database": {
+          "type": "string"
+        },
+        "tantivy_index": {
+          "type": "string"
+        },
+        "cache": {
+          "type": "string"
+        },
+        "logs": {
           "type": "string"
         }
       },

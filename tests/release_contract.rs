@@ -302,6 +302,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "#/$defs/github"
     );
     assert_eq!(
+        status_schema["properties"]["paths"]["$ref"],
+        "#/$defs/paths"
+    );
+    assert_eq!(
         status_schema["properties"]["sources"]["$ref"],
         "#/$defs/sources"
     );
@@ -327,6 +331,40 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "web_base_url".to_string(),
         ])
     );
+    let status_paths = &status_schema["$defs"]["paths"];
+    assert_eq!(
+        status_paths["required"],
+        json!([
+            "config",
+            "profile_data",
+            "database",
+            "tantivy_index",
+            "cache",
+            "logs"
+        ])
+    );
+    assert_eq!(status_paths["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(status_paths),
+        BTreeSet::from([
+            "cache".to_string(),
+            "config".to_string(),
+            "database".to_string(),
+            "logs".to_string(),
+            "profile_data".to_string(),
+            "tantivy_index".to_string(),
+        ])
+    );
+    for field in [
+        "cache",
+        "config",
+        "database",
+        "logs",
+        "profile_data",
+        "tantivy_index",
+    ] {
+        assert_eq!(status_paths["properties"][field]["type"], "string");
+    }
     let status_sources = &status_schema["$defs"]["sources"];
     assert_eq!(
         status_sources["required"],
