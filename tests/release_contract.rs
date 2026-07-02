@@ -1304,9 +1304,114 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         get_schema["oneOf"][1]["properties"]["summary"]["properties"]["batch_size_cap"]["const"],
         20
     );
+    let get_batch = &get_schema["oneOf"][1];
+    assert_eq!(
+        get_batch["required"],
+        json!(["profile_id", "summary", "lifecycle_check_policy", "items"])
+    );
+    assert_eq!(get_batch["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(get_batch),
+        BTreeSet::from([
+            "items".to_string(),
+            "lifecycle_check_policy".to_string(),
+            "profile_id".to_string(),
+            "summary".to_string(),
+        ])
+    );
+    let get_batch_summary = &get_batch["properties"]["summary"];
+    assert_eq!(
+        get_batch_summary["required"],
+        json!(["requested", "returned", "failed", "batch_size_cap"])
+    );
+    assert_eq!(get_batch_summary["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(get_batch_summary),
+        BTreeSet::from([
+            "batch_size_cap".to_string(),
+            "failed".to_string(),
+            "requested".to_string(),
+            "returned".to_string(),
+        ])
+    );
+    assert_eq!(get_batch_summary["properties"]["requested"]["minimum"], 2);
+    assert_eq!(get_batch_summary["properties"]["returned"]["minimum"], 0);
+    assert_eq!(get_batch_summary["properties"]["failed"]["minimum"], 0);
+    assert_eq!(
+        get_batch_summary["properties"]["batch_size_cap"]["const"],
+        20
+    );
+    let get_lifecycle_policy = &get_batch["properties"]["lifecycle_check_policy"];
+    assert_eq!(
+        get_lifecycle_policy["required"],
+        json!([
+            "verify_lifecycle",
+            "mode",
+            "max_in_flight_requests",
+            "profile_max_in_flight_requests",
+            "hard_cap"
+        ])
+    );
+    assert_eq!(get_lifecycle_policy["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(get_lifecycle_policy),
+        BTreeSet::from([
+            "hard_cap".to_string(),
+            "max_in_flight_requests".to_string(),
+            "mode".to_string(),
+            "profile_max_in_flight_requests".to_string(),
+            "verify_lifecycle".to_string(),
+        ])
+    );
+    assert_eq!(
+        get_lifecycle_policy["properties"]["max_in_flight_requests"]["minimum"],
+        0
+    );
+    assert_eq!(
+        get_lifecycle_policy["properties"]["max_in_flight_requests"]["maximum"],
+        1
+    );
+    assert_eq!(
+        get_lifecycle_policy["properties"]["profile_max_in_flight_requests"]["minimum"],
+        1
+    );
+    assert_eq!(get_lifecycle_policy["properties"]["hard_cap"]["const"], 16);
     assert_eq!(
         get_schema["oneOf"][1]["properties"]["items"]["maxItems"],
         20
+    );
+    let get_batch_items = &get_batch["properties"]["items"];
+    assert_eq!(get_batch_items["minItems"], 2);
+    assert_eq!(get_batch_items["maxItems"], 20);
+    let get_batch_success_item = &get_batch_items["items"]["oneOf"][0];
+    assert_eq!(
+        get_batch_success_item["required"],
+        json!(["input_index", "source_id", "ok", "source"])
+    );
+    assert_eq!(get_batch_success_item["additionalProperties"], false);
+    assert_eq!(
+        get_batch_success_item["properties"]["input_index"]["minimum"],
+        0
+    );
+    assert_eq!(get_batch_success_item["properties"]["ok"]["const"], true);
+    assert_eq!(
+        get_batch_success_item["properties"]["source"]["$ref"],
+        "#/$defs/source"
+    );
+    let get_batch_error_item = &get_batch_items["items"]["oneOf"][1];
+    assert_eq!(
+        get_batch_error_item["required"],
+        json!(["input_index", "source_id", "ok", "error"])
+    );
+    assert_eq!(get_batch_error_item["additionalProperties"], false);
+    assert_eq!(
+        get_batch_error_item["properties"]["input_index"]["minimum"],
+        0
+    );
+    assert_eq!(get_batch_error_item["properties"]["ok"]["const"], false);
+    assert_eq!(
+        get_batch_error_item["properties"]["error"]["$ref"],
+        "error.schema.json"
     );
     assert_eq!(
         get_schema["oneOf"][1]["properties"]["lifecycle_check_policy"]["properties"]
