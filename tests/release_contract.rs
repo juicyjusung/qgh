@@ -318,6 +318,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "#/$defs/index"
     );
     assert_eq!(status_schema["properties"]["sync"]["$ref"], "#/$defs/sync");
+    assert_eq!(
+        status_schema["properties"]["reconciliation"]["$ref"],
+        "#/$defs/reconciliation"
+    );
     let status_github = &status_schema["$defs"]["github"];
     assert_eq!(
         status_github["required"],
@@ -492,6 +496,86 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         16
     );
     assert_eq!(sync_scheduler["properties"]["hard_cap"]["const"], 16);
+    let status_reconciliation = &status_schema["$defs"]["reconciliation"];
+    assert_eq!(
+        status_reconciliation["required"],
+        json!([
+            "last_full_at",
+            "age_days",
+            "stale",
+            "stale_warning",
+            "estimated_api_cost_class",
+            "last_checked_source_count",
+            "last_tombstoned_count",
+            "last_estimated_api_cost_class"
+        ])
+    );
+    assert_eq!(status_reconciliation["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(status_reconciliation),
+        BTreeSet::from([
+            "age_days".to_string(),
+            "estimated_api_cost_class".to_string(),
+            "last_checked_source_count".to_string(),
+            "last_estimated_api_cost_class".to_string(),
+            "last_full_at".to_string(),
+            "last_tombstoned_count".to_string(),
+            "stale".to_string(),
+            "stale_warning".to_string(),
+        ])
+    );
+    assert_eq!(
+        status_reconciliation["properties"]["last_full_at"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        status_reconciliation["properties"]["age_days"]["type"],
+        json!(["integer", "null"])
+    );
+    assert_eq!(
+        status_reconciliation["properties"]["age_days"]["minimum"],
+        0
+    );
+    assert_eq!(
+        status_reconciliation["properties"]["stale"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        status_reconciliation["properties"]["stale_warning"]["enum"],
+        json!(["reconciliation.stale", null])
+    );
+    assert_eq!(
+        status_reconciliation["properties"]["estimated_api_cost_class"]["$ref"],
+        "#/$defs/api_cost_class"
+    );
+    assert_eq!(
+        status_reconciliation["properties"]["last_checked_source_count"]["type"],
+        json!(["integer", "null"])
+    );
+    assert_eq!(
+        status_reconciliation["properties"]["last_checked_source_count"]["minimum"],
+        0
+    );
+    assert_eq!(
+        status_reconciliation["properties"]["last_tombstoned_count"]["type"],
+        json!(["integer", "null"])
+    );
+    assert_eq!(
+        status_reconciliation["properties"]["last_tombstoned_count"]["minimum"],
+        0
+    );
+    assert_eq!(
+        status_reconciliation["properties"]["last_estimated_api_cost_class"]["anyOf"][0]["$ref"],
+        "#/$defs/api_cost_class"
+    );
+    assert_eq!(
+        status_reconciliation["properties"]["last_estimated_api_cost_class"]["anyOf"][1]["type"],
+        "null"
+    );
+    assert_eq!(
+        status_schema["$defs"]["api_cost_class"]["enum"],
+        json!(["none", "low", "medium", "high"])
+    );
     let status_privacy = &status_schema["$defs"]["privacy"];
     assert_eq!(
         status_privacy["required"],

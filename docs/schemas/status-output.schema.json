@@ -46,7 +46,7 @@
       "$ref": "#/$defs/sync"
     },
     "reconciliation": {
-      "type": "object"
+      "$ref": "#/$defs/reconciliation"
     },
     "resolution": {
       "$ref": "#/$defs/resolution"
@@ -238,6 +238,60 @@
         }
       },
       "additionalProperties": false
+    },
+    "reconciliation": {
+      "type": "object",
+      "required": [
+        "last_full_at",
+        "age_days",
+        "stale",
+        "stale_warning",
+        "estimated_api_cost_class",
+        "last_checked_source_count",
+        "last_tombstoned_count",
+        "last_estimated_api_cost_class"
+      ],
+      "properties": {
+        "last_full_at": {
+          "type": ["string", "null"]
+        },
+        "age_days": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "stale": {
+          "type": "boolean"
+        },
+        "stale_warning": {
+          "enum": ["reconciliation.stale", null]
+        },
+        "estimated_api_cost_class": {
+          "$ref": "#/$defs/api_cost_class"
+        },
+        "last_checked_source_count": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "last_tombstoned_count": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "last_estimated_api_cost_class": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/api_cost_class"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "api_cost_class": {
+      "type": "string",
+      "enum": ["none", "low", "medium", "high"]
     },
     "privacy": {
       "type": "object",
