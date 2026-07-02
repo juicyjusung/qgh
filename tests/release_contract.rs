@@ -105,6 +105,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
                 );
                 assert_eq!(tool["inputSchema"]["properties"]["limit"]["minimum"], 1);
                 assert_eq!(tool["inputSchema"]["properties"]["issue"]["minimum"], 1);
+                assert_eq!(
+                    tool["inputSchema"]["properties"]["repo"]["pattern"],
+                    "^[^/]+/[^/]+$"
+                );
             }
             "get" => {
                 assert_eq!(

@@ -241,7 +241,7 @@ fn parse_query_args(arguments: &Value) -> Result<QueryArgs, QghError> {
     Ok(QueryArgs {
         query: required_string(object, "query")?,
         limit: optional_positive_usize(object, "limit")?,
-        repo: optional_string(object, "repo")?,
+        repo: optional_repo(object)?,
         label: optional_string_array(object, "label")?,
         state: optional_query_state(object)?,
         author: optional_string(object, "author")?,
@@ -320,6 +320,24 @@ fn optional_query_state(object: &Map<String, Value>) -> Result<Option<String>, Q
         ));
     }
     Ok(state)
+}
+
+fn optional_repo(object: &Map<String, Value>) -> Result<Option<String>, QghError> {
+    let repo = optional_string(object, "repo")?;
+    if repo.as_deref().is_some_and(|repo| !is_owner_repo(repo)) {
+        return Err(validation_error(
+            "MCP parameter `repo` must use owner/repo format.",
+        ));
+    }
+    Ok(repo)
+}
+
+fn is_owner_repo(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty()
+    )
 }
 
 fn optional_duration_string(
