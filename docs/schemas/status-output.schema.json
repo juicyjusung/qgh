@@ -43,7 +43,7 @@
       "$ref": "#/$defs/index"
     },
     "sync": {
-      "type": "object"
+      "$ref": "#/$defs/sync"
     },
     "reconciliation": {
       "type": "object"
@@ -145,6 +145,96 @@
         "dirty_task_count": {
           "type": "integer",
           "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "sync": {
+      "type": "object",
+      "required": ["last_sync_at", "cursors", "backoff", "scheduler"],
+      "properties": {
+        "last_sync_at": {
+          "type": ["string", "null"]
+        },
+        "cursors": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/sync_cursor"
+          }
+        },
+        "backoff": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sync_backoff"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scheduler": {
+          "$ref": "#/$defs/sync_scheduler"
+        }
+      },
+      "additionalProperties": false
+    },
+    "sync_cursor": {
+      "type": "object",
+      "required": ["watermark", "has_etag"],
+      "properties": {
+        "watermark": {
+          "type": ["string", "null"]
+        },
+        "has_etag": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "sync_backoff": {
+      "type": "object",
+      "required": [
+        "reason",
+        "scope",
+        "retry_after_seconds",
+        "reset_at",
+        "observed_at",
+        "last_successful_sync"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "retry_after_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reset_at": {
+          "type": ["string", "null"]
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "last_successful_sync": {
+          "type": ["string", "null"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "sync_scheduler": {
+      "type": "object",
+      "required": ["max_in_flight_requests", "hard_cap"],
+      "properties": {
+        "max_in_flight_requests": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "hard_cap": {
+          "const": 16
         }
       },
       "additionalProperties": false

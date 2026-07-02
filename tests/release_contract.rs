@@ -317,6 +317,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         status_schema["properties"]["index"]["$ref"],
         "#/$defs/index"
     );
+    assert_eq!(status_schema["properties"]["sync"]["$ref"], "#/$defs/sync");
     let status_github = &status_schema["$defs"]["github"];
     assert_eq!(
         status_github["required"],
@@ -408,6 +409,89 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         0
     );
     assert_eq!(status_index["properties"]["dirty_task_count"]["minimum"], 0);
+    let status_sync = &status_schema["$defs"]["sync"];
+    assert_eq!(
+        status_sync["required"],
+        json!(["last_sync_at", "cursors", "backoff", "scheduler"])
+    );
+    assert_eq!(status_sync["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(status_sync),
+        BTreeSet::from([
+            "backoff".to_string(),
+            "cursors".to_string(),
+            "last_sync_at".to_string(),
+            "scheduler".to_string(),
+        ])
+    );
+    assert_eq!(
+        status_sync["properties"]["last_sync_at"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        status_sync["properties"]["cursors"]["additionalProperties"]["$ref"],
+        "#/$defs/sync_cursor"
+    );
+    assert_eq!(
+        status_sync["properties"]["scheduler"]["$ref"],
+        "#/$defs/sync_scheduler"
+    );
+    let sync_cursor = &status_schema["$defs"]["sync_cursor"];
+    assert_eq!(sync_cursor["required"], json!(["watermark", "has_etag"]));
+    assert_eq!(sync_cursor["additionalProperties"], false);
+    assert_eq!(
+        sync_cursor["properties"]["watermark"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(sync_cursor["properties"]["has_etag"]["type"], "boolean");
+    let sync_backoff = &status_schema["$defs"]["sync_backoff"];
+    assert_eq!(
+        status_sync["properties"]["backoff"]["anyOf"][0]["$ref"],
+        "#/$defs/sync_backoff"
+    );
+    assert_eq!(
+        status_sync["properties"]["backoff"]["anyOf"][1]["type"],
+        "null"
+    );
+    assert_eq!(
+        sync_backoff["required"],
+        json!([
+            "reason",
+            "scope",
+            "retry_after_seconds",
+            "reset_at",
+            "observed_at",
+            "last_successful_sync"
+        ])
+    );
+    assert_eq!(sync_backoff["additionalProperties"], false);
+    assert_eq!(
+        sync_backoff["properties"]["retry_after_seconds"]["minimum"],
+        0
+    );
+    assert_eq!(
+        sync_backoff["properties"]["reset_at"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        sync_backoff["properties"]["last_successful_sync"]["type"],
+        json!(["string", "null"])
+    );
+    let sync_scheduler = &status_schema["$defs"]["sync_scheduler"];
+    assert_eq!(
+        sync_scheduler["required"],
+        json!(["max_in_flight_requests", "hard_cap"])
+    );
+    assert_eq!(sync_scheduler["additionalProperties"], false);
+    assert_eq!(
+        sync_scheduler["properties"]["max_in_flight_requests"]["minimum"],
+        1
+    );
+    assert_eq!(
+        sync_scheduler["properties"]["max_in_flight_requests"]["maximum"],
+        16
+    );
+    assert_eq!(sync_scheduler["properties"]["hard_cap"]["const"], 16);
     let status_privacy = &status_schema["$defs"]["privacy"];
     assert_eq!(
         status_privacy["required"],
