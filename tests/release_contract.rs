@@ -202,6 +202,9 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     for path in artifact["schema_snapshots"].as_array().unwrap() {
         let path = path.as_str().unwrap();
         assert!(root.join(path).exists(), "missing schema snapshot: {path}");
+        let schema: Value =
+            serde_json::from_str(&fs::read_to_string(root.join(path)).unwrap()).unwrap();
+        assert_released_schema_objects_are_closed_or_documented(path, &schema);
     }
     let init_schema: Value = serde_json::from_str(
         &fs::read_to_string(root.join("docs/schemas/init-output.schema.json")).unwrap(),
@@ -1190,6 +1193,75 @@ fn schema_property_names(schema: &Value) -> BTreeSet<String> {
         .keys()
         .cloned()
         .collect()
+}
+
+fn assert_released_schema_objects_are_closed_or_documented(path: &str, schema: &Value) {
+    let mut violations = Vec::new();
+    collect_schema_object_closure_violations(path, schema, &mut Vec::new(), &mut violations);
+    assert!(
+        violations.is_empty(),
+        "released schema object shapes must be closed or documented extension points:\n{}",
+        violations.join("\n")
+    );
+}
+
+fn collect_schema_object_closure_violations(
+    schema_path: &str,
+    value: &Value,
+    json_path: &mut Vec<String>,
+    violations: &mut Vec<String>,
+) {
+    match value {
+        Value::Object(object) => {
+            let schema_location = format_schema_location(schema_path, json_path);
+            if object.get("additionalProperties") == Some(&Value::Bool(true)) {
+                violations.push(format!(
+                    "{schema_location} explicitly allows additionalProperties: true"
+                ));
+            }
+            if matches!(object.get("type"), Some(Value::String(kind)) if kind == "object")
+                && !object.contains_key("additionalProperties")
+                && !is_documented_schema_extension_point(schema_path, json_path)
+            {
+                violations.push(format!(
+                    "{schema_location} is an object schema without additionalProperties"
+                ));
+            }
+            for (key, child) in object {
+                json_path.push(key.clone());
+                collect_schema_object_closure_violations(schema_path, child, json_path, violations);
+                json_path.pop();
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                json_path.push(index.to_string());
+                collect_schema_object_closure_violations(schema_path, child, json_path, violations);
+                json_path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_documented_schema_extension_point(schema_path: &str, json_path: &[String]) -> bool {
+    matches!(
+        (schema_path, json_path),
+        ("docs/schemas/envelope.schema.json", [data, field])
+            if data == "properties" && field == "data"
+    ) || matches!(
+        (schema_path, json_path),
+        ("docs/schemas/error.schema.json", [data, field])
+            if data == "properties" && field == "details"
+    )
+}
+
+fn format_schema_location(schema_path: &str, json_path: &[String]) -> String {
+    if json_path.is_empty() {
+        format!("{schema_path}:<root>")
+    } else {
+        format!("{schema_path}:{}", json_path.join("."))
+    }
 }
 
 fn binary() -> String {
