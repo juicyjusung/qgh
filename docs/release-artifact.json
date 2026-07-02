@@ -4,6 +4,7 @@
     "envelope_schema_version": "qgh.v1",
     "product_core": "CLI-first local retrieval with strict --json envelopes and SQLite/Tantivy behavior",
     "contract_source_of_truth": ["CLI args", "docs/schemas/*.schema.json", "local SQLite/Tantivy retrieval behavior"],
+    "schema_object_closure": "released schema object shapes are closed by default; only envelope.data and error.details are documented extension points",
     "cli_commands": ["init", "sync", "query", "search", "get", "status", "doctor", "mcp"],
     "canonical_cli_commands": ["init", "sync", "query", "get", "status", "doctor"],
     "cli_aliases": {

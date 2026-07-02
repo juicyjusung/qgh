@@ -56,6 +56,12 @@ Released schema snapshots:
 - `docs/schemas/status-output.schema.json`: `status` data payload.
 - `docs/schemas/doctor-output.schema.json`: CLI-only `doctor` data payload.
 
+Released command payload schemas are closed by default: object schemas either
+set `additionalProperties: false` or use a bounded map value schema. The
+reusable envelope keeps `data` as the command-specific payload slot, and
+structured errors keep `details` as the error-code-specific diagnostic
+extension point.
+
 MCP uses the same envelope in structured tool content to mirror CLI behavior.
 Tool-level validation failures set `isError: true`; JSON-RPC protocol errors
 are reserved for malformed protocol messages or server faults.

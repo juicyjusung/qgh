@@ -46,7 +46,7 @@ Excluded or post-MVP gates:
 | Area | Release check |
 | --- | --- |
 | Tantivy BM25-only path | `sync`, `query`, `get`, and `status` pass without vector, model, GPU, or hosted provider dependencies. |
-| strict schema/envelope | CLI JSON and MCP structured content use `qgh.v1`; unknown CLI/MCP adapter/config parameters fail with structured errors. |
+| strict schema/envelope | CLI JSON and MCP structured content use `qgh.v1`; released schema object shapes are closed except documented envelope `data` and error `details` extension points; unknown CLI/MCP adapter/config parameters fail with structured errors. |
 | human CLI summaries | Non-json `init`, `sync`, `query`/`search`, `get`, `status`, and `doctor` output explains profile/repo/path/source/next-step state for people, while `--json` keeps the schema-compatible envelope. |
 | init output | top-level `init` is CLI-only first-run profile/repo bootstrap with preset preview/custom fallback, `--yes`/`-y` bypass prompts, `init repo` is repo-policy-only, both emit `docs/schemas/init-output.schema.json`, and neither appears in MCP `tools/list`. |
 | get batch output | `get` preserves single-source JSON shape, accepts 2-20 `source_id` values for CLI batch retrieval, preserves input order, records item-level source errors, and documents opt-in lifecycle checks. |

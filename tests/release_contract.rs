@@ -162,6 +162,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         ])
     );
     assert_eq!(
+        artifact["contract"]["schema_object_closure"],
+        "released schema object shapes are closed by default; only envelope.data and error.details are documented extension points"
+    );
+    assert_eq!(
         artifact["contract"]["supported_token_sources"],
         json!(["github_cli", "env"])
     );
@@ -1131,6 +1135,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     for required in [
         "Tantivy BM25-only path",
         "strict schema/envelope",
+        "released schema object shapes are closed",
+        "documented envelope `data` and error `details` extension points",
         "human CLI summaries",
         "get batch output",
         "init output",
@@ -1163,6 +1169,19 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     }
     assert!(checklist.contains("credential_store"));
     assert!(checklist.contains("validation.invalid_token_source"));
+
+    let cli_json_contract = fs::read_to_string(root.join("docs/cli-json-contract.md")).unwrap();
+    for required in [
+        "Released command payload schemas are closed by default",
+        "additionalProperties: false",
+        "bounded map value schema",
+        "error-code-specific diagnostic",
+    ] {
+        assert!(
+            cli_json_contract.contains(required),
+            "missing CLI JSON contract phrase: {required}"
+        );
+    }
 }
 
 fn qgh(args: &[&str]) -> Output {
