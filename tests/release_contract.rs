@@ -778,6 +778,62 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             .unwrap()
             .contains("Recent lookback is acceleration")
     );
+    assert_eq!(
+        status_schema["properties"]["resolution"]["$ref"],
+        "#/$defs/resolution"
+    );
+    let status_resolution = &status_schema["$defs"]["resolution"];
+    assert_eq!(
+        status_resolution["required"],
+        json!([
+            "profile_id",
+            "profile_source",
+            "effective_repo_scope",
+            "repo_source",
+            "repo_policy_path",
+            "allowlist_match_count"
+        ])
+    );
+    assert_eq!(status_resolution["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(status_resolution),
+        BTreeSet::from([
+            "allowlist_match_count".to_string(),
+            "effective_repo_scope".to_string(),
+            "profile_id".to_string(),
+            "profile_source".to_string(),
+            "repo_policy_path".to_string(),
+            "repo_source".to_string(),
+        ])
+    );
+    assert_eq!(
+        status_resolution["properties"]["profile_source"]["enum"],
+        json!(["cli", "env", "single_match"])
+    );
+    assert_eq!(
+        status_resolution["properties"]["effective_repo_scope"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        status_resolution["properties"]["effective_repo_scope"]["pattern"],
+        "^[^/]+/[^/]+$"
+    );
+    assert_eq!(
+        status_resolution["properties"]["repo_source"]["enum"],
+        json!(["cli", "repo_policy", "git_remote", "command", null])
+    );
+    assert_eq!(
+        status_resolution["properties"]["repo_policy_path"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        status_resolution["properties"]["allowlist_match_count"]["type"],
+        json!(["integer", "null"])
+    );
+    assert_eq!(
+        status_resolution["properties"]["allowlist_match_count"]["minimum"],
+        0
+    );
     let status_github = &status_schema["$defs"]["github"];
     assert_eq!(
         status_github["required"],
