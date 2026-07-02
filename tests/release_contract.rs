@@ -406,6 +406,38 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         json!(["none", "low", "medium", "high"])
     );
     assert_eq!(
+        sync_schema["properties"]["backfill"]["$ref"],
+        "#/$defs/backfill"
+    );
+    let sync_backfill = &sync_schema["$defs"]["backfill"];
+    assert_eq!(
+        sync_backfill["required"],
+        json!([
+            "issues",
+            "comments",
+            "skipped_pull_requests",
+            "reached_end",
+            "history_cursor",
+            "historical_backfill_complete"
+        ])
+    );
+    assert_eq!(sync_backfill["additionalProperties"], false);
+    for field in ["issues", "comments", "skipped_pull_requests"] {
+        assert_eq!(sync_backfill["properties"][field]["minimum"], 0);
+    }
+    assert_eq!(
+        sync_backfill["properties"]["reached_end"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        sync_backfill["properties"]["history_cursor"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        sync_backfill["properties"]["historical_backfill_complete"]["type"],
+        "boolean"
+    );
+    assert_eq!(
         sync_schema["properties"]["cursors"]["$ref"],
         "#/$defs/cursors"
     );

@@ -40,7 +40,7 @@
       "type": "object"
     },
     "backfill": {
-      "type": "object"
+      "$ref": "#/$defs/backfill"
     },
     "sources": {
       "$ref": "#/$defs/sources"
@@ -163,6 +163,41 @@
         },
         "estimated_api_cost_class": {
           "$ref": "#/$defs/api_cost_class"
+        }
+      },
+      "additionalProperties": false
+    },
+    "backfill": {
+      "type": "object",
+      "required": [
+        "issues",
+        "comments",
+        "skipped_pull_requests",
+        "reached_end",
+        "history_cursor",
+        "historical_backfill_complete"
+      ],
+      "properties": {
+        "issues": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "comments": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped_pull_requests": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reached_end": {
+          "type": "boolean"
+        },
+        "history_cursor": {
+          "type": ["string", "null"]
+        },
+        "historical_backfill_complete": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false
