@@ -215,6 +215,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         &fs::read_to_string(root.join("docs/schemas/sync-output.schema.json")).unwrap(),
     )
     .unwrap();
+    let status_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/status-output.schema.json")).unwrap(),
+    )
+    .unwrap();
     let get_schema: Value = serde_json::from_str(
         &fs::read_to_string(root.join("docs/schemas/get-output.schema.json")).unwrap(),
     )
@@ -288,6 +292,38 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "sync_state".to_string(),
             "target".to_string(),
         ])
+    );
+    assert_eq!(
+        status_schema["properties"]["privacy"]["$ref"],
+        "#/$defs/privacy"
+    );
+    let status_privacy = &status_schema["$defs"]["privacy"];
+    assert_eq!(
+        status_privacy["required"],
+        json!([
+            "classification",
+            "default_network_egress",
+            "hosted_provider_egress",
+            "local_paths_may_contain_private_content",
+            "single_user_permissions"
+        ])
+    );
+    assert_eq!(status_privacy["additionalProperties"], false);
+    assert_eq!(
+        status_privacy["properties"]["classification"]["const"],
+        "sensitive_derivative_data"
+    );
+    assert_eq!(
+        status_privacy["properties"]["default_network_egress"]["const"],
+        "configured_github_host_only"
+    );
+    assert_eq!(
+        status_privacy["properties"]["hosted_provider_egress"]["const"],
+        "disabled"
+    );
+    assert_eq!(
+        status_privacy["properties"]["local_paths_may_contain_private_content"]["const"],
+        true
     );
     assert_eq!(
         get_schema["oneOf"][0]["required"],

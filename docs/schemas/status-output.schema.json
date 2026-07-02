@@ -52,11 +52,39 @@
       "$ref": "#/$defs/resolution"
     },
     "privacy": {
-      "type": "object"
+      "$ref": "#/$defs/privacy"
     }
   },
   "additionalProperties": false,
   "$defs": {
+    "privacy": {
+      "type": "object",
+      "required": [
+        "classification",
+        "default_network_egress",
+        "hosted_provider_egress",
+        "local_paths_may_contain_private_content",
+        "single_user_permissions"
+      ],
+      "properties": {
+        "classification": {
+          "const": "sensitive_derivative_data"
+        },
+        "default_network_egress": {
+          "const": "configured_github_host_only"
+        },
+        "hosted_provider_egress": {
+          "const": "disabled"
+        },
+        "local_paths_may_contain_private_content": {
+          "const": true
+        },
+        "single_user_permissions": {
+          "const": "0600_files_0700_dirs_where_supported"
+        }
+      },
+      "additionalProperties": false
+    },
     "freshness": {
       "type": "object",
       "required": [
