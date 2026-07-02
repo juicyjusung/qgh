@@ -906,6 +906,49 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         query_result["properties"]["ranking"]["$ref"],
         "#/$defs/ranking"
     );
+    let query_parent_issue = &query_schema["$defs"]["parent_issue"];
+    assert_eq!(
+        query_parent_issue["required"],
+        json!(["source_id", "repo", "number", "title", "canonical_url"])
+    );
+    assert_eq!(query_parent_issue["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(query_parent_issue),
+        BTreeSet::from([
+            "canonical_url".to_string(),
+            "number".to_string(),
+            "repo".to_string(),
+            "source_id".to_string(),
+            "title".to_string(),
+        ])
+    );
+    assert_eq!(
+        query_parent_issue["properties"]["canonical_url"]["format"],
+        "uri"
+    );
+    assert_eq!(
+        query_schema["$defs"]["source_version"],
+        get_schema["$defs"]["source_version"]
+    );
+    let query_ranking = &query_schema["$defs"]["ranking"];
+    assert_eq!(query_ranking["required"], json!(["kind", "lexical_score"]));
+    assert_eq!(query_ranking["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(query_ranking),
+        BTreeSet::from(["kind".to_string(), "lexical_score".to_string()])
+    );
+    assert_eq!(
+        query_ranking["properties"]["kind"]["enum"],
+        json!(["bm25", "exact"])
+    );
+    assert_eq!(
+        query_ranking["properties"]["lexical_score"]["type"],
+        json!(["number", "null"])
+    );
+    assert!(query_ranking["properties"]["lexical_score"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("not confidence or probability"));
     assert_eq!(
         status_schema["properties"]["resolution"]["$ref"],
         "#/$defs/resolution"
