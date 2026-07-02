@@ -297,6 +297,24 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         status_schema["properties"]["privacy"]["$ref"],
         "#/$defs/privacy"
     );
+    assert_eq!(
+        status_schema["properties"]["github"]["$ref"],
+        "#/$defs/github"
+    );
+    let status_github = &status_schema["$defs"]["github"];
+    assert_eq!(
+        status_github["required"],
+        json!(["host", "api_base_url", "web_base_url"])
+    );
+    assert_eq!(status_github["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(status_github),
+        BTreeSet::from([
+            "api_base_url".to_string(),
+            "host".to_string(),
+            "web_base_url".to_string(),
+        ])
+    );
     let status_privacy = &status_schema["$defs"]["privacy"];
     assert_eq!(
         status_privacy["required"],

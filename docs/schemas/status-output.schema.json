@@ -28,7 +28,7 @@
       "$ref": "#/$defs/coverage"
     },
     "github": {
-      "type": "object"
+      "$ref": "#/$defs/github"
     },
     "paths": {
       "type": "object"
@@ -57,6 +57,22 @@
   },
   "additionalProperties": false,
   "$defs": {
+    "github": {
+      "type": "object",
+      "required": ["host", "api_base_url", "web_base_url"],
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "api_base_url": {
+          "type": "string"
+        },
+        "web_base_url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
     "privacy": {
       "type": "object",
       "required": [
