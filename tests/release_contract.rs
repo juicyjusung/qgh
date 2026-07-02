@@ -309,6 +309,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         status_schema["properties"]["database"]["$ref"],
         "#/$defs/database"
     );
+    assert_eq!(
+        status_schema["properties"]["index"]["$ref"],
+        "#/$defs/index"
+    );
     let status_github = &status_schema["$defs"]["github"];
     assert_eq!(
         status_github["required"],
@@ -348,6 +352,24 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         schema_property_names(status_database),
         BTreeSet::from(["schema_version".to_string()])
     );
+    let status_index = &status_schema["$defs"]["index"];
+    assert_eq!(
+        status_index["required"],
+        json!(["active_generation", "dirty_task_count"])
+    );
+    assert_eq!(status_index["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(status_index),
+        BTreeSet::from([
+            "active_generation".to_string(),
+            "dirty_task_count".to_string()
+        ])
+    );
+    assert_eq!(
+        status_index["properties"]["active_generation"]["minimum"],
+        0
+    );
+    assert_eq!(status_index["properties"]["dirty_task_count"]["minimum"], 0);
     let status_privacy = &status_schema["$defs"]["privacy"];
     assert_eq!(
         status_privacy["required"],

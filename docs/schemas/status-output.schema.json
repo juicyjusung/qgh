@@ -40,7 +40,7 @@
       "$ref": "#/$defs/database"
     },
     "index": {
-      "type": "object"
+      "$ref": "#/$defs/index"
     },
     "sync": {
       "type": "object"
@@ -98,6 +98,21 @@
       "properties": {
         "schema_version": {
           "const": "qgh.db.v1"
+        }
+      },
+      "additionalProperties": false
+    },
+    "index": {
+      "type": "object",
+      "required": ["active_generation", "dirty_task_count"],
+      "properties": {
+        "active_generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dirty_task_count": {
+          "type": "integer",
+          "minimum": 0
         }
       },
       "additionalProperties": false
