@@ -47,4 +47,11 @@ normal profile resolution and allowlist checks.
 `source.not_found`, `source.tombstoned`, and `source.outside_effective_scope`
 failures are represented as item-level errors without failing the whole batch.
 
+`sync` may additionally return `validation.window_requires_recent` when
+`--window` is used without `--reconcile recent`, `validation.backfill_conflicts`
+when `--backfill` is combined with live-sync modifiers,
+`validation.requires_backfill` when backfill budget flags are used without
+`--backfill`, and `validation.repo_required` when `sync issue` cannot resolve a
+single target repo.
+
 Human output and JSON output share exit-code classes. Human diagnostics go to stderr; JSON envelopes go to stdout.

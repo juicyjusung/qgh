@@ -242,18 +242,23 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         init_schema["properties"]["token_source"]["properties"]["kind"]["enum"],
         json!(["github_cli", "env"])
     );
-    assert!(error_schema["$defs"]["error_code"]["enum"]
+    let error_codes = error_schema["$defs"]["error_code"]["enum"]
         .as_array()
-        .unwrap()
-        .contains(&json!("validation.init_cancelled")));
-    assert!(error_schema["$defs"]["error_code"]["enum"]
-        .as_array()
-        .unwrap()
-        .contains(&json!("validation.batch_size")));
-    assert!(error_schema["$defs"]["error_code"]["enum"]
-        .as_array()
-        .unwrap()
-        .contains(&json!("validation.invalid_issue_number")));
+        .unwrap();
+    for code in [
+        "validation.init_cancelled",
+        "validation.batch_size",
+        "validation.invalid_issue_number",
+        "validation.window_requires_recent",
+        "validation.backfill_conflicts",
+        "validation.requires_backfill",
+        "validation.repo_required",
+    ] {
+        assert!(
+            error_codes.contains(&json!(code)),
+            "released error schema must include {code}"
+        );
+    }
     assert_eq!(
         get_schema["oneOf"][0]["required"],
         json!(["profile_id", "source"])

@@ -4326,6 +4326,19 @@ fn incremental_sync_records_new_versions_and_uses_since_overlap_and_etag() {
 }
 
 #[test]
+fn sync_issue_requires_single_target_repo_scope() {
+    let fixture = TestFixture::new("targeted-refresh-repo-required");
+    fixture.write_config_with_repos("http://127.0.0.1:1", &["owner/repo", "other/repo"]);
+
+    let refresh = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_eq!(refresh.status.code(), Some(2));
+    let refresh_json = stdout_json(&refresh);
+    assert_eq!(refresh_json["error"]["code"], "validation.repo_required");
+    assert_eq!(refresh_json["error"]["details"]["profile_id"], "work");
+    assert_eq!(refresh_json["error"]["details"]["repo_count"], 2);
+}
+
+#[test]
 fn sync_issue_refreshes_target_issue_and_reconciles_comment_diff() {
     let fixture = TestFixture::new("targeted-refresh-comment-diff");
     let server = TargetedRefreshFakeGitHub::start();
