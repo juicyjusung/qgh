@@ -16,7 +16,7 @@
       "type": "string"
     },
     "sync": {
-      "type": "object"
+      "$ref": "#/$defs/sync"
     },
     "issues": {
       "$ref": "#/$defs/issues"
@@ -68,6 +68,27 @@
         "dirty_task_count": {
           "type": "integer",
           "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "sync": {
+      "type": "object",
+      "required": ["last_successful_sync"],
+      "properties": {
+        "last_successful_sync": {
+          "type": ["string", "null"]
+        },
+        "snapshot_age_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_age_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "scheduler": {
+          "$ref": "#/$defs/scheduler"
         }
       },
       "additionalProperties": false

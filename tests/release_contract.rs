@@ -309,6 +309,32 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(sync_index["properties"]["active_generation"]["minimum"], 0);
     assert_eq!(sync_index["properties"]["dirty_task_count"]["minimum"], 0);
+    assert_eq!(sync_schema["properties"]["sync"]["$ref"], "#/$defs/sync");
+    let sync_details = &sync_schema["$defs"]["sync"];
+    assert_eq!(sync_details["required"], json!(["last_successful_sync"]));
+    assert_eq!(sync_details["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(sync_details),
+        BTreeSet::from([
+            "last_successful_sync".to_string(),
+            "max_age_seconds".to_string(),
+            "scheduler".to_string(),
+            "snapshot_age_seconds".to_string(),
+        ])
+    );
+    assert_eq!(
+        sync_details["properties"]["last_successful_sync"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        sync_details["properties"]["snapshot_age_seconds"]["minimum"],
+        0
+    );
+    assert_eq!(sync_details["properties"]["max_age_seconds"]["minimum"], 1);
+    assert_eq!(
+        sync_details["properties"]["scheduler"]["$ref"],
+        "#/$defs/scheduler"
+    );
     assert_eq!(
         sync_schema["properties"]["issues"]["$ref"],
         "#/$defs/issues"
