@@ -134,6 +134,30 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         }
         assert_eq!(tool["outputSchema"]["type"], "object");
         assert_eq!(tool["outputSchema"]["additionalProperties"], false);
+        assert_eq!(
+            tool["outputSchema"]["oneOf"][0]["required"],
+            json!(["data"])
+        );
+        assert_eq!(
+            tool["outputSchema"]["oneOf"][0]["properties"]["ok"]["const"],
+            true
+        );
+        assert_eq!(
+            tool["outputSchema"]["oneOf"][0]["not"]["required"],
+            json!(["error"])
+        );
+        assert_eq!(
+            tool["outputSchema"]["oneOf"][1]["required"],
+            json!(["error"])
+        );
+        assert_eq!(
+            tool["outputSchema"]["oneOf"][1]["properties"]["ok"]["const"],
+            false
+        );
+        assert_eq!(
+            tool["outputSchema"]["oneOf"][1]["not"]["required"],
+            json!(["data"])
+        );
     }
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

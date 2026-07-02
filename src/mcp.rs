@@ -602,6 +602,26 @@ fn envelope_output_schema() -> Value {
                 "additionalProperties": false
             }
         },
+        "oneOf": [
+            {
+                "required": ["data"],
+                "properties": {
+                    "ok": { "const": true }
+                },
+                "not": {
+                    "required": ["error"]
+                }
+            },
+            {
+                "required": ["error"],
+                "properties": {
+                    "ok": { "const": false }
+                },
+                "not": {
+                    "required": ["data"]
+                }
+            }
+        ],
         "additionalProperties": false
     })
 }
