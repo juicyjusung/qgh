@@ -121,7 +121,7 @@ impl Store {
                 &issue.body_hash,
                 &issue.updated_at,
                 &issue.indexed_at,
-                &sync_run_id,
+                sync_run_id,
             )?;
             tx.execute(
                 "INSERT INTO issue_metadata
@@ -206,7 +206,7 @@ impl Store {
                 &comment.body_hash,
                 &comment.updated_at,
                 &comment.indexed_at,
-                &sync_run_id,
+                sync_run_id,
             )?;
             tx.execute(
                 "INSERT INTO comment_metadata

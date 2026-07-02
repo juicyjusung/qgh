@@ -162,7 +162,6 @@ pub async fn fetch_issues(
         let stored_cursor = cursor_map.get(&endpoint);
         let mut max_watermark = stored_cursor.and_then(|cursor| cursor.cursor.clone());
         let mut next_url = Some(issue_url(profile, repo, stored_cursor));
-        let mut endpoint_not_modified = false;
         let mut response_etag = stored_cursor.and_then(|cursor| cursor.etag.clone());
         let mut repo_issue_count = 0;
         let mut repo_comment_count = 0;
@@ -199,7 +198,6 @@ pub async fn fetch_issues(
                 break;
             }
             if status == StatusCode::NOT_MODIFIED {
-                endpoint_not_modified = true;
                 emit(
                     progress,
                     ProgressEvent::IssueEndpointNotModified {
@@ -214,7 +212,7 @@ pub async fn fetch_issues(
                         endpoint: endpoint.clone(),
                         cursor: max_watermark.clone(),
                         etag: response_etag.clone(),
-                        not_modified: endpoint_not_modified,
+                        not_modified: true,
                     }],
                 })?;
                 break;

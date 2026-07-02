@@ -6252,11 +6252,8 @@ fn handle_paginated_backoff_connection(
         ("200 OK", paginated_issue_page_one_payload(), link_header)
     } else if request_line.starts_with("GET /repos/owner/repo/issues?page=2") {
         ("200 OK", paginated_issue_page_two_payload(), String::new())
-    } else if request_line.starts_with("GET /repos/owner/repo/issues/1/comments?")
-        && request_line.contains("per_page=100")
-    {
-        ("200 OK", "[]", String::new())
-    } else if request_line.starts_with("GET /repos/owner/repo/issues/2/comments?")
+    } else if (request_line.starts_with("GET /repos/owner/repo/issues/1/comments?")
+        || request_line.starts_with("GET /repos/owner/repo/issues/2/comments?"))
         && request_line.contains("per_page=100")
     {
         ("200 OK", "[]", String::new())
