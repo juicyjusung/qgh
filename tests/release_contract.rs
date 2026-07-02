@@ -366,6 +366,31 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(sync_target["properties"]["issue_number"]["minimum"], 1);
     assert_eq!(
+        sync_schema["properties"]["lifecycle"]["$ref"],
+        "#/$defs/lifecycle"
+    );
+    let sync_lifecycle = &sync_schema["$defs"]["lifecycle"];
+    assert_eq!(
+        sync_lifecycle["required"],
+        json!(["status", "reason", "http_status", "alias_chain"])
+    );
+    assert_eq!(sync_lifecycle["additionalProperties"], false);
+    assert_eq!(sync_lifecycle["properties"]["status"]["type"], "string");
+    assert_eq!(
+        sync_lifecycle["properties"]["reason"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        sync_lifecycle["properties"]["http_status"]["type"],
+        json!(["integer", "null"])
+    );
+    assert_eq!(sync_lifecycle["properties"]["http_status"]["minimum"], 100);
+    assert_eq!(sync_lifecycle["properties"]["http_status"]["maximum"], 599);
+    assert_eq!(
+        sync_lifecycle["properties"]["alias_chain"]["items"]["type"],
+        "string"
+    );
+    assert_eq!(
         status_schema["properties"]["privacy"]["$ref"],
         "#/$defs/privacy"
     );

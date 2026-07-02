@@ -52,7 +52,7 @@
       "$ref": "#/$defs/target"
     },
     "lifecycle": {
-      "type": "object"
+      "$ref": "#/$defs/lifecycle"
     }
   },
   "additionalProperties": false,
@@ -120,6 +120,30 @@
         "issue_number": {
           "type": "integer",
           "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "lifecycle": {
+      "type": "object",
+      "required": ["status", "reason", "http_status", "alias_chain"],
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "reason": {
+          "type": ["string", "null"]
+        },
+        "http_status": {
+          "type": ["integer", "null"],
+          "minimum": 100,
+          "maximum": 599
+        },
+        "alias_chain": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false
