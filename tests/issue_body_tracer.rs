@@ -2459,7 +2459,7 @@ fn query_freshness_uses_effective_repo_sync_age_not_profile_latest_sync_run() {
     fixture.write_config_with_freshness_and_repos(
         &server.base_url,
         &["owner/repo", "other/repo"],
-        Some("1s"),
+        Some("30m"),
         Some("warn"),
         None,
     );
