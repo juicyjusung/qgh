@@ -22,7 +22,7 @@
       "$ref": "#/$defs/issues"
     },
     "comments": {
-      "type": "object"
+      "$ref": "#/$defs/comments"
     },
     "comment_listing": {
       "type": "object"
@@ -85,6 +85,37 @@
           "minimum": 0
         },
         "skipped_pull_requests": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tombstoned": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "comments": {
+      "type": "object",
+      "required": ["fetched", "upserted"],
+      "properties": {
+        "fetched": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "upserted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "added": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "updated": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "deleted": {
           "type": "integer",
           "minimum": 0
         },
