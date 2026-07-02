@@ -360,6 +360,25 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         assert_eq!(sync_comments["properties"][field]["minimum"], 0);
     }
     assert_eq!(
+        sync_schema["properties"]["comment_listing"]["$ref"],
+        "#/$defs/comment_listing"
+    );
+    let sync_comment_listing = &sync_schema["$defs"]["comment_listing"];
+    assert_eq!(sync_comment_listing["required"], json!(["mode"]));
+    assert_eq!(sync_comment_listing["additionalProperties"], false);
+    assert_eq!(
+        sync_comment_listing["properties"]["mode"]["enum"],
+        json!(["per_issue", "repo_listing"])
+    );
+    assert_eq!(
+        sync_comment_listing["properties"]["skipped_pr_comments"]["minimum"],
+        0
+    );
+    assert_eq!(
+        sync_comment_listing["properties"]["deferred_comments"]["minimum"],
+        0
+    );
+    assert_eq!(
         sync_schema["properties"]["cursors"]["$ref"],
         "#/$defs/cursors"
     );

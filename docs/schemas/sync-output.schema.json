@@ -25,7 +25,7 @@
       "$ref": "#/$defs/comments"
     },
     "comment_listing": {
-      "type": "object"
+      "$ref": "#/$defs/comment_listing"
     },
     "cursors": {
       "$ref": "#/$defs/cursors"
@@ -120,6 +120,25 @@
           "minimum": 0
         },
         "tombstoned": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "comment_listing": {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["per_issue", "repo_listing"]
+        },
+        "skipped_pr_comments": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "deferred_comments": {
           "type": "integer",
           "minimum": 0
         }
