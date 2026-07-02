@@ -2486,6 +2486,50 @@ fn query_freshness_uses_effective_repo_sync_age_not_profile_latest_sync_run() {
         "freshness.query_snapshot_stale"
     );
 
+    let scoped_status = fixture.qgh_in(&nested_worktree_dir, ["status", "--json"]);
+    assert_success(&scoped_status);
+    let scoped_status_json = stdout_json(&scoped_status);
+    assert_eq!(scoped_status_json["meta"]["repo"], "owner/repo");
+    assert_eq!(
+        scoped_status_json["data"]["freshness"]["decision"],
+        "stale_warn"
+    );
+    assert!(
+        scoped_status_json["data"]["freshness"]["snapshot_age_seconds"]
+            .as_i64()
+            .is_some_and(|age| age >= 3_600)
+    );
+    assert_eq!(
+        scoped_status_json["warnings"][0]["code"],
+        "freshness.query_snapshot_stale"
+    );
+
+    let mcp_status = fixture.mcp_in(
+        &nested_worktree_dir,
+        Some("work"),
+        [json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {}
+            }
+        })],
+    );
+    assert_success(&mcp_status);
+    let mcp_messages = stdout_json_lines(&mcp_status);
+    let mcp_status_json = &mcp_messages[0]["result"]["structuredContent"];
+    assert_eq!(mcp_status_json["meta"]["repo"], "owner/repo");
+    assert_eq!(
+        mcp_status_json["data"]["freshness"]["decision"],
+        "stale_warn"
+    );
+    assert_eq!(
+        mcp_status_json["warnings"][0]["code"],
+        "freshness.query_snapshot_stale"
+    );
+
     let require_fresh = fixture.qgh_in(
         &nested_worktree_dir,
         [

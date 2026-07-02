@@ -2145,6 +2145,7 @@ fn is_get_item_error(error: &QghError) -> bool {
 pub fn status(
     profile_id: &str,
     args: &crate::cli::StatusArgs,
+    repo_scope: Option<&ResolvedRepoScope>,
 ) -> Result<LocalReadOutcome, QghError> {
     let profile = load_profile(profile_id)?;
     let repo_policy = discover_repo_policy()?;
@@ -2152,10 +2153,16 @@ pub fn status(
     let status = store.status()?;
     let coverage = coverage::evaluate(&store.coverage_snapshot()?, false);
     let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
+    let last_successful_sync_at = match repo_scope {
+        Some(scope) => {
+            store.oldest_successful_sync_at_for_repos(std::slice::from_ref(&scope.repo))?
+        }
+        None => status.last_sync_at.clone(),
+    };
     let freshness = freshness::evaluate(
         profile.freshness_settings(repo_policy.as_ref()),
         FreshnessContext {
-            last_successful_sync_at: status.last_sync_at.as_deref(),
+            last_successful_sync_at: last_successful_sync_at.as_deref(),
             includes_open_issue: false,
             overrides: freshness_overrides(args.max_age.as_deref(), args.require_fresh)?,
         },

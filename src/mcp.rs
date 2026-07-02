@@ -128,7 +128,7 @@ async fn tool_get(session: &McpSession, arguments: &Value) -> Result<Value, QghE
 fn tool_status(session: &McpSession, arguments: &Value) -> Result<Value, QghError> {
     let args = parse_status_args(arguments)?;
     let context = resolve_mcp_context(session, repo_scope_from_worktree()?)?;
-    let mut outcome = commands::status(&context.profile_id, &args)?;
+    let mut outcome = commands::status(&context.profile_id, &args, context.repo_scope.as_ref())?;
     let data = &mut outcome.data;
     data["resolution"] = context.resolution_json();
     Ok(tool_success(

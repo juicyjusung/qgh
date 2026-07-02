@@ -148,7 +148,7 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
             (data, Vec::new())
         }
         crate::cli::Command::Status(args) => {
-            let outcome = commands::status(&profile_id, &args)?;
+            let outcome = commands::status(&profile_id, &args, context.repo_scope.as_ref())?;
             (outcome.data, outcome.warnings)
         }
         crate::cli::Command::Doctor { .. } => {
