@@ -19,7 +19,7 @@
       "type": "object"
     },
     "issues": {
-      "type": "object"
+      "$ref": "#/$defs/issues"
     },
     "comments": {
       "type": "object"
@@ -66,6 +66,29 @@
           "minimum": 0
         },
         "dirty_task_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "issues": {
+      "type": "object",
+      "required": ["fetched", "upserted", "skipped_pull_requests"],
+      "properties": {
+        "fetched": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "upserted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped_pull_requests": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tombstoned": {
           "type": "integer",
           "minimum": 0
         }

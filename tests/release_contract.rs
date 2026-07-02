@@ -310,6 +310,28 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert_eq!(sync_index["properties"]["active_generation"]["minimum"], 0);
     assert_eq!(sync_index["properties"]["dirty_task_count"]["minimum"], 0);
     assert_eq!(
+        sync_schema["properties"]["issues"]["$ref"],
+        "#/$defs/issues"
+    );
+    let sync_issues = &sync_schema["$defs"]["issues"];
+    assert_eq!(
+        sync_issues["required"],
+        json!(["fetched", "upserted", "skipped_pull_requests"])
+    );
+    assert_eq!(sync_issues["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(sync_issues),
+        BTreeSet::from([
+            "fetched".to_string(),
+            "skipped_pull_requests".to_string(),
+            "tombstoned".to_string(),
+            "upserted".to_string(),
+        ])
+    );
+    for field in ["fetched", "upserted", "skipped_pull_requests", "tombstoned"] {
+        assert_eq!(sync_issues["properties"][field]["minimum"], 0);
+    }
+    assert_eq!(
         sync_schema["properties"]["sources"]["$ref"],
         "#/$defs/sources"
     );
