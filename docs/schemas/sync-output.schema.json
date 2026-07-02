@@ -49,7 +49,7 @@
       "$ref": "#/$defs/scheduler"
     },
     "target": {
-      "type": "object"
+      "$ref": "#/$defs/target"
     },
     "lifecycle": {
       "type": "object"
@@ -102,6 +102,24 @@
         },
         "hard_cap": {
           "const": 16
+        }
+      },
+      "additionalProperties": false
+    },
+    "target": {
+      "type": "object",
+      "required": ["kind", "repo", "issue_number"],
+      "properties": {
+        "kind": {
+          "const": "issue"
+        },
+        "repo": {
+          "type": "string",
+          "pattern": "^[^/]+/[^/]+$"
+        },
+        "issue_number": {
+          "type": "integer",
+          "minimum": 1
         }
       },
       "additionalProperties": false

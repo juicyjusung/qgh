@@ -350,6 +350,22 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(sync_scheduler["properties"]["hard_cap"]["const"], 16);
     assert_eq!(
+        sync_schema["properties"]["target"]["$ref"],
+        "#/$defs/target"
+    );
+    let sync_target = &sync_schema["$defs"]["target"];
+    assert_eq!(
+        sync_target["required"],
+        json!(["kind", "repo", "issue_number"])
+    );
+    assert_eq!(sync_target["additionalProperties"], false);
+    assert_eq!(sync_target["properties"]["kind"]["const"], "issue");
+    assert_eq!(
+        sync_target["properties"]["repo"]["pattern"],
+        "^[^/]+/[^/]+$"
+    );
+    assert_eq!(sync_target["properties"]["issue_number"]["minimum"], 1);
+    assert_eq!(
         status_schema["properties"]["privacy"]["$ref"],
         "#/$defs/privacy"
     );
