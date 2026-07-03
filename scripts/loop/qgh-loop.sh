@@ -25,6 +25,60 @@ runlog() { # append one run entry to #19 (append-only run history)
   gh issue comment "$RUNLOG_ISSUE" -R "$REPO" --body "$1" >/dev/null || true
 }
 
+notify() { # best-effort macOS desktop notification
+  command -v osascript >/dev/null 2>&1 || return 0
+  osascript -e "display notification \"$2\" with title \"qgh-loop\" subtitle \"$1\" sound name \"Glass\"" 2>/dev/null || true
+}
+
+# =========================== status mode ====================================
+if [ "${1:-}" = "status" ]; then
+  printf '=== qgh-loop status %s ===\n' "$(date +%H:%M:%S)"
+  body="$(gh issue view "$STATE_ISSUE" -R "$REPO" --json body -q .body 2>/dev/null || true)"
+  if printf '%s\n' "$body" | grep -q '^Loop status: paused'; then
+    echo "⛔ kill switch: PAUSED (#$STATE_ISSUE)"
+  else
+    echo "🟢 loop: active  (pause: #$STATE_ISSUE body에 'Loop status: paused' 행 추가)"
+  fi
+  echo
+  echo "--- lanes (max $MAX_LANES) ---"
+  found=0
+  for c in "$ROOT/.worktrees"/.claim-*; do
+    [ -d "$c" ] || continue
+    found=1
+    n="${c##*/.claim-}"
+    pid="$(cat "$c/pid" 2>/dev/null || echo '?')"
+    if kill -0 "$pid" 2>/dev/null; then
+      elapsed="$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')"
+      stage="$(grep -E '^\[[0-9:]+\]' "$LOGDIR/issue-$n.log" 2>/dev/null | tail -1)"
+      echo "🔄 #$n  elapsed ${elapsed:-?}  ${stage:-starting…}"
+    else
+      echo "💀 #$n  worker dead — stale claim (다음 dispatcher가 정리)"
+    fi
+  done
+  for w in "$ROOT/.worktrees"/issue-*; do
+    [ -d "$w" ] || continue
+    n="${w##*/issue-}"
+    [ -d "$ROOT/.worktrees/.claim-$n" ] && continue
+    echo "🟡 #$n  실패 작업물 보존 worktree (사람 확인 대기)"
+    found=1
+  done
+  [ "$found" -eq 0 ] && echo "(idle — 레인 없음)"
+  echo
+  echo "--- queue (ready-for-agent) ---"
+  gh issue list -R "$REPO" --label ready-for-agent --state open --json number,title,labels \
+    --jq '.[] | if ([.labels[].name] | index("needs-info")) then "⏸ #\(.number) \(.title)  ← needs-info 파킹" else "▶ #\(.number) \(.title)" end' \
+    2>/dev/null || echo "(gh 조회 실패)"
+  echo
+  echo "--- recent outcomes ---"
+  grep -h -E 'FAIL #|done: #' "$LOGDIR"/issue-*.log 2>/dev/null | tail -5 || true
+  echo
+  echo "--- open PRs ---"
+  gh pr list -R "$REPO" --state open \
+    --json number,title,isDraft \
+    --jq '.[] | "PR #\(.number) \(.title)\(if .isDraft then "  (draft — 리뷰 대기)" else "" end)"' 2>/dev/null || true
+  exit 0
+fi
+
 # =========================== worker mode ====================================
 if [ "${1:-}" = "--worker" ]; then
   ISSUE="$2"; WT="$3"
@@ -62,6 +116,7 @@ $detail
     fi
     gh issue comment "$ISSUE" -R "$REPO" --body "$outcome" >/dev/null || true
     runlog "**Implementation Lane 실패** ($TS) — #$ISSUE, stage: $reason (상세는 #$ISSUE 코멘트)"
+    notify "#$ISSUE 실패" "$reason"
     exit 1
   }
 
@@ -150,6 +205,7 @@ Implementation Lane (L2 assisted) 자동 생성 draft PR.
 - draft PR: $PR_URL — 사람 리뷰 후 ready 전환·머지
 - 검증: fmt / clippy / test / all-features 게이트 green + checker APPROVE" >/dev/null || true
   runlog "**Implementation Lane 성공** ($TS) — #$ISSUE → $PR_URL (draft)"
+  notify "#$ISSUE 성공" "draft PR 생성 — 리뷰 대기"
 
   # lane slot 반환 — 브랜치는 origin에 있음
   git -C "$ROOT" worktree remove --force "$WT" 2>/dev/null || true
