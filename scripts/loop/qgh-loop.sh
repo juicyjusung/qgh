@@ -137,69 +137,92 @@ $detail
   gh issue view "$ISSUE" -R "$REPO" --json title,body,comments \
     --jq '{title: .title, body: .body, comments: [.comments[].body]}' > "$TMP/issue.json"
 
-  # --- maker: codex exec implements ----------------------------------------
-  log "maker session start (#$ISSUE)"
-  run_timed "$MAKER_TIMEOUT_SECS" codex exec \
-    -C "$WT" \
-    -s workspace-write \
-    --add-dir "$ROOT/.git" \
-    -c 'sandbox_workspace_write.network_access=true' \
-    -o "$TMP/maker-last.txt" \
-    "You are the maker in a maker/checker loop for the qgh project.
-Read AGENTS.md and loop-constraints.md first and obey both.
-
-Implement GitHub issue #$ISSUE. Full issue JSON (title/body/comments):
-$(cat "$TMP/issue.json")
-
-Rules:
+  MAKER_RULES="Rules:
 - Touch only files required by this issue. Never touch denylist paths in loop-constraints.md.
 - All acceptance criteria in the issue must be satisfied.
 - Run: cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test — all must pass.
 - If the crate defines cargo features, also: cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-features. Feature-gated code that never compiles in gates is a REJECT.
 - Commit with Conventional Commits (English type/subject). Do NOT push. Do NOT open PRs.
-- If the issue is ambiguous or requires denylist changes, stop and explain instead of guessing." \
-    || fail "maker: codex exec error or timeout" "$(tail -c 1500 "$TMP/maker-last.txt" 2>/dev/null || true)"
+- If the issue is ambiguous or requires denylist changes, stop and explain instead of guessing."
 
-  # require at least one commit
-  if [ "$(git -C "$WT" rev-list --count origin/main..HEAD)" -eq 0 ]; then
-    fail "maker: no commits produced" "$(tail -c 1500 "$TMP/maker-last.txt" 2>/dev/null || true)"
-  fi
+  MAKER_PROMPT="You are the maker in a maker/checker loop for the qgh project.
+Read AGENTS.md and loop-constraints.md first and obey both.
 
-  # --- independent gates (script does not trust the maker) ------------------
-  log "verification gates (#$ISSUE)"
+Implement GitHub issue #$ISSUE. Full issue JSON (title/body/comments):
+$(cat "$TMP/issue.json")
+
+$MAKER_RULES"
+
   gate() { # run a gate, keep its tail for the failure comment
     local name="$1"; shift
     ( cd "$WT" && "$@" ) > "$TMP/gate.log" 2>&1 \
       || fail "gate: $name" "$(tail -c 1500 "$TMP/gate.log")"
   }
-  gate "cargo fmt"                    cargo fmt --all --check
-  gate "cargo clippy"                 cargo clippy --all-targets -- -D warnings
-  gate "cargo test"                   cargo test
-  # feature-gated code must be exercised too (BM25 default path + hybrid path)
-  gate "cargo clippy (all-features)"  cargo clippy --all-targets --all-features -- -D warnings
-  gate "cargo test (all-features)"    cargo test --all-features
 
-  # --- checker: separate read-only codex session -----------------------------
-  log "checker session start (#$ISSUE)"
-  git -C "$WT" diff origin/main...HEAD > "$TMP/lane.diff"
-  run_timed "$CHECKER_TIMEOUT_SECS" codex exec \
-    -C "$WT" \
-    -s read-only \
-    -o "$TMP/verdict.txt" \
-    "$(sed -n '/instructions = """/,/"""/p' "$ROOT/.codex/agents/verifier.toml" | sed '1d;$d')
+  # --- maker -> gates -> checker, with one repair round on REJECT -------------
+  round=1
+  while :; do
+    log "maker session start (#$ISSUE, round $round)"
+    run_timed "$MAKER_TIMEOUT_SECS" codex exec \
+      -C "$WT" \
+      -s workspace-write \
+      --add-dir "$ROOT/.git" \
+      -c 'sandbox_workspace_write.network_access=true' \
+      -o "$TMP/maker-last.txt" \
+      "$MAKER_PROMPT" \
+      || fail "maker: codex exec error or timeout (round $round)" "$(tail -c 1500 "$TMP/maker-last.txt" 2>/dev/null || true)"
 
-Context: maker implemented GitHub issue #$ISSUE on branch $BR.
+    if [ "$(git -C "$WT" rev-list --count origin/main..HEAD)" -eq 0 ]; then
+      fail "maker: no commits produced" "$(tail -c 1500 "$TMP/maker-last.txt" 2>/dev/null || true)"
+    fi
+
+    log "verification gates (#$ISSUE, round $round)"
+    gate "cargo fmt"                    cargo fmt --all --check
+    gate "cargo clippy"                 cargo clippy --all-targets -- -D warnings
+    gate "cargo test"                   cargo test
+    # feature-gated code must be exercised too (BM25 default path + hybrid path)
+    gate "cargo clippy (all-features)"  cargo clippy --all-targets --all-features -- -D warnings
+    gate "cargo test (all-features)"    cargo test --all-features
+
+    log "checker session start (#$ISSUE, round $round)"
+    git -C "$WT" diff origin/main...HEAD > "$TMP/lane.diff"
+    run_timed "$CHECKER_TIMEOUT_SECS" codex exec \
+      -C "$WT" \
+      -s read-only \
+      -o "$TMP/verdict.txt" \
+      "$(sed -n '/instructions = """/,/"""/p' "$ROOT/.codex/agents/verifier.toml" | sed '1d;$d')
+
+Context: maker implemented GitHub issue #$ISSUE on branch $BR (review round $round).
 Issue JSON: $(cat "$TMP/issue.json")
 Gates already passed independently: cargo fmt --check, clippy -D warnings, cargo test, clippy --all-features -D warnings, cargo test --all-features.
 Diff to review:
 $(cat "$TMP/lane.diff")
 
 End your reply with exactly one final line: 'VERDICT: APPROVE' or 'VERDICT: REJECT' or 'VERDICT: ESCALATE_HUMAN'." \
-    || fail "checker: codex exec error or timeout"
+      || fail "checker: codex exec error or timeout (round $round)"
 
-  if ! grep -q 'VERDICT: APPROVE' "$TMP/verdict.txt"; then
-    fail "checker: verdict not APPROVE" "$(tail -c 1500 "$TMP/verdict.txt")"
-  fi
+    grep -q 'VERDICT: APPROVE' "$TMP/verdict.txt" && break
+
+    if [ "$round" -ge 2 ]; then
+      fail "checker: verdict not APPROVE after repair round" "$(tail -c 1500 "$TMP/verdict.txt")"
+    fi
+    log "checker REJECT — repair round (#$ISSUE)"
+    round=2
+    MAKER_PROMPT="You are the maker in a maker/checker loop for the qgh project.
+Read AGENTS.md and loop-constraints.md first and obey both.
+
+You already implemented GitHub issue #$ISSUE in this worktree, but the
+independent checker REJECTED it. Fix EVERY finding below. Keep the valid
+existing work; make targeted fixes and commit them.
+
+Checker findings:
+$(tail -c 2500 "$TMP/verdict.txt")
+
+Issue JSON for reference:
+$(cat "$TMP/issue.json")
+
+$MAKER_RULES"
+  done
 
   # --- draft PR ---------------------------------------------------------------
   log "opening draft PR (#$ISSUE)"
