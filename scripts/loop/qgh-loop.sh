@@ -106,7 +106,7 @@ Rules:
 
 Context: maker implemented GitHub issue #$ISSUE on branch $BR.
 Issue JSON: $(cat "$TMP/issue.json")
-Gates already passed independently: cargo fmt --check, clippy -D warnings, cargo test.
+Gates already passed independently: cargo fmt --check, clippy -D warnings, cargo test, clippy --all-features -D warnings, cargo test --all-features.
 Diff to review:
 $(cat "$TMP/lane.diff")
 
