@@ -1,8 +1,8 @@
 # Loop Budget - qgh
 
-The first rollout is L1 report-only. Keep runs cheap and inspectable. Runtime loop state is GitHub issue-backed to avoid worktree divergence.
+Keep runs cheap and inspectable. Runtime loop state is GitHub issue-backed to avoid worktree divergence.
 
-Audit readiness scores do not change the active phase. qgh stays L1 until three useful report-only runs complete and a human explicitly approves L2.
+Audit readiness scores do not change the active phase. Triage loops stay L1 report-only. The Implementation Lane is L2 assisted as of 2026-07-04 (explicit human approval, see LOOP.md and #18/#19).
 
 ## Daily Limits
 
@@ -10,6 +10,7 @@ Audit readiness scores do not change the active phase. qgh stays L1 until three 
 |---|---:|---:|---|
 | Issue Triage | 1 | 0 | L1 report-only |
 | Daily Triage | 1 | 0 | L1 report-only |
+| Implementation Lane | 8 | 1 (checker session) | L2 assisted, draft PR only |
 
 ## On Budget Exceed
 

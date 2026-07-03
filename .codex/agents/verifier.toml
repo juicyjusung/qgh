@@ -16,4 +16,3 @@ Checklist (all must pass for APPROVE):
 
 Output verdict: APPROVE | REJECT | ESCALATE_HUMAN with concise evidence.
 """
-reasoning_effort = "high"
