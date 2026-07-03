@@ -2079,7 +2079,20 @@ fn status_reports_never_synced_and_validates_duration_config() {
 #[test]
 fn embedding_config_accepts_local_provider_without_status_shape_change() {
     let fixture = TestFixture::new("embedding-local-config");
-    fixture.write_config_with_embedding("http://127.0.0.1:1", r#"provider = "local""#);
+    fixture.write_config_with_embedding(
+        "http://127.0.0.1:1",
+        r#"
+provider = "local"
+model = "hf:Snowflake/snowflake-arctic-embed-l-v2.0"
+file = "onnx/model_quantized.onnx"
+pooling = "cls"
+query_prefix = "query: "
+
+[embedding.token_source]
+type = "env"
+env = "QGH_TEST_HF_TOKEN"
+"#,
+    );
 
     let status = fixture.qgh(["status", "--json"]);
     assert_success(&status);
@@ -2111,6 +2124,31 @@ providre = "local"
             "embedding-invalid-provider",
             r#"provider = "remote""#,
             "unknown variant",
+        ),
+        (
+            "embedding-literal-token",
+            r#"
+provider = "local"
+token = "hf_literal_token_forbidden"
+"#,
+            "unknown field",
+        ),
+        (
+            "embedding-invalid-query-prefix",
+            r#"
+provider = "local"
+query_prefix = "Query: "
+"#,
+            "lowercase `query: ` prefix",
+        ),
+        (
+            "embedding-model-and-path",
+            r#"
+provider = "local"
+model = "hf:Snowflake/snowflake-arctic-embed-l-v2.0"
+model_path = "/tmp/model.onnx"
+"#,
+            "only one of `model` or `model_path`",
         ),
     ] {
         let fixture = TestFixture::new(fixture_name);

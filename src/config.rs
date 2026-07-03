@@ -1,3 +1,4 @@
+use crate::embedding::{PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_QUERY_PREFIX};
 use crate::error::QghError;
 use crate::freshness::{parse_duration_seconds, DEFAULT_QUERY_MAX_AGE_SECONDS};
 use crate::paths::{config_file_path, ensure_private_dir, set_private_file, ProfilePaths};
@@ -136,6 +137,16 @@ pub enum EmbeddingProviderKind {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EmbeddingTokenSource {
+    Env {
+        env: String,
+    },
+    #[serde(other)]
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TokenSource {
     GithubCli,
     Env {
@@ -154,10 +165,22 @@ struct ConfigFile {
     profiles: BTreeMap<String, RawProfile>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawEmbeddingConfig {
     provider: EmbeddingProviderKind,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    model_path: Option<PathBuf>,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    pooling: Option<PoolingKind>,
+    #[serde(default)]
+    query_prefix: Option<String>,
+    #[serde(default)]
+    token_source: Option<EmbeddingTokenSource>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -424,7 +447,9 @@ fn load_config_file() -> Result<ConfigFile, QghError> {
     if config.schema_version != "qgh.config.v1" {
         return Err(QghError::config("Unsupported config schema_version."));
     }
-    ensure_embedding_config_supported(&config);
+    if let Some(embedding) = &config.embedding {
+        parse_embedding_config(embedding)?;
+    }
     validate_config_token_sources(&config)?;
     Ok(config)
 }
@@ -861,9 +886,93 @@ fn validate_config_token_sources(config: &ConfigFile) -> Result<(), QghError> {
     Ok(())
 }
 
-fn ensure_embedding_config_supported(config: &ConfigFile) {
-    if let Some(embedding) = &config.embedding {
-        let EmbeddingProviderKind::Local = embedding.provider;
+fn parse_embedding_config(raw: &RawEmbeddingConfig) -> Result<(), QghError> {
+    let EmbeddingProviderKind::Local = raw.provider;
+    if raw.model.is_some() && raw.model_path.is_some() {
+        return Err(QghError::config(
+            "Embedding config must use only one of `model` or `model_path`.",
+        ));
+    }
+    if let Some(model) = raw.model.as_deref() {
+        validate_hf_model_reference(model)?;
+    } else if raw.model_path.is_none() {
+        validate_hf_model_reference(&format!("hf:{DEFAULT_HF_MODEL_ID}"))?;
+    }
+    if let Some(file) = &raw.file {
+        validate_embedding_repo_file(file)?;
+    }
+    if let Some(query_prefix) = &raw.query_prefix {
+        if query_prefix != DEFAULT_QUERY_PREFIX {
+            return Err(QghError::config(
+                "Embedding query_prefix must be the lowercase `query: ` prefix.",
+            ));
+        }
+    }
+    if raw.model_path.is_some() && raw.token_source.is_some() {
+        return Err(QghError::config(
+            "Embedding token_source is only valid with `model = \"hf:<org>/<repo>\"`.",
+        ));
+    }
+    if let Some(token_source) = &raw.token_source {
+        validate_embedding_token_source(token_source)?;
+    }
+    Ok(())
+}
+
+fn validate_hf_model_reference(model: &str) -> Result<(), QghError> {
+    let Some(repo) = model.strip_prefix("hf:") else {
+        return Err(QghError::config(
+            "Embedding model must use `hf:<org>/<repo>`.",
+        ));
+    };
+    let Some((owner, name)) = repo.split_once('/') else {
+        return Err(QghError::config(
+            "Embedding model must use `hf:<org>/<repo>`.",
+        ));
+    };
+    if owner.is_empty()
+        || name.is_empty()
+        || owner.contains("..")
+        || name.contains("..")
+        || repo.contains('\\')
+        || repo.contains('*')
+    {
+        return Err(QghError::config(
+            "Embedding model must use `hf:<org>/<repo>`.",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_embedding_repo_file(file: &str) -> Result<(), QghError> {
+    if file.is_empty()
+        || file.starts_with('/')
+        || file.starts_with('~')
+        || file.split('/').any(|part| part == ".." || part.is_empty())
+        || looks_like_windows_absolute_path(file)
+    {
+        return Err(QghError::config(
+            "Embedding file must be a relative path inside the model repository.",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_embedding_token_source(token_source: &EmbeddingTokenSource) -> Result<(), QghError> {
+    match token_source {
+        EmbeddingTokenSource::Env { env } => {
+            if env.is_empty() || env.contains('=') || env.contains('/') {
+                return Err(QghError::validation(
+                    "validation.invalid_token_source",
+                    "Embedding token env var name must be a non-empty environment variable name.",
+                ));
+            }
+            Ok(())
+        }
+        EmbeddingTokenSource::Unsupported => Err(QghError::validation(
+            "validation.invalid_token_source",
+            "Embedding token_source must be `env`.",
+        )),
     }
 }
 
