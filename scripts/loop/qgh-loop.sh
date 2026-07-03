@@ -244,6 +244,16 @@ for w in data.get("result", {}).get("workspaces", []):
         print(w["workspace_id"]); break
 ' "$ROOT" 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
+  # close stale tabs from previous runs of the same issue (dead tail panes)
+  herdr tab list --workspace "$ws" 2>/dev/null | python3 -c '
+import sys, json
+label = sys.argv[1]
+for t in json.load(sys.stdin).get("result", {}).get("tabs", []):
+    if t.get("label") == label:
+        print(t["tab_id"])
+' "issue-$issue" 2>/dev/null | while read -r stale; do
+    herdr tab close "$stale" >/dev/null 2>&1 || true
+  done
   pane="$(herdr tab create --workspace "$ws" --label "issue-$issue" --no-focus 2>/dev/null \
     | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])' 2>/dev/null)" || return 0
   [ -n "$pane" ] || return 0
