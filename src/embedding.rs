@@ -11,7 +11,12 @@ use std::sync::Mutex;
 pub type EmbeddingVector = Vec<f32>;
 
 pub const DEFAULT_HF_MODEL_ID: &str = "Snowflake/snowflake-arctic-embed-l-v2.0";
-pub const DEFAULT_HF_MODEL_REVISION: &str = "main";
+/// Pinned commit of the default Hugging Face model. A mutable revision
+/// (e.g. "main") would let upstream file changes alter inferred pooling,
+/// query prefix, and dimension without changing the fingerprint's
+/// (model_id, model_revision) pair, silently invalidating stored
+/// embeddings. Users can opt into a moving revision via `@<revision>`.
+pub const DEFAULT_HF_MODEL_REVISION: &str = "ac6544c8a46e00af67e330e85a9028c66b8cfd9a";
 pub const DEFAULT_HF_MODEL_FILE: &str = "onnx/model_quantized.onnx";
 pub const DEFAULT_QUERY_PREFIX: &str = "query: ";
 pub const HUGGINGFACE_ENDPOINT: &str = "https://huggingface.co";
@@ -266,6 +271,13 @@ impl EmbeddingFingerprint {
         hex_digest(&Sha256::digest(encoded))
     }
 
+    /// `None` expectation fields defer to the model's own defaults rather
+    /// than acting as unchecked wildcards: inferred pooling, query prefix,
+    /// and the embedding dimension are deterministic functions of the model
+    /// files plus the explicit config, and the model files are fixed by
+    /// (`model_id`, immutable `model_revision`) — both always compared.
+    /// `model_path` snapshots rely on the user keeping the local directory
+    /// contents stable.
     pub fn matches_expectation(&self, expectation: &EmbeddingFingerprintExpectation) -> bool {
         self.schema_version == EMBEDDING_FINGERPRINT_SCHEMA_VERSION
             && self.provider == expectation.provider
@@ -1094,6 +1106,44 @@ mod tests {
             self.calls.borrow_mut().push(texts.to_vec());
             Ok(texts.iter().map(|_| vec![1.0, 2.0, 3.0]).collect())
         }
+    }
+
+    #[test]
+    fn default_hf_model_revision_is_pinned_commit() {
+        assert_eq!(DEFAULT_HF_MODEL_REVISION.len(), 40);
+        assert!(DEFAULT_HF_MODEL_REVISION
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn expectation_defaults_pin_model_id_and_revision() {
+        let fingerprint = EmbeddingFingerprintSeed {
+            provider: "local".to_string(),
+            model_id: DEFAULT_HF_MODEL_ID.to_string(),
+            model_revision: "superseded-commit-sha".to_string(),
+            pooling: PoolingKind::Mean,
+            query_prefix: DEFAULT_QUERY_PREFIX.to_string(),
+        }
+        .with_dimension(1024);
+        let expectation = EmbeddingFingerprintExpectation {
+            provider: "local".to_string(),
+            model_id: Some(DEFAULT_HF_MODEL_ID.to_string()),
+            model_revision: Some(DEFAULT_HF_MODEL_REVISION.to_string()),
+            pooling: None,
+            query_prefix: None,
+        };
+        assert!(!fingerprint.matches_expectation(&expectation));
+
+        let current = EmbeddingFingerprintSeed {
+            provider: "local".to_string(),
+            model_id: DEFAULT_HF_MODEL_ID.to_string(),
+            model_revision: DEFAULT_HF_MODEL_REVISION.to_string(),
+            pooling: PoolingKind::Mean,
+            query_prefix: DEFAULT_QUERY_PREFIX.to_string(),
+        }
+        .with_dimension(1024);
+        assert!(current.matches_expectation(&expectation));
     }
 
     #[test]
