@@ -30,7 +30,10 @@ trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
 # --- kill switch ------------------------------------------------------------
 # Activation = a line STARTING with the phrase; prose that merely mentions the
 # phrase (e.g. the kill-switch instructions themselves) must not trigger it.
-if gh issue view "$STATE_ISSUE" -R "$REPO" --json body -q .body | grep -q '^Loop status: paused'; then
+# Fail closed: if the state issue cannot be read, do not run.
+state_body="$(gh issue view "$STATE_ISSUE" -R "$REPO" --json body -q .body)" \
+  || { log "cannot read #$STATE_ISSUE — fail closed, exit"; exit 0; }
+if printf '%s\n' "$state_body" | grep -q '^Loop status: paused'; then
   log "kill switch active (#$STATE_ISSUE: Loop status: paused) — exit"; exit 0
 fi
 
