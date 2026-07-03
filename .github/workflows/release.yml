@@ -113,6 +113,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     permissions:
+      "artifact-metadata": "write"
       "attestations": "write"
       "contents": "read"
       "id-token": "write"

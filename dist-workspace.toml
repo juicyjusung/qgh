@@ -3,6 +3,7 @@ members = ["cargo:."]
 
 # Config for 'dist'
 [dist]
+allow-dirty = ["ci"]
 tap = "juicyjusung/homebrew-tap"
 publish-jobs = ["homebrew"]
 post-announce-jobs = ["./homebrew-smoke"]

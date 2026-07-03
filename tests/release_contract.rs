@@ -236,7 +236,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         json!([
             "artifact checksums",
             "Homebrew sha256",
-            "GitHub Artifact Attestations"
+            "GitHub Artifact Attestations",
+            "actions/attest@v4 id-token/attestations/artifact-metadata permissions"
         ])
     );
     assert_eq!(
@@ -262,6 +263,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert_eq!(
         artifact["contract"]["release_workflow"]["checksum"],
         "sha256"
+    );
+    assert_eq!(
+        artifact["contract"]["release_workflow"]["ci_generated_config_policy"],
+        "allow-dirty ci preserves the actions/attest@v4 artifact-metadata permission"
     );
     assert_eq!(
         artifact["contract"]["release_workflow"]["post_announce_jobs"],
@@ -329,6 +334,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         Some(true)
     );
     assert_eq!(dist_workspace["dist"]["checksum"].as_str(), Some("sha256"));
+    assert_eq!(
+        toml_array_strings(&dist_workspace["dist"]["allow-dirty"]),
+        vec!["ci"]
+    );
 
     let release_workflow = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
     for required in [
@@ -338,6 +347,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json \"--artifacts=global\"",
         "gh release create",
         "actions/attest@v4",
+        "\"artifact-metadata\": \"write\"",
         "\"attestations\": \"write\"",
         "\"id-token\": \"write\"",
         "repository: \"juicyjusung/homebrew-tap\"",

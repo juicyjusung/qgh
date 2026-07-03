@@ -39,10 +39,13 @@ This release artifact is for the qgh MVP contract. It does not define new produc
   `vX.Y.Z` tag push.
 - Release config: `dist-workspace.toml` pins `cargo-dist` 0.32.0, enables
   `homebrew`, uses `sha256` checksums, enables GitHub Artifact Attestations,
-  and runs `./homebrew-smoke` after announcement.
+  keeps the customized CI workflow dirty because `actions/attest@v4` requires
+  `artifact-metadata: write`, and runs `./homebrew-smoke` after announcement.
 - Release workflow: `.github/workflows/release.yml` builds local artifacts,
   global artifacts, checksum-backed installers, GitHub Release uploads, and
-  Homebrew formula publication.
+  Homebrew formula publication. Its attestation job grants `id-token`,
+  `attestations`, and `artifact-metadata` write permissions required by
+  `actions/attest@v4`.
 - Homebrew smoke workflow: `.github/workflows/homebrew-smoke.yml` validates the
   generated formula's versioned GitHub Release URL and Homebrew `sha256`, then
   installs the formula and runs `qgh --version` plus `qgh help`.

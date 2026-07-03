@@ -27,6 +27,7 @@
       "workflow": ".github/workflows/release.yml",
       "homebrew_smoke_workflow": ".github/workflows/homebrew-smoke.yml",
       "checksum": "sha256",
+      "ci_generated_config_policy": "allow-dirty ci preserves the actions/attest@v4 artifact-metadata permission",
       "post_announce_jobs": ["./homebrew-smoke"]
     },
     "release_targets": [
@@ -37,7 +38,8 @@
     "release_integrity_gate": [
       "artifact checksums",
       "Homebrew sha256",
-      "GitHub Artifact Attestations"
+      "GitHub Artifact Attestations",
+      "actions/attest@v4 id-token/attestations/artifact-metadata permissions"
     ],
     "tap_publish_credential": {
       "secret_name": "HOMEBREW_TAP_TOKEN",
