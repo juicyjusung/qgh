@@ -21,6 +21,15 @@
     "release_artifact_origin": "GitHub Releases",
     "release_automation": "cargo-dist",
     "release_trigger": "Cargo.toml version bump commit plus matching vX.Y.Z tag push",
+    "release_workflow": {
+      "cargo_dist_version": "0.32.0",
+      "config": "dist-workspace.toml",
+      "workflow": ".github/workflows/release.yml",
+      "homebrew_smoke_workflow": ".github/workflows/homebrew-smoke.yml",
+      "checksum": "sha256",
+      "ci_generated_config_policy": "allow-dirty ci preserves the actions/attest@v4 artifact-metadata permission",
+      "post_announce_jobs": ["./homebrew-smoke"]
+    },
     "release_targets": [
       "aarch64-apple-darwin",
       "x86_64-apple-darwin",
@@ -29,7 +38,8 @@
     "release_integrity_gate": [
       "artifact checksums",
       "Homebrew sha256",
-      "GitHub Artifact Attestations"
+      "GitHub Artifact Attestations",
+      "actions/attest@v4 id-token/attestations/artifact-metadata permissions"
     ],
     "tap_publish_credential": {
       "secret_name": "HOMEBREW_TAP_TOKEN",
