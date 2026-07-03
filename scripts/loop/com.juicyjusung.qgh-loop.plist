@@ -11,7 +11,7 @@
         <string>exec /Users/user/projects/juicyjusung/juicy-qgh/scripts/loop/qgh-loop.sh</string>
     </array>
     <key>StartInterval</key>
-    <integer>10800</integer>
+    <integer>3600</integer>
     <key>RunAtLoad</key>
     <false/>
     <key>StandardOutPath</key>

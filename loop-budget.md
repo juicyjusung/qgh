@@ -10,7 +10,7 @@ Audit readiness scores do not change the active phase. Triage loops stay L1 repo
 |---|---:|---:|---|
 | Issue Triage | 1 | 0 | L1 report-only |
 | Daily Triage | 1 | 0 | L1 report-only |
-| Implementation Lane | 8 | 1 (checker session) | L2 assisted, draft PR only |
+| Implementation Lane | 24 | 1 (checker session) | L2 assisted, draft PR only |
 
 ## On Budget Exceed
 
