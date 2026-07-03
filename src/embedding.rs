@@ -11,6 +11,7 @@ use std::sync::Mutex;
 pub type EmbeddingVector = Vec<f32>;
 
 pub const DEFAULT_HF_MODEL_ID: &str = "Snowflake/snowflake-arctic-embed-l-v2.0";
+pub const DEFAULT_HF_MODEL_REVISION: &str = "main";
 pub const DEFAULT_HF_MODEL_FILE: &str = "onnx/model_quantized.onnx";
 pub const DEFAULT_QUERY_PREFIX: &str = "query: ";
 pub const HUGGINGFACE_ENDPOINT: &str = "https://huggingface.co";
@@ -176,6 +177,33 @@ impl Default for FastembedProviderOptions {
             cache_dir: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfModelReference {
+    pub model_id: String,
+    pub revision: String,
+}
+
+pub fn default_hf_model_reference() -> HfModelReference {
+    HfModelReference {
+        model_id: DEFAULT_HF_MODEL_ID.to_string(),
+        revision: DEFAULT_HF_MODEL_REVISION.to_string(),
+    }
+}
+
+pub fn parse_hf_model_reference(model: &str) -> Option<HfModelReference> {
+    let reference = model.strip_prefix("hf:")?;
+    let (model_id, revision) = reference
+        .rsplit_once('@')
+        .unwrap_or((reference, DEFAULT_HF_MODEL_REVISION));
+    if model_id.is_empty() || revision.is_empty() {
+        return None;
+    }
+    Some(HfModelReference {
+        model_id: model_id.to_string(),
+        revision: revision.to_string(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -660,14 +688,19 @@ pub fn resolve_fastembed_snapshot(
             },
         );
     }
-    let model_id = hf_model_id(options.model.as_deref())?;
+    let reference = hf_model_reference(options.model.as_deref())?;
     let cache_dir = options
         .cache_dir
         .map(Ok)
         .unwrap_or_else(default_hf_cache_dir)?;
-    let mut repo = HfHubModelRepository::new(model_id, cache_dir, options.token_source_env)?;
+    let mut repo = HfHubModelRepository::new(
+        &reference.model_id,
+        &reference.revision,
+        cache_dir,
+        options.token_source_env,
+    )?;
     resolve_hf_model_snapshot(
-        model_id,
+        &reference.model_id,
         ManualModelBehavior {
             file: options.file,
             pooling: options.pooling,
@@ -680,6 +713,7 @@ pub fn resolve_fastembed_snapshot(
 #[cfg(feature = "fastembed-provider")]
 struct HfHubModelRepository {
     repo: hf_hub::api::sync::ApiRepo,
+    model_revision: String,
     info: Option<hf_hub::api::RepoInfo>,
 }
 
@@ -687,6 +721,7 @@ struct HfHubModelRepository {
 impl HfHubModelRepository {
     fn new(
         model_id: &str,
+        model_revision: &str,
         cache_dir: PathBuf,
         token_source_env: Option<String>,
     ) -> Result<Self, EmbeddingProviderError> {
@@ -718,7 +753,12 @@ impl HfHubModelRepository {
                 }))
             })?;
         Ok(Self {
-            repo: api.model(model_id.to_string()),
+            repo: api.repo(hf_hub::Repo::with_revision(
+                model_id.to_string(),
+                hf_hub::RepoType::Model,
+                model_revision.to_string(),
+            )),
+            model_revision: model_revision.to_string(),
             info: None,
         })
     }
@@ -767,17 +807,19 @@ impl ModelRepository for HfHubModelRepository {
     }
 
     fn revision(&mut self) -> Result<Option<String>, EmbeddingProviderError> {
-        Ok(Some(self.info()?.sha.clone()))
+        Ok(Some(self.model_revision.clone()))
     }
 }
 
 #[cfg(feature = "fastembed-provider")]
-fn hf_model_id(model: Option<&str>) -> Result<&str, EmbeddingProviderError> {
-    let model = model.unwrap_or(DEFAULT_HF_MODEL_ID);
-    model.strip_prefix("hf:").ok_or_else(|| {
+fn hf_model_reference(model: Option<&str>) -> Result<HfModelReference, EmbeddingProviderError> {
+    let Some(model) = model else {
+        return Ok(default_hf_model_reference());
+    };
+    parse_hf_model_reference(model).ok_or_else(|| {
         EmbeddingProviderError::structured(
             "embedding.invalid_model",
-            "Embedding model must use `hf:<org>/<repo>`.",
+            "Embedding model must use `hf:<org>/<repo>[@revision]`.",
         )
         .with_details(json!({ "model": model }))
     })

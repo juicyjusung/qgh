@@ -9,14 +9,14 @@ use crate::config::{
 use crate::coverage;
 #[cfg(feature = "fastembed-provider")]
 use crate::embedding::FastembedTokenizer;
+use crate::embedding::{
+    default_hf_model_reference, parse_hf_model_reference, EmbeddingFingerprintExpectation,
+    EmbeddingFingerprintSeed, EmbeddingProvider, EmbeddingProviderError, EmbeddingTokenizer,
+    EmbeddingVector, LOCAL_MODEL_REVISION,
+};
 #[cfg(feature = "fastembed-provider")]
 use crate::embedding::{
     resolve_fastembed_snapshot, FastembedEngine, LocalEmbeddingProvider, ResolvedModelSnapshot,
-};
-use crate::embedding::{
-    EmbeddingFingerprintExpectation, EmbeddingFingerprintSeed, EmbeddingProvider,
-    EmbeddingProviderError, EmbeddingTokenizer, EmbeddingVector, DEFAULT_HF_MODEL_ID,
-    LOCAL_MODEL_REVISION,
 };
 use crate::error::QghError;
 use crate::freshness::{self, FreshnessContext, FreshnessOverrides};
@@ -2136,28 +2136,37 @@ fn embedding_fingerprint_expectation(
     EmbeddingFingerprintExpectation {
         provider: embedding_provider_name(embedding.provider).to_string(),
         model_id: configured_embedding_model_id(embedding),
-        model_revision: embedding
-            .model_path
-            .as_ref()
-            .map(|_| LOCAL_MODEL_REVISION.to_string()),
+        model_revision: configured_embedding_model_revision(embedding),
         pooling: embedding.pooling,
         query_prefix: embedding.query_prefix.clone(),
     }
 }
 
 fn configured_embedding_model_id(embedding: &EmbeddingConfig) -> Option<String> {
-    if let Some(model) = &embedding.model {
-        return Some(
-            model
-                .strip_prefix("hf:")
-                .map(str::to_string)
-                .unwrap_or_else(|| model.clone()),
-        );
+    if embedding.model_path.is_some() {
+        return embedding
+            .model_path
+            .as_ref()
+            .map(|path| format!("model_path:{}", path.to_string_lossy()));
     }
-    if let Some(path) = &embedding.model_path {
-        return Some(format!("model_path:{}", path.to_string_lossy()));
+    Some(configured_hf_model_reference(embedding).model_id)
+}
+
+fn configured_embedding_model_revision(embedding: &EmbeddingConfig) -> Option<String> {
+    if embedding.model_path.is_some() {
+        return Some(LOCAL_MODEL_REVISION.to_string());
     }
-    Some(DEFAULT_HF_MODEL_ID.to_string())
+    Some(configured_hf_model_reference(embedding).revision)
+}
+
+fn configured_hf_model_reference(
+    embedding: &EmbeddingConfig,
+) -> crate::embedding::HfModelReference {
+    embedding
+        .model
+        .as_deref()
+        .map(|model| parse_hf_model_reference(model).expect("validated embedding model reference"))
+        .unwrap_or_else(default_hf_model_reference)
 }
 
 fn embedding_provider_name(provider: EmbeddingProviderKind) -> &'static str {

@@ -1,6 +1,8 @@
 #[cfg(feature = "fastembed-provider")]
 use crate::embedding::FastembedProviderOptions;
-use crate::embedding::{PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_QUERY_PREFIX};
+use crate::embedding::{
+    parse_hf_model_reference, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_QUERY_PREFIX,
+};
 use crate::error::QghError;
 use crate::freshness::{parse_duration_seconds, DEFAULT_QUERY_MAX_AGE_SECONDS};
 use crate::paths::{config_file_path, ensure_private_dir, set_private_file, ProfilePaths};
@@ -975,14 +977,15 @@ fn parse_embedding_config(raw: &RawEmbeddingConfig) -> Result<(), QghError> {
 }
 
 fn validate_hf_model_reference(model: &str) -> Result<(), QghError> {
-    let Some(repo) = model.strip_prefix("hf:") else {
+    let Some(reference) = parse_hf_model_reference(model) else {
         return Err(QghError::config(
-            "Embedding model must use `hf:<org>/<repo>`.",
+            "Embedding model must use `hf:<org>/<repo>[@revision]`.",
         ));
     };
+    let repo = reference.model_id;
     let Some((owner, name)) = repo.split_once('/') else {
         return Err(QghError::config(
-            "Embedding model must use `hf:<org>/<repo>`.",
+            "Embedding model must use `hf:<org>/<repo>[@revision]`.",
         ));
     };
     if owner.is_empty()
@@ -991,9 +994,12 @@ fn validate_hf_model_reference(model: &str) -> Result<(), QghError> {
         || name.contains("..")
         || repo.contains('\\')
         || repo.contains('*')
+        || reference.revision.contains("..")
+        || reference.revision.contains('\\')
+        || reference.revision.contains('*')
     {
         return Err(QghError::config(
-            "Embedding model must use `hf:<org>/<repo>`.",
+            "Embedding model must use `hf:<org>/<repo>[@revision]`.",
         ));
     }
     Ok(())

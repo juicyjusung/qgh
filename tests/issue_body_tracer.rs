@@ -1,5 +1,7 @@
 use chrono::{Duration, SecondsFormat, Utc};
-use qgh::embedding::{EmbeddingFingerprintSeed, PoolingKind, DEFAULT_QUERY_PREFIX};
+use qgh::embedding::{
+    EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_QUERY_PREFIX,
+};
 use serde_json::{json, Value};
 #[cfg(feature = "fastembed-provider")]
 use std::collections::HashMap;
@@ -2175,6 +2177,39 @@ query_prefix = "query: "
     let warning_text = warning.to_string();
     assert!(!warning_text.contains("Example/old-model"));
     assert!(!warning_text.contains("BM25 issue body tracer"));
+}
+
+#[test]
+fn embedding_fingerprint_revision_mismatch_warns_and_keeps_bm25_results() {
+    let fixture = TestFixture::new("embedding-fingerprint-revision-mismatch");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        r#"
+provider = "local"
+model = "hf:Snowflake/snowflake-arctic-embed-l-v2.0"
+file = "onnx/model_quantized.onnx"
+pooling = "cls"
+query_prefix = "query: "
+"#,
+    );
+    fixture.insert_active_embedding_fingerprint_with_revision(DEFAULT_HF_MODEL_ID, "old-main-sha");
+
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    assert_eq!(
+        query_json["data"]["results"][0]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+    assert_eq!(query_json["data"]["results"][0]["ranking"]["kind"], "bm25");
+    assert_eq!(
+        query_json["warnings"][0]["code"],
+        "embedding.fingerprint_mismatch"
+    );
 }
 
 #[test]
@@ -5662,10 +5697,18 @@ limit = 10
     }
 
     fn insert_active_embedding_fingerprint(&self, model_id: &str) {
+        self.insert_active_embedding_fingerprint_with_revision(model_id, "fixture-sha");
+    }
+
+    fn insert_active_embedding_fingerprint_with_revision(
+        &self,
+        model_id: &str,
+        model_revision: &str,
+    ) {
         let fingerprint = EmbeddingFingerprintSeed {
             provider: "local".to_string(),
             model_id: model_id.to_string(),
-            model_revision: "fixture-sha".to_string(),
+            model_revision: model_revision.to_string(),
             pooling: PoolingKind::Cls,
             query_prefix: DEFAULT_QUERY_PREFIX.to_string(),
         }
