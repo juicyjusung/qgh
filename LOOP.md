@@ -41,13 +41,16 @@ Approved 2026-07-04 by explicit human approval (recorded in #18/#19).
 Driver: `scripts/loop/qgh-loop.sh` via `codex exec`, scheduled by launchd
 or triggered manually.
 
-Per run:
+Per run the dispatcher fills up to 3 parallel lanes:
 
-1. Read `loop-constraints.md`; check #18 for `Loop status: paused`.
-2. Pick one `ready-for-agent` issue (oldest first). Empty queue -> no-op
-   exit, no state writes.
-3. Create isolated worktree `.worktrees/issue-<n>` on branch
-   `agent/issue-<n>`.
+1. Read `loop-constraints.md`; check #18 for a line starting with
+   `Loop status: paused` (fail closed if #18 is unreadable).
+2. Pick `ready-for-agent` issues (oldest first, skipping `needs-info`,
+   active claims, and existing worktrees/branches) until 3 lanes are
+   busy. Empty queue -> no-op exit, no state writes.
+3. Per issue: atomic claim, isolated worktree `.worktrees/issue-<n>` on
+   branch `agent/issue-<n>`, then a detached worker
+   (logs: `~/Library/Logs/qgh-loop/issue-<n>.log`).
 4. Maker: `codex exec` implements the issue and commits.
 5. Checker: a separate `codex exec` session reviews the diff with
    `.codex/agents/verifier.toml` stance (default REJECT). Verdict

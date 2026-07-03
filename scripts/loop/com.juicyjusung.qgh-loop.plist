@@ -14,6 +14,8 @@
     <integer>3600</integer>
     <key>RunAtLoad</key>
     <false/>
+    <key>AbandonProcessGroup</key>
+    <true/>
     <key>StandardOutPath</key>
     <string>/Users/user/Library/Logs/qgh-loop.log</string>
     <key>StandardErrorPath</key>

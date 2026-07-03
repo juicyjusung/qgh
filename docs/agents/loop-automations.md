@@ -27,7 +27,11 @@ launchctl load ~/Library/LaunchAgents/com.juicyjusung.qgh-loop.plist
 launchctl unload ~/Library/LaunchAgents/com.juicyjusung.qgh-loop.plist
 ```
 
-로그: `~/Library/Logs/qgh-loop.log`. 런 이력: GitHub #19 comments.
+로그: dispatcher는 `~/Library/Logs/qgh-loop.log`, 이슈별 worker는
+`~/Library/Logs/qgh-loop/issue-<n>.log`. 런 이력: GitHub #19 comments.
+동시 처리: dispatcher가 최대 3 lane까지 병렬 spawn. 병렬로 풀 이슈
+세트는 파일 충돌 없는 조합으로 — `/orchestrating-qgh-worktrees`로 선정
+후 라벨 부여 권장.
 
 재시도 정책: 레인 실패 시 이슈에 `needs-info` 라벨이 붙고 큐에서
 빠진다. 사람이 원인 확인 후 `ready-for-agent`를 다시 붙여야 재시도된다.
