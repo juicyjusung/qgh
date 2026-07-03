@@ -12,6 +12,9 @@ rtk git worktree list
 rtk gh issue list --state open --limit 100 --json number,title,state,labels,assignees,updatedAt
 rtk gh issue view 18 --comments --json number,title,body,comments,state,updatedAt,url
 rtk gh issue view 19 --comments --json number,title,body,comments,state,updatedAt,url
+rtk gh pr list --state open --json number,title,isDraft,headRefName
+ls .worktrees/            # issue-<n> = lane busy, .claim-<n> = worker running
+tail -5 ~/Library/Logs/qgh-loop/issue-*.log 2>/dev/null
 ```
 
 For a specific issue:
@@ -39,7 +42,14 @@ rtk rg -n "<term|contract|module>" .
 
 ## Starting a Worktree
 
-Use `using-git-worktrees` before creating an implementation lane. That skill owns isolation detection, native tool preference, `.worktrees/` selection, ignore checks, setup, and baseline tests.
+Default path for implementation is the L2 lane: label the issue
+`ready-for-agent` and let the dispatcher own the worktree
+(`.worktrees/issue-<n>`, branch `agent/issue-<n>`). Create a manual
+worktree only when a human session must do the work itself — and only
+after confirming the issue is not labeled `ready-for-agent` and has no
+lane worktree/claim/branch. Remove the label first when taking over.
+
+Use `using-git-worktrees` before creating a manual implementation lane. That skill owns isolation detection, native tool preference, `.worktrees/` selection, ignore checks, setup, and baseline tests.
 
 Before creation:
 
@@ -108,7 +118,14 @@ Recommended output:
 Issue update not needed: <reason>
 ```
 
-Batch size should usually be 1-3 for qgh. Prefer fewer lanes when work touches shared contracts or release criteria.
+Batch size should usually be 1-3 for qgh (the lane dispatcher caps at 3
+concurrent workers). Prefer fewer lanes when work touches shared
+contracts or release criteria.
+
+When the user asks to dispatch the batch, deliver it by labeling the
+safe candidates `ready-for-agent` (and clearing `needs-info` on
+approved retries), then optionally trigger `scripts/loop/qgh-loop.sh`.
+Do not also create manual worktrees for those issues.
 
 ## Issue Updates
 
@@ -121,7 +138,7 @@ Do not post:
 - secrets, tokens, config values, private content, or sensitive snippets
 - speculative status that was not verified
 
-Do not edit issue body, labels, milestones, assignees, state, or closure unless the user explicitly asked and the relevant flow allows it.
+Do not edit issue body, milestones, assignees, state, or closure unless the user explicitly asked and the relevant flow allows it. Label edits are allowed only for the lane dispatch cycle (`ready-for-agent` on user-approved batches, clearing `needs-info` on approved retries); everything else stays propose-only.
 
 Completion/status line:
 
@@ -140,6 +157,8 @@ Issue update not needed: <reason>
 | Mistake | Fix |
 | --- | --- |
 | Recommending from memory | Re-read git worktrees, #18/#19, and relevant issues |
+| Manual worktree for a `ready-for-agent` issue | The lane owns labeled issues — remove the label first or let the dispatcher run |
+| Re-labeling a `needs-info` issue without reading #19 | Read the failure entry; fix the issue spec or constraints first |
 | Treating #18/#19 as implementation issues | Exclude them from product candidate batches |
 | Starting implementation with unresolved D2 | Route to `issue-grill-with-docs` or ask for confirmation |
 | Ignoring qgh MVP guardrails | Check PRD/AGENTS/LOOP before widening scope |

@@ -26,6 +26,28 @@ Load related skills only when the request crosses into their domain:
 | Splitting oversized scope into vertical slices | `to-issues` |
 | Unsure which qgh flow applies | `ask-matt` |
 
+## L2 Implementation Lane (autonomous dispatch)
+
+An automated lane exists (`scripts/loop/qgh-loop.sh`, LOOP.md "L2
+Implementation Lane"): a dispatcher fills up to 3 parallel worker lanes
+from open issues labeled `ready-for-agent` (oldest first), each worker
+running maker -> gates -> checker -> draft PR in `.worktrees/issue-<n>`
+on branch `agent/issue-<n>`.
+
+Consequences for this skill:
+
+- `ready-for-agent` label = dispatch queue. Applying it IS the routing
+  action; a "safe parallel batch" is delivered by labeling that set.
+- `needs-info` = parked after a failed lane run; requires human
+  re-label to retry (check #19 for the failure reason first).
+- `agent/issue-<n>` branches, `.worktrees/issue-<n>` dirs, and
+  `.worktrees/.claim-<n>` dirs are lane-owned. Treat them as `active`.
+  Never create a manual worktree for an issue that is labeled
+  `ready-for-agent` or lane-active — remove the label first if a human
+  session must take the issue over.
+- Worker logs: `~/Library/Logs/qgh-loop/issue-<n>.log`; dispatcher log:
+  `~/Library/Logs/qgh-loop.log`.
+
 ## qgh Boundaries
 
 - Tracker SSOT is GitHub Issues for `juicyjusung/qgh`.
@@ -52,7 +74,8 @@ Load related skills only when the request crosses into their domain:
 
 | Bucket | Criteria |
 | --- | --- |
-| `active` | Existing issue branch/worktree, recent explicit user status, or in-progress PR |
+| `active` | Existing issue branch/worktree (including lane-owned `agent/issue-<n>`, `.claim-<n>`), open draft PR, recent explicit user status |
+| `parked` | Labeled `needs-info` by a failed lane run — read the #19 failure entry before recommending re-label |
 | `ready` | Clear acceptance criteria, blockers closed, D2 decisions resolved or explicitly accepted |
 | `needs-grill` | Ambiguous contract, missing acceptance criteria, unresolved D2, or risky qgh domain decision |
 | `human-needed` | Scope, ADR, privacy, schema, MCP surface, token, hosted egress, or release-gate judgment |
