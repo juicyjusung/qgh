@@ -177,12 +177,20 @@ $MAKER_RULES"
     fi
 
     log "verification gates (#$ISSUE, round $round)"
+    GATES_RUN="cargo fmt --check, clippy -D warnings, cargo test, clippy --all-features -D warnings, cargo test --all-features"
     gate "cargo fmt"                    cargo fmt --all --check
     gate "cargo clippy"                 cargo clippy --all-targets -- -D warnings
     gate "cargo test"                   cargo test
     # feature-gated code must be exercised too (BM25 default path + hybrid path)
     gate "cargo clippy (all-features)"  cargo clippy --all-targets --all-features -- -D warnings
     gate "cargo test (all-features)"    cargo test --all-features
+    # release tooling present -> prove the dist plan too (checker sandbox has no network)
+    if [ -f "$WT/dist-workspace.toml" ] || grep -q 'workspace.metadata.dist' "$WT/Cargo.toml" 2>/dev/null; then
+      if command -v dist >/dev/null 2>&1; then
+        gate "cargo dist plan"          dist plan
+        GATES_RUN="$GATES_RUN, cargo dist plan"
+      fi
+    fi
 
     log "checker session start (#$ISSUE, round $round)"
     git -C "$WT" diff origin/main...HEAD > "$TMP/lane.diff"
@@ -194,7 +202,8 @@ $MAKER_RULES"
 
 Context: maker implemented GitHub issue #$ISSUE on branch $BR (review round $round).
 Issue JSON: $(cat "$TMP/issue.json")
-Gates already passed independently: cargo fmt --check, clippy -D warnings, cargo test, clippy --all-features -D warnings, cargo test --all-features.
+Gates already passed independently: $GATES_RUN.
+Your sandbox has no network access — do not attempt network commands; trust the gate evidence above for anything requiring network.
 Diff to review:
 $(cat "$TMP/lane.diff")
 
