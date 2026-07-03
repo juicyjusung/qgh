@@ -59,15 +59,23 @@ WT="$ROOT/.worktrees/issue-$ISSUE"
 TMP="$(mktemp -d)"
 
 fail() { # label needs-info, record, clean up lane
-  local reason="$1"
+  local reason="$1" disposition
   log "FAIL #$ISSUE: $reason"
   gh issue edit "$ISSUE" -R "$REPO" --add-label needs-info >/dev/null || true
+  # preserve the worktree if it holds any work (commits or dirty tree)
+  if [ -d "$WT" ] && { [ "$(git -C "$WT" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)" -gt 0 ] \
+      || [ -n "$(git -C "$WT" status --porcelain 2>/dev/null)" ]; }; then
+    disposition="worktree 보존: \`.worktrees/issue-$ISSUE\` (작업물 있음 — 사람이 확인)"
+  else
+    git -C "$ROOT" worktree remove --force "$WT" 2>/dev/null || true
+    git -C "$ROOT" branch -D "$BR" 2>/dev/null || true
+    disposition="worktree 정리 완료 (보존할 작업물 없음)"
+  fi
   runlog "**Implementation Lane 실패** ($TS)
 - issue: #$ISSUE
 - stage: $reason
-- action: \`needs-info\` 라벨 추가, worktree 정리. 사람이 확인 후 \`ready-for-agent\` 재부여 시 재시도."
-  git -C "$ROOT" worktree remove --force "$WT" 2>/dev/null || true
-  git -C "$ROOT" branch -D "$BR" 2>/dev/null || true
+- $disposition
+- action: \`needs-info\` 라벨 추가. 사람이 확인 후 \`ready-for-agent\` 재부여 시 재시도."
   rm -rf "$TMP"
   exit 1
 }
@@ -85,6 +93,7 @@ log "maker session start"
 codex exec \
   -C "$WT" \
   -s workspace-write \
+  --add-dir "$ROOT/.git" \
   -c 'sandbox_workspace_write.network_access=true' \
   -o "$TMP/maker-last.txt" \
   "You are the maker in a maker/checker loop for the qgh project.
