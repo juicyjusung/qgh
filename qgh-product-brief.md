@@ -1,8 +1,8 @@
 # qgh Product Brief
 
 문서 역할: canonical product brief.
-게시본: GitHub issue #1 (`https://github.com/juicyjusung/qgh/issues/1`)은 이 파일의 mirror다.
-업데이트 규칙: 제품 포지셔닝, 사용자, scope, success criteria가 바뀌면 이 파일을 먼저 수정하고 GitHub issue #1 body를 동기화한다.
+게시본: GitHub issue #1 (`https://github.com/juicyjusung/qgh/issues/1`)은 이 파일의 full mirror가 아니라 tracker gateway summary다.
+업데이트 규칙: 제품 포지셔닝, 사용자, scope, success criteria가 바뀌면 이 파일을 먼저 수정하고 GitHub issue #1의 gateway summary가 canonical 위치, current-as-of, 안전 불변식, 변경된 owning issue/ADR을 가리키게 갱신한다. #1 body는 전체 brief를 복사하지 않는다.
 
 작성일: 2026-06-27 KST
 개정: 2026-06-27 — 딥리서치 반영 (GitHub native semantic search GA, MCP 2025-11-25, FTS5 한국어 토크나이저, sqlite-vec 상태, 인접 도구, rate-limit 리스크)
@@ -19,6 +19,7 @@
 개정: 2026-06-30 — first-run init wizard and git-origin Command Resolution
 개정: 2026-06-30 — CLI-first contract and MCP thin-adapter positioning
 개정: 2026-06-30 — init preset preview, customize fallback, and `-y` alias
+개정: 2026-07-02 — issue #1을 full mirror에서 tracker gateway summary로 전환
 
 ## 1. 제품 정의
 

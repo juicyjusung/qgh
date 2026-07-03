@@ -1,0 +1,11 @@
+# Optional Local Vector Runtime and SQLite-Vec Storage
+
+qgh will add vector/hybrid retrieval only as an opt-in local capability behind `[embedding]`. The v1 runtime is `fastembed-rs` with local ONNX inference behind an `EmbeddingProvider` boundary; the default model is `Snowflake/snowflake-arctic-embed-l-v2.0`, with model identity and behavior captured in a fingerprint that includes provider, model id/revision, dimension, pooling, query prefix, chunker version, and source schema version.
+
+Vector storage uses `sqlite-vec` stable `vec0` tables linked into the single binary and registered immediately after `Store::open()` and before migrations. Migrations are additive and idempotent: existing SQLite stores must not require drop/resync, and vector tables are created only when embedding is enabled. ANN alpha paths are out of scope until a later ADR changes that decision.
+
+Search indexes chunks but still returns source candidates. Chunk hits are deduped to source-level results, the best chunk represents each source, and citations continue to use the existing `query -> get -> cite` source contract rather than chunk-level citation. Hybrid ranking uses BM25 over-fetch plus vector over-fetch fused with RRF `k=60`; repo, label, state, author, issue, and other hard filters are applied before each retriever creates candidates and must not be relaxed by fusion or rerank.
+
+Embedding failures are never fatal to the required retrieval path. Runtime init failure, missing model files, fingerprint mismatch, corrupt vector state, and partial coverage produce structured warnings or errors as appropriate, then fall back to BM25 where a source-safe result can still be returned. `status` may expose local embedding coverage and fingerprint state, but it must not load models or probe the network.
+
+Hosted or HTTP embedding providers, rerank activation, normalized weighted fusion, and chunk-level citations are reserved follow-up capabilities. MCP v1 stays read-only and does not expose sync, embed, write, delete, update, or provider-management tools.

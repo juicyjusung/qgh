@@ -2,7 +2,7 @@
 
 문서 역할: canonical full PRD.
 관련 문서: `qgh-product-brief.md`는 제품 포지셔닝/brief다. 별도 tracker working PRD가 생기면 이 파일의 파생본이어야 한다.
-업데이트 규칙: MVP 요구사항, acceptance criteria, release gate, source model, CLI contract, MCP adapter contract가 바뀌면 이 파일을 먼저 수정하고 필요한 mirror 문서를 동기화한다.
+업데이트 규칙: MVP 요구사항, acceptance criteria, release gate, source model, CLI contract, MCP adapter contract가 바뀌면 이 파일을 먼저 수정하고 GitHub issue #2 (`https://github.com/juicyjusung/qgh/issues/2`)의 tracker gateway summary가 canonical 위치, current-as-of, 안전 불변식, 변경된 owning issue/ADR을 가리키게 갱신한다. #2 body는 이 파일의 full mirror가 아니다.
 
 작성일: 2026-06-27 KST
 개정: 2026-06-27 KST (리뷰 반영 — positioning 정정, search-quality gate 수치화, 삭제 감지 전략, vector post-MVP 연기, GHES 결정, privacy hardening)
@@ -19,6 +19,7 @@
 개정: 2026-06-30 KST (MVP token source contract — `github_cli`/`env` only, `credential_store` post-MVP)
 개정: 2026-06-30 KST (CLI-first contract — MCP is a read-only thin adapter over CLI JSON/local retrieval)
 개정: 2026-06-30 KST (init preset preview, customize fallback, and `-y` alias)
+개정: 2026-07-02 KST (#2를 full mirror에서 tracker gateway summary로 전환)
 제품명: qgh
 문서 목적: GitHub Issues와 issue comments용 CLI-first local retrieval 도구와 read-only MCP adapter의 MVP 요구사항을 정의한다.
 
