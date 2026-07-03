@@ -152,6 +152,26 @@ fi
 # ========================== dispatcher mode ==================================
 mkdir -p "$ROOT/.worktrees" "$LOGDIR"
 
+open_worktree_in_herdr() { # best-effort: open the lane worktree as a tab in the qgh herdr workspace
+  local issue="$1" wt="$2" ws pane
+  command -v herdr >/dev/null 2>&1 || return 0
+  ws="$(herdr workspace list 2>/dev/null | python3 -c '
+import sys, json
+root = sys.argv[1]
+data = json.load(sys.stdin)
+for w in data.get("result", {}).get("workspaces", []):
+    t = w.get("worktree") or {}
+    if t.get("checkout_path") == root and not t.get("is_linked_worktree"):
+        print(w["workspace_id"]); break
+' "$ROOT" 2>/dev/null)" || return 0
+  [ -n "$ws" ] || return 0
+  pane="$(herdr tab create --workspace "$ws" --label "issue-$issue" --no-focus 2>/dev/null \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])' 2>/dev/null)" || return 0
+  [ -n "$pane" ] || return 0
+  herdr pane run "$pane" "cd $wt && tail -f $LOGDIR/issue-$issue.log" 2>/dev/null || true
+  log "herdr tab opened for #$issue (workspace $ws, pane $pane)"
+}
+
 # --- kill switch -------------------------------------------------------------
 # Activation = a line STARTING with the phrase; prose that merely mentions the
 # phrase (e.g. the kill-switch instructions themselves) must not trigger it.
@@ -200,6 +220,7 @@ for n in $(gh issue list -R "$REPO" --label ready-for-agent --state open \
   "$0" --worker "$n" "$ROOT/.worktrees/issue-$n" > "$LOGDIR/issue-$n.log" 2>&1 &
   echo $! > "$ROOT/.worktrees/.claim-$n/pid"
   log "lane launched: #$n (pid $!, log $LOGDIR/issue-$n.log)"
+  open_worktree_in_herdr "$n" "$ROOT/.worktrees/issue-$n"
   launched=$((launched+1))
 done
 
