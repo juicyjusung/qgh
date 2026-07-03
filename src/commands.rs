@@ -1,5 +1,5 @@
 use crate::chunking::chunk_markdown;
-use crate::cli::{InitArgs, InitRepoArgs, InitTokenSourceArg, QueryArgs, ReconcileMode};
+use crate::cli::{EmbedArgs, InitArgs, InitRepoArgs, InitTokenSourceArg, QueryArgs, ReconcileMode};
 use crate::config::{
     bootstrap_profile_repo, current_git_worktree_root, discover_repo_policy,
     git_remote_defaults_for_root, load_profile, load_repo_policy_at, parse_repo, resolve_token,
@@ -8,10 +8,16 @@ use crate::config::{
 };
 use crate::coverage;
 #[cfg(feature = "fastembed-provider")]
-use crate::embedding::EmbeddingProviderError;
-use crate::embedding::EmbeddingTokenizer;
-#[cfg(feature = "fastembed-provider")]
 use crate::embedding::FastembedTokenizer;
+#[cfg(feature = "fastembed-provider")]
+use crate::embedding::{
+    resolve_fastembed_snapshot, FastembedEngine, LocalEmbeddingProvider, ResolvedModelSnapshot,
+};
+use crate::embedding::{
+    EmbeddingFingerprintExpectation, EmbeddingFingerprintSeed, EmbeddingProvider,
+    EmbeddingProviderError, EmbeddingTokenizer, EmbeddingVector, DEFAULT_HF_MODEL_ID,
+    LOCAL_MODEL_REVISION,
+};
 use crate::error::QghError;
 use crate::freshness::{self, FreshnessContext, FreshnessOverrides};
 use crate::github;
@@ -869,7 +875,6 @@ fn embedding_tokenizer(
     }
 }
 
-#[cfg(feature = "fastembed-provider")]
 fn embedding_error(error: EmbeddingProviderError) -> QghError {
     let mut qgh_error =
         QghError::validation(error.code(), error.message()).with_details(error.details().clone());
@@ -969,6 +974,177 @@ fn target_issue_sync_json(
             "mode": "targeted_issue"
         }
     })
+}
+
+pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, QghError> {
+    if !args.force {
+        return Err(QghError::validation(
+            "embedding.force_required",
+            "`qgh embed` requires --force for this full-refresh slice.",
+        )
+        .with_hint("Run `qgh embed --force` to recompute every stored chunk embedding."));
+    }
+
+    let profile = load_profile(profile_id)?;
+    let Some(embedding) = profile.embedding.as_ref() else {
+        return Err(QghError::validation(
+            "embedding.not_configured",
+            "Embedding is not configured for this profile.",
+        )
+        .with_hint("Add an [embedding] section before running `qgh embed --force`."));
+    };
+    let mut store = Store::open(&profile.paths)?;
+    let runtime = embedding_runtime(embedding)?;
+    let progress = StderrSyncProgress::new(false);
+    let refreshed_chunks =
+        refresh_embedding_chunks(&mut store, runtime.tokenizer.as_ref(), &progress)?;
+    let data = refresh_chunk_embeddings(
+        &mut store,
+        runtime.provider.as_ref(),
+        runtime.fingerprint_seed,
+    )?;
+    Ok(LocalReadOutcome {
+        data: json!({
+            "profile_id": profile.id,
+            "embedding_state": "refreshed",
+            "chunks": {
+                "refreshed": refreshed_chunks,
+                "embedded": data["embedded_chunks"]
+            }
+        }),
+        warnings: Vec::new(),
+    })
+}
+
+struct EmbeddingRuntime {
+    tokenizer: Box<dyn EmbeddingTokenizer>,
+    provider: Box<dyn EmbeddingProvider>,
+    fingerprint_seed: EmbeddingFingerprintSeed,
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn embedding_runtime(embedding: &EmbeddingConfig) -> Result<EmbeddingRuntime, QghError> {
+    match embedding.provider {
+        EmbeddingProviderKind::Local => {
+            let snapshot = resolve_fastembed_snapshot(embedding.fastembed_options())
+                .map_err(embedding_error)?;
+            let tokenizer = FastembedTokenizer::from_snapshot(&snapshot)
+                .map(|tokenizer| Box::new(tokenizer) as Box<dyn EmbeddingTokenizer>)
+                .map_err(embedding_error)?;
+            let engine = FastembedEngine::from_snapshot(&snapshot).map_err(embedding_error)?;
+            let provider = LocalEmbeddingProvider::new(engine, snapshot.query_prefix.clone());
+            Ok(EmbeddingRuntime {
+                tokenizer,
+                provider: Box::new(provider),
+                fingerprint_seed: embedding_fingerprint_seed(embedding, &snapshot),
+            })
+        }
+    }
+}
+
+#[cfg(not(feature = "fastembed-provider"))]
+fn embedding_runtime(embedding: &EmbeddingConfig) -> Result<EmbeddingRuntime, QghError> {
+    match embedding.provider {
+        EmbeddingProviderKind::Local => Err(QghError::validation(
+            "embedding.provider_unavailable",
+            "This qgh binary was built without the fastembed-provider feature.",
+        )
+        .with_hint("Rebuild with `--features fastembed-provider` or remove `[embedding]`.")),
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn embedding_fingerprint_seed(
+    embedding: &EmbeddingConfig,
+    snapshot: &ResolvedModelSnapshot,
+) -> EmbeddingFingerprintSeed {
+    EmbeddingFingerprintSeed {
+        provider: embedding_provider_name(embedding.provider).to_string(),
+        model_id: embedding_model_id(embedding, snapshot),
+        model_revision: snapshot.model_revision.clone(),
+        pooling: snapshot.pooling,
+        query_prefix: snapshot.query_prefix.clone(),
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn embedding_model_id(embedding: &EmbeddingConfig, snapshot: &ResolvedModelSnapshot) -> String {
+    if let Some(model_id) = &snapshot.model_id {
+        return model_id.clone();
+    }
+    embedding
+        .model_path
+        .as_ref()
+        .map(|path| format!("model_path:{}", path.to_string_lossy()))
+        .unwrap_or_else(|| format!("model_file:{}", snapshot.model_file))
+}
+
+fn refresh_chunk_embeddings(
+    store: &mut Store,
+    provider: &dyn EmbeddingProvider,
+    fingerprint_seed: EmbeddingFingerprintSeed,
+) -> Result<Value, QghError> {
+    let chunks = store.active_embedding_chunks()?;
+    if chunks.is_empty() {
+        return Err(QghError::validation(
+            "embedding.no_chunks",
+            "No active chunks are available to embed.",
+        )
+        .with_hint("Run `qgh sync` with [embedding] configured before `qgh embed --force`."));
+    }
+
+    let texts = chunks
+        .iter()
+        .map(|chunk| chunk.body.as_str())
+        .collect::<Vec<_>>();
+    let vectors = provider.embed_documents(&texts).map_err(embedding_error)?;
+    if vectors.len() != chunks.len() {
+        return Err(QghError::validation(
+            "embedding.vector_count_mismatch",
+            "Embedding provider returned a different number of vectors than input chunks.",
+        )
+        .with_details(json!({
+            "chunk_count": chunks.len(),
+            "vector_count": vectors.len()
+        })));
+    }
+    let dimension = embedding_dimension(&vectors)?;
+    let fingerprint = fingerprint_seed.with_dimension(dimension);
+    let embeddings = chunks
+        .iter()
+        .zip(vectors)
+        .map(|(chunk, vector)| (chunk.chunk_id, vector))
+        .collect::<Vec<_>>();
+    let embedded_chunks = store.replace_all_chunk_embeddings(&fingerprint, &embeddings)?;
+    let usable_embeddings = store.current_chunk_embedding_count_for_fingerprint(&fingerprint)?;
+    Ok(json!({
+        "embedded_chunks": embedded_chunks,
+        "usable_embeddings": usable_embeddings
+    }))
+}
+
+fn embedding_dimension(vectors: &[EmbeddingVector]) -> Result<usize, QghError> {
+    let Some(first) = vectors.first() else {
+        return Err(QghError::validation(
+            "embedding.empty_result",
+            "Embedding provider returned no vectors.",
+        ));
+    };
+    if first.is_empty() {
+        return Err(QghError::validation(
+            "embedding.empty_vector",
+            "Embedding provider returned an empty vector.",
+        ));
+    }
+    let dimension = first.len();
+    if vectors.iter().any(|vector| vector.len() != dimension) {
+        return Err(QghError::validation(
+            "embedding.dimension_mismatch",
+            "Embedding provider returned inconsistent vector dimensions.",
+        )
+        .with_details(json!({ "expected_dimension": dimension })));
+    }
+    Ok(dimension)
 }
 
 fn profile_scoped_to_repo(
@@ -1555,6 +1731,7 @@ pub fn query(
         let coverage = coverage::evaluate(&store.coverage_snapshot()?, false);
         let mut warnings = freshness.warnings;
         warnings.extend(coverage.warnings);
+        warnings.extend(embedding_warnings(&profile, &store)?);
         return Ok(LocalReadOutcome {
             data: json!({
             "profile_id": profile.id,
@@ -1597,6 +1774,7 @@ pub fn query(
     let coverage = coverage::evaluate(&store.coverage_snapshot()?, results.items.is_empty());
     let mut warnings = freshness.warnings;
     warnings.extend(coverage.warnings);
+    warnings.extend(embedding_warnings(&profile, &store)?);
     Ok(LocalReadOutcome {
         data: json!({
         "profile_id": profile.id,
@@ -1930,6 +2108,61 @@ impl QueryResults {
             self.repos.push(repo.clone());
         }
         self.items.push(source_result(source, ranking, profile_id));
+    }
+}
+
+fn embedding_warnings(profile: &Profile, store: &Store) -> Result<Vec<Value>, QghError> {
+    let Some(embedding) = profile.embedding.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(active) = store.active_embedding_fingerprint()? else {
+        return Ok(Vec::new());
+    };
+    let expectation = embedding_fingerprint_expectation(embedding);
+    if active.matches_expectation(&expectation) {
+        return Ok(Vec::new());
+    }
+    Ok(vec![json!({
+        "code": "embedding.fingerprint_mismatch",
+        "severity": "warn_strong",
+        "message": "Stored embeddings were created with a different embedding fingerprint and will not be used for vector search. BM25 results are still returned.",
+        "hint": "Run `qgh embed --force` to recompute local embeddings."
+    })])
+}
+
+fn embedding_fingerprint_expectation(
+    embedding: &EmbeddingConfig,
+) -> EmbeddingFingerprintExpectation {
+    EmbeddingFingerprintExpectation {
+        provider: embedding_provider_name(embedding.provider).to_string(),
+        model_id: configured_embedding_model_id(embedding),
+        model_revision: embedding
+            .model_path
+            .as_ref()
+            .map(|_| LOCAL_MODEL_REVISION.to_string()),
+        pooling: embedding.pooling,
+        query_prefix: embedding.query_prefix.clone(),
+    }
+}
+
+fn configured_embedding_model_id(embedding: &EmbeddingConfig) -> Option<String> {
+    if let Some(model) = &embedding.model {
+        return Some(
+            model
+                .strip_prefix("hf:")
+                .map(str::to_string)
+                .unwrap_or_else(|| model.clone()),
+        );
+    }
+    if let Some(path) = &embedding.model_path {
+        return Some(format!("model_path:{}", path.to_string_lossy()));
+    }
+    Some(DEFAULT_HF_MODEL_ID.to_string())
+}
+
+fn embedding_provider_name(provider: EmbeddingProviderKind) -> &'static str {
+    match provider {
+        EmbeddingProviderKind::Local => "local",
     }
 }
 
@@ -2277,6 +2510,8 @@ pub fn status(
     if freshness.fails {
         return Err(freshness_error(freshness.block, freshness.warnings));
     }
+    let mut warnings = freshness.warnings;
+    warnings.extend(embedding_warnings(&profile, &store)?);
     let source_count = (status.issue_count + status.comment_count) as usize;
     let age_days = status
         .last_reconciliation
@@ -2365,7 +2600,7 @@ pub fn status(
             "single_user_permissions": "0600_files_0700_dirs_where_supported"
         }
         }),
-        warnings: freshness.warnings,
+        warnings,
     })
 }
 
@@ -2648,4 +2883,135 @@ fn snippet(body: &str) -> String {
         end -= 1;
     }
     format!("{}...", &body[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chunking::MarkdownChunk;
+    use crate::embedding::PoolingKind;
+    use crate::model::IssueRecord;
+    use crate::paths::ProfilePaths;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct MockEmbeddingProvider;
+
+    impl EmbeddingProvider for MockEmbeddingProvider {
+        fn embed_documents(
+            &self,
+            texts: &[&str],
+        ) -> Result<Vec<EmbeddingVector>, EmbeddingProviderError> {
+            Ok(texts
+                .iter()
+                .enumerate()
+                .map(|(index, _)| vec![index as f32, 1.0, 2.0])
+                .collect())
+        }
+
+        fn embed_query(&self, _text: &str) -> Result<EmbeddingVector, EmbeddingProviderError> {
+            Ok(vec![0.0, 1.0, 2.0])
+        }
+    }
+
+    #[test]
+    fn force_refresh_persists_vectors_under_new_fingerprint() {
+        let paths = temp_profile_paths("command-embed-force");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_COMMAND_EMBED";
+        let issue = IssueRecord {
+            source_id: source_id.to_string(),
+            host: "github.com".to_string(),
+            repo: "owner/repo".to_string(),
+            node_id: "I_COMMAND_EMBED".to_string(),
+            github_id: 303,
+            number: 9,
+            title: "Command embed".to_string(),
+            body: "alpha beta gamma delta".to_string(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone: None,
+            assignees: Vec::new(),
+            author: Some("alice".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            closed_at: None,
+            canonical_url: "https://github.com/owner/repo/issues/9".to_string(),
+            body_hash: "body-hash-command-embed".to_string(),
+            indexed_at: "2026-01-02T00:00:01Z".to_string(),
+        };
+        store
+            .upsert_sources_for_run("sync-command-embed", &[issue], &[], 0, &[])
+            .unwrap();
+        let source_version_id = store.latest_source_version_id(source_id).unwrap().unwrap();
+        store
+            .replace_chunks_for_source_version(
+                source_id,
+                source_version_id,
+                &[
+                    MarkdownChunk {
+                        chunk_index: 0,
+                        byte_start: 0,
+                        byte_end: 10,
+                        token_start: 0,
+                        token_end: 2,
+                        token_count: 2,
+                        body: "alpha beta".to_string(),
+                    },
+                    MarkdownChunk {
+                        chunk_index: 1,
+                        byte_start: 11,
+                        byte_end: 22,
+                        token_start: 2,
+                        token_end: 4,
+                        token_count: 2,
+                        body: "gamma delta".to_string(),
+                    },
+                ],
+            )
+            .unwrap();
+        let seed = EmbeddingFingerprintSeed {
+            provider: "local".to_string(),
+            model_id: "Snowflake/snowflake-arctic-embed-l-v2.0".to_string(),
+            model_revision: "fixture-sha".to_string(),
+            pooling: PoolingKind::Cls,
+            query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
+        };
+
+        let outcome = refresh_chunk_embeddings(&mut store, &MockEmbeddingProvider, seed).unwrap();
+        let active = store.active_embedding_fingerprint().unwrap().unwrap();
+
+        assert_eq!(outcome["embedded_chunks"], 2);
+        assert_eq!(outcome["usable_embeddings"], 2);
+        assert_eq!(active.dimension, 3);
+        assert_eq!(active.model_revision, "fixture-sha");
+        assert_eq!(
+            store
+                .current_chunk_embedding_count_for_fingerprint(&active)
+                .unwrap(),
+            2
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    fn temp_profile_paths(name: &str) -> ProfilePaths {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile_dir = std::env::temp_dir().join(format!("qgh-commands-{name}-{nanos}"));
+        let cache_dir = profile_dir.join("cache");
+        let log_dir = cache_dir.join("logs");
+        let index_root = profile_dir.join("tantivy");
+        ProfilePaths {
+            config_file: profile_dir.join("config.toml"),
+            db_path: profile_dir.join("qgh.sqlite3"),
+            index_active: index_root.join("active"),
+            index_root,
+            log_dir,
+            cache_dir,
+            profile_dir,
+        }
+    }
 }

@@ -1,4 +1,5 @@
 use crate::chunking::MarkdownChunk;
+use crate::embedding::{EmbeddingFingerprint, EmbeddingVector};
 use crate::error::QghError;
 use crate::model::{
     BackoffView, CommentRecord, CoverageSnapshot, CursorUpdate, CursorView, IndexSource,
@@ -589,6 +590,146 @@ impl Store {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
+    }
+
+    pub fn active_embedding_chunks(&self) -> Result<Vec<StoredChunk>, QghError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.source_id, c.source_version_id, c.body
+             FROM chunks c
+             JOIN source_entities se ON se.source_id = c.source_id
+             LEFT JOIN issue_metadata im ON im.source_id = c.source_id
+             LEFT JOIN comment_metadata cm ON cm.source_id = c.source_id
+             WHERE se.lifecycle_state = 'active'
+               AND c.source_version_id = coalesce(im.latest_version_id, cm.latest_version_id)
+             ORDER BY c.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StoredChunk {
+                chunk_id: row.get(0)?,
+                source_id: row.get(1)?,
+                source_version_id: row.get(2)?,
+                body: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
+    }
+
+    pub fn active_embedding_fingerprint(&self) -> Result<Option<EmbeddingFingerprint>, QghError> {
+        let fingerprint_json = self
+            .conn
+            .query_row(
+                "SELECT fingerprint_json
+                 FROM embedding_fingerprints
+                 WHERE active = 1
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        fingerprint_json
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|error| {
+                    QghError::storage(format!("Stored embedding fingerprint is invalid: {error}"))
+                })
+            })
+            .transpose()
+    }
+
+    pub fn replace_all_chunk_embeddings(
+        &mut self,
+        fingerprint: &EmbeddingFingerprint,
+        embeddings: &[(i64, EmbeddingVector)],
+    ) -> Result<usize, QghError> {
+        let fingerprint_hash = fingerprint.hash();
+        let fingerprint_json = serde_json::to_string(fingerprint).map_err(|error| {
+            QghError::storage(format!(
+                "Failed to serialize embedding fingerprint: {error}"
+            ))
+        })?;
+        let now = now_rfc3339();
+        let tx = self.conn.transaction()?;
+        tx.execute("UPDATE embedding_fingerprints SET active = 0", [])?;
+        tx.execute(
+            "INSERT INTO embedding_fingerprints
+                (fingerprint_hash, fingerprint_json, provider, model_id, model_revision,
+                 dimension, pooling, query_prefix, chunker_version, source_schema_version,
+                 created_at, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)
+             ON CONFLICT(fingerprint_hash) DO UPDATE SET
+                fingerprint_json = excluded.fingerprint_json,
+                provider = excluded.provider,
+                model_id = excluded.model_id,
+                model_revision = excluded.model_revision,
+                dimension = excluded.dimension,
+                pooling = excluded.pooling,
+                query_prefix = excluded.query_prefix,
+                chunker_version = excluded.chunker_version,
+                source_schema_version = excluded.source_schema_version,
+                active = 1",
+            params![
+                &fingerprint_hash,
+                &fingerprint_json,
+                &fingerprint.provider,
+                &fingerprint.model_id,
+                &fingerprint.model_revision,
+                fingerprint.dimension as i64,
+                fingerprint.pooling.as_str(),
+                &fingerprint.query_prefix,
+                &fingerprint.chunker_version,
+                &fingerprint.source_schema_version,
+                &now
+            ],
+        )?;
+        let fingerprint_id: i64 = tx.query_row(
+            "SELECT id FROM embedding_fingerprints WHERE fingerprint_hash = ?1",
+            params![&fingerprint_hash],
+            |row| row.get(0),
+        )?;
+        tx.execute("DELETE FROM chunk_embeddings", [])?;
+        for (chunk_id, vector) in embeddings {
+            if vector.len() != fingerprint.dimension {
+                return Err(QghError::storage(format!(
+                    "Embedding vector dimension {} does not match fingerprint dimension {}.",
+                    vector.len(),
+                    fingerprint.dimension
+                )));
+            }
+            let vector_json = serde_json::to_string(vector).map_err(|error| {
+                QghError::storage(format!("Failed to serialize embedding vector: {error}"))
+            })?;
+            tx.execute(
+                "INSERT INTO chunk_embeddings
+                    (chunk_id, fingerprint_id, vector_json, embedded_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![chunk_id, fingerprint_id, vector_json, &now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(embeddings.len())
+    }
+
+    pub fn current_chunk_embedding_count_for_fingerprint(
+        &self,
+        fingerprint: &EmbeddingFingerprint,
+    ) -> Result<i64, QghError> {
+        let fingerprint_hash = fingerprint.hash();
+        self.conn
+            .query_row(
+                "SELECT count(*)
+                 FROM chunk_embeddings ce
+                 JOIN embedding_fingerprints ef ON ef.id = ce.fingerprint_id
+                 JOIN chunks c ON c.id = ce.chunk_id
+                 JOIN source_entities se ON se.source_id = c.source_id
+                 LEFT JOIN issue_metadata im ON im.source_id = c.source_id
+                 LEFT JOIN comment_metadata cm ON cm.source_id = c.source_id
+                 WHERE ef.fingerprint_hash = ?1
+                   AND se.lifecycle_state = 'active'
+                   AND c.source_version_id = coalesce(im.latest_version_id, cm.latest_version_id)",
+                params![fingerprint_hash],
+                |row| row.get(0),
+            )
+            .map_err(QghError::from)
     }
 
     pub fn get_tombstone(&self, source_id: &str) -> Result<Option<TombstoneView>, QghError> {
@@ -1304,6 +1445,30 @@ impl Store {
                 body TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS embedding_fingerprints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint_hash TEXT NOT NULL UNIQUE,
+                fingerprint_json TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                model_revision TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                pooling TEXT NOT NULL,
+                query_prefix TEXT NOT NULL,
+                chunker_version TEXT NOT NULL,
+                source_schema_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS chunk_embeddings (
+                chunk_id INTEGER NOT NULL,
+                fingerprint_id INTEGER NOT NULL,
+                vector_json TEXT NOT NULL,
+                embedded_at TEXT NOT NULL,
+                PRIMARY KEY (chunk_id, fingerprint_id)
+            );
+
             CREATE TABLE IF NOT EXISTS sync_runs (
                 id TEXT PRIMARY KEY,
                 started_at TEXT NOT NULL,
@@ -1744,6 +1909,85 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn chunk_embeddings_are_usable_only_for_matching_fingerprint() {
+        let paths = temp_profile_paths("embedding-fingerprint-gate");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_EMBED_GATE";
+        let issue = IssueRecord {
+            source_id: source_id.to_string(),
+            host: "github.com".to_string(),
+            repo: "owner/repo".to_string(),
+            node_id: "I_EMBED_GATE".to_string(),
+            github_id: 202,
+            number: 8,
+            title: "Embedding gate".to_string(),
+            body: "alpha beta gamma delta".to_string(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone: None,
+            assignees: Vec::new(),
+            author: Some("alice".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            closed_at: None,
+            canonical_url: "https://github.com/owner/repo/issues/8".to_string(),
+            body_hash: "body-hash-embed".to_string(),
+            indexed_at: "2026-01-02T00:00:01Z".to_string(),
+        };
+        store
+            .upsert_sources_for_run("sync-embed-test", &[issue], &[], 0, &[])
+            .unwrap();
+        let source_version_id = store.latest_source_version_id(source_id).unwrap().unwrap();
+        let chunks = vec![MarkdownChunk {
+            chunk_index: 0,
+            byte_start: 0,
+            byte_end: 10,
+            token_start: 0,
+            token_end: 2,
+            token_count: 2,
+            body: "alpha beta".to_string(),
+        }];
+        let stored_chunks = store
+            .replace_chunks_for_source_version(source_id, source_version_id, &chunks)
+            .unwrap();
+        let matching = embedding_fingerprint("Snowflake/snowflake-arctic-embed-l-v2.0");
+        let mismatched = embedding_fingerprint("Example/other-model");
+
+        store
+            .replace_all_chunk_embeddings(
+                &matching,
+                &[(stored_chunks[0].chunk_id, vec![0.1, 0.2, 0.3])],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .current_chunk_embedding_count_for_fingerprint(&matching)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .current_chunk_embedding_count_for_fingerprint(&mismatched)
+                .unwrap(),
+            0
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    fn embedding_fingerprint(model_id: &str) -> EmbeddingFingerprint {
+        crate::embedding::EmbeddingFingerprintSeed {
+            provider: "local".to_string(),
+            model_id: model_id.to_string(),
+            model_revision: "fixture-sha".to_string(),
+            pooling: crate::embedding::PoolingKind::Cls,
+            query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
+        }
+        .with_dimension(3)
     }
 
     fn temp_profile_paths(name: &str) -> ProfilePaths {
