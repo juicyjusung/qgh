@@ -9,6 +9,8 @@ brew install juicyjusung/tap/qgh
 ```
 
 The Homebrew formula installs a self-contained `qgh` binary on your PATH.
+Release artifacts are built by `cargo-dist` from `vX.Y.Z` tags and served from
+GitHub Releases; the tap formula is published to `juicyjusung/homebrew-tap`.
 
 ## First Use
 

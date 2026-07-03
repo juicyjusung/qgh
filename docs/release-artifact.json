@@ -21,6 +21,14 @@
     "release_artifact_origin": "GitHub Releases",
     "release_automation": "cargo-dist",
     "release_trigger": "Cargo.toml version bump commit plus matching vX.Y.Z tag push",
+    "release_workflow": {
+      "cargo_dist_version": "0.32.0",
+      "config": "dist-workspace.toml",
+      "workflow": ".github/workflows/release.yml",
+      "homebrew_smoke_workflow": ".github/workflows/homebrew-smoke.yml",
+      "checksum": "sha256",
+      "post_announce_jobs": ["./homebrew-smoke"]
+    },
     "release_targets": [
       "aarch64-apple-darwin",
       "x86_64-apple-darwin",
