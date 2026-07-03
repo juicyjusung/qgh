@@ -33,8 +33,8 @@ if [ "${1:-}" = "--worker" ]; then
   TMP="$(mktemp -d)"
   trap 'rm -rf "$CLAIM" "$TMP" 2>/dev/null || true' EXIT
 
-  fail() { # label needs-info, record, clean up lane
-    local reason="$1" disposition
+  fail() { # label needs-info, comment outcome on the issue, record, clean up
+    local reason="$1" detail="${2:-}" disposition
     log "FAIL #$ISSUE: $reason"
     gh issue edit "$ISSUE" -R "$REPO" --add-label needs-info >/dev/null || true
     # preserve the worktree if it holds any work (commits or dirty tree)
@@ -46,11 +46,22 @@ if [ "${1:-}" = "--worker" ]; then
       git -C "$ROOT" branch -D "$BR" 2>/dev/null || true
       disposition="worktree 정리 완료 (보존할 작업물 없음)"
     fi
-    runlog "**Implementation Lane 실패** ($TS)
-- issue: #$ISSUE
+    local outcome="**🔴 Implementation Lane 실패** ($TS)
 - stage: $reason
 - $disposition
-- action: \`needs-info\` 라벨 추가. 사람이 확인 후 \`ready-for-agent\` 재부여 시 재시도."
+- 재시도: 원인 해결 후 \`needs-info\` 라벨 제거 (\`ready-for-agent\` 유지)"
+    if [ -n "$detail" ]; then
+      outcome="$outcome
+
+<details><summary>에이전트 마지막 메시지</summary>
+
+\`\`\`
+$detail
+\`\`\`
+</details>"
+    fi
+    gh issue comment "$ISSUE" -R "$REPO" --body "$outcome" >/dev/null || true
+    runlog "**Implementation Lane 실패** ($TS) — #$ISSUE, stage: $reason (상세는 #$ISSUE 코멘트)"
     exit 1
   }
 
@@ -78,22 +89,26 @@ Rules:
 - If the crate defines cargo features, also: cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-features. Feature-gated code that never compiles in gates is a REJECT.
 - Commit with Conventional Commits (English type/subject). Do NOT push. Do NOT open PRs.
 - If the issue is ambiguous or requires denylist changes, stop and explain instead of guessing." \
-    || fail "maker: codex exec error"
+    || fail "maker: codex exec error" "$(tail -c 1500 "$TMP/maker-last.txt" 2>/dev/null || true)"
 
   # require at least one commit
   if [ "$(git -C "$WT" rev-list --count origin/main..HEAD)" -eq 0 ]; then
-    fail "maker: no commits produced (see maker-last message in #$RUNLOG_ISSUE)"
+    fail "maker: no commits produced" "$(tail -c 1500 "$TMP/maker-last.txt" 2>/dev/null || true)"
   fi
 
   # --- independent gates (script does not trust the maker) ------------------
   log "verification gates (#$ISSUE)"
-  ( cd "$WT" && cargo fmt --all --check )                      || fail "gate: cargo fmt"
-  ( cd "$WT" && cargo clippy --all-targets -- -D warnings )    || fail "gate: cargo clippy"
-  ( cd "$WT" && cargo test )                                   || fail "gate: cargo test"
+  gate() { # run a gate, keep its tail for the failure comment
+    local name="$1"; shift
+    ( cd "$WT" && "$@" ) > "$TMP/gate.log" 2>&1 \
+      || fail "gate: $name" "$(tail -c 1500 "$TMP/gate.log")"
+  }
+  gate "cargo fmt"                    cargo fmt --all --check
+  gate "cargo clippy"                 cargo clippy --all-targets -- -D warnings
+  gate "cargo test"                   cargo test
   # feature-gated code must be exercised too (BM25 default path + hybrid path)
-  ( cd "$WT" && cargo clippy --all-targets --all-features -- -D warnings ) \
-                                                               || fail "gate: cargo clippy (all-features)"
-  ( cd "$WT" && cargo test --all-features )                    || fail "gate: cargo test (all-features)"
+  gate "cargo clippy (all-features)"  cargo clippy --all-targets --all-features -- -D warnings
+  gate "cargo test (all-features)"    cargo test --all-features
 
   # --- checker: separate read-only codex session -----------------------------
   log "checker session start (#$ISSUE)"
@@ -114,12 +129,7 @@ End your reply with exactly one final line: 'VERDICT: APPROVE' or 'VERDICT: REJE
     || fail "checker: codex exec error"
 
   if ! grep -q 'VERDICT: APPROVE' "$TMP/verdict.txt"; then
-    verdict_tail="$(tail -c 1500 "$TMP/verdict.txt")"
-    runlog "**Checker verdict (non-APPROVE)** ($TS) — issue #$ISSUE
-\`\`\`
-$verdict_tail
-\`\`\`"
-    fail "checker: verdict not APPROVE"
+    fail "checker: verdict not APPROVE" "$(tail -c 1500 "$TMP/verdict.txt")"
   fi
 
   # --- draft PR ---------------------------------------------------------------
@@ -136,11 +146,10 @@ Implementation Lane (L2 assisted) 자동 생성 draft PR.
 - 머지는 사람이 리뷰 후 진행. LOOP.md 참고.")
 
   gh issue edit "$ISSUE" -R "$REPO" --remove-label ready-for-agent >/dev/null || true
-  runlog "**Implementation Lane 성공** ($TS)
-- issue: #$ISSUE
-- branch: \`$BR\`
-- PR: $PR_URL (draft)
-- 검증: fmt/clippy/test green + checker APPROVE"
+  gh issue comment "$ISSUE" -R "$REPO" --body "**🟢 Implementation Lane 성공** ($TS)
+- draft PR: $PR_URL — 사람 리뷰 후 ready 전환·머지
+- 검증: fmt / clippy / test / all-features 게이트 green + checker APPROVE" >/dev/null || true
+  runlog "**Implementation Lane 성공** ($TS) — #$ISSUE → $PR_URL (draft)"
 
   # lane slot 반환 — 브랜치는 origin에 있음
   git -C "$ROOT" worktree remove --force "$WT" 2>/dev/null || true

@@ -23,7 +23,8 @@ stricter rule wins.
 
 - Never close issues, edit issue bodies, or change milestones/assignees.
 - Loop state writes go only to #18 (snapshot) and #19 (append-only run
-  log).
+  log), plus one run-outcome comment (success PR link or failure reason)
+  on the single issue the lane run is implementing.
 - Label changes allowed only on the issue a lane run is implementing:
   remove `ready-for-agent` on success, add `needs-info` on failure.
   Everything else is propose-only in run output.
