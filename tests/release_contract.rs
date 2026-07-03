@@ -890,7 +890,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         query_result["properties"]["source_id"]["pattern"],
-        "^qgh://github\\.com/(issue|issue-comment)/"
+        "^qgh://[^/]+/(issue|issue-comment)/"
     );
     assert_eq!(
         query_result["properties"]["entity_type"]["enum"],
@@ -952,7 +952,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         query_parent_issue["properties"]["source_id"]["pattern"],
-        "^qgh://github\\.com/issue/"
+        "^qgh://[^/]+/issue/"
     );
     assert_eq!(
         query_parent_issue["properties"]["repo"]["pattern"],
@@ -1508,7 +1508,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         get_parent_issue["properties"]["source_id"]["pattern"],
-        "^qgh://github\\.com/issue/"
+        "^qgh://[^/]+/issue/"
     );
     assert_eq!(
         get_parent_issue["properties"]["repo"]["pattern"],

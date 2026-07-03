@@ -52,7 +52,7 @@
       "properties": {
         "source_id": {
           "type": "string",
-          "pattern": "^qgh://github\\.com/(issue|issue-comment)/",
+          "pattern": "^qgh://[^/]+/(issue|issue-comment)/",
           "description": "Stable qgh source URI."
         },
         "entity_type": {
@@ -191,7 +191,7 @@
       "properties": {
         "source_id": {
           "type": "string",
-          "pattern": "^qgh://github\\.com/issue/"
+          "pattern": "^qgh://[^/]+/issue/"
         },
         "repo": {
           "type": "string",

@@ -2293,7 +2293,7 @@ pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
         || index::search(&active_index_path, "__qgh_doctor_probe__", 1).is_ok();
     let (github_ok, rate_limit_ok, rate_limit_headers) = match resolve_token(&profile) {
         Ok(token) => doctor_github_probe(&profile, &token).await,
-        Err(_) => (false, false, json!({})),
+        Err(_) => (false, false, rate_limit_headers_json(None, None)),
     };
     Ok(json!({
         "profile_id": profile.id,
@@ -2468,7 +2468,7 @@ async fn doctor_github_probe(profile: &crate::config::Profile, token: &str) -> (
         .send()
         .await;
     let Ok(response) = response else {
-        return (false, false, json!({}));
+        return (false, false, rate_limit_headers_json(None, None));
     };
     let headers = response.headers();
     let remaining = headers
@@ -2483,11 +2483,15 @@ async fn doctor_github_probe(profile: &crate::config::Profile, token: &str) -> (
     (
         response.status().is_success(),
         rate_limit_ok,
-        json!({
-            "x-ratelimit-remaining": remaining,
-            "x-ratelimit-reset": reset
-        }),
+        rate_limit_headers_json(remaining, reset),
     )
+}
+
+fn rate_limit_headers_json(remaining: Option<String>, reset: Option<String>) -> Value {
+    json!({
+        "x-ratelimit-remaining": remaining,
+        "x-ratelimit-reset": reset
+    })
 }
 
 fn private_paths_ok(paths: &crate::paths::ProfilePaths) -> bool {

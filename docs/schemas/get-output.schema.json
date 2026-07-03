@@ -193,7 +193,7 @@
       "properties": {
         "source_id": {
           "type": "string",
-          "pattern": "^qgh://github\\.com/issue/"
+          "pattern": "^qgh://[^/]+/issue/"
         },
         "repo": {
           "type": "string",

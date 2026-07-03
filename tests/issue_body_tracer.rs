@@ -2792,6 +2792,51 @@ fn doctor_runs_explicit_checks_and_reports_cli_only_scope() {
 }
 
 #[test]
+fn doctor_reports_null_rate_limit_headers_when_token_is_unavailable() {
+    let fixture = TestFixture::new("doctor-missing-token");
+    fixture.write_config_with_missing_token_profile("http://127.0.0.1:1");
+
+    let doctor = fixture.qgh_in_profile(&fixture.root, "strict", ["doctor", "--json"]);
+    assert_success(&doctor);
+    let doctor_json = stdout_json(&doctor);
+    let checks = doctor_json["data"]["checks"].as_array().unwrap();
+    let rate_limit = checks
+        .iter()
+        .find(|check| check["name"] == "rate_limit_headers")
+        .unwrap();
+    assert_eq!(rate_limit["ok"], false);
+    assert_eq!(rate_limit["headers"]["x-ratelimit-remaining"], Value::Null);
+    assert_eq!(rate_limit["headers"]["x-ratelimit-reset"], Value::Null);
+}
+
+#[test]
+fn ghes_comment_parent_issue_ids_use_profile_host() {
+    let fixture = TestFixture::new("ghes-parent-issue-source-id");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config_with_host("ghe.internal.example", &server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let parent_id = "qgh://ghe.internal.example/issue/I_kwDOISSUE1";
+    let comment_id = "qgh://ghe.internal.example/issue-comment/IC_kwDOCOMMENT1";
+
+    let get = fixture.qgh(["get", comment_id, "--json"]);
+    assert_success(&get);
+    let get_json = stdout_json(&get);
+    assert_eq!(
+        get_json["data"]["source"]["parent_issue"]["source_id"],
+        parent_id
+    );
+
+    let query = fixture.qgh(["query", "comment-only mitigation", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    assert_eq!(
+        query_json["data"]["results"][0]["parent_issue"]["source_id"],
+        parent_id
+    );
+}
+
+#[test]
 fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
     let fixture = TestFixture::new("mcp-tools");
     fixture.write_config("http://127.0.0.1:1");
@@ -4816,6 +4861,25 @@ impl TestFixture {
 
     fn write_config(&self, api_base_url: &str) {
         self.write_config_with_reconcile_after(api_base_url, None);
+    }
+
+    fn write_config_with_host(&self, host: &str, api_base_url: &str) {
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "{host}"
+api_base_url = "{api_base_url}"
+web_base_url = "https://{host}"
+repos = ["owner/repo"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
     }
 
     fn write_config_with_repos(&self, api_base_url: &str, repos: &[&str]) {
