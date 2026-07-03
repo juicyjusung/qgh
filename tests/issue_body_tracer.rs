@@ -2077,6 +2077,61 @@ fn status_reports_never_synced_and_validates_duration_config() {
 }
 
 #[test]
+fn embedding_config_accepts_local_provider_without_status_shape_change() {
+    let fixture = TestFixture::new("embedding-local-config");
+    fixture.write_config_with_embedding("http://127.0.0.1:1", r#"provider = "local""#);
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["freshness"]["decision"], "never_synced");
+    assert!(
+        status_json["data"].get("embedding").is_none(),
+        "embedding config must not change status schema in this slice: {status_json}"
+    );
+}
+
+#[test]
+fn embedding_config_rejects_unknown_keys_and_non_local_provider() {
+    for (fixture_name, embedding, expected_message_fragment) in [
+        (
+            "embedding-unknown-key",
+            r#"
+provider = "local"
+providre = "local"
+"#,
+            "unknown field",
+        ),
+        (
+            "embedding-openai-compatible",
+            r#"provider = "openai-compatible""#,
+            "unknown variant",
+        ),
+        (
+            "embedding-invalid-provider",
+            r#"provider = "remote""#,
+            "unknown variant",
+        ),
+    ] {
+        let fixture = TestFixture::new(fixture_name);
+        fixture.write_config_with_embedding("http://127.0.0.1:1", embedding);
+
+        let status = fixture.qgh(["status", "--json"]);
+        assert_eq!(status.status.code(), Some(2));
+        let status_json = stdout_json(&status);
+        assert_eq!(status_json["ok"], false);
+        assert_eq!(status_json["error"]["code"], "config.invalid");
+        assert!(
+            status_json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected_message_fragment),
+            "unexpected embedding config error: {status_json}"
+        );
+    }
+}
+
+#[test]
 fn active_issue_max_age_tightens_query_freshness_and_lists_all_triggers() {
     let fixture = TestFixture::new("active-issue-freshness");
     let server = FakeGitHub::start(issue_payload_with_pr());
@@ -4901,6 +4956,28 @@ repos = [{repos}]
 [profiles.work.token_source]
 type = "env"
 env = "QGH_TEST_TOKEN"
+"#
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
+    }
+
+    fn write_config_with_embedding(&self, api_base_url: &str, embedding: &str) {
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+
+[embedding]
+{embedding}
 "#
         );
         fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();

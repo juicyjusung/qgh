@@ -128,6 +128,12 @@ pub enum CommentsMode {
 /// Default remote parent-classification budget for repo-level comment listing.
 pub const DEFAULT_PARENT_RESOLUTION_BUDGET: usize = 50;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmbeddingProviderKind {
+    Local,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TokenSource {
@@ -143,7 +149,15 @@ pub enum TokenSource {
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
     schema_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding: Option<RawEmbeddingConfig>,
     profiles: BTreeMap<String, RawProfile>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawEmbeddingConfig {
+    provider: EmbeddingProviderKind,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -264,6 +278,7 @@ pub fn bootstrap_profile_repo(
     let config_path = config_file_path()?;
     let mut config = load_config_file_optional()?.unwrap_or_else(|| ConfigFile {
         schema_version: "qgh.config.v1".to_string(),
+        embedding: None,
         profiles: BTreeMap::new(),
     });
     let profile_action;
@@ -409,6 +424,7 @@ fn load_config_file() -> Result<ConfigFile, QghError> {
     if config.schema_version != "qgh.config.v1" {
         return Err(QghError::config("Unsupported config schema_version."));
     }
+    ensure_embedding_config_supported(&config);
     validate_config_token_sources(&config)?;
     Ok(config)
 }
@@ -843,6 +859,12 @@ fn validate_config_token_sources(config: &ConfigFile) -> Result<(), QghError> {
         validate_token_source(&raw.token_source)?;
     }
     Ok(())
+}
+
+fn ensure_embedding_config_supported(config: &ConfigFile) {
+    if let Some(embedding) = &config.embedding {
+        let EmbeddingProviderKind::Local = embedding.provider;
+    }
 }
 
 fn validate_profile_id(profile_id: &str) -> Result<(), QghError> {

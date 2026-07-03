@@ -1700,6 +1700,28 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     }
 }
 
+#[test]
+fn bm25_only_build_has_no_embedding_runtime_dependencies() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let lockfile = fs::read_to_string(root.join("Cargo.lock")).unwrap();
+
+    for crate_name in ["fastembed", "hf-hub", "sqlite-vec", "ort"] {
+        let dependency_prefix = format!("{crate_name} =");
+        assert!(
+            !manifest
+                .lines()
+                .any(|line| line.trim_start().starts_with(&dependency_prefix)),
+            "BM25-only build must not depend on embedding runtime crate `{crate_name}`"
+        );
+        let lock_entry = format!("name = \"{crate_name}\"");
+        assert!(
+            !lockfile.contains(&lock_entry),
+            "BM25-only lockfile must not include embedding runtime crate `{crate_name}`"
+        );
+    }
+}
+
 fn qgh(args: &[&str]) -> Output {
     let mut cmd = Command::new(binary());
     cmd.args(args).output().unwrap()

@@ -3,6 +3,7 @@ mod cli;
 mod commands;
 mod config;
 mod coverage;
+pub mod embedding;
 mod error;
 mod freshness;
 mod github;
