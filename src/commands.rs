@@ -2156,7 +2156,17 @@ fn configured_embedding_model_revision(embedding: &EmbeddingConfig) -> Option<St
     if embedding.model_path.is_some() {
         return Some(LOCAL_MODEL_REVISION.to_string());
     }
-    Some(configured_hf_model_reference(embedding).revision)
+    // Stored fingerprints record the resolved commit sha. The query path
+    // loads no model files and must stay offline, so a mutable configured
+    // revision ("main", tags) cannot be asserted here; only an immutable
+    // sha-pinned revision is comparable. Mutable revisions are resolved
+    // and re-checked whenever the provider runtime loads (embed/search).
+    let revision = configured_hf_model_reference(embedding).revision;
+    if revision.len() == 40 && revision.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(revision)
+    } else {
+        None
+    }
 }
 
 fn configured_hf_model_reference(

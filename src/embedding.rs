@@ -819,7 +819,11 @@ impl ModelRepository for HfHubModelRepository {
     }
 
     fn revision(&mut self) -> Result<Option<String>, EmbeddingProviderError> {
-        Ok(Some(self.model_revision.clone()))
+        // Record the resolved commit sha, not the configured revision:
+        // a mutable revision name ("main", tags) can point at different
+        // model files over time, which would let inferred pooling, query
+        // prefix, and dimension drift behind an unchanged fingerprint.
+        Ok(Some(self.info()?.sha.clone()))
     }
 }
 
