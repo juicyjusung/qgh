@@ -75,6 +75,7 @@ Rules:
 - Touch only files required by this issue. Never touch denylist paths in loop-constraints.md.
 - All acceptance criteria in the issue must be satisfied.
 - Run: cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test — all must pass.
+- If the crate defines cargo features, also: cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-features. Feature-gated code that never compiles in gates is a REJECT.
 - Commit with Conventional Commits (English type/subject). Do NOT push. Do NOT open PRs.
 - If the issue is ambiguous or requires denylist changes, stop and explain instead of guessing." \
     || fail "maker: codex exec error"
@@ -89,6 +90,10 @@ Rules:
   ( cd "$WT" && cargo fmt --all --check )                      || fail "gate: cargo fmt"
   ( cd "$WT" && cargo clippy --all-targets -- -D warnings )    || fail "gate: cargo clippy"
   ( cd "$WT" && cargo test )                                   || fail "gate: cargo test"
+  # feature-gated code must be exercised too (BM25 default path + hybrid path)
+  ( cd "$WT" && cargo clippy --all-targets --all-features -- -D warnings ) \
+                                                               || fail "gate: cargo clippy (all-features)"
+  ( cd "$WT" && cargo test --all-features )                    || fail "gate: cargo test (all-features)"
 
   # --- checker: separate read-only codex session -----------------------------
   log "checker session start (#$ISSUE)"
