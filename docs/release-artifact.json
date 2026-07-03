@@ -12,6 +12,29 @@
     },
     "cli_only_commands": ["init", "sync", "doctor"],
     "human_output": "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v1 envelopes",
+    "primary_install_channel": {
+      "manager": "homebrew",
+      "command": "brew install juicyjusung/tap/qgh",
+      "tap_repository": "juicyjusung/homebrew-tap",
+      "formula": "qgh"
+    },
+    "release_artifact_origin": "GitHub Releases",
+    "release_automation": "cargo-dist",
+    "release_trigger": "Cargo.toml version bump commit plus matching vX.Y.Z tag push",
+    "release_targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu"
+    ],
+    "release_integrity_gate": [
+      "artifact checksums",
+      "Homebrew sha256",
+      "GitHub Artifact Attestations"
+    ],
+    "tap_publish_credential": {
+      "secret_name": "HOMEBREW_TAP_TOKEN",
+      "scope": "contents write on juicyjusung/homebrew-tap only"
+    },
     "init_behavior": "top-level init previews inferred profile/repo defaults before writing; Enter/Y accepts, n customizes, EOF cancels without writes; init --yes and init -y apply the preset non-interactively; init repo is repo-policy-only",
     "init_yes_aliases": ["--yes", "-y"],
     "get_batch": {
@@ -111,12 +134,18 @@
     "privacy no-egress",
     "DB/index permissions",
     "doctor output",
-    "search eval result"
+    "search eval result",
+    "one-command Homebrew install",
+    "cargo-dist plan/build",
+    "generated Homebrew formula smoke",
+    "release integrity attestations"
   ],
   "residual_risks": [
     "Wiki source connector is post-MVP",
     "vector and hosted provider quality improvements require an explicit future decision",
     "shared server and GitHub App token operations require separate ACL and audit design",
-    "GHES remains best-effort until a dedicated compatibility pass"
+    "GHES remains best-effort until a dedicated compatibility pass",
+    "Linux ARM64, Windows packages, and homebrew/core submission are later distribution targets",
+    "Live dogfood against juicyjusung/qgh is manual and not a blocking CI gate"
   ]
 }

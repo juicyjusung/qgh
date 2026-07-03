@@ -215,6 +215,35 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v1 envelopes"
     );
     assert_eq!(
+        artifact["contract"]["primary_install_channel"]["command"],
+        "brew install juicyjusung/tap/qgh"
+    );
+    assert_eq!(
+        artifact["contract"]["primary_install_channel"]["tap_repository"],
+        "juicyjusung/homebrew-tap"
+    );
+    assert_eq!(artifact["contract"]["release_automation"], "cargo-dist");
+    assert_eq!(
+        artifact["contract"]["release_targets"],
+        json!([
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-gnu"
+        ])
+    );
+    assert_eq!(
+        artifact["contract"]["release_integrity_gate"],
+        json!([
+            "artifact checksums",
+            "Homebrew sha256",
+            "GitHub Artifact Attestations"
+        ])
+    );
+    assert_eq!(
+        artifact["contract"]["tap_publish_credential"]["secret_name"],
+        "HOMEBREW_TAP_TOKEN"
+    );
+    assert_eq!(
         artifact["verification"],
         json!([
             "Tantivy BM25-only path",
@@ -227,7 +256,11 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "privacy no-egress",
             "DB/index permissions",
             "doctor output",
-            "search eval result"
+            "search eval result",
+            "one-command Homebrew install",
+            "cargo-dist plan/build",
+            "generated Homebrew formula smoke",
+            "release integrity attestations"
         ])
     );
     assert!(artifact["contract"]["init_behavior"]
@@ -1662,6 +1695,12 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "DB/index permissions",
         "doctor output",
         "search eval result",
+        "brew install juicyjusung/tap/qgh",
+        "juicyjusung/homebrew-tap",
+        "cargo-dist",
+        "HOMEBREW_TAP_TOKEN",
+        "Homebrew formula smoke",
+        "GitHub Artifact Attestations",
         "Supported MVP token sources",
         "Product contract source of truth",
         "qgh query --json",
@@ -1685,6 +1724,19 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     }
     assert!(checklist.contains("credential_store"));
     assert!(checklist.contains("validation.invalid_token_source"));
+
+    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+    for required in [
+        "brew install juicyjusung/tap/qgh",
+        "qgh init -y",
+        "qgh sync",
+        "qgh query",
+        "qgh get",
+        "qgh --version",
+        "qgh doctor",
+    ] {
+        assert!(readme.contains(required), "missing README phrase: {required}");
+    }
 
     let cli_json_contract = fs::read_to_string(root.join("docs/cli-json-contract.md")).unwrap();
     for required in [

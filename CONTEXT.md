@@ -136,6 +136,50 @@ _Avoid_: empty result, silent fallback
 A versioned JSON wrapper used for CLI `--json` output and MCP structured content, separating `data`, `error`, `warnings`, and `meta`.
 _Avoid_: ad hoc JSON, plain text error
 
+**Primary Install Channel**:
+The user-facing installation path that must work before a qgh release is considered shippable.
+_Avoid_: deployment target, optional package
+
+**Release Artifact Origin**:
+The authoritative hosted location for immutable qgh release binaries, checksums, and installer inputs.
+_Avoid_: package manager, tap, build output
+
+**One-Command Install**:
+A single package-manager or installer command that places a self-contained `qgh` binary on the user's PATH.
+_Avoid_: bootstrap, sync, first query
+
+**First-Use Smoke Gate**:
+The post-install verification path where a user can initialize an explicit repo scope, sync, and run a query after authentication is available.
+_Avoid_: install success, hidden sync, automatic repo access
+
+**Release Automation**:
+The repeatable system that turns a version tag into release artifacts and updates install channels.
+_Avoid_: manual release notes, local build
+
+**Release Target Matrix**:
+The operating system and CPU target set that must have release artifacts and install-channel smoke tests for a shippable qgh release.
+_Avoid_: supported platforms, best-effort builds
+
+**Release Integrity Gate**:
+The checks and provenance evidence that must exist before release artifacts and install channels are trusted.
+_Avoid_: optional checksum, local signing experiment
+
+**Release Trigger**:
+The explicit version-control action that starts release automation for a qgh version.
+_Avoid_: ad hoc workflow run, implicit version bump
+
+**Release Preflight Gate**:
+The blocking verification set that must pass before qgh publishes release artifacts or install-channel updates.
+_Avoid_: manual dogfood, post-release smoke, advisory check
+
+**Tap Publish Credential**:
+The narrowly scoped GitHub credential used by release automation to update the qgh Homebrew formula in the tap repository.
+_Avoid_: general GitHub token, user auth, runtime token
+
+**Install Documentation Surface**:
+The user-facing and release-contract documents that describe how qgh is installed and verified.
+_Avoid_: hidden release notes, package-manager-only docs
+
 **Sensitive Derivative Data**:
 Local DB rows, snippets, logs, cache files, and embeddings derived from private GitHub content.
 _Avoid_: cache, metadata only
