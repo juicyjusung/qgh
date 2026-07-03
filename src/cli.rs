@@ -18,6 +18,7 @@ impl Cli {
     pub fn wants_json(&self) -> bool {
         match &self.command {
             Command::Sync(args) => args.wants_json(),
+            Command::Embed(args) => args.json,
             Command::Init(args) => args.wants_json(),
             Command::Status(args) => args.json,
             Command::Doctor { json } => *json,
@@ -31,6 +32,7 @@ impl Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Sync(SyncArgs),
+    Embed(EmbedArgs),
     Init(InitArgs),
     Query(QueryArgs),
     Search(QueryArgs),
@@ -53,6 +55,17 @@ pub enum Command {
         json: bool,
     },
     Mcp,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct EmbedArgs {
+    #[arg(
+        long,
+        help = "Recompute every stored chunk embedding for the active fingerprint"
+    )]
+    pub force: bool,
+    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Args)]

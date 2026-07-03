@@ -1,4 +1,7 @@
 use chrono::{Duration, SecondsFormat, Utc};
+use qgh::embedding::{
+    EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_QUERY_PREFIX,
+};
 use serde_json::{json, Value};
 #[cfg(feature = "fastembed-provider")]
 use std::collections::HashMap;
@@ -2135,6 +2138,94 @@ query_prefix = "query: "
         chunk_count > 0,
         "embedding-enabled sync must persist tokenizer-backed chunks"
     );
+}
+
+#[test]
+fn embedding_fingerprint_mismatch_warns_and_keeps_bm25_results() {
+    let fixture = TestFixture::new("embedding-fingerprint-mismatch");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        r#"
+provider = "local"
+model = "hf:Snowflake/snowflake-arctic-embed-l-v2.0"
+file = "onnx/model_quantized.onnx"
+pooling = "cls"
+query_prefix = "query: "
+"#,
+    );
+    assert_success(&fixture.qgh(["status", "--json"]));
+    fixture.insert_active_embedding_fingerprint("Example/old-model");
+
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    assert_eq!(
+        query_json["data"]["results"][0]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+    assert_eq!(query_json["data"]["results"][0]["ranking"]["kind"], "bm25");
+    let warning = &query_json["warnings"][0];
+    assert_eq!(warning["code"], "embedding.fingerprint_mismatch");
+    assert_eq!(
+        warning["hint"],
+        "Run `qgh embed --force` to recompute local embeddings."
+    );
+    let warning_text = warning.to_string();
+    assert!(!warning_text.contains("Example/old-model"));
+    assert!(!warning_text.contains("BM25 issue body tracer"));
+}
+
+#[test]
+fn embedding_fingerprint_revision_mismatch_warns_and_keeps_bm25_results() {
+    let fixture = TestFixture::new("embedding-fingerprint-revision-mismatch");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        r#"
+provider = "local"
+model = "hf:Snowflake/snowflake-arctic-embed-l-v2.0"
+file = "onnx/model_quantized.onnx"
+pooling = "cls"
+query_prefix = "query: "
+"#,
+    );
+    fixture.insert_active_embedding_fingerprint_with_revision(DEFAULT_HF_MODEL_ID, "old-main-sha");
+
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    assert_eq!(
+        query_json["data"]["results"][0]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+    assert_eq!(query_json["data"]["results"][0]["ranking"]["kind"], "bm25");
+    assert_eq!(
+        query_json["warnings"][0]["code"],
+        "embedding.fingerprint_mismatch"
+    );
+}
+
+#[test]
+fn embed_requires_force_for_full_refresh() {
+    let fixture = TestFixture::new("embed-requires-force");
+    fixture.write_config("http://127.0.0.1:1");
+
+    let embed = fixture.qgh(["embed", "--json"]);
+
+    assert_eq!(embed.status.code(), Some(2));
+    let embed_json = stdout_json(&embed);
+    assert_eq!(embed_json["error"]["code"], "embedding.force_required");
+    assert!(embed_json["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .contains("qgh embed --force"));
 }
 
 #[test]
@@ -5603,6 +5694,51 @@ limit = 10
         let conn = rusqlite::Connection::open(db_path).unwrap();
         conn.query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))
             .unwrap()
+    }
+
+    fn insert_active_embedding_fingerprint(&self, model_id: &str) {
+        self.insert_active_embedding_fingerprint_with_revision(model_id, "fixture-sha");
+    }
+
+    fn insert_active_embedding_fingerprint_with_revision(
+        &self,
+        model_id: &str,
+        model_revision: &str,
+    ) {
+        let fingerprint = EmbeddingFingerprintSeed {
+            provider: "local".to_string(),
+            model_id: model_id.to_string(),
+            model_revision: model_revision.to_string(),
+            pooling: PoolingKind::Cls,
+            query_prefix: DEFAULT_QUERY_PREFIX.to_string(),
+        }
+        .with_dimension(3);
+        let fingerprint_hash = fingerprint.hash();
+        let fingerprint_json = serde_json::to_string(&fingerprint).unwrap();
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute("UPDATE embedding_fingerprints SET active = 0", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO embedding_fingerprints
+                (fingerprint_hash, fingerprint_json, provider, model_id, model_revision,
+                 dimension, pooling, query_prefix, chunker_version, source_schema_version,
+                 created_at, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '2026-01-02T00:00:00Z', 1)",
+            rusqlite::params![
+                fingerprint_hash,
+                fingerprint_json,
+                fingerprint.provider,
+                fingerprint.model_id,
+                fingerprint.model_revision,
+                fingerprint.dimension as i64,
+                fingerprint.pooling.as_str(),
+                fingerprint.query_prefix,
+                fingerprint.chunker_version,
+                fingerprint.source_schema_version
+            ],
+        )
+        .unwrap();
     }
 
     fn assert_source_version_count(&self, source_id: &str, expected: i64) {

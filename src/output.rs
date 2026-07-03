@@ -6,6 +6,7 @@ use std::fmt::{self, Write as _};
 pub enum SuccessOutputKind {
     Init,
     Sync,
+    Embed,
     Query,
     Get,
     Status,
@@ -50,6 +51,7 @@ pub fn print_human_success(
     let rendered = match kind {
         SuccessOutputKind::Init => render_init(data, warnings),
         SuccessOutputKind::Sync => render_sync(data, meta),
+        SuccessOutputKind::Embed => render_embed(data),
         SuccessOutputKind::Query => render_query(data),
         SuccessOutputKind::Get => render_get(data),
         SuccessOutputKind::Status => render_status(data),
@@ -78,6 +80,28 @@ pub fn print_error(error: &QghError, json_mode: bool) {
             eprintln!("hint: {hint}");
         }
     }
+}
+
+fn render_embed(data: &Value) -> String {
+    let mut out = String::new();
+    line(&mut out, format_args!("qgh embed complete"));
+    line(
+        &mut out,
+        format_args!("profile: {}", display_at(data, &["profile_id"])),
+    );
+    line(
+        &mut out,
+        format_args!("state: {}", display_at(data, &["embedding_state"])),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "chunks: refreshed {}, embedded {}",
+            display_at(data, &["chunks", "refreshed"]),
+            display_at(data, &["chunks", "embedded"])
+        ),
+    );
+    out
 }
 
 fn render_init(data: &Value, warnings: &[Value]) -> String {

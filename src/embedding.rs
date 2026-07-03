@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -10,9 +11,19 @@ use std::sync::Mutex;
 pub type EmbeddingVector = Vec<f32>;
 
 pub const DEFAULT_HF_MODEL_ID: &str = "Snowflake/snowflake-arctic-embed-l-v2.0";
+/// Pinned commit of the default Hugging Face model. A mutable revision
+/// (e.g. "main") would let upstream file changes alter inferred pooling,
+/// query prefix, and dimension without changing the fingerprint's
+/// (model_id, model_revision) pair, silently invalidating stored
+/// embeddings. Users can opt into a moving revision via `@<revision>`.
+pub const DEFAULT_HF_MODEL_REVISION: &str = "ac6544c8a46e00af67e330e85a9028c66b8cfd9a";
 pub const DEFAULT_HF_MODEL_FILE: &str = "onnx/model_quantized.onnx";
 pub const DEFAULT_QUERY_PREFIX: &str = "query: ";
 pub const HUGGINGFACE_ENDPOINT: &str = "https://huggingface.co";
+pub const EMBEDDING_FINGERPRINT_SCHEMA_VERSION: &str = "qgh.embedding_fingerprint.v1";
+pub const CHUNKER_VERSION: &str = "qgh.chunker.v1";
+pub const SOURCE_SCHEMA_VERSION: &str = "qgh.source_schema.v1";
+pub const LOCAL_MODEL_REVISION: &str = "local_path";
 
 const MODULES_FILE: &str = "modules.json";
 const DEFAULT_POOLING_CONFIG_FILE: &str = "1_Pooling/config.json";
@@ -139,6 +150,15 @@ pub enum PoolingKind {
     Mean,
 }
 
+impl PoolingKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PoolingKind::Cls => "cls",
+            PoolingKind::Mean => "mean",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FastembedProviderOptions {
     pub model: Option<String>,
@@ -165,8 +185,36 @@ impl Default for FastembedProviderOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfModelReference {
+    pub model_id: String,
+    pub revision: String,
+}
+
+pub fn default_hf_model_reference() -> HfModelReference {
+    HfModelReference {
+        model_id: DEFAULT_HF_MODEL_ID.to_string(),
+        revision: DEFAULT_HF_MODEL_REVISION.to_string(),
+    }
+}
+
+pub fn parse_hf_model_reference(model: &str) -> Option<HfModelReference> {
+    let reference = model.strip_prefix("hf:")?;
+    let (model_id, revision) = reference
+        .rsplit_once('@')
+        .unwrap_or((reference, DEFAULT_HF_MODEL_REVISION));
+    if model_id.is_empty() || revision.is_empty() {
+        return None;
+    }
+    Some(HfModelReference {
+        model_id: model_id.to_string(),
+        revision: revision.to_string(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedModelSnapshot {
     pub model_id: Option<String>,
+    pub model_revision: String,
     pub model_file: String,
     pub query_prefix: String,
     pub pooling: PoolingKind,
@@ -177,6 +225,98 @@ impl ResolvedModelSnapshot {
     pub fn path_for(&self, file: &str) -> Option<&Path> {
         self.paths.get(file).map(PathBuf::as_path)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingFingerprintSeed {
+    pub provider: String,
+    pub model_id: String,
+    pub model_revision: String,
+    pub pooling: PoolingKind,
+    pub query_prefix: String,
+}
+
+impl EmbeddingFingerprintSeed {
+    pub fn with_dimension(self, dimension: usize) -> EmbeddingFingerprint {
+        EmbeddingFingerprint {
+            schema_version: EMBEDDING_FINGERPRINT_SCHEMA_VERSION.to_string(),
+            provider: self.provider,
+            model_id: self.model_id,
+            model_revision: self.model_revision,
+            dimension,
+            pooling: self.pooling,
+            query_prefix: self.query_prefix,
+            chunker_version: CHUNKER_VERSION.to_string(),
+            source_schema_version: SOURCE_SCHEMA_VERSION.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct EmbeddingFingerprint {
+    pub schema_version: String,
+    pub provider: String,
+    pub model_id: String,
+    pub model_revision: String,
+    pub dimension: usize,
+    pub pooling: PoolingKind,
+    pub query_prefix: String,
+    pub chunker_version: String,
+    pub source_schema_version: String,
+}
+
+impl EmbeddingFingerprint {
+    pub fn hash(&self) -> String {
+        let encoded = serde_json::to_vec(self).expect("embedding fingerprint serializes");
+        hex_digest(&Sha256::digest(encoded))
+    }
+
+    /// `None` expectation fields defer to the model's own defaults rather
+    /// than acting as unchecked wildcards: inferred pooling, query prefix,
+    /// and the embedding dimension are deterministic functions of the model
+    /// files plus the explicit config, and the model files are fixed by
+    /// (`model_id`, immutable `model_revision`) — both always compared.
+    /// `model_path` snapshots rely on the user keeping the local directory
+    /// contents stable.
+    pub fn matches_expectation(&self, expectation: &EmbeddingFingerprintExpectation) -> bool {
+        self.schema_version == EMBEDDING_FINGERPRINT_SCHEMA_VERSION
+            && self.provider == expectation.provider
+            && expectation
+                .model_id
+                .as_ref()
+                .is_none_or(|model_id| &self.model_id == model_id)
+            && expectation
+                .model_revision
+                .as_ref()
+                .is_none_or(|revision| &self.model_revision == revision)
+            && expectation
+                .pooling
+                .is_none_or(|pooling| self.pooling == pooling)
+            && expectation
+                .query_prefix
+                .as_ref()
+                .is_none_or(|prefix| &self.query_prefix == prefix)
+            && self.chunker_version == CHUNKER_VERSION
+            && self.source_schema_version == SOURCE_SCHEMA_VERSION
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingFingerprintExpectation {
+    pub provider: String,
+    pub model_id: Option<String>,
+    pub model_revision: Option<String>,
+    pub pooling: Option<PoolingKind>,
+    pub query_prefix: Option<String>,
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut out, "{byte:02x}").expect("hex write cannot fail");
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -261,6 +401,9 @@ pub fn default_hf_cache_dir() -> Result<PathBuf, EmbeddingProviderError> {
 pub trait ModelRepository {
     fn get(&mut self, file: &str) -> Result<PathBuf, EmbeddingProviderError>;
     fn list_files(&mut self) -> Result<Vec<String>, EmbeddingProviderError>;
+    fn revision(&mut self) -> Result<Option<String>, EmbeddingProviderError> {
+        Ok(None)
+    }
 }
 
 pub fn resolve_hf_model_snapshot(
@@ -324,6 +467,7 @@ pub fn resolve_hf_model_snapshot(
 
     Ok(ResolvedModelSnapshot {
         model_id: Some(model_id.to_string()),
+        model_revision: repo.revision()?.unwrap_or_else(|| "unknown".to_string()),
         model_file: behavior.model_file,
         query_prefix: behavior.query_prefix,
         pooling: behavior.pooling,
@@ -401,6 +545,7 @@ pub fn resolve_model_path_snapshot(
 
     Ok(ResolvedModelSnapshot {
         model_id: None,
+        model_revision: LOCAL_MODEL_REVISION.to_string(),
         model_file: behavior.model_file,
         query_prefix: behavior.query_prefix,
         pooling: behavior.pooling,
@@ -555,14 +700,19 @@ pub fn resolve_fastembed_snapshot(
             },
         );
     }
-    let model_id = hf_model_id(options.model.as_deref())?;
+    let reference = hf_model_reference(options.model.as_deref())?;
     let cache_dir = options
         .cache_dir
         .map(Ok)
         .unwrap_or_else(default_hf_cache_dir)?;
-    let mut repo = HfHubModelRepository::new(model_id, cache_dir, options.token_source_env)?;
+    let mut repo = HfHubModelRepository::new(
+        &reference.model_id,
+        &reference.revision,
+        cache_dir,
+        options.token_source_env,
+    )?;
     resolve_hf_model_snapshot(
-        model_id,
+        &reference.model_id,
         ManualModelBehavior {
             file: options.file,
             pooling: options.pooling,
@@ -575,12 +725,14 @@ pub fn resolve_fastembed_snapshot(
 #[cfg(feature = "fastembed-provider")]
 struct HfHubModelRepository {
     repo: hf_hub::api::sync::ApiRepo,
+    info: Option<hf_hub::api::RepoInfo>,
 }
 
 #[cfg(feature = "fastembed-provider")]
 impl HfHubModelRepository {
     fn new(
         model_id: &str,
+        model_revision: &str,
         cache_dir: PathBuf,
         token_source_env: Option<String>,
     ) -> Result<Self, EmbeddingProviderError> {
@@ -612,8 +764,29 @@ impl HfHubModelRepository {
                 }))
             })?;
         Ok(Self {
-            repo: api.model(model_id.to_string()),
+            repo: api.repo(hf_hub::Repo::with_revision(
+                model_id.to_string(),
+                hf_hub::RepoType::Model,
+                model_revision.to_string(),
+            )),
+            info: None,
         })
+    }
+
+    fn info(&mut self) -> Result<&hf_hub::api::RepoInfo, EmbeddingProviderError> {
+        if self.info.is_none() {
+            self.info = Some(self.repo.info().map_err(|error| {
+                EmbeddingProviderError::structured(
+                    "embedding.hf_model_info_failed",
+                    "Failed to inspect Hugging Face model revision.",
+                )
+                .with_details(json!({
+                    "host": HUGGINGFACE_ENDPOINT,
+                    "error": error.to_string()
+                }))
+            })?);
+        }
+        Ok(self.info.as_ref().expect("info initialized"))
     }
 }
 
@@ -634,31 +807,33 @@ impl ModelRepository for HfHubModelRepository {
     }
 
     fn list_files(&mut self) -> Result<Vec<String>, EmbeddingProviderError> {
-        let info = self.repo.info().map_err(|error| {
-            EmbeddingProviderError::structured(
-                "embedding.hf_model_info_failed",
-                "Failed to list Hugging Face model files.",
-            )
-            .with_details(json!({
-                "host": HUGGINGFACE_ENDPOINT,
-                "error": error.to_string()
-            }))
-        })?;
-        Ok(info
+        Ok(self
+            .info()?
             .siblings
+            .clone()
             .into_iter()
             .map(|sibling| sibling.rfilename)
             .collect())
     }
+
+    fn revision(&mut self) -> Result<Option<String>, EmbeddingProviderError> {
+        // Record the resolved commit sha, not the configured revision:
+        // a mutable revision name ("main", tags) can point at different
+        // model files over time, which would let inferred pooling, query
+        // prefix, and dimension drift behind an unchanged fingerprint.
+        Ok(Some(self.info()?.sha.clone()))
+    }
 }
 
 #[cfg(feature = "fastembed-provider")]
-fn hf_model_id(model: Option<&str>) -> Result<&str, EmbeddingProviderError> {
-    let model = model.unwrap_or(DEFAULT_HF_MODEL_ID);
-    model.strip_prefix("hf:").ok_or_else(|| {
+fn hf_model_reference(model: Option<&str>) -> Result<HfModelReference, EmbeddingProviderError> {
+    let Some(model) = model else {
+        return Ok(default_hf_model_reference());
+    };
+    parse_hf_model_reference(model).ok_or_else(|| {
         EmbeddingProviderError::structured(
             "embedding.invalid_model",
-            "Embedding model must use `hf:<org>/<repo>`.",
+            "Embedding model must use `hf:<org>/<repo>[@revision]`.",
         )
         .with_details(json!({ "model": model }))
     })
@@ -936,6 +1111,44 @@ mod tests {
     }
 
     #[test]
+    fn default_hf_model_revision_is_pinned_commit() {
+        assert_eq!(DEFAULT_HF_MODEL_REVISION.len(), 40);
+        assert!(DEFAULT_HF_MODEL_REVISION
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn expectation_defaults_pin_model_id_and_revision() {
+        let fingerprint = EmbeddingFingerprintSeed {
+            provider: "local".to_string(),
+            model_id: DEFAULT_HF_MODEL_ID.to_string(),
+            model_revision: "superseded-commit-sha".to_string(),
+            pooling: PoolingKind::Mean,
+            query_prefix: DEFAULT_QUERY_PREFIX.to_string(),
+        }
+        .with_dimension(1024);
+        let expectation = EmbeddingFingerprintExpectation {
+            provider: "local".to_string(),
+            model_id: Some(DEFAULT_HF_MODEL_ID.to_string()),
+            model_revision: Some(DEFAULT_HF_MODEL_REVISION.to_string()),
+            pooling: None,
+            query_prefix: None,
+        };
+        assert!(!fingerprint.matches_expectation(&expectation));
+
+        let current = EmbeddingFingerprintSeed {
+            provider: "local".to_string(),
+            model_id: DEFAULT_HF_MODEL_ID.to_string(),
+            model_revision: DEFAULT_HF_MODEL_REVISION.to_string(),
+            pooling: PoolingKind::Mean,
+            query_prefix: DEFAULT_QUERY_PREFIX.to_string(),
+        }
+        .with_dimension(1024);
+        assert!(current.matches_expectation(&expectation));
+    }
+
+    #[test]
     fn local_provider_prefixes_queries_only_and_records_dimension_dynamically() {
         let engine = RecordingEngine::default();
         let provider = LocalEmbeddingProvider::new(engine, DEFAULT_QUERY_PREFIX);
@@ -1124,6 +1337,7 @@ mod tests {
         let snapshot = resolve_model_path_snapshot(&root, ManualModelBehavior::default()).unwrap();
 
         assert_eq!(snapshot.model_id, None);
+        assert_eq!(snapshot.model_revision, LOCAL_MODEL_REVISION);
         assert_eq!(snapshot.model_file, DEFAULT_HF_MODEL_FILE);
         assert_eq!(snapshot.pooling, PoolingKind::Cls);
         assert_eq!(snapshot.query_prefix, DEFAULT_QUERY_PREFIX);
@@ -1140,6 +1354,7 @@ mod tests {
         }
         let snapshot = ResolvedModelSnapshot {
             model_id: Some(DEFAULT_HF_MODEL_ID.to_string()),
+            model_revision: "fixture-sha".to_string(),
             model_file: DEFAULT_HF_MODEL_FILE.to_string(),
             query_prefix: DEFAULT_QUERY_PREFIX.to_string(),
             pooling: PoolingKind::Cls,
@@ -1234,6 +1449,10 @@ mod tests {
 
         fn list_files(&mut self) -> Result<Vec<String>, EmbeddingProviderError> {
             Ok(self.files.keys().cloned().collect())
+        }
+
+        fn revision(&mut self) -> Result<Option<String>, EmbeddingProviderError> {
+            Ok(Some("fixture-sha".to_string()))
         }
     }
 

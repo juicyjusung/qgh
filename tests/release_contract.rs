@@ -13,14 +13,14 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert!(help_text.contains("human output by default"));
     assert!(help_text.contains("use --json for qgh.v1 envelopes"));
     for command in [
-        "init", "sync", "query", "search", "get", "status", "doctor", "mcp",
+        "init", "sync", "embed", "query", "search", "get", "status", "doctor", "mcp",
     ] {
         assert!(
             help_text.contains(command),
             "missing top-level help command: {command}"
         );
     }
-    for excluded in ["eval", "embed", "write", "delete", "update"] {
+    for excluded in ["eval", "write", "delete", "update"] {
         assert!(
             !help_text.contains(&format!("  {excluded}")),
             "unexpected top-level help command: {excluded}"
@@ -31,6 +31,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         &["init", "--help"][..],
         &["init", "repo", "--help"][..],
         &["sync", "--help"][..],
+        &["embed", "--help"][..],
         &["query", "--help"][..],
         &["get", "--help"][..],
         &["status", "--help"][..],
@@ -170,8 +171,16 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         json!(["query", "get", "status"])
     );
     assert_eq!(
+        artifact["contract"]["cli_commands"],
+        json!(["init", "sync", "embed", "query", "search", "get", "status", "doctor", "mcp"])
+    );
+    assert_eq!(
+        artifact["contract"]["canonical_cli_commands"],
+        json!(["init", "sync", "embed", "query", "get", "status", "doctor"])
+    );
+    assert_eq!(
         artifact["contract"]["cli_only_commands"],
-        json!(["init", "sync", "doctor"])
+        json!(["init", "sync", "embed", "doctor"])
     );
     assert_eq!(
         artifact["contract"]["product_core"],
