@@ -1575,7 +1575,7 @@ fn optional_git_remote_defaults(
 ) -> Result<Option<GitRemote>, QghError> {
     match git_remote_defaults_for_root(root) {
         Ok(remote) => Ok(Some(remote)),
-        Err(error) if args.repo.is_some() && args.host.is_some() => Ok(None),
+        Err(_error) if args.repo.is_some() && args.host.is_some() => Ok(None),
         Err(error) => Err(error),
     }
 }
