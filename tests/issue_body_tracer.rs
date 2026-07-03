@@ -1,5 +1,7 @@
 use chrono::{Duration, SecondsFormat, Utc};
 use serde_json::{json, Value};
+#[cfg(feature = "fastembed-provider")]
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -30,6 +32,7 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     assert_eq!(sync_json["data"]["index"]["dirty_task_count"], 0);
     fixture.assert_sqlite_issue_metadata();
     fixture.assert_sqlite_comment_metadata(1);
+    fixture.assert_sqlite_chunks_empty();
 
     let status = fixture.qgh(["status", "--json"]);
     assert_success(&status);
@@ -2101,6 +2104,36 @@ env = "QGH_TEST_HF_TOKEN"
     assert!(
         status_json["data"].get("embedding").is_none(),
         "embedding config must not change status schema in this slice: {status_json}"
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn embedding_enabled_sync_persists_tokenizer_backed_chunks() {
+    let fixture = TestFixture::new("embedding-sync-chunks");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    let model_dir = fixture.write_local_embedding_tokenizer_model();
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        &format!(
+            r#"
+provider = "local"
+model_path = "{}"
+file = "onnx/model_quantized.onnx"
+pooling = "cls"
+query_prefix = "query: "
+"#,
+            model_dir.display()
+        ),
+    );
+
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+
+    let chunk_count = fixture.sqlite_chunk_count();
+    assert!(
+        chunk_count > 0,
+        "embedding-enabled sync must persist tokenizer-backed chunks"
     );
 }
 
@@ -5021,6 +5054,32 @@ env = "QGH_TEST_TOKEN"
         fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
     }
 
+    #[cfg(feature = "fastembed-provider")]
+    fn write_local_embedding_tokenizer_model(&self) -> PathBuf {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+        use tokenizers::Tokenizer;
+
+        let model_dir = self.data_home.join("embedding-model");
+        fs::create_dir_all(model_dir.join("onnx")).unwrap();
+        fs::write(model_dir.join("onnx/model_quantized.onnx"), b"not-used").unwrap();
+
+        let mut vocab = HashMap::new();
+        vocab.insert("[UNK]".to_string(), 0);
+        let model = WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        tokenizer
+            .save(model_dir.join("tokenizer.json"), false)
+            .unwrap();
+
+        model_dir
+    }
+
     fn write_config_repo_listing_comments(&self, api_base_url: &str) {
         let config = format!(
             r#"
@@ -5529,6 +5588,21 @@ limit = 10
             comment.5,
             "https://github.com/owner/repo/issues/42#issuecomment-5001"
         );
+    }
+
+    fn assert_sqlite_chunks_empty(&self) {
+        let chunk_count = self.sqlite_chunk_count();
+        assert_eq!(
+            chunk_count, 0,
+            "BM25-only sync must not materialize chunks without [embedding]"
+        );
+    }
+
+    fn sqlite_chunk_count(&self) -> i64 {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))
+            .unwrap()
     }
 
     fn assert_source_version_count(&self, source_id: &str, expected: i64) {

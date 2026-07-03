@@ -1,9 +1,10 @@
+use crate::chunking::MarkdownChunk;
 use crate::error::QghError;
 use crate::model::{
     BackoffView, CommentRecord, CoverageSnapshot, CursorUpdate, CursorView, IndexSource,
     IssueRecord, ParentIssueView, ReconciliationCandidate, ReconciliationRunView,
-    SourceVersionView, StatusSnapshot, StoredComment, StoredCursor, StoredIssue, StoredSource,
-    SyncSummary, TargetedSyncSummary, TombstoneView,
+    SourceVersionView, StatusSnapshot, StoredChunk, StoredComment, StoredCursor, StoredIssue,
+    StoredSource, SyncSummary, TargetedSyncSummary, TombstoneView,
 };
 use crate::paths::ProfilePaths;
 use crate::paths::{ensure_private_dir, set_private_file};
@@ -515,6 +516,79 @@ impl Store {
             return Ok(Some(StoredSource::Comment(comment)));
         }
         Ok(None)
+    }
+
+    pub fn latest_source_version_id(&self, source_id: &str) -> Result<Option<i64>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT coalesce(im.latest_version_id, cm.latest_version_id)
+                 FROM source_entities se
+                 LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+                 LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+                 WHERE se.source_id = ?1 AND se.lifecycle_state = 'active'",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(QghError::from)
+    }
+
+    pub fn replace_chunks_for_source_version(
+        &mut self,
+        source_id: &str,
+        source_version_id: i64,
+        chunks: &[MarkdownChunk],
+    ) -> Result<Vec<StoredChunk>, QghError> {
+        let version_exists = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM source_versions WHERE id = ?1 AND source_id = ?2",
+                params![source_version_id, source_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !version_exists {
+            return Err(QghError::storage(format!(
+                "Cannot store chunks for missing source version `{source_version_id}`."
+            )));
+        }
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM chunks WHERE source_version_id = ?1",
+            params![source_version_id],
+        )?;
+        for chunk in chunks {
+            tx.execute(
+                "INSERT INTO chunks (source_id, source_version_id, body)
+                 VALUES (?1, ?2, ?3)",
+                params![source_id, source_version_id, chunk.body],
+            )?;
+        }
+        tx.commit()?;
+        self.chunks_for_source_version(source_version_id)
+    }
+
+    pub fn chunks_for_source_version(
+        &self,
+        source_version_id: i64,
+    ) -> Result<Vec<StoredChunk>, QghError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_id, source_version_id, body
+             FROM chunks
+             WHERE source_version_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![source_version_id], |row| {
+            Ok(StoredChunk {
+                chunk_id: row.get(0)?,
+                source_id: row.get(1)?,
+                source_version_id: row.get(2)?,
+                body: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
     }
 
     pub fn get_tombstone(&self, source_id: &str) -> Result<Option<TombstoneView>, QghError> {
@@ -1587,6 +1661,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(active_count, 1);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn chunks_round_trip_through_source_version_mapping() {
+        let paths = temp_profile_paths("chunks-source-version-round-trip");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_CHUNK_ROUNDTRIP";
+        let issue = IssueRecord {
+            source_id: source_id.to_string(),
+            host: "github.com".to_string(),
+            repo: "owner/repo".to_string(),
+            node_id: "I_CHUNK_ROUNDTRIP".to_string(),
+            github_id: 101,
+            number: 7,
+            title: "Chunk round trip".to_string(),
+            body: "alpha beta gamma delta".to_string(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone: None,
+            assignees: Vec::new(),
+            author: Some("alice".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            closed_at: None,
+            canonical_url: "https://github.com/owner/repo/issues/7".to_string(),
+            body_hash: "body-hash-1".to_string(),
+            indexed_at: "2026-01-02T00:00:01Z".to_string(),
+        };
+        store
+            .upsert_sources_for_run("sync-chunk-test", &[issue], &[], 0, &[])
+            .unwrap();
+        let source_version_id = store.latest_source_version_id(source_id).unwrap().unwrap();
+        let chunks = vec![
+            MarkdownChunk {
+                chunk_index: 0,
+                byte_start: 0,
+                byte_end: 10,
+                token_start: 0,
+                token_end: 2,
+                token_count: 2,
+                body: "alpha beta".to_string(),
+            },
+            MarkdownChunk {
+                chunk_index: 1,
+                byte_start: 6,
+                byte_end: 22,
+                token_start: 1,
+                token_end: 4,
+                token_count: 3,
+                body: "beta gamma delta".to_string(),
+            },
+        ];
+
+        let stored = store
+            .replace_chunks_for_source_version(source_id, source_version_id, &chunks)
+            .unwrap();
+        let loaded = store.chunks_for_source_version(source_version_id).unwrap();
+
+        assert_eq!(stored, loaded);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().all(|chunk| chunk.chunk_id > 0));
+        assert!(loaded.iter().all(|chunk| chunk.source_id == source_id));
+        assert!(loaded
+            .iter()
+            .all(|chunk| chunk.source_version_id == source_version_id));
+        assert_eq!(loaded[0].body, "alpha beta");
+        assert_eq!(loaded[1].body, "beta gamma delta");
+
+        let stored_again = store
+            .replace_chunks_for_source_version(source_id, source_version_id, &chunks)
+            .unwrap();
+        assert_eq!(stored_again.len(), 2);
+        assert_eq!(
+            store
+                .chunks_for_source_version(source_version_id)
+                .unwrap()
+                .len(),
+            2
+        );
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }

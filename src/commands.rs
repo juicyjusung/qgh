@@ -1,10 +1,17 @@
+use crate::chunking::chunk_markdown;
 use crate::cli::{InitArgs, InitRepoArgs, InitTokenSourceArg, QueryArgs, ReconcileMode};
 use crate::config::{
     bootstrap_profile_repo, current_git_worktree_root, discover_repo_policy,
     git_remote_defaults_for_root, load_profile, load_repo_policy_at, parse_repo, resolve_token,
-    CommentsMode, GitRemote, Profile, ProfileBootstrapInput, RepoPolicy, RepoRef, TokenSource,
+    CommentsMode, EmbeddingConfig, EmbeddingProviderKind, GitRemote, Profile,
+    ProfileBootstrapInput, RepoPolicy, RepoRef, TokenSource,
 };
 use crate::coverage;
+#[cfg(feature = "fastembed-provider")]
+use crate::embedding::EmbeddingProviderError;
+use crate::embedding::EmbeddingTokenizer;
+#[cfg(feature = "fastembed-provider")]
+use crate::embedding::FastembedTokenizer;
 use crate::error::QghError;
 use crate::freshness::{self, FreshnessContext, FreshnessOverrides};
 use crate::github;
@@ -769,6 +776,7 @@ fn rebuild_bm25_index(
     store: &mut Store,
     progress: &StderrSyncProgress,
 ) -> Result<(i64, i64), QghError> {
+    refresh_embedding_chunks_if_enabled(profile, store, progress)?;
     let sources = store.active_index_sources()?;
     progress.line(format_args!(
         "qgh sync: rebuilding BM25 index sources={}",
@@ -790,6 +798,85 @@ fn rebuild_bm25_index(
     ));
     let status = store.status()?;
     Ok((generation, status.dirty_task_count))
+}
+
+fn refresh_embedding_chunks_if_enabled(
+    profile: &Profile,
+    store: &mut Store,
+    progress: &StderrSyncProgress,
+) -> Result<usize, QghError> {
+    let Some(embedding) = profile.embedding.as_ref() else {
+        return Ok(0);
+    };
+    let tokenizer = embedding_tokenizer(embedding)?;
+    refresh_embedding_chunks(store, tokenizer.as_ref(), progress)
+}
+
+fn refresh_embedding_chunks(
+    store: &mut Store,
+    tokenizer: &dyn EmbeddingTokenizer,
+    progress: &StderrSyncProgress,
+) -> Result<usize, QghError> {
+    let mut stored_chunk_count = 0;
+    for source in store.active_index_sources()? {
+        let source_version_id = store
+            .latest_source_version_id(&source.source_id)?
+            .ok_or_else(|| {
+                QghError::storage(format!(
+                    "Cannot chunk source `{}` without an active source version.",
+                    source.source_id
+                ))
+            })?;
+        let chunks = chunk_markdown(&source.body, tokenizer).map_err(|error| {
+            QghError::storage(format!(
+                "Failed to chunk source `{}` with embedding tokenizer: {error}",
+                source.source_id
+            ))
+        })?;
+        stored_chunk_count += store
+            .replace_chunks_for_source_version(&source.source_id, source_version_id, &chunks)?
+            .len();
+    }
+    progress.line(format_args!(
+        "qgh sync: refreshed embedding chunks chunks={stored_chunk_count}"
+    ));
+    Ok(stored_chunk_count)
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn embedding_tokenizer(
+    embedding: &EmbeddingConfig,
+) -> Result<Box<dyn EmbeddingTokenizer>, QghError> {
+    match embedding.provider {
+        EmbeddingProviderKind::Local => {
+            FastembedTokenizer::from_options(embedding.fastembed_options())
+                .map(|tokenizer| Box::new(tokenizer) as Box<dyn EmbeddingTokenizer>)
+                .map_err(embedding_error)
+        }
+    }
+}
+
+#[cfg(not(feature = "fastembed-provider"))]
+fn embedding_tokenizer(
+    embedding: &EmbeddingConfig,
+) -> Result<Box<dyn EmbeddingTokenizer>, QghError> {
+    match embedding.provider {
+        EmbeddingProviderKind::Local => Err(QghError::validation(
+            "embedding.provider_unavailable",
+            "This qgh binary was built without the fastembed-provider feature.",
+        )
+        .with_hint("Rebuild with `--features fastembed-provider` or remove `[embedding]`.")),
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn embedding_error(error: EmbeddingProviderError) -> QghError {
+    let mut qgh_error =
+        QghError::validation(error.code(), error.message()).with_details(error.details().clone());
+    if let Some(hint) = error.hint() {
+        qgh_error = qgh_error.with_hint(hint);
+    }
+    qgh_error
 }
 
 fn target_issue_repo(
