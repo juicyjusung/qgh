@@ -28,7 +28,9 @@ fi
 trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
 
 # --- kill switch ------------------------------------------------------------
-if gh issue view "$STATE_ISSUE" -R "$REPO" --json body -q .body | grep -q 'Loop status: paused'; then
+# Activation = a line STARTING with the phrase; prose that merely mentions the
+# phrase (e.g. the kill-switch instructions themselves) must not trigger it.
+if gh issue view "$STATE_ISSUE" -R "$REPO" --json body -q .body | grep -q '^Loop status: paused'; then
   log "kill switch active (#$STATE_ISSUE: Loop status: paused) — exit"; exit 0
 fi
 
