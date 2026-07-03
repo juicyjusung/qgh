@@ -725,7 +725,6 @@ pub fn resolve_fastembed_snapshot(
 #[cfg(feature = "fastembed-provider")]
 struct HfHubModelRepository {
     repo: hf_hub::api::sync::ApiRepo,
-    model_revision: String,
     info: Option<hf_hub::api::RepoInfo>,
 }
 
@@ -770,7 +769,6 @@ impl HfHubModelRepository {
                 hf_hub::RepoType::Model,
                 model_revision.to_string(),
             )),
-            model_revision: model_revision.to_string(),
             info: None,
         })
     }
