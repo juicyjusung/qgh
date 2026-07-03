@@ -34,7 +34,12 @@ stricter rule wins.
   `CONTEXT.md`, `docs/adr/`
 - Anything defining source identity, locators, tombstones,
   reconciliation, or the Citation Contract
-- Local DB schema / storage format / migration code
+- Local DB schema / storage format / migration changes, EXCEPT changes
+  explicitly specified in the acceptance criteria of the
+  `ready-for-agent` issue being implemented — the human applying that
+  label is the approval. Such changes must be additive and idempotent;
+  anything destructive or beyond the issue's stated schema scope still
+  escalates to a human.
 - MCP tool surface (tool names, schemas, read-only guarantee)
 - `LOOP.md`, `loop-constraints.md`, `loop-budget.md` (the loop must not
   rewrite its own rules)
