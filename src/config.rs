@@ -1,3 +1,5 @@
+#[cfg(feature = "fastembed-provider")]
+use crate::embedding::FastembedProviderOptions;
 use crate::embedding::{PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_QUERY_PREFIX};
 use crate::error::QghError;
 use crate::freshness::{parse_duration_seconds, DEFAULT_QUERY_MAX_AGE_SECONDS};
@@ -15,6 +17,7 @@ pub struct Profile {
     pub api_base_url: String,
     pub web_base_url: String,
     pub repos: Vec<RepoRef>,
+    pub embedding: Option<EmbeddingConfig>,
     pub reconcile_after_seconds: Option<i64>,
     pub freshness: FreshnessSettings,
     pub bootstrap: BootstrapSettings,
@@ -133,6 +136,37 @@ pub const DEFAULT_PARENT_RESOLUTION_BUDGET: usize = 50;
 #[serde(rename_all = "kebab-case")]
 pub enum EmbeddingProviderKind {
     Local,
+}
+
+#[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub struct EmbeddingConfig {
+    pub provider: EmbeddingProviderKind,
+    pub model: Option<String>,
+    pub model_path: Option<PathBuf>,
+    pub file: Option<String>,
+    pub pooling: Option<PoolingKind>,
+    pub query_prefix: Option<String>,
+    pub token_source: Option<EmbeddingTokenSource>,
+}
+
+#[cfg(feature = "fastembed-provider")]
+impl EmbeddingConfig {
+    pub fn fastembed_options(&self) -> FastembedProviderOptions {
+        let token_source_env = match &self.token_source {
+            Some(EmbeddingTokenSource::Env { env }) => Some(env.clone()),
+            Some(EmbeddingTokenSource::Unsupported) | None => None,
+        };
+        FastembedProviderOptions {
+            model: self.model.clone(),
+            model_path: self.model_path.clone(),
+            file: self.file.clone(),
+            pooling: self.pooling,
+            query_prefix: self.query_prefix.clone(),
+            token_source_env,
+            cache_dir: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -264,7 +298,11 @@ pub fn load_profile(profile_id: &str) -> Result<Profile, QghError> {
             "Profile `{profile_id}` is not defined."
         )));
     };
-    profile_from_raw(profile_id, raw)
+    profile_from_raw(
+        profile_id,
+        raw,
+        config.embedding.as_ref().map(embedding_config_from_raw),
+    )
 }
 
 pub struct ProfileBootstrapInput {
@@ -462,7 +500,11 @@ fn load_config_file_optional() -> Result<Option<ConfigFile>, QghError> {
     load_config_file().map(Some)
 }
 
-fn profile_from_raw(profile_id: &str, raw: &RawProfile) -> Result<Profile, QghError> {
+fn profile_from_raw(
+    profile_id: &str,
+    raw: &RawProfile,
+    embedding: Option<EmbeddingConfig>,
+) -> Result<Profile, QghError> {
     let paths = ProfilePaths::resolve(profile_id)?;
     if raw.repos.is_empty() {
         return Err(QghError::config("Profile repos must not be empty."));
@@ -495,6 +537,7 @@ fn profile_from_raw(profile_id: &str, raw: &RawProfile) -> Result<Profile, QghEr
         api_base_url: raw.api_base_url.trim_end_matches('/').to_string(),
         web_base_url: raw.web_base_url.trim_end_matches('/').to_string(),
         repos,
+        embedding,
         reconcile_after_seconds,
         freshness,
         bootstrap,
@@ -507,6 +550,18 @@ fn profile_from_raw(profile_id: &str, raw: &RawProfile) -> Result<Profile, QghEr
         token_source: raw.token_source.clone(),
         paths,
     })
+}
+
+fn embedding_config_from_raw(raw: &RawEmbeddingConfig) -> EmbeddingConfig {
+    EmbeddingConfig {
+        provider: raw.provider,
+        model: raw.model.clone(),
+        model_path: raw.model_path.clone(),
+        file: raw.file.clone(),
+        pooling: raw.pooling,
+        query_prefix: raw.query_prefix.clone(),
+        token_source: raw.token_source.clone(),
+    }
 }
 
 pub fn discover_repo_policy() -> Result<Option<RepoPolicy>, QghError> {

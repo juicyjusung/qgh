@@ -23,6 +23,12 @@ const TOKENIZER_FILES: [&str; 4] = [
     "tokenizer_config.json",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
 pub trait EmbeddingProvider {
     fn embed_documents(
         &self,
@@ -34,6 +40,14 @@ pub trait EmbeddingProvider {
 pub trait EmbeddingEngine {
     fn embed_texts(&self, texts: &[String])
         -> Result<Vec<EmbeddingVector>, EmbeddingProviderError>;
+}
+
+pub trait EmbeddingTokenizer {
+    fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError>;
+
+    fn count_tokens(&self, text: &str) -> Result<usize, EmbeddingProviderError> {
+        Ok(self.tokenize(text)?.len())
+    }
 }
 
 pub struct LocalEmbeddingProvider<E> {
@@ -408,6 +422,11 @@ pub struct FastembedEngine {
 }
 
 #[cfg(feature = "fastembed-provider")]
+pub struct FastembedTokenizer {
+    tokenizer: tokenizers::Tokenizer,
+}
+
+#[cfg(feature = "fastembed-provider")]
 impl FastembedEngine {
     pub fn from_snapshot(snapshot: &ResolvedModelSnapshot) -> Result<Self, EmbeddingProviderError> {
         use fastembed::{
@@ -468,38 +487,89 @@ impl EmbeddingEngine for FastembedEngine {
 }
 
 #[cfg(feature = "fastembed-provider")]
+impl FastembedTokenizer {
+    pub fn from_snapshot(snapshot: &ResolvedModelSnapshot) -> Result<Self, EmbeddingProviderError> {
+        let tokenizer_path = required_path(snapshot, "tokenizer.json")?;
+        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|error| {
+            EmbeddingProviderError::structured(
+                "embedding.tokenizer_init_failed",
+                "Failed to initialize embedding tokenizer.",
+            )
+            .with_details(json!({
+                "file": tokenizer_path.display().to_string(),
+                "error": error.to_string()
+            }))
+        })?;
+        Ok(Self { tokenizer })
+    }
+
+    pub fn from_options(options: FastembedProviderOptions) -> Result<Self, EmbeddingProviderError> {
+        let snapshot = resolve_fastembed_snapshot(options)?;
+        Self::from_snapshot(&snapshot)
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
+impl EmbeddingTokenizer for FastembedTokenizer {
+    fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError> {
+        let encoding = self.tokenizer.encode(text, false).map_err(|error| {
+            EmbeddingProviderError::structured(
+                "embedding.tokenizer_failed",
+                "Embedding tokenizer failed to tokenize source text.",
+            )
+            .with_details(json!({ "error": error.to_string() }))
+        })?;
+        Ok(encoding
+            .get_offsets()
+            .iter()
+            .filter_map(|(start, end)| {
+                (start < end).then_some(TokenSpan {
+                    start: *start,
+                    end: *end,
+                })
+            })
+            .collect())
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
 impl LocalEmbeddingProvider<FastembedEngine> {
     pub fn from_options(options: FastembedProviderOptions) -> Result<Self, EmbeddingProviderError> {
-        let snapshot = if let Some(model_path) = options.model_path {
-            resolve_model_path_snapshot(
-                &model_path,
-                ManualModelBehavior {
-                    file: options.file,
-                    pooling: options.pooling,
-                    query_prefix: options.query_prefix,
-                },
-            )?
-        } else {
-            let model_id = hf_model_id(options.model.as_deref())?;
-            let cache_dir = options
-                .cache_dir
-                .map(Ok)
-                .unwrap_or_else(default_hf_cache_dir)?;
-            let mut repo =
-                HfHubModelRepository::new(model_id, cache_dir, options.token_source_env)?;
-            resolve_hf_model_snapshot(
-                model_id,
-                ManualModelBehavior {
-                    file: options.file,
-                    pooling: options.pooling,
-                    query_prefix: options.query_prefix,
-                },
-                &mut repo,
-            )?
-        };
+        let snapshot = resolve_fastembed_snapshot(options)?;
         let engine = FastembedEngine::from_snapshot(&snapshot)?;
         Ok(Self::new(engine, snapshot.query_prefix))
     }
+}
+
+#[cfg(feature = "fastembed-provider")]
+pub fn resolve_fastembed_snapshot(
+    options: FastembedProviderOptions,
+) -> Result<ResolvedModelSnapshot, EmbeddingProviderError> {
+    if let Some(model_path) = options.model_path {
+        return resolve_model_path_snapshot(
+            &model_path,
+            ManualModelBehavior {
+                file: options.file,
+                pooling: options.pooling,
+                query_prefix: options.query_prefix,
+            },
+        );
+    }
+    let model_id = hf_model_id(options.model.as_deref())?;
+    let cache_dir = options
+        .cache_dir
+        .map(Ok)
+        .unwrap_or_else(default_hf_cache_dir)?;
+    let mut repo = HfHubModelRepository::new(model_id, cache_dir, options.token_source_env)?;
+    resolve_hf_model_snapshot(
+        model_id,
+        ManualModelBehavior {
+            file: options.file,
+            pooling: options.pooling,
+            query_prefix: options.query_prefix,
+        },
+        &mut repo,
+    )
 }
 
 #[cfg(feature = "fastembed-provider")]

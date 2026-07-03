@@ -93,6 +93,14 @@ pub enum StoredSource {
     Comment(StoredComment),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredChunk {
+    pub chunk_id: i64,
+    pub source_id: String,
+    pub source_version_id: i64,
+    pub body: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReconciliationCandidate {
     pub source_id: String,

@@ -1,4 +1,5 @@
 mod app;
+pub mod chunking;
 mod cli;
 mod commands;
 mod config;
