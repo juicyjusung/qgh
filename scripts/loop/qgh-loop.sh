@@ -14,6 +14,8 @@ set -euo pipefail
 REPO="juicyjusung/qgh"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MAX_LANES=3
+MAKER_TIMEOUT_SECS=2700    # 45m — a hung codex stream must not pin a lane slot
+CHECKER_TIMEOUT_SECS=1200  # 20m
 STATE_ISSUE=18
 RUNLOG_ISSUE=19
 LOGDIR="$HOME/Library/Logs/qgh-loop"
@@ -28,6 +30,18 @@ runlog() { # append one run entry to #19 (append-only run history)
 notify() { # best-effort macOS desktop notification
   command -v osascript >/dev/null 2>&1 || return 0
   osascript -e "display notification \"$2\" with title \"qgh-loop\" subtitle \"$1\" sound name \"Glass\"" 2>/dev/null || true
+}
+
+run_timed() { # watchdog: $1 = timeout secs, rest = command; kills on timeout
+  local secs="$1"; shift
+  "$@" &
+  local cmd=$!
+  ( sleep "$secs" && kill "$cmd" 2>/dev/null ) &
+  local dog=$!
+  local rc=0
+  wait "$cmd" || rc=$?
+  kill "$dog" 2>/dev/null; wait "$dog" 2>/dev/null || true
+  return $rc
 }
 
 # =========================== status mode ====================================
@@ -125,7 +139,7 @@ $detail
 
   # --- maker: codex exec implements ----------------------------------------
   log "maker session start (#$ISSUE)"
-  codex exec \
+  run_timed "$MAKER_TIMEOUT_SECS" codex exec \
     -C "$WT" \
     -s workspace-write \
     --add-dir "$ROOT/.git" \
@@ -144,7 +158,7 @@ Rules:
 - If the crate defines cargo features, also: cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-features. Feature-gated code that never compiles in gates is a REJECT.
 - Commit with Conventional Commits (English type/subject). Do NOT push. Do NOT open PRs.
 - If the issue is ambiguous or requires denylist changes, stop and explain instead of guessing." \
-    || fail "maker: codex exec error" "$(tail -c 1500 "$TMP/maker-last.txt" 2>/dev/null || true)"
+    || fail "maker: codex exec error or timeout" "$(tail -c 1500 "$TMP/maker-last.txt" 2>/dev/null || true)"
 
   # require at least one commit
   if [ "$(git -C "$WT" rev-list --count origin/main..HEAD)" -eq 0 ]; then
@@ -168,7 +182,7 @@ Rules:
   # --- checker: separate read-only codex session -----------------------------
   log "checker session start (#$ISSUE)"
   git -C "$WT" diff origin/main...HEAD > "$TMP/lane.diff"
-  codex exec \
+  run_timed "$CHECKER_TIMEOUT_SECS" codex exec \
     -C "$WT" \
     -s read-only \
     -o "$TMP/verdict.txt" \
@@ -181,7 +195,7 @@ Diff to review:
 $(cat "$TMP/lane.diff")
 
 End your reply with exactly one final line: 'VERDICT: APPROVE' or 'VERDICT: REJECT' or 'VERDICT: ESCALATE_HUMAN'." \
-    || fail "checker: codex exec error"
+    || fail "checker: codex exec error or timeout"
 
   if ! grep -q 'VERDICT: APPROVE' "$TMP/verdict.txt"; then
     fail "checker: verdict not APPROVE" "$(tail -c 1500 "$TMP/verdict.txt")"
