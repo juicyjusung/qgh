@@ -114,11 +114,13 @@ pub fn search_with_filters(
     let label_exact = if filters.labels.is_empty() {
         None
     } else {
-        Some(
-            schema
-                .get_field("label_exact")
-                .map_err(|e| QghError::index(e.to_string()))?,
-        )
+        Some(schema.get_field("label_exact").map_err(|_| {
+            QghError::validation(
+                "validation.stale_index_label_filter",
+                "The local BM25 index predates label filtering support and cannot honor a label filter yet.",
+            )
+            .with_hint("Run `qgh sync` to rebuild the local search index, then retry the label-filtered query.")
+        })?)
     };
     let repo = schema
         .get_field("repo")
@@ -527,6 +529,68 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].source_id, "qgh://github.com/issue/ALLOWED");
+        let _ = fs::remove_dir_all(index_root);
+    }
+
+    #[test]
+    fn label_filter_on_pre_label_exact_index_fails_with_actionable_resync_hint() {
+        // Simulates an on-disk index built before label_exact existed
+        // (pre-#55 schema): label filtering must not panic or surface a raw
+        // Tantivy schema error — it must fail with a structured, actionable
+        // error telling the user to resync, and unfiltered queries against
+        // the same stale index must keep working (BM25-only stays complete).
+        let index_root = temp_index_root("bm25-stale-schema-label-filter");
+        let generation_path = index_root.join("generation-1");
+        fs::create_dir_all(&generation_path).unwrap();
+
+        let mut builder = Schema::builder();
+        let source_id = builder.add_text_field("source_id", STRING | STORED);
+        let entity_type = builder.add_text_field("entity_type", STRING | STORED);
+        let repo = builder.add_text_field("repo", STRING | STORED);
+        let issue_number = builder.add_text_field("issue_number", STRING | STORED);
+        let state = builder.add_text_field("state", STRING | STORED);
+        let labels = builder.add_text_field("labels", TEXT | STORED);
+        let author = builder.add_text_field("author", STRING | STORED);
+        let title = builder.add_text_field("title", TEXT | STORED);
+        let body = builder.add_text_field("body", TEXT | STORED);
+        let old_schema = builder.build();
+        let index = Index::create_in_dir(&generation_path, old_schema).unwrap();
+        let mut writer = index.writer(15_000_000).unwrap();
+        let mut document = TantivyDocument::default();
+        document.add_text(source_id, "qgh://github.com/issue/OLD_SCHEMA");
+        document.add_text(entity_type, "issue");
+        document.add_text(repo, "owner/repo");
+        document.add_text(issue_number, "1");
+        document.add_text(state, "open");
+        document.add_text(labels, "ready-for-agent");
+        document.add_text(author, "bob");
+        document.add_text(title, "Pre-label_exact issue");
+        document.add_text(body, "needle");
+        writer.add_document(document).unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+
+        let unfiltered = search(&generation_path, "needle", 5).unwrap();
+        assert_eq!(
+            unfiltered.len(),
+            1,
+            "stale index must keep serving BM25 queries without a label filter"
+        );
+
+        let error = search_with_filters(
+            &generation_path,
+            "needle",
+            &SearchFilters {
+                labels: vec!["ready-for-agent".to_string()],
+                source_types: vec!["issue".to_string()],
+                ..SearchFilters::default()
+            },
+            5,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "validation.stale_index_label_filter");
+        assert!(error.hint.is_some_and(|hint| hint.contains("qgh sync")));
+
         let _ = fs::remove_dir_all(index_root);
     }
 
