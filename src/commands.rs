@@ -57,6 +57,10 @@ pub struct LocalReadOutcome {
     pub warnings: Vec<Value>,
 }
 
+fn local_read_outcome(data: Value, warnings: Vec<Value>) -> LocalReadOutcome {
+    LocalReadOutcome { data, warnings }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn sync(
     profile_id: &str,
@@ -69,7 +73,7 @@ pub async fn sync(
     max_duration: Option<&str>,
     repo_scope: Option<&ResolvedRepoScope>,
     show_progress: bool,
-) -> Result<Value, QghError> {
+) -> Result<LocalReadOutcome, QghError> {
     let progress = StderrSyncProgress::new(show_progress);
     progress.line(format_args!(
         "qgh sync: loading profile profile={profile_id}"
@@ -113,15 +117,20 @@ pub async fn sync(
                 progress.line(format_args!(
                     "qgh sync: skipped, snapshot fresh age={snapshot_age_seconds}s max_age={max_age_seconds}s"
                 ));
-                return Ok(json!({
-                    "profile_id": profile.id,
-                    "sync_state": "skipped_fresh",
-                    "sync": {
-                        "last_successful_sync": last_sync,
-                        "snapshot_age_seconds": snapshot_age_seconds,
-                        "max_age_seconds": max_age_seconds
-                    }
-                }));
+                let warnings =
+                    refresh_embedding_for_sync_if_enabled(&profile, &mut store, &progress);
+                return Ok(local_read_outcome(
+                    json!({
+                        "profile_id": profile.id,
+                        "sync_state": "skipped_fresh",
+                        "sync": {
+                            "last_successful_sync": last_sync,
+                            "snapshot_age_seconds": snapshot_age_seconds,
+                            "max_age_seconds": max_age_seconds
+                        }
+                    }),
+                    warnings,
+                ));
             }
         }
     }
@@ -185,27 +194,30 @@ pub async fn sync(
                 backoff.reset_at.as_deref(),
             )?;
             let status = store.status()?;
-            return Ok(json!({
-                "profile_id": profile.id,
-                "sync_state": "backoff",
-                "backoff": backoff,
-                "sync": {
-                    "last_successful_sync": status.last_sync_at,
-                    "scheduler": {
-                        "max_in_flight_requests": profile.max_in_flight_requests,
-                        "hard_cap": 16
+            return Ok(local_read_outcome(
+                json!({
+                    "profile_id": profile.id,
+                    "sync_state": "backoff",
+                    "backoff": backoff,
+                    "sync": {
+                        "last_successful_sync": status.last_sync_at,
+                        "scheduler": {
+                            "max_in_flight_requests": profile.max_in_flight_requests,
+                            "hard_cap": 16
+                        }
+                    },
+                    "sources": {
+                        "issue_count": status.issue_count,
+                        "comment_count": status.comment_count,
+                        "tombstone_count": status.tombstone_count
+                    },
+                    "index": {
+                        "active_generation": status.active_generation,
+                        "dirty_task_count": status.dirty_task_count
                     }
-                },
-                "sources": {
-                    "issue_count": status.issue_count,
-                    "comment_count": status.comment_count,
-                    "tombstone_count": status.tombstone_count
-                },
-                "index": {
-                    "active_generation": status.active_generation,
-                    "dirty_task_count": status.dirty_task_count
-                }
-            }));
+                }),
+                Vec::new(),
+            ));
         }
     };
     progress.line(format_args!(
@@ -267,27 +279,30 @@ pub async fn sync(
                 backoff.reset_at.as_deref(),
             )?;
             let status = store.status()?;
-            return Ok(json!({
-                "profile_id": profile.id,
-                "sync_state": "backoff",
-                "backoff": backoff,
-                "sync": {
-                    "last_successful_sync": status.last_sync_at,
-                    "scheduler": {
-                        "max_in_flight_requests": profile.max_in_flight_requests,
-                        "hard_cap": 16
+            return Ok(local_read_outcome(
+                json!({
+                    "profile_id": profile.id,
+                    "sync_state": "backoff",
+                    "backoff": backoff,
+                    "sync": {
+                        "last_successful_sync": status.last_sync_at,
+                        "scheduler": {
+                            "max_in_flight_requests": profile.max_in_flight_requests,
+                            "hard_cap": 16
+                        }
+                    },
+                    "sources": {
+                        "issue_count": status.issue_count,
+                        "comment_count": status.comment_count,
+                        "tombstone_count": status.tombstone_count
+                    },
+                    "index": {
+                        "active_generation": status.active_generation,
+                        "dirty_task_count": status.dirty_task_count
                     }
-                },
-                "sources": {
-                    "issue_count": status.issue_count,
-                    "comment_count": status.comment_count,
-                    "tombstone_count": status.tombstone_count
-                },
-                "index": {
-                    "active_generation": status.active_generation,
-                    "dirty_task_count": status.dirty_task_count
-                }
-            }));
+                }),
+                Vec::new(),
+            ));
         }
     }
 
@@ -389,7 +404,7 @@ pub async fn sync(
         None => json!({ "mode": "none" }),
     };
     store.clear_backoff_state()?;
-    let (generation, dirty_task_count) = rebuild_bm25_index(&profile, &mut store, &progress)?;
+    let index = rebuild_bm25_index(&profile, &mut store, &progress)?;
     store.mark_sync_run_completed(&summary.sync_run_id)?;
     let comment_listing = match repo_comment_stats {
         Some((skipped_pr_comments, deferred_comments)) => json!({
@@ -408,35 +423,38 @@ pub async fn sync(
         "qgh sync: complete sync_run_id={}",
         summary.sync_run_id
     ));
-    Ok(json!({
-        "profile_id": profile.id,
-        "sync_state": "ok",
-        "sync_run_id": summary.sync_run_id,
-        "scheduler": {
-            "max_in_flight_requests": profile.max_in_flight_requests,
-            "hard_cap": 16
-        },
-        "issues": {
-            "fetched": summary.fetched_issues,
-            "upserted": summary.upserted_issues,
-            "skipped_pull_requests": summary.skipped_pull_requests
-        },
-        "comments": {
-            "fetched": summary.fetched_comments,
-            "upserted": summary.upserted_comments
-        },
-        "comment_listing": comment_listing,
-        "cursors": {
-            "updated": summary.cursor_updates.len(),
-            "not_modified_endpoints": summary.not_modified_endpoints,
-            "watermarks": watermarks
-        },
-        "index": {
-            "active_generation": generation,
-            "dirty_task_count": dirty_task_count
-        },
-        "reconciliation": reconciliation
-    }))
+    Ok(local_read_outcome(
+        json!({
+            "profile_id": profile.id,
+            "sync_state": "ok",
+            "sync_run_id": summary.sync_run_id,
+            "scheduler": {
+                "max_in_flight_requests": profile.max_in_flight_requests,
+                "hard_cap": 16
+            },
+            "issues": {
+                "fetched": summary.fetched_issues,
+                "upserted": summary.upserted_issues,
+                "skipped_pull_requests": summary.skipped_pull_requests
+            },
+            "comments": {
+                "fetched": summary.fetched_comments,
+                "upserted": summary.upserted_comments
+            },
+            "comment_listing": comment_listing,
+            "cursors": {
+                "updated": summary.cursor_updates.len(),
+                "not_modified_endpoints": summary.not_modified_endpoints,
+                "watermarks": watermarks
+            },
+            "index": {
+                "active_generation": index.generation,
+                "dirty_task_count": index.dirty_task_count
+            },
+            "reconciliation": reconciliation
+        }),
+        index.warnings,
+    ))
 }
 
 async fn backfill_sync(
@@ -447,7 +465,7 @@ async fn backfill_sync(
     max_requests: Option<usize>,
     max_duration: Option<&str>,
     progress: &StderrSyncProgress,
-) -> Result<Value, QghError> {
+) -> Result<LocalReadOutcome, QghError> {
     progress.line(format_args!("qgh sync: historical backfill"));
     let max_duration_seconds = max_duration
         .map(|value| freshness::parse_duration_seconds("max_duration", value))
@@ -511,49 +529,55 @@ async fn backfill_sync(
             backoff.retry_after_seconds,
             backoff.reset_at.as_deref(),
         )?;
-        rebuild_bm25_index(profile, store, progress)?;
+        let index = rebuild_bm25_index(profile, store, progress)?;
         let status = store.status()?;
-        return Ok(json!({
+        return Ok(local_read_outcome(
+            json!({
+                "profile_id": profile.id,
+                "sync_state": "backoff",
+                "backoff": backoff,
+                "backfill": {
+                    "issues": outcome.issues,
+                    "comments": outcome.comments,
+                    "skipped_pull_requests": outcome.skipped_pull_requests,
+                    "reached_end": false,
+                    "history_cursor": coverage.history_cursor,
+                    "historical_backfill_complete": coverage.historical_backfill_complete
+                },
+                "sources": {
+                    "issue_count": status.issue_count,
+                    "comment_count": status.comment_count,
+                    "tombstone_count": status.tombstone_count
+                }
+            }),
+            index.warnings,
+        ));
+    }
+
+    store.clear_backoff_state()?;
+    let index = rebuild_bm25_index(profile, store, progress)?;
+    if let Some(summary) = &summary {
+        store.mark_sync_run_completed(&summary.sync_run_id)?;
+    }
+    Ok(local_read_outcome(
+        json!({
             "profile_id": profile.id,
-            "sync_state": "backoff",
-            "backoff": backoff,
+            "sync_state": "ok",
             "backfill": {
                 "issues": outcome.issues,
                 "comments": outcome.comments,
                 "skipped_pull_requests": outcome.skipped_pull_requests,
-                "reached_end": false,
+                "reached_end": outcome.all_reached_end,
                 "history_cursor": coverage.history_cursor,
                 "historical_backfill_complete": coverage.historical_backfill_complete
             },
-            "sources": {
-                "issue_count": status.issue_count,
-                "comment_count": status.comment_count,
-                "tombstone_count": status.tombstone_count
+            "index": {
+                "active_generation": index.generation,
+                "dirty_task_count": index.dirty_task_count
             }
-        }));
-    }
-
-    store.clear_backoff_state()?;
-    let (generation, dirty_task_count) = rebuild_bm25_index(profile, store, progress)?;
-    if let Some(summary) = &summary {
-        store.mark_sync_run_completed(&summary.sync_run_id)?;
-    }
-    Ok(json!({
-        "profile_id": profile.id,
-        "sync_state": "ok",
-        "backfill": {
-            "issues": outcome.issues,
-            "comments": outcome.comments,
-            "skipped_pull_requests": outcome.skipped_pull_requests,
-            "reached_end": outcome.all_reached_end,
-            "history_cursor": coverage.history_cursor,
-            "historical_backfill_complete": coverage.historical_backfill_complete
-        },
-        "index": {
-            "active_generation": generation,
-            "dirty_task_count": dirty_task_count
-        }
-    }))
+        }),
+        index.warnings,
+    ))
 }
 
 fn merge_sync_summary(total: &mut Option<SyncSummary>, page: SyncSummary) {
@@ -577,7 +601,7 @@ pub async fn sync_issue(
     issue_number: i64,
     repo_scope: Option<&ResolvedRepoScope>,
     show_progress: bool,
-) -> Result<Value, QghError> {
+) -> Result<LocalReadOutcome, QghError> {
     if issue_number < 1 {
         return Err(QghError::validation(
             "validation.invalid_issue_number",
@@ -614,32 +638,35 @@ pub async fn sync_issue(
                 backoff.reset_at.as_deref(),
             )?;
             let status = store.status()?;
-            Ok(json!({
-                "profile_id": profile.id,
-                "sync_state": "backoff",
-                "target": {
-                    "kind": "issue",
-                    "repo": repo.full_name(),
-                    "issue_number": issue_number
-                },
-                "backoff": backoff,
-                "sync": {
-                    "last_successful_sync": status.last_sync_at,
-                    "scheduler": {
-                        "max_in_flight_requests": profile.max_in_flight_requests,
-                        "hard_cap": 16
+            Ok(local_read_outcome(
+                json!({
+                    "profile_id": profile.id,
+                    "sync_state": "backoff",
+                    "target": {
+                        "kind": "issue",
+                        "repo": repo.full_name(),
+                        "issue_number": issue_number
+                    },
+                    "backoff": backoff,
+                    "sync": {
+                        "last_successful_sync": status.last_sync_at,
+                        "scheduler": {
+                            "max_in_flight_requests": profile.max_in_flight_requests,
+                            "hard_cap": 16
+                        }
+                    },
+                    "sources": {
+                        "issue_count": status.issue_count,
+                        "comment_count": status.comment_count,
+                        "tombstone_count": status.tombstone_count
+                    },
+                    "index": {
+                        "active_generation": status.active_generation,
+                        "dirty_task_count": status.dirty_task_count
                     }
-                },
-                "sources": {
-                    "issue_count": status.issue_count,
-                    "comment_count": status.comment_count,
-                    "tombstone_count": status.tombstone_count
-                },
-                "index": {
-                    "active_generation": status.active_generation,
-                    "dirty_task_count": status.dirty_task_count
-                }
-            }))
+                }),
+                Vec::new(),
+            ))
         }
         github::TargetIssueFetchOutcome::Fetched(fetched) => {
             progress.line(format_args!(
@@ -666,20 +693,22 @@ pub async fn sync_issue(
                 summary.added_comments, summary.updated_comments, summary.deleted_comments
             ));
             store.clear_backoff_state()?;
-            let (generation, dirty_task_count) =
-                rebuild_bm25_index(&profile, &mut store, &progress)?;
+            let index = rebuild_bm25_index(&profile, &mut store, &progress)?;
             progress.line(format_args!(
                 "qgh sync issue: complete sync_run_id={}",
                 summary.sync_run_id
             ));
-            Ok(target_issue_sync_json(
-                &profile,
-                &repo,
-                issue_number,
-                &summary,
-                &fetched.lifecycle,
-                generation,
-                dirty_task_count,
+            Ok(local_read_outcome(
+                target_issue_sync_json(
+                    &profile,
+                    &repo,
+                    issue_number,
+                    &summary,
+                    &fetched.lifecycle,
+                    index.generation,
+                    index.dirty_task_count,
+                ),
+                index.warnings,
             ))
         }
         github::TargetIssueFetchOutcome::Unavailable(lifecycle) => {
@@ -691,20 +720,22 @@ pub async fn sync_issue(
             let summary =
                 store.tombstone_target_issue_refresh(&repo.full_name(), issue_number, reason)?;
             store.clear_backoff_state()?;
-            let (generation, dirty_task_count) =
-                rebuild_bm25_index(&profile, &mut store, &progress)?;
+            let index = rebuild_bm25_index(&profile, &mut store, &progress)?;
             progress.line(format_args!(
                 "qgh sync issue: complete sync_run_id={}",
                 summary.sync_run_id
             ));
-            Ok(target_issue_sync_json(
-                &profile,
-                &repo,
-                issue_number,
-                &summary,
-                &lifecycle,
-                generation,
-                dirty_task_count,
+            Ok(local_read_outcome(
+                target_issue_sync_json(
+                    &profile,
+                    &repo,
+                    issue_number,
+                    &summary,
+                    &lifecycle,
+                    index.generation,
+                    index.dirty_task_count,
+                ),
+                index.warnings,
             ))
         }
     }
@@ -781,8 +812,8 @@ fn rebuild_bm25_index(
     profile: &Profile,
     store: &mut Store,
     progress: &StderrSyncProgress,
-) -> Result<(i64, i64), QghError> {
-    refresh_embedding_chunks_if_enabled(profile, store, progress)?;
+) -> Result<IndexRebuildOutcome, QghError> {
+    let warnings = refresh_embedding_for_sync_if_enabled(profile, store, progress);
     let sources = store.active_index_sources()?;
     progress.line(format_args!(
         "qgh sync: rebuilding BM25 index sources={}",
@@ -803,27 +834,70 @@ fn rebuild_bm25_index(
         sources.len()
     ));
     let status = store.status()?;
-    Ok((generation, status.dirty_task_count))
+    Ok(IndexRebuildOutcome {
+        generation,
+        dirty_task_count: status.dirty_task_count,
+        warnings,
+    })
 }
 
-fn refresh_embedding_chunks_if_enabled(
+struct IndexRebuildOutcome {
+    generation: i64,
+    dirty_task_count: i64,
+    warnings: Vec<Value>,
+}
+
+#[derive(Default)]
+struct ChunkRefreshStats {
+    refreshed_chunks: usize,
+    skipped_sources: usize,
+}
+
+fn refresh_embedding_for_sync_if_enabled(
     profile: &Profile,
     store: &mut Store,
     progress: &StderrSyncProgress,
-) -> Result<usize, QghError> {
+) -> Vec<Value> {
     let Some(embedding) = profile.embedding.as_ref() else {
-        return Ok(0);
+        return Vec::new();
     };
-    let tokenizer = embedding_tokenizer(embedding)?;
-    refresh_embedding_chunks(store, tokenizer.as_ref(), progress)
+
+    let mut warnings = Vec::new();
+    match store.cleanup_inactive_embedding_artifacts() {
+        Ok(cleaned_chunks) if cleaned_chunks > 0 => progress.line(format_args!(
+            "qgh sync: cleaned stale embedding artifacts chunks={cleaned_chunks}"
+        )),
+        Ok(_) => {}
+        Err(error) => warnings.push(embedding_sync_warning(&error)),
+    }
+
+    let tokenizer = match embedding_tokenizer(embedding) {
+        Ok(tokenizer) => tokenizer,
+        Err(error) => {
+            warnings.push(embedding_sync_warning(&error));
+            return warnings;
+        }
+    };
+    if let Err(error) = refresh_embedding_chunks(store, tokenizer.as_ref(), progress) {
+        warnings.push(embedding_sync_warning(&error));
+        return warnings;
+    }
+
+    match refresh_incremental_chunk_embeddings(store, embedding) {
+        Ok(embedded_chunks) => progress.line(format_args!(
+            "qgh sync: refreshed chunk embeddings embedded={embedded_chunks}"
+        )),
+        Err(error) => warnings.push(embedding_sync_warning(&error)),
+    }
+    warnings
 }
 
 fn refresh_embedding_chunks(
     store: &mut Store,
     tokenizer: &dyn EmbeddingTokenizer,
     progress: &StderrSyncProgress,
-) -> Result<usize, QghError> {
-    let mut stored_chunk_count = 0;
+) -> Result<ChunkRefreshStats, QghError> {
+    let mut stats = ChunkRefreshStats::default();
     for source in store.active_index_sources()? {
         let source_version_id = store
             .latest_source_version_id(&source.source_id)?
@@ -833,20 +907,101 @@ fn refresh_embedding_chunks(
                     source.source_id
                 ))
             })?;
+        if store.source_version_has_chunks(source_version_id)? {
+            stats.skipped_sources += 1;
+            continue;
+        }
         let chunks = chunk_markdown(&source.body, tokenizer).map_err(|error| {
             QghError::storage(format!(
                 "Failed to chunk source `{}` with embedding tokenizer: {error}",
                 source.source_id
             ))
         })?;
-        stored_chunk_count += store
+        stats.refreshed_chunks += store
             .replace_chunks_for_source_version(&source.source_id, source_version_id, &chunks)?
             .len();
     }
     progress.line(format_args!(
-        "qgh sync: refreshed embedding chunks chunks={stored_chunk_count}"
+        "qgh sync: refreshed embedding chunks chunks={} skipped_sources={}",
+        stats.refreshed_chunks, stats.skipped_sources
     ));
-    Ok(stored_chunk_count)
+    Ok(stats)
+}
+
+fn refresh_incremental_chunk_embeddings(
+    store: &mut Store,
+    embedding: &EmbeddingConfig,
+) -> Result<usize, QghError> {
+    let runtime = embedding_runtime(embedding)?;
+    let expectation = embedding_fingerprint_expectation(embedding);
+    let matching_active_fingerprint = store
+        .active_embedding_fingerprint()?
+        .filter(|fingerprint| fingerprint.matches_expectation(&expectation));
+    let chunks = match matching_active_fingerprint.as_ref() {
+        Some(fingerprint) => store.active_chunks_missing_embedding_for_fingerprint(fingerprint)?,
+        None => store.active_embedding_chunks()?,
+    };
+    if chunks.is_empty() {
+        return Ok(0);
+    }
+
+    let texts = chunks
+        .iter()
+        .map(|chunk| chunk.body.as_str())
+        .collect::<Vec<_>>();
+    let vectors = runtime
+        .provider
+        .embed_documents(&texts)
+        .map_err(embedding_error)?;
+    if vectors.len() != chunks.len() {
+        return Err(QghError::validation(
+            "embedding.vector_count_mismatch",
+            "Embedding provider returned a different number of vectors than input chunks.",
+        )
+        .with_details(json!({
+            "chunk_count": chunks.len(),
+            "vector_count": vectors.len()
+        })));
+    }
+    let dimension = embedding_dimension(&vectors)?;
+    let fingerprint = match matching_active_fingerprint {
+        Some(fingerprint) => {
+            if fingerprint.dimension != dimension {
+                return Err(QghError::validation(
+                    "embedding.dimension_mismatch",
+                    "Embedding provider returned a different vector dimension than the active fingerprint.",
+                )
+                .with_details(json!({
+                    "active_dimension": fingerprint.dimension,
+                    "provider_dimension": dimension
+                }))
+                .with_hint("Run `qgh embed --force` to recompute local embeddings."));
+            }
+            fingerprint
+        }
+        None => runtime.fingerprint_seed.with_dimension(dimension),
+    };
+    let embeddings = chunks
+        .iter()
+        .zip(vectors)
+        .map(|(chunk, vector)| (chunk.chunk_id, vector))
+        .collect::<Vec<_>>();
+    store.upsert_chunk_embeddings(&fingerprint, &embeddings)
+}
+
+fn embedding_sync_warning(error: &QghError) -> Value {
+    let mut warning = json!({
+        "code": "embedding.sync_failed",
+        "severity": "warn",
+        "message": "Embedding refresh failed during sync. BM25 index refresh completed without vector updates.",
+        "details": {
+            "cause_code": error.code
+        }
+    });
+    if let Some(hint) = &error.hint {
+        warning["hint"] = json!(hint);
+    }
+    warning
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -996,8 +1151,7 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
     let mut store = Store::open(&profile.paths)?;
     let runtime = embedding_runtime(embedding)?;
     let progress = StderrSyncProgress::new(false);
-    let refreshed_chunks =
-        refresh_embedding_chunks(&mut store, runtime.tokenizer.as_ref(), &progress)?;
+    let chunk_stats = refresh_embedding_chunks(&mut store, runtime.tokenizer.as_ref(), &progress)?;
     let data = refresh_chunk_embeddings(
         &mut store,
         runtime.provider.as_ref(),
@@ -1008,7 +1162,7 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
             "profile_id": profile.id,
             "embedding_state": "refreshed",
             "chunks": {
-                "refreshed": refreshed_chunks,
+                "refreshed": chunk_stats.refreshed_chunks,
                 "embedded": data["embedded_chunks"]
             }
         }),
