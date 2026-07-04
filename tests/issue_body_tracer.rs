@@ -1,7 +1,7 @@
 use chrono::{Duration, SecondsFormat, Utc};
 use qgh::embedding::{
     EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_HF_MODEL_REVISION,
-    DEFAULT_QUERY_PREFIX,
+    DEFAULT_QUERY_PREFIX, LOCAL_MODEL_REVISION,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -2508,6 +2508,126 @@ query_prefix = "query: "
     assert_eq!(
         query_json["warnings"][0]["code"],
         "embedding.fingerprint_mismatch"
+    );
+}
+
+#[test]
+fn partial_embedding_coverage_warns_and_falls_back_to_bm25_results() {
+    let fixture = TestFixture::new("embedding-coverage-partial-query");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let bm25_query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&bm25_query);
+    let bm25_json = stdout_json(&bm25_query);
+    let bm25_results = bm25_json["data"]["results"].clone();
+    assert_eq!(bm25_json["warnings"], json!([]));
+
+    let issue_chunk = fixture.insert_chunk_for_source(
+        "qgh://github.com/issue/I_kwDOISSUE1",
+        "issue embedding chunk",
+    );
+    fixture.insert_chunk_for_source(
+        "qgh://github.com/issue-comment/IC_kwDOCOMMENT1",
+        "comment embedding chunk",
+    );
+    fixture.write_default_embedding_config(&server.base_url);
+    fixture.insert_matching_active_embedding_fingerprint();
+    fixture.insert_embedding_for_chunk(issue_chunk);
+
+    let fallback = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&fallback);
+    let fallback_json = stdout_json(&fallback);
+
+    assert_eq!(
+        warning_codes(&fallback_json),
+        vec!["embedding.coverage_partial"]
+    );
+    assert_eq!(
+        fallback_json["data"]["results"], bm25_results,
+        "partial embedding coverage must disable hybrid and preserve BM25 result schema/content"
+    );
+    assert_eq!(
+        fallback_json["data"]["results"][0]["ranking"]["kind"],
+        "bm25"
+    );
+    assert!(fallback_json["data"]["results"][0]["ranking"]
+        .get("rrf_rank_score")
+        .is_none());
+}
+
+#[test]
+fn missing_embedding_runtime_warns_and_does_not_break_local_commands() {
+    let fixture = TestFixture::new("embedding-runtime-missing-fallback");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let source_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    let bm25_query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&bm25_query);
+    let bm25_results = stdout_json(&bm25_query)["data"]["results"].clone();
+    let request_count_after_seed = server.request_count();
+
+    let model_path = "/definitely/not/a/model";
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        &format!(
+            r#"
+provider = "local"
+model_path = "{model_path}"
+file = "onnx/model_quantized.onnx"
+pooling = "cls"
+query_prefix = "query: "
+"#
+        ),
+    );
+    let chunk_id = fixture.insert_chunk_for_source(source_id, "issue embedding chunk");
+    fixture.insert_active_embedding_fingerprint_with_revision(
+        &format!("model_path:{model_path}"),
+        LOCAL_MODEL_REVISION,
+    );
+    fixture.insert_embedding_for_chunk(chunk_id);
+
+    let sync = fixture.qgh(["sync", "--if-stale", "--max-age", "30m", "--json"]);
+    assert_success(&sync);
+    let sync_json = stdout_json(&sync);
+    assert_eq!(sync_json["data"]["sync_state"], "skipped_fresh");
+    assert!(
+        warning_codes(&sync_json).contains(&"embedding.sync_failed"),
+        "embedding runtime failure during sync must be a structured warning: {sync_json}"
+    );
+    assert_eq!(
+        server.request_count(),
+        request_count_after_seed,
+        "fresh sync fallback must stay local"
+    );
+
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    assert_eq!(
+        warning_codes(&query_json),
+        vec!["embedding.hybrid_unavailable"]
+    );
+    assert!(query_json["warnings"][0]["details"]["cause_code"]
+        .as_str()
+        .is_some_and(|code| code.starts_with("embedding.")));
+    assert_eq!(
+        query_json["data"]["results"], bm25_results,
+        "runtime fallback must preserve BM25 result schema/content"
+    );
+
+    let get = fixture.qgh(["get", source_id, "--json"]);
+    assert_success(&get);
+    assert_eq!(stdout_json(&get)["data"]["source"]["source_id"], source_id);
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    assert_eq!(
+        stdout_json(&status)["data"]["embedding"]["state"],
+        "complete"
     );
 }
 
@@ -7403,6 +7523,15 @@ fn json_object_keys(value: &Value) -> BTreeSet<String> {
         .expect("JSON object")
         .keys()
         .cloned()
+        .collect()
+}
+
+fn warning_codes(output_json: &Value) -> Vec<&str> {
+    output_json["warnings"]
+        .as_array()
+        .expect("warnings array")
+        .iter()
+        .map(|warning| warning["code"].as_str().expect("warning code"))
         .collect()
 }
 
