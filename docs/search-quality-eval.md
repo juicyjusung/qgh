@@ -10,6 +10,7 @@ The MVP search-quality eval is a release/test harness, not a user-facing CLI or 
 - Wiki is post-MVP and excluded from the MVP eval fixture.
 - Hosted embedding, rerank, GPU/model availability, and model A/B are outside this gate.
 - Hybrid coverage uses deterministic local eval vectors so the gate does not download a model or create network egress.
+- The source vectors and query vectors are authored as separate topic-axis fixtures; query vectors are not generated from Gold source_id labels.
 
 ## Labels
 
@@ -39,6 +40,8 @@ The CJK/mixed class exercises the Tantivy tokenizer baseline plus the CJK n-gram
 
 The semantic/paraphrase and cross-language classes run as a BM25-only vs hybrid A/B report over the same fixture. The initial semantic thresholds are directional: a miss records `section_8_3_triggers` for rerank/fusion review instead of weakening the hard release gate.
 
+Hybrid eval rows also gate `ranking.kind=hybrid` coverage. Exact locator queries and negative abstention queries are excluded from this path gate because they intentionally bypass ranked hybrid retrieval or return no results.
+
 ## Result Record
 
 The harness records class rates, top failures, `get` round-trip failures, and:
@@ -59,10 +62,12 @@ Current synthetic fixture result:
   "keyword_top5": 1.0,
   "cjk_top5": 1.0,
   "negative_abstention": 1.0,
+  "hybrid_regression_path_queries": "15/15",
   "semantic_bm25_top5": 0.92,
   "semantic_hybrid_top5": 1.0,
   "semantic_hybrid_delta": 0.08,
   "semantic_hybrid_target": 0.7,
+  "semantic_hybrid_path_queries": "20/20",
   "cross_language_bm25_top5": 0.5,
   "cross_language_hybrid_top5": 1.0,
   "cross_language_hybrid_delta": 0.5,
