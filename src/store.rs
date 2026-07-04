@@ -12,7 +12,10 @@ use crate::paths::{ensure_private_dir, set_private_file};
 use crate::time::{now_rfc3339, now_run_id_suffix};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
+
+const CHUNK_EMBEDDING_VECTORS_TABLE: &str = "chunk_embedding_vectors";
 
 pub struct Store {
     conn: Connection,
@@ -27,6 +30,7 @@ impl Store {
         ensure_private_dir(&paths.profile_dir)?;
         ensure_private_dir(&paths.cache_dir)?;
         ensure_private_dir(&paths.log_dir)?;
+        register_sqlite_vec_extension()?;
         let conn = Connection::open(&paths.db_path)?;
         set_private_file(&paths.db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -723,6 +727,7 @@ impl Store {
         fingerprint: &EmbeddingFingerprint,
         embeddings: &[(i64, EmbeddingVector)],
     ) -> Result<usize, QghError> {
+        self.ensure_vector_storage(fingerprint.dimension)?;
         let fingerprint_hash = fingerprint.hash();
         let fingerprint_json = serde_json::to_string(fingerprint).map_err(|error| {
             QghError::storage(format!(
@@ -769,6 +774,7 @@ impl Store {
             |row| row.get(0),
         )?;
         tx.execute("DELETE FROM chunk_embeddings", [])?;
+        tx.execute(&format!("DELETE FROM {CHUNK_EMBEDDING_VECTORS_TABLE}"), [])?;
         for (chunk_id, vector) in embeddings {
             if vector.len() != fingerprint.dimension {
                 return Err(QghError::storage(format!(
@@ -786,6 +792,7 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4)",
                 params![chunk_id, fingerprint_id, vector_json, &now],
             )?;
+            upsert_vector_row(&tx, *chunk_id, vector)?;
         }
         tx.commit()?;
         Ok(embeddings.len())
@@ -796,6 +803,7 @@ impl Store {
         fingerprint: &EmbeddingFingerprint,
         embeddings: &[(i64, EmbeddingVector)],
     ) -> Result<usize, QghError> {
+        self.ensure_vector_storage(fingerprint.dimension)?;
         let fingerprint_hash = fingerprint.hash();
         let fingerprint_json = serde_json::to_string(fingerprint).map_err(|error| {
             QghError::storage(format!(
@@ -804,6 +812,17 @@ impl Store {
         })?;
         let now = now_rfc3339();
         let tx = self.conn.transaction()?;
+        let previous_active_fingerprint_hash = tx
+            .query_row(
+                "SELECT fingerprint_hash
+                 FROM embedding_fingerprints
+                 WHERE active = 1
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
         tx.execute("UPDATE embedding_fingerprints SET active = 0", [])?;
         tx.execute(
             "INSERT INTO embedding_fingerprints
@@ -841,6 +860,9 @@ impl Store {
             params![&fingerprint_hash],
             |row| row.get(0),
         )?;
+        if previous_active_fingerprint_hash.as_deref() != Some(fingerprint_hash.as_str()) {
+            tx.execute(&format!("DELETE FROM {CHUNK_EMBEDDING_VECTORS_TABLE}"), [])?;
+        }
         for (chunk_id, vector) in embeddings {
             if vector.len() != fingerprint.dimension {
                 return Err(QghError::storage(format!(
@@ -861,6 +883,7 @@ impl Store {
                     embedded_at = excluded.embedded_at",
                 params![chunk_id, fingerprint_id, vector_json, &now],
             )?;
+            upsert_vector_row(&tx, *chunk_id, vector)?;
         }
         tx.commit()?;
         Ok(embeddings.len())
@@ -887,6 +910,50 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(QghError::from)
+    }
+
+    pub fn ensure_vector_storage_for_fingerprint(
+        &mut self,
+        fingerprint: &EmbeddingFingerprint,
+    ) -> Result<usize, QghError> {
+        self.ensure_vector_storage(fingerprint.dimension)?;
+        let fingerprint_hash = fingerprint.hash();
+        let rows = {
+            let mut stmt = self.conn.prepare(
+                "SELECT ce.chunk_id, ce.vector_json
+                 FROM chunk_embeddings ce
+                 JOIN embedding_fingerprints ef ON ef.id = ce.fingerprint_id
+                 JOIN chunks c ON c.id = ce.chunk_id
+                 JOIN source_entities se ON se.source_id = c.source_id
+                 LEFT JOIN issue_metadata im ON im.source_id = c.source_id
+                 LEFT JOIN comment_metadata cm ON cm.source_id = c.source_id
+                 WHERE ef.fingerprint_hash = ?1
+                   AND se.lifecycle_state = 'active'
+                   AND c.source_version_id = coalesce(im.latest_version_id, cm.latest_version_id)
+                 ORDER BY ce.chunk_id",
+            )?;
+            let rows = stmt.query_map(params![fingerprint_hash], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let tx = self.conn.transaction()?;
+        for (chunk_id, vector_json) in &rows {
+            let vector: EmbeddingVector = serde_json::from_str(vector_json).map_err(|error| {
+                QghError::storage(format!("Stored embedding vector is invalid: {error}"))
+            })?;
+            if vector.len() != fingerprint.dimension {
+                return Err(QghError::storage(format!(
+                    "Stored embedding vector dimension {} does not match fingerprint dimension {}.",
+                    vector.len(),
+                    fingerprint.dimension
+                )));
+            }
+            upsert_vector_row(&tx, *chunk_id, &vector)?;
+        }
+        tx.commit()?;
+        Ok(rows.len())
     }
 
     pub fn get_tombstone(&self, source_id: &str) -> Result<Option<TombstoneView>, QghError> {
@@ -1486,6 +1553,30 @@ impl Store {
         Ok(())
     }
 
+    fn ensure_vector_storage(&mut self, dimension: usize) -> Result<(), QghError> {
+        if dimension == 0 {
+            return Err(QghError::storage(
+                "Cannot create sqlite-vec storage for zero-dimensional embeddings.",
+            ));
+        }
+        let sql = format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS {CHUNK_EMBEDDING_VECTORS_TABLE}
+             USING vec0(embedding float[{dimension}])"
+        );
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.conn.execute(&sql, []);
+        match result {
+            Ok(_) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(QghError::from(error))
+            }
+        }
+    }
+
     /// Oldest `updated_at` across active issues. NULL (empty corpus) maps to None.
     pub fn oldest_active_issue_updated_at(&self) -> Result<Option<String>, QghError> {
         let oldest: Option<String> = self.conn.query_row(
@@ -1810,6 +1901,56 @@ impl Store {
     }
 }
 
+fn register_sqlite_vec_extension() -> Result<(), QghError> {
+    type SqliteVecEntryPoint = unsafe extern "C" fn(
+        db: *mut rusqlite::ffi::sqlite3,
+        pz_err_msg: *mut *const c_char,
+        p_api: *const rusqlite::ffi::sqlite3_api_routines,
+    ) -> c_int;
+
+    // sqlite-vec exposes a no-arg C symbol, while SQLite expects the
+    // extension-init ABI when registering static auto-extensions.
+    let entry_point = unsafe {
+        std::mem::transmute::<unsafe extern "C" fn(), SqliteVecEntryPoint>(
+            sqlite_vec::sqlite3_vec_init,
+        )
+    };
+    let rc = unsafe { rusqlite::ffi::sqlite3_auto_extension(Some(entry_point)) };
+    if rc != rusqlite::ffi::SQLITE_OK {
+        return Err(QghError::storage(format!(
+            "Failed to register sqlite-vec extension: sqlite rc {rc}."
+        )));
+    }
+    Ok(())
+}
+
+fn embedding_vector_blob(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
+    for value in vector {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    bytes
+}
+
+fn upsert_vector_row(
+    tx: &rusqlite::Transaction<'_>,
+    chunk_id: i64,
+    vector: &[f32],
+) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        &format!("DELETE FROM {CHUNK_EMBEDDING_VECTORS_TABLE} WHERE rowid = ?1"),
+        params![chunk_id],
+    )?;
+    tx.execute(
+        &format!(
+            "INSERT INTO {CHUNK_EMBEDDING_VECTORS_TABLE}(rowid, embedding)
+             VALUES (?1, ?2)"
+        ),
+        params![chunk_id, embedding_vector_blob(vector)],
+    )?;
+    Ok(())
+}
+
 fn upsert_alias(
     tx: &rusqlite::Transaction<'_>,
     source_id: &str,
@@ -2011,6 +2152,64 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_vec_registers_without_creating_vector_table_on_open() {
+        let paths = temp_profile_paths("sqlite-vec-open-no-schema");
+        let store = Store::open(&paths).unwrap();
+
+        let vec_version: String = store
+            .conn
+            .query_row("SELECT vec_version()", [], |row| row.get(0))
+            .unwrap();
+        assert!(vec_version.starts_with('v'));
+        assert!(!vector_table_exists(&store.conn));
+        let tables_after_first_open = table_names(&store.conn);
+        drop(store);
+
+        let reopened = Store::open(&paths).unwrap();
+        assert!(!vector_table_exists(&reopened.conn));
+        assert_eq!(table_names(&reopened.conn), tables_after_first_open);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn vector_storage_migration_is_dimension_driven_and_idempotent() {
+        let paths = temp_profile_paths("vector-storage-idempotent");
+        let mut store = Store::open(&paths).unwrap();
+        assert!(!vector_table_exists(&store.conn));
+
+        store.ensure_vector_storage(3).unwrap();
+        let first_sql = vector_table_sql(&store.conn).unwrap();
+        assert!(first_sql.contains("vec0"));
+        assert!(first_sql.contains("float[3]"));
+
+        store.ensure_vector_storage(3).unwrap();
+        assert_eq!(vector_table_sql(&store.conn).unwrap(), first_sql);
+
+        store
+            .conn
+            .execute(
+                &format!(
+                    "INSERT INTO {CHUNK_EMBEDDING_VECTORS_TABLE}(rowid, embedding)
+                     VALUES (?1, ?2)"
+                ),
+                params![1_i64, embedding_vector_blob(&[0.1, 0.2, 0.3])],
+            )
+            .unwrap();
+        let stored: String = store
+            .conn
+            .query_row(
+                &format!("SELECT vec_to_json(embedding) FROM {CHUNK_EMBEDDING_VECTORS_TABLE}"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "[0.100000,0.200000,0.300000]");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
     fn chunks_round_trip_through_source_version_mapping() {
         let paths = temp_profile_paths("chunks-source-version-round-trip");
         let mut store = Store::open(&paths).unwrap();
@@ -2156,6 +2355,27 @@ mod tests {
             0
         );
 
+        store
+            .conn
+            .execute(&format!("DROP TABLE {CHUNK_EMBEDDING_VECTORS_TABLE}"), [])
+            .unwrap();
+        assert!(!vector_table_exists(&store.conn));
+        assert_eq!(
+            store
+                .ensure_vector_storage_for_fingerprint(&matching)
+                .unwrap(),
+            1
+        );
+        let stored_vectors: i64 = store
+            .conn
+            .query_row(
+                &format!("SELECT count(*) FROM {CHUNK_EMBEDDING_VECTORS_TABLE}"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_vectors, 1);
+
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
@@ -2168,6 +2388,32 @@ mod tests {
             query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
         }
         .with_dimension(3)
+    }
+
+    fn vector_table_exists(conn: &Connection) -> bool {
+        vector_table_sql(conn).is_some()
+    }
+
+    fn vector_table_sql(conn: &Connection) -> Option<String> {
+        conn.query_row(
+            "SELECT sql
+             FROM sqlite_schema
+             WHERE type = 'table' AND name = ?1",
+            params![CHUNK_EMBEDDING_VECTORS_TABLE],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn table_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
     }
 
     fn temp_profile_paths(name: &str) -> ProfilePaths {
