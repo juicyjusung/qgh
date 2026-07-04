@@ -110,6 +110,26 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
                     tool["inputSchema"]["properties"]["repo"]["pattern"],
                     "^[^/]+/[^/]+$"
                 );
+                let query_output_data = &tool["outputSchema"]["properties"]["data"];
+                assert_eq!(
+                    query_output_data["$id"],
+                    "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/query-result.schema.json"
+                );
+                let mcp_query_ranking = &query_output_data["$defs"]["ranking"];
+                assert_eq!(
+                    ranking_variant(mcp_query_ranking, "hybrid")["required"],
+                    json!([
+                        "kind",
+                        "lexical_score",
+                        "vector_distance",
+                        "rrf_rank_score",
+                        "final_order_score"
+                    ])
+                );
+                assert_eq!(
+                    ranking_variant(mcp_query_ranking, "bm25")["required"],
+                    json!(["kind", "lexical_score", "vector_distance"])
+                );
             }
             "get" => {
                 assert_eq!(
@@ -1311,40 +1331,121 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         get_schema["$defs"]["source_version"]
     );
     let query_ranking = &query_schema["$defs"]["ranking"];
+    let ranking_variants = query_ranking["oneOf"].as_array().unwrap();
+    assert_eq!(ranking_variants.len(), 4);
+
+    let bm25_ranking = ranking_variant(query_ranking, "bm25");
     assert_eq!(
-        query_ranking["required"],
+        bm25_ranking["required"],
         json!(["kind", "lexical_score", "vector_distance"])
     );
-    assert_eq!(query_ranking["additionalProperties"], false);
+    assert_eq!(bm25_ranking["additionalProperties"], false);
     assert_eq!(
-        schema_property_names(query_ranking),
+        schema_property_names(bm25_ranking),
         BTreeSet::from([
             "kind".to_string(),
             "lexical_score".to_string(),
             "vector_distance".to_string()
         ])
     );
+    assert_eq!(bm25_ranking["properties"]["kind"]["const"], "bm25");
     assert_eq!(
-        query_ranking["properties"]["kind"]["enum"],
-        json!(["bm25", "vector", "exact"])
+        bm25_ranking["properties"]["lexical_score"]["type"],
+        "number"
     );
     assert_eq!(
-        query_ranking["properties"]["lexical_score"]["type"],
-        json!(["number", "null"])
+        bm25_ranking["properties"]["vector_distance"]["type"],
+        "null"
     );
-    assert!(query_ranking["properties"]["lexical_score"]["description"]
+    assert!(bm25_ranking["properties"]["lexical_score"]["description"]
         .as_str()
         .unwrap()
         .contains("not confidence or probability"));
+
+    let vector_ranking = ranking_variant(query_ranking, "vector");
     assert_eq!(
-        query_ranking["properties"]["vector_distance"]["type"],
-        json!(["number", "null"])
+        vector_ranking["required"],
+        json!(["kind", "lexical_score", "vector_distance"])
+    );
+    assert_eq!(vector_ranking["additionalProperties"], false);
+    assert_eq!(vector_ranking["properties"]["kind"]["const"], "vector");
+    assert_eq!(
+        vector_ranking["properties"]["lexical_score"]["type"],
+        "null"
+    );
+    assert_eq!(
+        vector_ranking["properties"]["vector_distance"]["type"],
+        "number"
     );
     assert!(
-        query_ranking["properties"]["vector_distance"]["description"]
+        vector_ranking["properties"]["vector_distance"]["description"]
             .as_str()
             .unwrap()
             .contains("not confidence or probability")
+    );
+
+    let hybrid_ranking = ranking_variant(query_ranking, "hybrid");
+    assert_eq!(
+        hybrid_ranking["required"],
+        json!([
+            "kind",
+            "lexical_score",
+            "vector_distance",
+            "rrf_rank_score",
+            "final_order_score"
+        ])
+    );
+    assert_eq!(hybrid_ranking["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(hybrid_ranking),
+        BTreeSet::from([
+            "final_order_score".to_string(),
+            "kind".to_string(),
+            "lexical_score".to_string(),
+            "rrf_rank_score".to_string(),
+            "vector_distance".to_string(),
+        ])
+    );
+    assert_eq!(hybrid_ranking["properties"]["kind"]["const"], "hybrid");
+    assert_eq!(
+        hybrid_ranking["properties"]["lexical_score"]["type"],
+        json!(["number", "null"])
+    );
+    assert_eq!(
+        hybrid_ranking["properties"]["vector_distance"]["type"],
+        json!(["number", "null"])
+    );
+    assert_eq!(
+        hybrid_ranking["properties"]["rrf_rank_score"]["type"],
+        "number"
+    );
+    assert_eq!(
+        hybrid_ranking["properties"]["final_order_score"]["type"],
+        "number"
+    );
+    for field in [
+        "lexical_score",
+        "vector_distance",
+        "rrf_rank_score",
+        "final_order_score",
+    ] {
+        assert!(hybrid_ranking["properties"][field]["description"]
+            .as_str()
+            .unwrap()
+            .contains("not confidence or probability"));
+    }
+
+    let exact_ranking = ranking_variant(query_ranking, "exact");
+    assert_eq!(
+        exact_ranking["required"],
+        json!(["kind", "lexical_score", "vector_distance"])
+    );
+    assert_eq!(exact_ranking["additionalProperties"], false);
+    assert_eq!(exact_ranking["properties"]["kind"]["const"], "exact");
+    assert_eq!(exact_ranking["properties"]["lexical_score"]["type"], "null");
+    assert_eq!(
+        exact_ranking["properties"]["vector_distance"]["type"],
+        "null"
     );
     assert_eq!(
         status_schema["properties"]["resolution"]["$ref"],
@@ -2150,6 +2251,15 @@ fn schema_property_names(schema: &Value) -> BTreeSet<String> {
         .keys()
         .cloned()
         .collect()
+}
+
+fn ranking_variant<'a>(ranking_schema: &'a Value, kind: &str) -> &'a Value {
+    ranking_schema["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| variant["properties"]["kind"]["const"] == kind)
+        .unwrap_or_else(|| panic!("missing ranking variant: {kind}"))
 }
 
 fn toml_array_strings(value: &toml::Value) -> Vec<&str> {

@@ -2287,14 +2287,15 @@ impl HybridAccumulator {
     }
 
     fn into_query_hit(self) -> QueryHit {
-        let ranking = match (self.bm25_score, self.vector_distance) {
-            (Some(score), _) => Ranking::Bm25(score),
-            (None, Some(vector_distance)) => Ranking::Vector { vector_distance },
-            (None, None) => Ranking::Bm25(0.0),
-        };
+        let rrf_rank_score = self.rrf_score();
         QueryHit {
             source_id: self.source_id,
-            ranking,
+            ranking: Ranking::Hybrid {
+                lexical_score: self.bm25_score,
+                vector_distance: self.vector_distance,
+                rrf_rank_score,
+                final_order_score: rrf_rank_score,
+            },
         }
     }
 }
@@ -3225,7 +3226,15 @@ fn freshness_error(freshness: Value, warnings: Vec<Value>) -> QghError {
 #[derive(Debug)]
 enum Ranking {
     Bm25(f32),
-    Vector { vector_distance: f32 },
+    Vector {
+        vector_distance: f32,
+    },
+    Hybrid {
+        lexical_score: Option<f32>,
+        vector_distance: Option<f32>,
+        rrf_rank_score: f32,
+        final_order_score: f32,
+    },
     Exact,
 }
 
@@ -3287,6 +3296,18 @@ fn ranking_json(ranking: Ranking) -> Value {
             "kind": "vector",
             "lexical_score": Value::Null,
             "vector_distance": vector_distance
+        }),
+        Ranking::Hybrid {
+            lexical_score,
+            vector_distance,
+            rrf_rank_score,
+            final_order_score,
+        } => json!({
+            "kind": "hybrid",
+            "lexical_score": lexical_score,
+            "vector_distance": vector_distance,
+            "rrf_rank_score": rrf_rank_score,
+            "final_order_score": final_order_score
         }),
         Ranking::Exact => json!({
             "kind": "exact",
@@ -3514,13 +3535,48 @@ mod tests {
             1
         );
         match &hits[0].ranking {
-            Ranking::Bm25(score) => assert_eq!(*score, 10.0),
-            _ => panic!("sources with BM25 evidence must keep BM25 ranking evidence"),
+            Ranking::Hybrid {
+                lexical_score,
+                vector_distance,
+                rrf_rank_score,
+                final_order_score,
+            } => {
+                assert_eq!(*lexical_score, Some(10.0));
+                assert_eq!(*vector_distance, Some(0.02));
+                let expected = rrf_component(Some(1)) + rrf_component(Some(2));
+                assert_eq!(*rrf_rank_score, expected);
+                assert_eq!(*final_order_score, expected);
+            }
+            _ => panic!("hybrid sources must expose fused ranking evidence"),
         }
         match &hits[1].ranking {
-            Ranking::Vector { vector_distance } => assert_eq!(*vector_distance, 0.01),
-            _ => panic!("vector-only sources must keep vector ranking evidence"),
+            Ranking::Hybrid {
+                lexical_score,
+                vector_distance,
+                rrf_rank_score,
+                final_order_score,
+            } => {
+                assert_eq!(*lexical_score, None);
+                assert_eq!(*vector_distance, Some(0.01));
+                let expected = rrf_component(Some(1));
+                assert_eq!(*rrf_rank_score, expected);
+                assert_eq!(*final_order_score, expected);
+            }
+            _ => panic!("vector-only hybrid sources must expose fused ranking evidence"),
         }
+        let ranking = ranking_json(Ranking::Hybrid {
+            lexical_score: Some(10.0),
+            vector_distance: Some(0.02),
+            rrf_rank_score: 0.032,
+            final_order_score: 0.032,
+        });
+        assert_eq!(ranking["kind"], "hybrid");
+        assert_eq!(ranking["lexical_score"], json!(10.0));
+        assert!((ranking["vector_distance"].as_f64().unwrap() - 0.02).abs() < 1e-6);
+        assert!((ranking["rrf_rank_score"].as_f64().unwrap() - 0.032).abs() < 1e-6);
+        assert!((ranking["final_order_score"].as_f64().unwrap() - 0.032).abs() < 1e-6);
+        assert!(ranking.get("confidence").is_none());
+        assert!(ranking.get("probability").is_none());
     }
 
     #[test]

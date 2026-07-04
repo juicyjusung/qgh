@@ -108,6 +108,8 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
     assert!(result["ranking"]["lexical_score"]
         .as_f64()
         .is_some_and(f64::is_finite));
+    assert!(result["ranking"].get("rrf_rank_score").is_none());
+    assert!(result["ranking"].get("final_order_score").is_none());
     assert!(result["ranking"].get("confidence").is_none());
     assert!(result["ranking"].get("probability").is_none());
     assert_eq!(
@@ -455,6 +457,8 @@ fn exact_lookup_uses_typed_ranking_without_non_finite_scores() {
     let issue_result = &issue_json["data"]["results"][0];
     assert_eq!(issue_result["ranking"]["kind"], "exact");
     assert!(issue_result["ranking"]["lexical_score"].is_null());
+    assert!(issue_result["ranking"].get("rrf_rank_score").is_none());
+    assert!(issue_result["ranking"].get("final_order_score").is_none());
     assert!(issue_result["ranking"].get("confidence").is_none());
     assert!(issue_result["ranking"].get("probability").is_none());
 

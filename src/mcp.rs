@@ -474,7 +474,7 @@ fn tool_list() -> Vec<Value> {
             "query",
             "Search local GitHub Issue and issue comment sources.",
             query_input_schema(),
-            envelope_output_schema(),
+            query_output_schema(),
         ),
         tool(
             "get",
@@ -551,7 +551,18 @@ fn get_input_schema() -> Value {
     })
 }
 
+fn query_output_schema() -> Value {
+    let data_schema: Value =
+        serde_json::from_str(include_str!("../docs/schemas/query-result.schema.json"))
+            .expect("query result schema must be valid JSON");
+    envelope_output_schema_with_data(data_schema)
+}
+
 fn envelope_output_schema() -> Value {
+    envelope_output_schema_with_data(json!({ "type": "object" }))
+}
+
+fn envelope_output_schema_with_data(data_schema: Value) -> Value {
     json!({
         "$schema": JSON_SCHEMA,
         "type": "object",
@@ -559,7 +570,7 @@ fn envelope_output_schema() -> Value {
         "properties": {
             "schema_version": { "const": "qgh.v1" },
             "ok": { "type": "boolean" },
-            "data": { "type": "object" },
+            "data": data_schema,
             "error": { "type": "object" },
             "warnings": {
                 "type": "array",

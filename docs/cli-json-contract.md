@@ -178,10 +178,15 @@ use the policy later still apply normal profile resolution and allowlist checks.
 `--limit` must be greater than zero; invalid values fail with a structured
 validation error instead of silently returning an empty result set.
 `--issue` must also be greater than zero.
-`ranking.lexical_score` is populated for BM25 results and `null` for exact or
-vector-ranked results. `ranking.vector_distance` is populated for internal
-vector-ranked results and `null` for BM25 or exact results; lower distance is
-closer, and it is not confidence or probability. Vector-only ranking is not a
+`ranking.lexical_score` is populated for BM25 results and for hybrid results
+with lexical evidence, otherwise `null`. `ranking.vector_distance` is populated
+for internal vector-ranked results and for hybrid results with vector evidence,
+otherwise `null`; lower distance is closer. Hybrid results also include
+`ranking.rrf_rank_score` and `ranking.final_order_score`; in hybrid v1,
+`final_order_score` is the score used for final ordering after RRF fusion.
+BM25, vector, and exact ranking objects keep their existing field set and do
+not include hybrid-only fields.
+Ranking fields are not confidence or probability. Vector-only ranking is not a
 user-facing CLI or MCP mode.
 
 Every result includes:
@@ -194,7 +199,9 @@ Every result includes:
   profile store that produced the result.
 - `parent_issue`: issue context for comments, or `null` for issue bodies.
 - `source_version`: body hash, GitHub updated timestamp, indexed timestamp, sync run, and lifecycle state.
-- `ranking`: typed ordering evidence. `lexical_score` is a BM25 ordering signal, not confidence or probability.
+- `ranking`: typed ordering evidence. `lexical_score`, `vector_distance`,
+  `rrf_rank_score`, and `final_order_score` are ranking signals, not confidence
+  or probability.
 
 Query results intentionally omit `body`. Use the `get` response when source text, canonical URL, and source identity are needed for a citation.
 
