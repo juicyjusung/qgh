@@ -4,13 +4,37 @@ use crate::paths::{ensure_private_dir, set_private_dir};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::schema::{Field, Schema, Value, STORED, STRING, TEXT};
-use tantivy::{doc, Index, TantivyDocument};
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
+use tantivy::schema::{Field, IndexRecordOption, Schema, Value, STORED, STRING, TEXT};
+use tantivy::{doc, Index, TantivyDocument, Term};
 
+#[derive(Debug, Clone)]
 pub struct SearchHit {
     pub source_id: String,
     pub score: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchFilters {
+    pub repo: Option<String>,
+    pub labels: Vec<String>,
+    pub state: Option<String>,
+    pub author: Option<String>,
+    pub issue: Option<i64>,
+    pub source_types: Vec<String>,
+}
+
+impl Default for SearchFilters {
+    fn default() -> Self {
+        Self {
+            repo: None,
+            labels: Vec::new(),
+            state: None,
+            author: None,
+            issue: None,
+            source_types: vec!["issue".to_string(), "issue_comment".to_string()],
+        }
+    }
 }
 
 pub fn rebuild(
@@ -69,6 +93,18 @@ pub fn search(
     query_text: &str,
     limit: usize,
 ) -> Result<Vec<SearchHit>, QghError> {
+    search_with_filters(active_path, query_text, &SearchFilters::default(), limit)
+}
+
+pub fn search_with_filters(
+    active_path: &Path,
+    query_text: &str,
+    filters: &SearchFilters,
+    limit: usize,
+) -> Result<Vec<SearchHit>, QghError> {
+    if limit == 0 || filters.source_types.is_empty() {
+        return Ok(Vec::new());
+    }
     if !active_path.exists() {
         return Ok(Vec::new());
     }
@@ -76,6 +112,9 @@ pub fn search(
     let schema = index.schema();
     let source_id = schema
         .get_field("source_id")
+        .map_err(|e| QghError::index(e.to_string()))?;
+    let entity_type = schema
+        .get_field("entity_type")
         .map_err(|e| QghError::index(e.to_string()))?;
     let title = schema
         .get_field("title")
@@ -92,6 +131,12 @@ pub fn search(
     let issue_number = schema
         .get_field("issue_number")
         .map_err(|e| QghError::index(e.to_string()))?;
+    let state = schema
+        .get_field("state")
+        .map_err(|e| QghError::index(e.to_string()))?;
+    let author = schema
+        .get_field("author")
+        .map_err(|e| QghError::index(e.to_string()))?;
     let reader = index.reader().map_err(|e| QghError::index(e.to_string()))?;
     let searcher = reader.searcher();
     let mut query_fields = vec![title, body, labels, repo, issue_number];
@@ -106,6 +151,15 @@ pub fn search(
     let query = parser.parse_query(&expanded_query).map_err(|e| {
         QghError::validation("validation.invalid_query", format!("Invalid query: {e}"))
     })?;
+    let filter_fields = FilterFields {
+        entity_type,
+        repo,
+        issue_number,
+        state,
+        labels,
+        author,
+    };
+    let query = filtered_query(query, &filter_fields, filters);
     let top_docs = searcher
         .search(&query, &TopDocs::with_limit(limit))
         .map_err(|e| QghError::index(e.to_string()))?;
@@ -126,6 +180,92 @@ pub fn search(
         });
     }
     Ok(hits)
+}
+
+fn filtered_query(
+    text_query: Box<dyn Query>,
+    fields: &FilterFields,
+    filters: &SearchFilters,
+) -> Box<dyn Query> {
+    let mut clauses = vec![(Occur::Must, text_query)];
+    push_source_type_filter(&mut clauses, fields, filters);
+    if let Some(repo) = &filters.repo {
+        clauses.push((Occur::Must, term_query(fields.repo, repo)));
+    }
+    if let Some(issue) = filters.issue {
+        clauses.push((
+            Occur::Must,
+            term_query(fields.issue_number, &issue.to_string()),
+        ));
+    }
+    if let Some(author) = &filters.author {
+        clauses.push((Occur::Must, term_query(fields.author, author)));
+    }
+    if let Some(state) = &filters.state {
+        clauses.push((Occur::Must, term_query(fields.state, state)));
+    }
+    for label in &filters.labels {
+        for term in label_terms(label) {
+            clauses.push((Occur::Must, term_query(fields.labels, &term)));
+        }
+    }
+    if clauses.len() == 1 {
+        return clauses.pop().expect("text query exists").1;
+    }
+    Box::new(BooleanQuery::new(clauses))
+}
+
+fn push_source_type_filter(
+    clauses: &mut Vec<(Occur, Box<dyn Query>)>,
+    fields: &FilterFields,
+    filters: &SearchFilters,
+) {
+    let includes_issue = filters
+        .source_types
+        .iter()
+        .any(|source_type| source_type == "issue");
+    let includes_comment = filters
+        .source_types
+        .iter()
+        .any(|source_type| source_type == "issue_comment");
+    if includes_issue && includes_comment {
+        return;
+    }
+    let source_type_terms = filters
+        .source_types
+        .iter()
+        .map(|source_type| (Occur::Should, term_query(fields.entity_type, source_type)))
+        .collect::<Vec<_>>();
+    clauses.push((Occur::Must, Box::new(BooleanQuery::new(source_type_terms))));
+}
+
+fn term_query(field: Field, text: &str) -> Box<dyn Query> {
+    Box::new(TermQuery::new(
+        Term::from_field_text(field, text),
+        IndexRecordOption::Basic,
+    ))
+}
+
+fn label_terms(label: &str) -> Vec<String> {
+    let terms = label
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        vec![label.to_ascii_lowercase()]
+    } else {
+        terms
+    }
+}
+
+struct FilterFields {
+    entity_type: Field,
+    repo: Field,
+    issue_number: Field,
+    state: Field,
+    labels: Field,
+    author: Field,
 }
 
 struct Fields {
@@ -306,6 +446,98 @@ mod tests {
             Some("qgh://github.com/issue/I_kwDOCJK1")
         );
         let _ = fs::remove_dir_all(index_root);
+    }
+
+    #[test]
+    fn search_filters_apply_before_top_docs_limit() {
+        let index_root = temp_index_root("bm25-prefilter");
+        let noisy_body = "needle ".repeat(50);
+        let sources = vec![
+            test_source(
+                "NOISY_REPO",
+                "other/repo",
+                "open",
+                "bob",
+                &["ready-for-agent"],
+                &noisy_body,
+            ),
+            test_source(
+                "NOISY_LABEL",
+                "owner/repo",
+                "open",
+                "bob",
+                &["ready-for-human"],
+                &noisy_body,
+            ),
+            test_source(
+                "NOISY_STATE",
+                "owner/repo",
+                "closed",
+                "bob",
+                &["ready-for-agent"],
+                &noisy_body,
+            ),
+            test_source(
+                "NOISY_AUTHOR",
+                "owner/repo",
+                "open",
+                "alice",
+                &["ready-for-agent"],
+                &noisy_body,
+            ),
+            test_source(
+                "ALLOWED",
+                "owner/repo",
+                "open",
+                "bob",
+                &["ready-for-agent"],
+                "needle",
+            ),
+        ];
+
+        let generation_path = rebuild(&index_root, 1, &sources).unwrap();
+        let hits = search_with_filters(
+            &generation_path,
+            "needle",
+            &SearchFilters {
+                repo: Some("owner/repo".to_string()),
+                labels: vec!["ready-for-agent".to_string()],
+                state: Some("open".to_string()),
+                author: Some("bob".to_string()),
+                issue: None,
+                source_types: vec!["issue".to_string()],
+            },
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source_id, "qgh://github.com/issue/ALLOWED");
+        let _ = fs::remove_dir_all(index_root);
+    }
+
+    fn test_source(
+        node_id: &str,
+        repo: &str,
+        state: &str,
+        author: &str,
+        labels: &[&str],
+        body: &str,
+    ) -> IndexSource {
+        IndexSource {
+            source_id: format!("qgh://github.com/issue/{node_id}"),
+            entity_type: "issue".to_string(),
+            repo: repo.to_string(),
+            issue_number: 1,
+            state: state.to_string(),
+            labels: labels.iter().map(|label| label.to_string()).collect(),
+            author: Some(author.to_string()),
+            title: format!("Prefilter {node_id}"),
+            body: body.to_string(),
+            parent_issue_title: String::new(),
+            github_updated_at: "2026-01-01T00:00:00Z".to_string(),
+            indexed_at: "2026-01-01T00:00:00Z".to_string(),
+        }
     }
 
     fn temp_index_root(name: &str) -> std::path::PathBuf {
