@@ -12,7 +12,8 @@ use crate::embedding::FastembedTokenizer;
 use crate::embedding::{
     default_hf_model_reference, parse_hf_model_reference, EmbeddingFingerprint,
     EmbeddingFingerprintExpectation, EmbeddingFingerprintSeed, EmbeddingProvider,
-    EmbeddingProviderError, EmbeddingTokenizer, EmbeddingVector, LOCAL_MODEL_REVISION,
+    EmbeddingProviderError, EmbeddingTokenizer, EmbeddingVector, PoolingKind, TokenSpan,
+    DEFAULT_QUERY_PREFIX, LOCAL_MODEL_REVISION,
 };
 #[cfg(feature = "fastembed-provider")]
 use crate::embedding::{
@@ -1194,8 +1195,113 @@ struct EmbeddingRuntime {
     fingerprint_seed: EmbeddingFingerprintSeed,
 }
 
+#[cfg(debug_assertions)]
+const TEST_EMBEDDING_QUERY_VECTORS_ENV: &str = "QGH_TEST_EMBEDDING_QUERY_VECTORS";
+
+#[cfg(debug_assertions)]
+struct TestEmbeddingProvider {
+    query_vectors: HashMap<String, EmbeddingVector>,
+}
+
+#[cfg(debug_assertions)]
+impl EmbeddingProvider for TestEmbeddingProvider {
+    fn embed_documents(
+        &self,
+        _texts: &[&str],
+    ) -> Result<Vec<EmbeddingVector>, EmbeddingProviderError> {
+        Err(EmbeddingProviderError::structured(
+            "embedding.test_provider_documents_unsupported",
+            "Test embedding provider supports query vectors only.",
+        ))
+    }
+
+    fn embed_query(&self, text: &str) -> Result<EmbeddingVector, EmbeddingProviderError> {
+        self.query_vectors.get(text).cloned().ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.test_query_vector_missing",
+                "Test embedding provider has no vector for this query.",
+            )
+        })
+    }
+}
+
+#[cfg(debug_assertions)]
+struct TestEmbeddingTokenizer;
+
+#[cfg(debug_assertions)]
+impl EmbeddingTokenizer for TestEmbeddingTokenizer {
+    fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError> {
+        if text.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![TokenSpan {
+                start: 0,
+                end: text.len(),
+            }])
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn test_embedding_runtime(
+    embedding: &EmbeddingConfig,
+) -> Result<Option<EmbeddingRuntime>, QghError> {
+    let Ok(raw_vectors) = std::env::var(TEST_EMBEDDING_QUERY_VECTORS_ENV) else {
+        return Ok(None);
+    };
+    let query_vectors: HashMap<String, EmbeddingVector> =
+        serde_json::from_str(&raw_vectors).map_err(|error| {
+            QghError::validation(
+                "embedding.test_query_vectors_invalid",
+                format!("{TEST_EMBEDDING_QUERY_VECTORS_ENV} must be a JSON object of query vectors: {error}"),
+            )
+        })?;
+    let Some(dimension) = query_vectors.values().next().map(Vec::len) else {
+        return Err(QghError::validation(
+            "embedding.test_query_vectors_empty",
+            format!("{TEST_EMBEDDING_QUERY_VECTORS_ENV} must contain at least one query vector."),
+        ));
+    };
+    if dimension == 0
+        || query_vectors
+            .values()
+            .any(|vector| vector.len() != dimension)
+    {
+        return Err(QghError::validation(
+            "embedding.test_query_vectors_dimension_mismatch",
+            format!("{TEST_EMBEDDING_QUERY_VECTORS_ENV} vectors must be non-empty and share one dimension."),
+        ));
+    }
+    Ok(Some(EmbeddingRuntime {
+        tokenizer: Box::new(TestEmbeddingTokenizer),
+        provider: Box::new(TestEmbeddingProvider { query_vectors }),
+        fingerprint_seed: EmbeddingFingerprintSeed {
+            provider: embedding_provider_name(embedding.provider).to_string(),
+            model_id: configured_embedding_model_id(embedding)
+                .unwrap_or_else(|| "qgh-test-embedding".to_string()),
+            model_revision: configured_embedding_model_revision(embedding)
+                .unwrap_or_else(|| LOCAL_MODEL_REVISION.to_string()),
+            pooling: embedding.pooling.unwrap_or(PoolingKind::Cls),
+            query_prefix: embedding
+                .query_prefix
+                .clone()
+                .unwrap_or_else(|| DEFAULT_QUERY_PREFIX.to_string()),
+        },
+    }))
+}
+
+#[cfg(not(debug_assertions))]
+fn test_embedding_runtime(
+    _embedding: &EmbeddingConfig,
+) -> Result<Option<EmbeddingRuntime>, QghError> {
+    Ok(None)
+}
+
 #[cfg(feature = "fastembed-provider")]
 fn embedding_runtime(embedding: &EmbeddingConfig) -> Result<EmbeddingRuntime, QghError> {
+    if let Some(runtime) = test_embedding_runtime(embedding)? {
+        return Ok(runtime);
+    }
     match embedding.provider {
         EmbeddingProviderKind::Local => {
             let snapshot = resolve_fastembed_snapshot(embedding.fastembed_options())
@@ -1216,6 +1322,9 @@ fn embedding_runtime(embedding: &EmbeddingConfig) -> Result<EmbeddingRuntime, Qg
 
 #[cfg(not(feature = "fastembed-provider"))]
 fn embedding_runtime(embedding: &EmbeddingConfig) -> Result<EmbeddingRuntime, QghError> {
+    if let Some(runtime) = test_embedding_runtime(embedding)? {
+        return Ok(runtime);
+    }
     match embedding.provider {
         EmbeddingProviderKind::Local => Err(QghError::validation(
             "embedding.provider_unavailable",
