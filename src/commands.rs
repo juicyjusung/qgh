@@ -2353,10 +2353,10 @@ fn hybrid_vector_hits(
     let Some(embedding) = profile.embedding.as_ref() else {
         return Ok((None, Vec::new()));
     };
-    let Some(active) = store.active_embedding_fingerprint()? else {
+    let Some(coverage) = embedding_coverage_state(profile, store)? else {
         return Ok((None, Vec::new()));
     };
-    if !active.matches_expectation(&embedding_fingerprint_expectation(embedding)) {
+    if !coverage.hybrid_ready() {
         return Ok((None, Vec::new()));
     }
     let runtime = match embedding_runtime(embedding) {
@@ -2378,6 +2378,77 @@ fn hybrid_vector_hits(
         Ok(hits) => Ok((Some(hits), Vec::new())),
         Err(error) => Ok((None, vec![hybrid_fallback_warning(&error)])),
     }
+}
+
+struct EmbeddingCoverageState {
+    active_fingerprint: Option<EmbeddingFingerprint>,
+    active_matches_config: bool,
+    total_chunks: i64,
+    completed_chunks: i64,
+    missing_chunks: i64,
+    mismatched_chunks: i64,
+}
+
+impl EmbeddingCoverageState {
+    fn state(&self) -> &'static str {
+        match (
+            &self.active_fingerprint,
+            self.active_matches_config,
+            self.missing_chunks,
+        ) {
+            (None, _, _) => "missing",
+            (Some(_), false, _) => "fingerprint_mismatch",
+            (Some(_), true, 0) => "complete",
+            (Some(_), true, _) => "partial",
+        }
+    }
+
+    fn hybrid_ready(&self) -> bool {
+        self.active_fingerprint.is_some()
+            && self.active_matches_config
+            && self.total_chunks > 0
+            && self.missing_chunks == 0
+    }
+}
+
+fn embedding_coverage_state(
+    profile: &Profile,
+    store: &Store,
+) -> Result<Option<EmbeddingCoverageState>, QghError> {
+    let Some(embedding) = profile.embedding.as_ref() else {
+        return Ok(None);
+    };
+    let expectation = embedding_fingerprint_expectation(embedding);
+    let total_chunks = store.active_embedding_chunk_count()?;
+    let active_fingerprint = store.active_embedding_fingerprint()?;
+    let active_matches_config = active_fingerprint
+        .as_ref()
+        .is_some_and(|fingerprint| fingerprint.matches_expectation(&expectation));
+    let active_embedding_count = active_fingerprint
+        .as_ref()
+        .map(|fingerprint| store.current_chunk_embedding_count_for_fingerprint(fingerprint))
+        .transpose()?
+        .unwrap_or(0);
+    let completed_chunks = if active_matches_config {
+        active_embedding_count
+    } else {
+        0
+    };
+    let missing_chunks = total_chunks.saturating_sub(completed_chunks);
+    let mismatched_chunks = if active_fingerprint.is_some() && !active_matches_config {
+        active_embedding_count
+    } else {
+        0
+    };
+
+    Ok(Some(EmbeddingCoverageState {
+        active_fingerprint,
+        active_matches_config,
+        total_chunks,
+        completed_chunks,
+        missing_chunks,
+        mismatched_chunks,
+    }))
 }
 
 fn hybrid_fallback_warning(error: &QghError) -> Value {
@@ -2533,71 +2604,54 @@ impl QueryResults {
 }
 
 fn embedding_warnings(profile: &Profile, store: &Store) -> Result<Vec<Value>, QghError> {
-    let Some(embedding) = profile.embedding.as_ref() else {
+    let Some(coverage) = embedding_coverage_state(profile, store)? else {
         return Ok(Vec::new());
     };
-    let Some(active) = store.active_embedding_fingerprint()? else {
-        return Ok(Vec::new());
-    };
-    let expectation = embedding_fingerprint_expectation(embedding);
-    if active.matches_expectation(&expectation) {
-        return Ok(Vec::new());
+    match coverage.state() {
+        "missing" => Ok(vec![json!({
+            "code": "embedding.coverage_missing",
+            "severity": "warn",
+            "message": "No usable embeddings are available. Hybrid retrieval is disabled and BM25 results are still returned."
+        })]),
+        "partial" => Ok(vec![json!({
+            "code": "embedding.coverage_partial",
+            "severity": "warn",
+            "message": "Embedding coverage is incomplete. Hybrid retrieval is disabled and BM25 results are still returned."
+        })]),
+        "fingerprint_mismatch" => Ok(vec![json!({
+            "code": "embedding.fingerprint_mismatch",
+            "severity": "warn_strong",
+            "message": "Stored embeddings were created with a different embedding fingerprint and will not be used for vector search. BM25 results are still returned.",
+            "hint": "Run `qgh embed --force` to recompute local embeddings."
+        })]),
+        "complete" => Ok(Vec::new()),
+        _ => unreachable!("embedding coverage state is closed"),
     }
-    Ok(vec![json!({
-        "code": "embedding.fingerprint_mismatch",
-        "severity": "warn_strong",
-        "message": "Stored embeddings were created with a different embedding fingerprint and will not be used for vector search. BM25 results are still returned.",
-        "hint": "Run `qgh embed --force` to recompute local embeddings."
-    })])
 }
 
 fn embedding_status(profile: &Profile, store: &Store) -> Result<Option<Value>, QghError> {
     let Some(embedding) = profile.embedding.as_ref() else {
         return Ok(None);
     };
-    let expectation = embedding_fingerprint_expectation(embedding);
-    let total_chunks = store.active_embedding_chunk_count()?;
-    let active_fingerprint = store.active_embedding_fingerprint()?;
-    let active_matches_config = active_fingerprint
-        .as_ref()
-        .is_some_and(|fingerprint| fingerprint.matches_expectation(&expectation));
-    let active_embedding_count = active_fingerprint
-        .as_ref()
-        .map(|fingerprint| store.current_chunk_embedding_count_for_fingerprint(fingerprint))
-        .transpose()?
-        .unwrap_or(0);
-    let completed_chunks = if active_matches_config {
-        active_embedding_count
-    } else {
-        0
-    };
-    let missing_chunks = total_chunks.saturating_sub(completed_chunks);
-    let mismatched_chunks = if active_fingerprint.is_some() && !active_matches_config {
-        active_embedding_count
-    } else {
-        0
-    };
-    let state = match (&active_fingerprint, active_matches_config, missing_chunks) {
-        (None, _, _) => "missing",
-        (Some(_), false, _) => "fingerprint_mismatch",
-        (Some(_), true, 0) => "complete",
-        (Some(_), true, _) => "partial",
+    let Some(coverage) = embedding_coverage_state(profile, store)? else {
+        return Ok(None);
     };
 
     Ok(Some(json!({
-        "state": state,
+        "state": coverage.state(),
         "coverage": {
-            "total_chunks": total_chunks,
-            "completed_chunks": completed_chunks,
-            "missing_chunks": missing_chunks,
-            "mismatched_chunks": mismatched_chunks
+            "total_chunks": coverage.total_chunks,
+            "completed_chunks": coverage.completed_chunks,
+            "missing_chunks": coverage.missing_chunks,
+            "mismatched_chunks": coverage.mismatched_chunks
         },
         "configured_model": configured_embedding_model_json(embedding),
-        "fingerprint": active_fingerprint
+        "fingerprint": coverage
+            .active_fingerprint
             .as_ref()
             .map(|fingerprint| embedding_fingerprint_status_json(
                 fingerprint,
-                active_matches_config
+                coverage.active_matches_config
             ))
     })))
 }
