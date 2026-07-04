@@ -27,6 +27,9 @@
     "coverage": {
       "$ref": "#/$defs/coverage"
     },
+    "embedding": {
+      "$ref": "#/$defs/embedding"
+    },
     "github": {
       "$ref": "#/$defs/github"
     },
@@ -387,6 +390,137 @@
         },
         "next_backfill_window_hint": {
           "type": ["string", "null"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "embedding": {
+      "type": "object",
+      "required": ["state", "coverage", "configured_model", "fingerprint"],
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["missing", "partial", "complete", "fingerprint_mismatch"]
+        },
+        "coverage": {
+          "$ref": "#/$defs/embedding_coverage"
+        },
+        "configured_model": {
+          "$ref": "#/$defs/embedding_configured_model"
+        },
+        "fingerprint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/embedding_fingerprint"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "embedding_coverage": {
+      "type": "object",
+      "required": [
+        "total_chunks",
+        "completed_chunks",
+        "missing_chunks",
+        "mismatched_chunks"
+      ],
+      "properties": {
+        "total_chunks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "completed_chunks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "missing_chunks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mismatched_chunks": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "embedding_configured_model": {
+      "type": "object",
+      "required": ["provider", "model", "model_id", "model_revision", "model_path"],
+      "properties": {
+        "provider": {
+          "enum": ["local"]
+        },
+        "model": {
+          "type": ["string", "null"]
+        },
+        "model_id": {
+          "type": "string"
+        },
+        "model_revision": {
+          "type": ["string", "null"]
+        },
+        "model_path": {
+          "type": ["string", "null"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "embedding_fingerprint": {
+      "type": "object",
+      "required": [
+        "hash",
+        "schema_version",
+        "provider",
+        "model_id",
+        "model_revision",
+        "dimension",
+        "pooling",
+        "query_prefix",
+        "chunker_version",
+        "source_schema_version",
+        "matches_config"
+      ],
+      "properties": {
+        "hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "schema_version": {
+          "const": "qgh.embedding_fingerprint.v1"
+        },
+        "provider": {
+          "enum": ["local"]
+        },
+        "model_id": {
+          "type": "string"
+        },
+        "model_revision": {
+          "type": "string"
+        },
+        "dimension": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pooling": {
+          "enum": ["cls", "mean"]
+        },
+        "query_prefix": {
+          "type": "string"
+        },
+        "chunker_version": {
+          "type": "string"
+        },
+        "source_schema_version": {
+          "type": "string"
+        },
+        "matches_config": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false

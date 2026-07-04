@@ -1,8 +1,10 @@
 use chrono::{Duration, SecondsFormat, Utc};
 use qgh::embedding::{
-    EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_QUERY_PREFIX,
+    EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_HF_MODEL_REVISION,
+    DEFAULT_QUERY_PREFIX,
 };
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 #[cfg(feature = "fastembed-provider")]
 use std::collections::HashMap;
 use std::fs;
@@ -2083,20 +2085,47 @@ fn status_reports_never_synced_and_validates_duration_config() {
 }
 
 #[test]
-fn embedding_config_accepts_local_provider_without_status_shape_change() {
-    let fixture = TestFixture::new("embedding-local-config");
+fn status_shape_is_unchanged_without_embedding_config() {
+    let fixture = TestFixture::new("status-bm25-shape");
+    fixture.write_config("http://127.0.0.1:1");
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(
+        json_object_keys(&status_json["data"]),
+        BTreeSet::from([
+            "coverage".to_string(),
+            "database".to_string(),
+            "freshness".to_string(),
+            "github".to_string(),
+            "index".to_string(),
+            "paths".to_string(),
+            "privacy".to_string(),
+            "profile_id".to_string(),
+            "reconciliation".to_string(),
+            "resolution".to_string(),
+            "sources".to_string(),
+            "sync".to_string(),
+        ])
+    );
+    assert!(
+        status_json["data"].get("embedding").is_none(),
+        "BM25-only status must not expose embedding shape: {status_json}"
+    );
+}
+
+#[test]
+fn embedding_status_uses_only_config_and_local_store_snapshot() {
+    let fixture = TestFixture::new("embedding-local-status");
     fixture.write_config_with_embedding(
         "http://127.0.0.1:1",
         r#"
 provider = "local"
-model = "hf:Snowflake/snowflake-arctic-embed-l-v2.0"
+model_path = "/definitely/not/a/model"
 file = "onnx/model_quantized.onnx"
 pooling = "cls"
 query_prefix = "query: "
-
-[embedding.token_source]
-type = "env"
-env = "QGH_TEST_HF_TOKEN"
 "#,
     );
 
@@ -2104,9 +2133,141 @@ env = "QGH_TEST_HF_TOKEN"
     assert_success(&status);
     let status_json = stdout_json(&status);
     assert_eq!(status_json["data"]["freshness"]["decision"], "never_synced");
-    assert!(
-        status_json["data"].get("embedding").is_none(),
-        "embedding config must not change status schema in this slice: {status_json}"
+    assert_eq!(status_json["data"]["embedding"]["state"], "missing");
+    assert_eq!(
+        status_json["data"]["embedding"]["configured_model"]["model_path"],
+        "/definitely/not/a/model"
+    );
+    assert_eq!(
+        status_json["data"]["embedding"]["coverage"]["total_chunks"],
+        0
+    );
+    assert_eq!(
+        status_json["data"]["embedding"]["coverage"]["completed_chunks"],
+        0
+    );
+    assert_eq!(
+        status_json["data"]["embedding"]["coverage"]["missing_chunks"],
+        0
+    );
+    assert_eq!(status_json["data"]["embedding"]["fingerprint"], Value::Null);
+}
+
+#[test]
+fn status_embedding_coverage_counts_completed_and_missing_chunks() {
+    let fixture = TestFixture::new("embedding-coverage-counts");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let issue_chunk = fixture.insert_chunk_for_source(
+        "qgh://github.com/issue/I_kwDOISSUE1",
+        "issue embedding chunk",
+    );
+    let comment_chunk = fixture.insert_chunk_for_source(
+        "qgh://github.com/issue-comment/IC_kwDOCOMMENT1",
+        "comment embedding chunk",
+    );
+    let requests_before_status = server.request_count();
+    fixture.write_default_embedding_config(&server.base_url);
+
+    let missing = fixture.qgh(["status", "--json"]);
+    assert_success(&missing);
+    assert_eq!(
+        server.request_count(),
+        requests_before_status,
+        "status embedding coverage must not probe GitHub"
+    );
+    let missing_json = stdout_json(&missing);
+    assert_eq!(missing_json["data"]["embedding"]["state"], "missing");
+    assert_eq!(
+        missing_json["data"]["embedding"]["coverage"]["total_chunks"],
+        2
+    );
+    assert_eq!(
+        missing_json["data"]["embedding"]["coverage"]["completed_chunks"],
+        0
+    );
+    assert_eq!(
+        missing_json["data"]["embedding"]["coverage"]["missing_chunks"],
+        2
+    );
+
+    fixture.insert_matching_active_embedding_fingerprint();
+    fixture.insert_embedding_for_chunk(issue_chunk);
+    let partial = fixture.qgh(["status", "--json"]);
+    assert_success(&partial);
+    let partial_json = stdout_json(&partial);
+    assert_eq!(partial_json["data"]["embedding"]["state"], "partial");
+    assert_eq!(
+        partial_json["data"]["embedding"]["coverage"]["completed_chunks"],
+        1
+    );
+    assert_eq!(
+        partial_json["data"]["embedding"]["coverage"]["missing_chunks"],
+        1
+    );
+    assert_eq!(
+        partial_json["data"]["embedding"]["fingerprint"]["matches_config"],
+        true
+    );
+
+    fixture.insert_embedding_for_chunk(comment_chunk);
+    let complete = fixture.qgh(["status", "--json"]);
+    assert_success(&complete);
+    let complete_json = stdout_json(&complete);
+    assert_eq!(complete_json["data"]["embedding"]["state"], "complete");
+    assert_eq!(
+        complete_json["data"]["embedding"]["coverage"]["completed_chunks"],
+        2
+    );
+    assert_eq!(
+        complete_json["data"]["embedding"]["coverage"]["missing_chunks"],
+        0
+    );
+}
+
+#[test]
+fn status_embedding_coverage_reports_fingerprint_mismatch() {
+    let fixture = TestFixture::new("embedding-coverage-mismatch");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let chunk_id = fixture.insert_chunk_for_source(
+        "qgh://github.com/issue/I_kwDOISSUE1",
+        "stale embedding chunk",
+    );
+    fixture.write_default_embedding_config(&server.base_url);
+    fixture.insert_active_embedding_fingerprint_with_revision("Other/model", "fixture-sha");
+    fixture.insert_embedding_for_chunk(chunk_id);
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(
+        status_json["warnings"][0]["code"],
+        "embedding.fingerprint_mismatch"
+    );
+    assert_eq!(
+        status_json["data"]["embedding"]["state"],
+        "fingerprint_mismatch"
+    );
+    assert_eq!(
+        status_json["data"]["embedding"]["coverage"]["completed_chunks"],
+        0
+    );
+    assert_eq!(
+        status_json["data"]["embedding"]["coverage"]["missing_chunks"],
+        1
+    );
+    assert_eq!(
+        status_json["data"]["embedding"]["coverage"]["mismatched_chunks"],
+        1
+    );
+    assert_eq!(
+        status_json["data"]["embedding"]["fingerprint"]["matches_config"],
+        false
     );
 }
 
@@ -5279,6 +5440,19 @@ env = "QGH_TEST_TOKEN"
         fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
     }
 
+    fn write_default_embedding_config(&self, api_base_url: &str) {
+        self.write_config_with_embedding(
+            api_base_url,
+            r#"
+provider = "local"
+model = "hf:Snowflake/snowflake-arctic-embed-l-v2.0"
+file = "onnx/model_quantized.onnx"
+pooling = "cls"
+query_prefix = "query: "
+"#,
+        );
+    }
+
     #[cfg(feature = "fastembed-provider")]
     fn write_local_embedding_tokenizer_model(&self) -> PathBuf {
         use tokenizers::models::wordlevel::WordLevel;
@@ -5830,6 +6004,29 @@ limit = 10
             .unwrap()
     }
 
+    fn insert_chunk_for_source(&self, source_id: &str, body: &str) -> i64 {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let source_version_id: i64 = conn
+            .query_row(
+                "SELECT coalesce(im.latest_version_id, cm.latest_version_id)
+                 FROM source_entities se
+                 LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+                 LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+                 WHERE se.source_id = ?1 AND se.lifecycle_state = 'active'",
+                [source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO chunks (source_id, source_version_id, body)
+             VALUES (?1, ?2, ?3)",
+            (source_id, source_version_id, body),
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
     #[cfg(feature = "fastembed-provider")]
     fn sqlite_chunk_ids(&self) -> Vec<i64> {
         let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
@@ -5908,6 +6105,32 @@ limit = 10
 
     fn insert_active_embedding_fingerprint(&self, model_id: &str) {
         self.insert_active_embedding_fingerprint_with_revision(model_id, "fixture-sha");
+    }
+
+    fn insert_matching_active_embedding_fingerprint(&self) {
+        self.insert_active_embedding_fingerprint_with_revision(
+            DEFAULT_HF_MODEL_ID,
+            DEFAULT_HF_MODEL_REVISION,
+        );
+    }
+
+    fn insert_embedding_for_chunk(&self, chunk_id: i64) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let fingerprint_id: i64 = conn
+            .query_row(
+                "SELECT id FROM embedding_fingerprints WHERE active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO chunk_embeddings
+                (chunk_id, fingerprint_id, vector_json, embedded_at)
+             VALUES (?1, ?2, '[0.1,0.2,0.3]', '2026-01-02T00:00:00Z')",
+            (chunk_id, fingerprint_id),
+        )
+        .unwrap();
     }
 
     fn insert_active_embedding_fingerprint_with_revision(
@@ -7150,6 +7373,15 @@ fn stdout_json(output: &Output) -> Value {
             stderr_text(output)
         )
     })
+}
+
+fn json_object_keys(value: &Value) -> BTreeSet<String> {
+    value
+        .as_object()
+        .expect("JSON object")
+        .keys()
+        .cloned()
+        .collect()
 }
 
 #[cfg(feature = "fastembed-provider")]

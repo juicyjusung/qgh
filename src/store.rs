@@ -649,6 +649,22 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
     }
 
+    pub fn active_embedding_chunk_count(&self) -> Result<i64, QghError> {
+        self.conn
+            .query_row(
+                "SELECT count(*)
+                 FROM chunks c
+                 JOIN source_entities se ON se.source_id = c.source_id
+                 LEFT JOIN issue_metadata im ON im.source_id = c.source_id
+                 LEFT JOIN comment_metadata cm ON cm.source_id = c.source_id
+                 WHERE se.lifecycle_state = 'active'
+                   AND c.source_version_id = coalesce(im.latest_version_id, cm.latest_version_id)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(QghError::from)
+    }
+
     pub fn active_chunks_missing_embedding_for_fingerprint(
         &self,
         fingerprint: &EmbeddingFingerprint,

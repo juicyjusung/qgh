@@ -887,6 +887,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         status_schema["properties"]["freshness"]["$ref"],
         "#/$defs/freshness"
     );
+    assert_eq!(
+        status_schema["properties"]["embedding"]["$ref"],
+        "#/$defs/embedding"
+    );
     let status_freshness = &status_schema["$defs"]["freshness"];
     assert_eq!(
         status_freshness["required"],
@@ -991,6 +995,163 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             .as_str()
             .unwrap()
             .contains("Recent lookback is acceleration")
+    );
+    let status_embedding = &status_schema["$defs"]["embedding"];
+    assert_eq!(
+        status_embedding["required"],
+        json!(["state", "coverage", "configured_model", "fingerprint"])
+    );
+    assert_eq!(status_embedding["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(status_embedding),
+        BTreeSet::from([
+            "configured_model".to_string(),
+            "coverage".to_string(),
+            "fingerprint".to_string(),
+            "state".to_string(),
+        ])
+    );
+    assert_eq!(
+        status_embedding["properties"]["state"]["enum"],
+        json!(["missing", "partial", "complete", "fingerprint_mismatch"])
+    );
+    assert_eq!(
+        status_embedding["properties"]["coverage"]["$ref"],
+        "#/$defs/embedding_coverage"
+    );
+    assert_eq!(
+        status_embedding["properties"]["configured_model"]["$ref"],
+        "#/$defs/embedding_configured_model"
+    );
+    assert_eq!(
+        status_embedding["properties"]["fingerprint"]["anyOf"][0]["$ref"],
+        "#/$defs/embedding_fingerprint"
+    );
+    assert_eq!(
+        status_embedding["properties"]["fingerprint"]["anyOf"][1]["type"],
+        "null"
+    );
+    let embedding_coverage = &status_schema["$defs"]["embedding_coverage"];
+    assert_eq!(
+        embedding_coverage["required"],
+        json!([
+            "total_chunks",
+            "completed_chunks",
+            "missing_chunks",
+            "mismatched_chunks"
+        ])
+    );
+    assert_eq!(embedding_coverage["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(embedding_coverage),
+        BTreeSet::from([
+            "completed_chunks".to_string(),
+            "mismatched_chunks".to_string(),
+            "missing_chunks".to_string(),
+            "total_chunks".to_string(),
+        ])
+    );
+    for field in [
+        "total_chunks",
+        "completed_chunks",
+        "missing_chunks",
+        "mismatched_chunks",
+    ] {
+        assert_eq!(embedding_coverage["properties"][field]["minimum"], 0);
+    }
+    let embedding_configured_model = &status_schema["$defs"]["embedding_configured_model"];
+    assert_eq!(
+        embedding_configured_model["required"],
+        json!([
+            "provider",
+            "model",
+            "model_id",
+            "model_revision",
+            "model_path"
+        ])
+    );
+    assert_eq!(embedding_configured_model["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(embedding_configured_model),
+        BTreeSet::from([
+            "model".to_string(),
+            "model_id".to_string(),
+            "model_path".to_string(),
+            "model_revision".to_string(),
+            "provider".to_string(),
+        ])
+    );
+    assert_eq!(
+        embedding_configured_model["properties"]["provider"]["enum"],
+        json!(["local"])
+    );
+    for field in ["model", "model_revision", "model_path"] {
+        assert_eq!(
+            embedding_configured_model["properties"][field]["type"],
+            json!(["string", "null"])
+        );
+    }
+    assert_eq!(
+        embedding_configured_model["properties"]["model_id"]["type"],
+        "string"
+    );
+    let embedding_fingerprint = &status_schema["$defs"]["embedding_fingerprint"];
+    assert_eq!(
+        embedding_fingerprint["required"],
+        json!([
+            "hash",
+            "schema_version",
+            "provider",
+            "model_id",
+            "model_revision",
+            "dimension",
+            "pooling",
+            "query_prefix",
+            "chunker_version",
+            "source_schema_version",
+            "matches_config"
+        ])
+    );
+    assert_eq!(embedding_fingerprint["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(embedding_fingerprint),
+        BTreeSet::from([
+            "chunker_version".to_string(),
+            "dimension".to_string(),
+            "hash".to_string(),
+            "matches_config".to_string(),
+            "model_id".to_string(),
+            "model_revision".to_string(),
+            "pooling".to_string(),
+            "provider".to_string(),
+            "query_prefix".to_string(),
+            "schema_version".to_string(),
+            "source_schema_version".to_string(),
+        ])
+    );
+    assert_eq!(
+        embedding_fingerprint["properties"]["hash"]["pattern"],
+        "^[0-9a-f]{64}$"
+    );
+    assert_eq!(
+        embedding_fingerprint["properties"]["schema_version"]["const"],
+        "qgh.embedding_fingerprint.v1"
+    );
+    assert_eq!(
+        embedding_fingerprint["properties"]["provider"]["enum"],
+        json!(["local"])
+    );
+    assert_eq!(
+        embedding_fingerprint["properties"]["dimension"]["minimum"],
+        1
+    );
+    assert_eq!(
+        embedding_fingerprint["properties"]["pooling"]["enum"],
+        json!(["cls", "mean"])
+    );
+    assert_eq!(
+        embedding_fingerprint["properties"]["matches_config"]["type"],
+        "boolean"
     );
     assert_eq!(
         query_schema["properties"]["freshness"]["$ref"],

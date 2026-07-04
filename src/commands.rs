@@ -10,9 +10,9 @@ use crate::coverage;
 #[cfg(feature = "fastembed-provider")]
 use crate::embedding::FastembedTokenizer;
 use crate::embedding::{
-    default_hf_model_reference, parse_hf_model_reference, EmbeddingFingerprintExpectation,
-    EmbeddingFingerprintSeed, EmbeddingProvider, EmbeddingProviderError, EmbeddingTokenizer,
-    EmbeddingVector, LOCAL_MODEL_REVISION,
+    default_hf_model_reference, parse_hf_model_reference, EmbeddingFingerprint,
+    EmbeddingFingerprintExpectation, EmbeddingFingerprintSeed, EmbeddingProvider,
+    EmbeddingProviderError, EmbeddingTokenizer, EmbeddingVector, LOCAL_MODEL_REVISION,
 };
 #[cfg(feature = "fastembed-provider")]
 use crate::embedding::{
@@ -2295,6 +2295,97 @@ fn embedding_warnings(profile: &Profile, store: &Store) -> Result<Vec<Value>, Qg
     })])
 }
 
+fn embedding_status(profile: &Profile, store: &Store) -> Result<Option<Value>, QghError> {
+    let Some(embedding) = profile.embedding.as_ref() else {
+        return Ok(None);
+    };
+    let expectation = embedding_fingerprint_expectation(embedding);
+    let total_chunks = store.active_embedding_chunk_count()?;
+    let active_fingerprint = store.active_embedding_fingerprint()?;
+    let active_matches_config = active_fingerprint
+        .as_ref()
+        .is_some_and(|fingerprint| fingerprint.matches_expectation(&expectation));
+    let active_embedding_count = active_fingerprint
+        .as_ref()
+        .map(|fingerprint| store.current_chunk_embedding_count_for_fingerprint(fingerprint))
+        .transpose()?
+        .unwrap_or(0);
+    let completed_chunks = if active_matches_config {
+        active_embedding_count
+    } else {
+        0
+    };
+    let missing_chunks = total_chunks.saturating_sub(completed_chunks);
+    let mismatched_chunks = if active_fingerprint.is_some() && !active_matches_config {
+        active_embedding_count
+    } else {
+        0
+    };
+    let state = match (&active_fingerprint, active_matches_config, missing_chunks) {
+        (None, _, _) => "missing",
+        (Some(_), false, _) => "fingerprint_mismatch",
+        (Some(_), true, 0) => "complete",
+        (Some(_), true, _) => "partial",
+    };
+
+    Ok(Some(json!({
+        "state": state,
+        "coverage": {
+            "total_chunks": total_chunks,
+            "completed_chunks": completed_chunks,
+            "missing_chunks": missing_chunks,
+            "mismatched_chunks": mismatched_chunks
+        },
+        "configured_model": configured_embedding_model_json(embedding),
+        "fingerprint": active_fingerprint
+            .as_ref()
+            .map(|fingerprint| embedding_fingerprint_status_json(
+                fingerprint,
+                active_matches_config
+            ))
+    })))
+}
+
+fn configured_embedding_model_json(embedding: &EmbeddingConfig) -> Value {
+    let model =
+        if embedding.model_path.is_some() {
+            None
+        } else {
+            Some(embedding.model.clone().unwrap_or_else(|| {
+                format!("hf:{}", configured_hf_model_reference(embedding).model_id)
+            }))
+        };
+    json!({
+        "provider": embedding_provider_name(embedding.provider),
+        "model": model,
+        "model_id": configured_embedding_model_id(embedding),
+        "model_revision": configured_embedding_model_revision(embedding),
+        "model_path": embedding
+            .model_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+    })
+}
+
+fn embedding_fingerprint_status_json(
+    fingerprint: &EmbeddingFingerprint,
+    matches_config: bool,
+) -> Value {
+    json!({
+        "hash": fingerprint.hash(),
+        "schema_version": fingerprint.schema_version,
+        "provider": fingerprint.provider,
+        "model_id": fingerprint.model_id,
+        "model_revision": fingerprint.model_revision,
+        "dimension": fingerprint.dimension,
+        "pooling": fingerprint.pooling.as_str(),
+        "query_prefix": fingerprint.query_prefix,
+        "chunker_version": fingerprint.chunker_version,
+        "source_schema_version": fingerprint.source_schema_version,
+        "matches_config": matches_config
+    })
+}
+
 fn embedding_fingerprint_expectation(
     embedding: &EmbeddingConfig,
 ) -> EmbeddingFingerprintExpectation {
@@ -2696,6 +2787,7 @@ pub fn status(
     }
     let mut warnings = freshness.warnings;
     warnings.extend(embedding_warnings(&profile, &store)?);
+    let embedding = embedding_status(&profile, &store)?;
     let source_count = (status.issue_count + status.comment_count) as usize;
     let age_days = status
         .last_reconciliation
@@ -2727,7 +2819,7 @@ pub fn status(
             )
         })
         .collect::<serde_json::Map<_, _>>();
-    Ok(LocalReadOutcome {
+    let mut outcome = LocalReadOutcome {
         data: json!({
         "profile_id": profile.id,
         "freshness": freshness.block,
@@ -2785,7 +2877,11 @@ pub fn status(
         }
         }),
         warnings,
-    })
+    };
+    if let Some(embedding) = embedding {
+        outcome.data["embedding"] = embedding;
+    }
+    Ok(outcome)
 }
 
 pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
