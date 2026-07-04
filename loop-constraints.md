@@ -41,7 +41,18 @@ stricter rule wins.
   label is the approval. Such changes must be additive and idempotent;
   anything destructive or beyond the issue's stated schema scope still
   escalates to a human.
-- MCP tool surface (tool names, schemas, read-only guarantee)
+- MCP tool surface: tool names/count and the read-only guarantee always
+  require human approval and must never change without an explicit scope
+  decision. Output schema field additions are NOT covered by this line
+  when explicitly specified in the acceptance criteria of the
+  `ready-for-agent` issue being implemented — the human applying that
+  label is the approval — because MCP v1 is a thin adapter that shares
+  the CLI JSON/local retrieval contract (qgh-prd.md), not an
+  independently versioned schema. Such changes must be additive
+  (existing fields/behavior unchanged) and must not add a tool, remove
+  the read-only guarantee, or add write/sync/embed/delete/update
+  capability; anything beyond the issue's stated field scope still
+  escalates to a human.
 - `LOOP.md`, `loop-constraints.md`, `loop-budget.md` (the loop must not
   rewrite its own rules)
 
