@@ -31,12 +31,15 @@ use crate::resolution::ResolvedRepoScope;
 use crate::store::Store;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
 const GET_BATCH_SIZE_CAP: usize = 20;
+const HYBRID_RRF_K: f32 = 60.0;
+const HYBRID_OVERFETCH_FACTOR: usize = 4;
 
 /// Default `--if-stale` threshold when neither the flag nor `[sync].max_age`
 /// provides one: 30 minutes.
@@ -1953,8 +1956,28 @@ pub fn query(
             warnings,
         });
     }
+    let (hybrid_vector_hits, mut hybrid_warnings) =
+        hybrid_vector_hits(&profile, &store, &args.query, &filters, limit)?;
     let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
-    let hits = index::search(&active_index_path, &args.query, limit)?;
+    let lexical_limit = if hybrid_vector_hits.is_some() {
+        hybrid_candidate_limit(limit)
+    } else {
+        limit
+    };
+    let lexical_hits = index::search_with_filters(
+        &active_index_path,
+        &args.query,
+        &filters.search_filters(),
+        lexical_limit,
+    )?;
+    let hits = match hybrid_vector_hits {
+        Some(vector_hits) => fuse_hybrid_hits(lexical_hits, vector_hits, limit),
+        None => lexical_hits
+            .into_iter()
+            .map(QueryHit::from_bm25)
+            .take(limit)
+            .collect(),
+    };
     let mut results = QueryResults::default();
     let mut unresolvable_hits = 0;
     for hit in hits {
@@ -1965,7 +1988,7 @@ pub fn query(
         if !filters.matches(&source) {
             continue;
         }
-        results.push(source, Ranking::Bm25(hit.score), &profile.id);
+        results.push(source, hit.ranking, &profile.id);
     }
     let last_successful_sync_at = query_freshness_sync_time(&store, &profile, &filters, &results)?;
     let freshness = freshness::evaluate(
@@ -1982,6 +2005,7 @@ pub fn query(
     let coverage = coverage::evaluate(&store.coverage_snapshot()?, results.items.is_empty());
     let mut warnings = freshness.warnings;
     warnings.extend(coverage.warnings);
+    warnings.append(&mut hybrid_warnings);
     warnings.extend(embedding_warnings(&profile, &store)?);
     Ok(LocalReadOutcome {
         data: json!({
@@ -2180,6 +2204,194 @@ impl QueryFilters {
             .iter()
             .any(|allowed| allowed == source_type)
     }
+
+    fn search_filters(&self) -> index::SearchFilters {
+        index::SearchFilters {
+            repo: self.repo.clone(),
+            labels: self.labels.clone(),
+            state: self.state.clone(),
+            author: self.author.clone(),
+            issue: self.issue,
+            source_types: self.source_types.clone(),
+        }
+    }
+
+    fn vector_search_filters(&self) -> VectorSearchFilters {
+        VectorSearchFilters {
+            repo: self.repo.clone(),
+            labels: self.labels.clone(),
+            state: self.state.clone(),
+            author: self.author.clone(),
+            issue: self.issue,
+            source_types: self.source_types.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct QueryHit {
+    source_id: String,
+    ranking: Ranking,
+}
+
+impl QueryHit {
+    fn from_bm25(hit: index::SearchHit) -> Self {
+        Self {
+            source_id: hit.source_id,
+            ranking: Ranking::Bm25(hit.score),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct HybridAccumulator {
+    source_id: String,
+    bm25_rank: Option<usize>,
+    bm25_score: Option<f32>,
+    vector_rank: Option<usize>,
+    vector_distance: Option<f32>,
+}
+
+impl HybridAccumulator {
+    fn new(source_id: String) -> Self {
+        Self {
+            source_id,
+            ..Self::default()
+        }
+    }
+
+    fn record_bm25(&mut self, rank: usize, score: f32) {
+        if self.bm25_rank.is_none_or(|current| rank < current) {
+            self.bm25_rank = Some(rank);
+            self.bm25_score = Some(score);
+        }
+    }
+
+    fn record_vector(&mut self, rank: usize, vector_distance: f32) {
+        if self.vector_rank.is_none_or(|current| rank < current) {
+            self.vector_rank = Some(rank);
+            self.vector_distance = Some(vector_distance);
+        }
+    }
+
+    fn rrf_score(&self) -> f32 {
+        rrf_component(self.bm25_rank) + rrf_component(self.vector_rank)
+    }
+
+    fn best_rank(&self) -> usize {
+        self.bm25_rank
+            .into_iter()
+            .chain(self.vector_rank)
+            .min()
+            .unwrap_or(usize::MAX)
+    }
+
+    fn into_query_hit(self) -> QueryHit {
+        let ranking = match (self.bm25_score, self.vector_distance) {
+            (Some(score), _) => Ranking::Bm25(score),
+            (None, Some(vector_distance)) => Ranking::Vector { vector_distance },
+            (None, None) => Ranking::Bm25(0.0),
+        };
+        QueryHit {
+            source_id: self.source_id,
+            ranking,
+        }
+    }
+}
+
+fn rrf_component(rank: Option<usize>) -> f32 {
+    rank.map(|rank| 1.0 / (HYBRID_RRF_K + rank as f32))
+        .unwrap_or(0.0)
+}
+
+fn hybrid_candidate_limit(limit: usize) -> usize {
+    limit.saturating_mul(HYBRID_OVERFETCH_FACTOR).max(limit)
+}
+
+fn fuse_hybrid_hits(
+    bm25_hits: Vec<index::SearchHit>,
+    vector_hits: Vec<crate::model::VectorSearchHit>,
+    limit: usize,
+) -> Vec<QueryHit> {
+    let mut candidates = HashMap::<String, HybridAccumulator>::new();
+    for (rank, hit) in bm25_hits.into_iter().enumerate() {
+        candidates
+            .entry(hit.source_id.clone())
+            .or_insert_with(|| HybridAccumulator::new(hit.source_id))
+            .record_bm25(rank + 1, hit.score);
+    }
+    for (rank, hit) in vector_hits.into_iter().enumerate() {
+        candidates
+            .entry(hit.source_id.clone())
+            .or_insert_with(|| HybridAccumulator::new(hit.source_id))
+            .record_vector(rank + 1, hit.vector_distance);
+    }
+
+    let mut candidates = candidates.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .rrf_score()
+            .total_cmp(&left.rrf_score())
+            .then_with(|| left.best_rank().cmp(&right.best_rank()))
+            .then_with(|| left.source_id.cmp(&right.source_id))
+    });
+    candidates
+        .into_iter()
+        .take(limit)
+        .map(HybridAccumulator::into_query_hit)
+        .collect()
+}
+
+fn hybrid_vector_hits(
+    profile: &Profile,
+    store: &Store,
+    query_text: &str,
+    filters: &QueryFilters,
+    limit: usize,
+) -> Result<(Option<Vec<crate::model::VectorSearchHit>>, Vec<Value>), QghError> {
+    let Some(embedding) = profile.embedding.as_ref() else {
+        return Ok((None, Vec::new()));
+    };
+    let Some(active) = store.active_embedding_fingerprint()? else {
+        return Ok((None, Vec::new()));
+    };
+    if !active.matches_expectation(&embedding_fingerprint_expectation(embedding)) {
+        return Ok((None, Vec::new()));
+    }
+    let runtime = match embedding_runtime(embedding) {
+        Ok(runtime) => runtime,
+        Err(error) => return Ok((None, vec![hybrid_fallback_warning(&error)])),
+    };
+    let query_vector = match runtime.provider.embed_query(query_text) {
+        Ok(vector) => vector,
+        Err(error) => {
+            let error = embedding_error(error);
+            return Ok((None, vec![hybrid_fallback_warning(&error)]));
+        }
+    };
+    match store.vector_only_search(
+        &query_vector,
+        &filters.vector_search_filters(),
+        hybrid_candidate_limit(limit),
+    ) {
+        Ok(hits) => Ok((Some(hits), Vec::new())),
+        Err(error) => Ok((None, vec![hybrid_fallback_warning(&error)])),
+    }
+}
+
+fn hybrid_fallback_warning(error: &QghError) -> Value {
+    let mut warning = json!({
+        "code": "embedding.hybrid_unavailable",
+        "severity": "warn",
+        "message": "Hybrid vector retrieval was unavailable. BM25 results are still returned.",
+        "details": {
+            "cause_code": error.code
+        }
+    });
+    if let Some(hint) = &error.hint {
+        warning["hint"] = json!(hint);
+    }
+    warning
 }
 
 fn effective_repo(
@@ -3010,6 +3222,7 @@ fn freshness_error(freshness: Value, warnings: Vec<Value>) -> QghError {
     .with_hint("Run qgh sync, increase --max-age for this run, or omit --require-fresh.")
 }
 
+#[derive(Debug)]
 enum Ranking {
     Bm25(f32),
     Vector { vector_distance: f32 },
@@ -3246,6 +3459,71 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_rrf_overfetch_snapshot_differs_from_bm25_and_dedupes_sources() {
+        let bm25_hits = vec![
+            index::SearchHit {
+                source_id: "source-a".to_string(),
+                score: 10.0,
+            },
+            index::SearchHit {
+                source_id: "source-b".to_string(),
+                score: 9.0,
+            },
+            index::SearchHit {
+                source_id: "source-d".to_string(),
+                score: 8.0,
+            },
+            index::SearchHit {
+                source_id: "source-a".to_string(),
+                score: 1.0,
+            },
+        ];
+        let bm25_snapshot = bm25_hits
+            .iter()
+            .take(3)
+            .map(|hit| hit.source_id.clone())
+            .collect::<Vec<_>>();
+        let vector_hits = vec![
+            crate::model::VectorSearchHit {
+                source_id: "source-c".to_string(),
+                vector_distance: 0.01,
+            },
+            crate::model::VectorSearchHit {
+                source_id: "source-a".to_string(),
+                vector_distance: 0.02,
+            },
+            crate::model::VectorSearchHit {
+                source_id: "source-c".to_string(),
+                vector_distance: 0.03,
+            },
+        ];
+
+        let hits = fuse_hybrid_hits(bm25_hits, vector_hits, 3);
+        let hybrid_snapshot = hits
+            .iter()
+            .map(|hit| hit.source_id.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(bm25_snapshot, vec!["source-a", "source-b", "source-d"]);
+        assert_eq!(hybrid_snapshot, vec!["source-a", "source-c", "source-b"]);
+        assert_ne!(hybrid_snapshot, bm25_snapshot);
+        assert_eq!(
+            hits.iter()
+                .filter(|hit| hit.source_id == "source-c")
+                .count(),
+            1
+        );
+        match &hits[0].ranking {
+            Ranking::Bm25(score) => assert_eq!(*score, 10.0),
+            _ => panic!("sources with BM25 evidence must keep BM25 ranking evidence"),
+        }
+        match &hits[1].ranking {
+            Ranking::Vector { vector_distance } => assert_eq!(*vector_distance, 0.01),
+            _ => panic!("vector-only sources must keep vector ranking evidence"),
+        }
+    }
+
+    #[test]
     fn force_refresh_persists_vectors_under_new_fingerprint() {
         let paths = temp_profile_paths("command-embed-force");
         let mut store = Store::open(&paths).unwrap();
@@ -3468,14 +3746,25 @@ mod tests {
                 .latest_source_version_id(&issue.source_id)
                 .unwrap()
                 .unwrap();
+            let chunk_bodies = if issue.node_id == "I_VECTOR_ALLOWED" {
+                vec![
+                    test_chunk("far allowed chunk".to_string()),
+                    test_chunk("best allowed chunk".to_string()),
+                ]
+            } else {
+                vec![test_chunk(format!("vector smoke chunk {}", issue.node_id))]
+            };
             let chunks = store
                 .replace_chunks_for_source_version(
                     &issue.source_id,
                     source_version_id,
-                    &[test_chunk(format!("vector smoke chunk {}", issue.node_id))],
+                    &chunk_bodies,
                 )
                 .unwrap();
             embeddings.push((chunks[0].chunk_id, vector));
+            if issue.node_id == "I_VECTOR_ALLOWED" {
+                embeddings.push((chunks[1].chunk_id, vec![0.0, 0.0, 0.0]));
+            }
         }
         let fingerprint = EmbeddingFingerprintSeed {
             provider: "local".to_string(),
@@ -3503,6 +3792,7 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].source_id, "qgh://github.com/issue/I_VECTOR_ALLOWED");
+        assert_eq!(hits[0].vector_distance, 0.0);
         assert!(
             hits[0].vector_distance.is_finite(),
             "vector_distance must be finite"
