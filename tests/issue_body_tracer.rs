@@ -2140,6 +2140,140 @@ query_prefix = "query: "
     );
 }
 
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn embedding_sync_backfills_locally_skips_unchanged_sources_and_cleans_tombstones() {
+    let fixture = TestFixture::new("embedding-sync-local-backfill");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.assert_sqlite_chunks_empty();
+    let request_count_after_seed = server.request_count();
+
+    let model_dir = fixture.write_local_embedding_tokenizer_model();
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        &format!(
+            r#"
+provider = "local"
+model_path = "{}"
+file = "onnx/model_quantized.onnx"
+pooling = "cls"
+query_prefix = "query: "
+"#,
+            model_dir.display()
+        ),
+    );
+
+    let local_backfill = fixture.qgh(["sync", "--if-stale", "--max-age", "30m", "--json"]);
+    assert_success(&local_backfill);
+    let local_backfill_json = stdout_json(&local_backfill);
+    assert_eq!(local_backfill_json["data"]["sync_state"], "skipped_fresh");
+    assert_embedding_sync_warning(&local_backfill_json);
+    assert_eq!(
+        server.request_count(),
+        request_count_after_seed,
+        "embedding backfill during fresh sync must use only local stored sources"
+    );
+    let first_chunk_ids = fixture.sqlite_chunk_ids();
+    assert!(
+        !first_chunk_ids.is_empty(),
+        "local embedding backfill must chunk the existing corpus"
+    );
+
+    let unchanged = fixture.qgh(["sync", "--if-stale", "--max-age", "30m", "--json"]);
+    assert_success(&unchanged);
+    let unchanged_json = stdout_json(&unchanged);
+    assert_embedding_sync_warning(&unchanged_json);
+    assert_eq!(
+        server.request_count(),
+        request_count_after_seed,
+        "body_hash-unchanged embedding skip must not request GitHub"
+    );
+    assert_eq!(
+        fixture.sqlite_chunk_ids(),
+        first_chunk_ids,
+        "body_hash-unchanged sources must keep existing chunks instead of replacing them"
+    );
+
+    let comment_source_id = "qgh://github.com/issue-comment/IC_kwDOCOMMENT1";
+    fixture.insert_embedding_for_first_chunk(comment_source_id);
+    assert!(fixture.sqlite_chunk_count_for_source(comment_source_id) > 0);
+    assert_eq!(fixture.sqlite_chunk_embedding_count(), 1);
+
+    fixture.mark_source_tombstoned_in_sql(comment_source_id, "deleted");
+    let cleanup = fixture.qgh(["sync", "--if-stale", "--max-age", "30m", "--json"]);
+    assert_success(&cleanup);
+    assert_eq!(
+        server.request_count(),
+        request_count_after_seed,
+        "tombstone embedding cleanup must stay local"
+    );
+    assert_eq!(fixture.sqlite_chunk_count_for_source(comment_source_id), 0);
+    assert_eq!(fixture.sqlite_chunk_embedding_count(), 0);
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn embedding_sync_skips_when_body_hash_matches_despite_new_github_timestamp() {
+    let fixture = TestFixture::new("embedding-sync-body-hash-skip");
+    let server = EditingFakeGitHub::start();
+    let model_dir = fixture.write_local_embedding_tokenizer_model();
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        &format!(
+            r#"
+provider = "local"
+model_path = "{}"
+file = "onnx/model_quantized.onnx"
+pooling = "cls"
+query_prefix = "query: "
+"#,
+            model_dir.display()
+        ),
+    );
+
+    let first_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&first_sync);
+    assert_embedding_sync_warning(&stdout_json(&first_sync));
+    let issue_source_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    let first_issue = stdout_json(&fixture.qgh(["get", issue_source_id, "--json"]));
+    let first_source_version = first_issue["data"]["source"]["source_version"].clone();
+    let first_chunk_ids = fixture.sqlite_chunk_ids_for_source(issue_source_id);
+    assert!(
+        !first_chunk_ids.is_empty(),
+        "embedding-enabled seed sync must chunk the issue source"
+    );
+    fixture.assert_source_version_count(issue_source_id, 1);
+
+    server.set_mode(EDITING_SAME_BODY_NEW_TIMESTAMP);
+    let second_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&second_sync);
+    assert_embedding_sync_warning(&stdout_json(&second_sync));
+
+    let second_issue = stdout_json(&fixture.qgh(["get", issue_source_id, "--json"]));
+    let second_source_version = &second_issue["data"]["source"]["source_version"];
+    assert_eq!(
+        second_source_version["body_hash"], first_source_version["body_hash"],
+        "timestamp-only GitHub edits must keep the same content identity"
+    );
+    assert_eq!(
+        second_source_version["github_updated_at"],
+        "2026-01-05T00:00:00Z"
+    );
+    assert_ne!(
+        second_source_version["github_updated_at"],
+        first_source_version["github_updated_at"]
+    );
+    assert_eq!(
+        fixture.sqlite_chunk_ids_for_source(issue_source_id),
+        first_chunk_ids,
+        "body_hash-unchanged sync must reuse existing chunks instead of re-chunking"
+    );
+    fixture.assert_source_version_count(issue_source_id, 1);
+}
+
 #[test]
 fn embedding_fingerprint_mismatch_warns_and_keeps_bm25_results() {
     let fixture = TestFixture::new("embedding-fingerprint-mismatch");
@@ -5696,6 +5830,82 @@ limit = 10
             .unwrap()
     }
 
+    #[cfg(feature = "fastembed-provider")]
+    fn sqlite_chunk_ids(&self) -> Vec<i64> {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM chunks ORDER BY source_id, source_version_id, id")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn sqlite_chunk_ids_for_source(&self, source_id: &str) -> Vec<i64> {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM chunks WHERE source_id = ?1 ORDER BY source_version_id, id")
+            .unwrap();
+        stmt.query_map([source_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn sqlite_chunk_count_for_source(&self, source_id: &str) -> i64 {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT count(*) FROM chunks WHERE source_id = ?1",
+            [source_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn sqlite_chunk_embedding_count(&self) -> i64 {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.query_row("SELECT count(*) FROM chunk_embeddings", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn insert_embedding_for_first_chunk(&self, source_id: &str) {
+        self.insert_active_embedding_fingerprint(DEFAULT_HF_MODEL_ID);
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let chunk_id: i64 = conn
+            .query_row(
+                "SELECT id FROM chunks WHERE source_id = ?1 ORDER BY id LIMIT 1",
+                [source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let fingerprint_id: i64 = conn
+            .query_row(
+                "SELECT id FROM embedding_fingerprints WHERE active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO chunk_embeddings
+                (chunk_id, fingerprint_id, vector_json, embedded_at)
+             VALUES (?1, ?2, '[0.1,0.2,0.3]', '2026-01-02T00:00:00Z')",
+            (chunk_id, fingerprint_id),
+        )
+        .unwrap();
+    }
+
     fn insert_active_embedding_fingerprint(&self, model_id: &str) {
         self.insert_active_embedding_fingerprint_with_revision(model_id, "fixture-sha");
     }
@@ -5868,6 +6078,33 @@ limit = 10
             )
             .unwrap();
         assert_eq!(changed, 1);
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn mark_source_tombstoned_in_sql(&self, source_id: &str, reason: &str) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE source_entities SET lifecycle_state = 'tombstoned' WHERE source_id = ?1",
+                [source_id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        conn.execute(
+            "UPDATE source_versions SET lifecycle_state = 'tombstoned' WHERE source_id = ?1",
+            [source_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tombstones (source_id, reason, observed_at)
+             VALUES (?1, ?2, '2026-01-03T00:00:00Z')
+             ON CONFLICT(source_id) DO UPDATE SET
+                reason = excluded.reason,
+                observed_at = excluded.observed_at",
+            (source_id, reason),
+        )
+        .unwrap();
     }
 }
 
@@ -6915,6 +7152,24 @@ fn stdout_json(output: &Output) -> Value {
     })
 }
 
+#[cfg(feature = "fastembed-provider")]
+fn assert_embedding_sync_warning(output_json: &Value) {
+    let warnings = output_json["warnings"].as_array().unwrap();
+    let warning = warnings
+        .iter()
+        .find(|warning| warning["code"] == "embedding.sync_failed")
+        .expect("embedding sync warning");
+    assert_eq!(warning["severity"], "warn");
+    assert!(warning["message"]
+        .as_str()
+        .unwrap()
+        .contains("BM25 index refresh completed"));
+    assert!(warning["details"]["cause_code"]
+        .as_str()
+        .unwrap()
+        .starts_with("embedding."));
+}
+
 fn stdout_json_lines(output: &Output) -> Vec<Value> {
     stdout_text(output)
         .lines()
@@ -6945,6 +7200,8 @@ fn assert_query_result_round_trips_to_get_result(result: &Value, source: &Value)
     assert_eq!(result["canonical_url"], source["canonical_url"]);
     assert_eq!(result["source_version"], source["source_version"]);
 }
+
+const EDITING_SAME_BODY_NEW_TIMESTAMP: usize = 3;
 
 struct EditingFakeGitHub {
     base_url: String,
@@ -7020,6 +7277,12 @@ fn handle_editing_connection(
     let (status, etag, body) = if request_line.starts_with("GET /repos/owner/repo/issues?") {
         if mode == 2 && lower.contains("if-none-match: \"issues-v2\"") {
             ("304 Not Modified", "\"issues-v2\"", "")
+        } else if mode == EDITING_SAME_BODY_NEW_TIMESTAMP {
+            (
+                "200 OK",
+                "\"issues-same-body-v3\"",
+                same_body_new_timestamp_issue_payload(),
+            )
         } else if mode == 2 {
             ("200 OK", "\"issues-v2\"", edited_issue_payload())
         } else {
@@ -7032,7 +7295,13 @@ fn handle_editing_connection(
             ("200 OK", "\"comments-v1\"", issue_comments_payload())
         }
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42 ") {
-        if mode == 2 {
+        if mode == EDITING_SAME_BODY_NEW_TIMESTAMP {
+            (
+                "200 OK",
+                "\"issue-same-body-v3\"",
+                same_body_new_timestamp_issue_object_payload(),
+            )
+        } else if mode == 2 {
             ("200 OK", "\"issue-v2\"", edited_issue_object_payload())
         } else {
             ("200 OK", "\"issue-v1\"", issue_object_payload())
@@ -7093,6 +7362,50 @@ fn edited_issue_object_payload() -> &'static str {
         "html_url": "https://github.com/owner/repo/issues/42",
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": "2026-01-04T00:00:00Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}, {"name": "mvp"}],
+        "milestone": {"title": "MVP"},
+        "assignees": [{"login": "alice"}]
+    }"#
+}
+
+fn same_body_new_timestamp_issue_payload() -> &'static str {
+    r#"[
+      {
+        "id": 1001,
+        "node_id": "I_kwDOISSUE1",
+        "number": 42,
+        "title": "Cache sync bug",
+        "body": "The BM25 issue body tracer must round-trip through get before citation.",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-05T00:00:00Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}, {"name": "mvp"}],
+        "milestone": {"title": "MVP"},
+        "assignees": [{"login": "alice"}]
+      }
+    ]"#
+}
+
+fn same_body_new_timestamp_issue_object_payload() -> &'static str {
+    r#"{
+        "id": 1001,
+        "node_id": "I_kwDOISSUE1",
+        "number": 42,
+        "title": "Cache sync bug",
+        "body": "The BM25 issue body tracer must round-trip through get before citation.",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-05T00:00:00Z",
         "closed_at": null,
         "user": {"login": "bob"},
         "labels": [{"name": "bug"}, {"name": "mvp"}],

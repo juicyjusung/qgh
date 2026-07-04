@@ -101,7 +101,7 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
     let (mut data, warnings) = match command {
         crate::cli::Command::Sync(args) => {
             let show_progress = !args.wants_json() && !args.quiet();
-            let data = match &args.target {
+            let outcome = match &args.target {
                 Some(crate::cli::SyncTarget::Issue(issue_args)) => {
                     commands::sync_issue(
                         &profile_id,
@@ -127,7 +127,7 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
                     .await?
                 }
             };
-            (data, Vec::new())
+            (outcome.data, outcome.warnings)
         }
         crate::cli::Command::Embed(args) => {
             let outcome = commands::embed(&profile_id, &args)?;

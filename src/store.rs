@@ -592,6 +592,41 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
     }
 
+    pub fn source_version_has_chunks(&self, source_version_id: i64) -> Result<bool, QghError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT count(*) FROM chunks WHERE source_version_id = ?1",
+            params![source_version_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn cleanup_inactive_embedding_artifacts(&mut self) -> Result<usize, QghError> {
+        const STALE_CHUNK_FILTER: &str = "SELECT c.id
+             FROM chunks c
+             LEFT JOIN source_entities se ON se.source_id = c.source_id
+             LEFT JOIN issue_metadata im ON im.source_id = c.source_id
+             LEFT JOIN comment_metadata cm ON cm.source_id = c.source_id
+             WHERE se.lifecycle_state IS NULL
+                OR se.lifecycle_state != 'active'
+                OR c.source_version_id != coalesce(im.latest_version_id, cm.latest_version_id, -1)";
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            &format!(
+                "DELETE FROM chunk_embeddings
+                 WHERE chunk_id IN ({STALE_CHUNK_FILTER})"
+            ),
+            [],
+        )?;
+        let deleted_chunks = tx.execute(
+            &format!("DELETE FROM chunks WHERE id IN ({STALE_CHUNK_FILTER})"),
+            [],
+        )?;
+        tx.commit()?;
+        Ok(deleted_chunks)
+    }
+
     pub fn active_embedding_chunks(&self) -> Result<Vec<StoredChunk>, QghError> {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.source_id, c.source_version_id, c.body
@@ -604,6 +639,37 @@ impl Store {
              ORDER BY c.id",
         )?;
         let rows = stmt.query_map([], |row| {
+            Ok(StoredChunk {
+                chunk_id: row.get(0)?,
+                source_id: row.get(1)?,
+                source_version_id: row.get(2)?,
+                body: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
+    }
+
+    pub fn active_chunks_missing_embedding_for_fingerprint(
+        &self,
+        fingerprint: &EmbeddingFingerprint,
+    ) -> Result<Vec<StoredChunk>, QghError> {
+        let fingerprint_hash = fingerprint.hash();
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.source_id, c.source_version_id, c.body
+             FROM chunks c
+             JOIN source_entities se ON se.source_id = c.source_id
+             LEFT JOIN issue_metadata im ON im.source_id = c.source_id
+             LEFT JOIN comment_metadata cm ON cm.source_id = c.source_id
+             LEFT JOIN embedding_fingerprints ef ON ef.fingerprint_hash = ?1
+             LEFT JOIN chunk_embeddings ce
+                ON ce.chunk_id = c.id
+               AND ce.fingerprint_id = ef.id
+             WHERE se.lifecycle_state = 'active'
+               AND c.source_version_id = coalesce(im.latest_version_id, cm.latest_version_id)
+               AND ce.chunk_id IS NULL
+             ORDER BY c.id",
+        )?;
+        let rows = stmt.query_map(params![fingerprint_hash], |row| {
             Ok(StoredChunk {
                 chunk_id: row.get(0)?,
                 source_id: row.get(1)?,
@@ -702,6 +768,81 @@ impl Store {
                 "INSERT INTO chunk_embeddings
                     (chunk_id, fingerprint_id, vector_json, embedded_at)
                  VALUES (?1, ?2, ?3, ?4)",
+                params![chunk_id, fingerprint_id, vector_json, &now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(embeddings.len())
+    }
+
+    pub fn upsert_chunk_embeddings(
+        &mut self,
+        fingerprint: &EmbeddingFingerprint,
+        embeddings: &[(i64, EmbeddingVector)],
+    ) -> Result<usize, QghError> {
+        let fingerprint_hash = fingerprint.hash();
+        let fingerprint_json = serde_json::to_string(fingerprint).map_err(|error| {
+            QghError::storage(format!(
+                "Failed to serialize embedding fingerprint: {error}"
+            ))
+        })?;
+        let now = now_rfc3339();
+        let tx = self.conn.transaction()?;
+        tx.execute("UPDATE embedding_fingerprints SET active = 0", [])?;
+        tx.execute(
+            "INSERT INTO embedding_fingerprints
+                (fingerprint_hash, fingerprint_json, provider, model_id, model_revision,
+                 dimension, pooling, query_prefix, chunker_version, source_schema_version,
+                 created_at, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)
+             ON CONFLICT(fingerprint_hash) DO UPDATE SET
+                fingerprint_json = excluded.fingerprint_json,
+                provider = excluded.provider,
+                model_id = excluded.model_id,
+                model_revision = excluded.model_revision,
+                dimension = excluded.dimension,
+                pooling = excluded.pooling,
+                query_prefix = excluded.query_prefix,
+                chunker_version = excluded.chunker_version,
+                source_schema_version = excluded.source_schema_version,
+                active = 1",
+            params![
+                &fingerprint_hash,
+                &fingerprint_json,
+                &fingerprint.provider,
+                &fingerprint.model_id,
+                &fingerprint.model_revision,
+                fingerprint.dimension as i64,
+                fingerprint.pooling.as_str(),
+                &fingerprint.query_prefix,
+                &fingerprint.chunker_version,
+                &fingerprint.source_schema_version,
+                &now
+            ],
+        )?;
+        let fingerprint_id: i64 = tx.query_row(
+            "SELECT id FROM embedding_fingerprints WHERE fingerprint_hash = ?1",
+            params![&fingerprint_hash],
+            |row| row.get(0),
+        )?;
+        for (chunk_id, vector) in embeddings {
+            if vector.len() != fingerprint.dimension {
+                return Err(QghError::storage(format!(
+                    "Embedding vector dimension {} does not match fingerprint dimension {}.",
+                    vector.len(),
+                    fingerprint.dimension
+                )));
+            }
+            let vector_json = serde_json::to_string(vector).map_err(|error| {
+                QghError::storage(format!("Failed to serialize embedding vector: {error}"))
+            })?;
+            tx.execute(
+                "INSERT INTO chunk_embeddings
+                    (chunk_id, fingerprint_id, vector_json, embedded_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(chunk_id, fingerprint_id) DO UPDATE SET
+                    vector_json = excluded.vector_json,
+                    embedded_at = excluded.embedded_at",
                 params![chunk_id, fingerprint_id, vector_json, &now],
             )?;
         }
@@ -1676,6 +1817,29 @@ fn upsert_source_version(
     indexed_at: &str,
     sync_run_id: &str,
 ) -> Result<i64, rusqlite::Error> {
+    if let Some(version_id) = tx
+        .query_row(
+            "SELECT id FROM source_versions
+             WHERE source_id = ?1 AND body_hash = ?2
+             ORDER BY id DESC
+             LIMIT 1",
+            params![source_id, body_hash],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        tx.execute(
+            "UPDATE source_versions
+             SET github_updated_at = ?1,
+                 indexed_at = ?2,
+                 sync_run_id = ?3,
+                 lifecycle_state = 'active'
+             WHERE id = ?4",
+            params![github_updated_at, indexed_at, sync_run_id, version_id],
+        )?;
+        return Ok(version_id);
+    }
+
     tx.execute(
         "INSERT INTO source_versions
             (source_id, body_hash, github_updated_at, indexed_at, sync_run_id, lifecycle_state)
