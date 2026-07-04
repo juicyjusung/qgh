@@ -24,7 +24,7 @@ use crate::github;
 use crate::index;
 use crate::model::{
     ReconciliationCandidate, StoredComment, StoredIssue, StoredSource, SyncSummary,
-    TargetedSyncSummary,
+    TargetedSyncSummary, VectorSearchFilters,
 };
 use crate::paths::ProfilePaths;
 use crate::resolution::ResolvedRepoScope;
@@ -1168,6 +1168,7 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
     let chunk_stats = refresh_embedding_chunks(&mut store, runtime.tokenizer.as_ref(), &progress)?;
     let data = refresh_chunk_embeddings(
         &mut store,
+        &profile.id,
         runtime.provider.as_ref(),
         runtime.fingerprint_seed,
     )?;
@@ -1249,6 +1250,7 @@ fn embedding_model_id(embedding: &EmbeddingConfig, snapshot: &ResolvedModelSnaps
 
 fn refresh_chunk_embeddings(
     store: &mut Store,
+    profile_id: &str,
     provider: &dyn EmbeddingProvider,
     fingerprint_seed: EmbeddingFingerprintSeed,
 ) -> Result<Value, QghError> {
@@ -1277,6 +1279,7 @@ fn refresh_chunk_embeddings(
         })));
     }
     let dimension = embedding_dimension(&vectors)?;
+    let smoke_query_vector = vectors[0].clone();
     let fingerprint = fingerprint_seed.with_dimension(dimension);
     let embeddings = chunks
         .iter()
@@ -1284,11 +1287,48 @@ fn refresh_chunk_embeddings(
         .map(|(chunk, vector)| (chunk.chunk_id, vector))
         .collect::<Vec<_>>();
     let embedded_chunks = store.replace_all_chunk_embeddings(&fingerprint, &embeddings)?;
+    ensure_vector_only_smoke(store, profile_id, &smoke_query_vector)?;
     let usable_embeddings = store.current_chunk_embedding_count_for_fingerprint(&fingerprint)?;
     Ok(json!({
         "embedded_chunks": embedded_chunks,
         "usable_embeddings": usable_embeddings
     }))
+}
+
+fn ensure_vector_only_smoke(
+    store: &Store,
+    profile_id: &str,
+    query_vector: &[f32],
+) -> Result<(), QghError> {
+    let hits = store.vector_only_search(query_vector, &VectorSearchFilters::default(), 1)?;
+    let Some(hit) = hits.first() else {
+        return Err(QghError::storage(
+            "Vector-only smoke returned no source candidates.",
+        ));
+    };
+    let source = store.get_source(&hit.source_id)?.ok_or_else(|| {
+        QghError::storage(format!(
+            "Vector-only smoke hit `{}` could not round-trip through local get.",
+            hit.source_id
+        ))
+    })?;
+    let result = source_result(
+        source,
+        Ranking::Vector {
+            vector_distance: hit.vector_distance,
+        },
+        profile_id,
+    );
+    let get_source = get_source_base(store, &hit.source_id, None)?;
+    for key in ["source_id", "canonical_url", "source_version"] {
+        if result[key] != get_source[key] {
+            return Err(QghError::storage(format!(
+                "Vector-only smoke hit `{}` lost {key} round-trip metadata.",
+                hit.source_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn embedding_dimension(vectors: &[EmbeddingVector]) -> Result<usize, QghError> {
@@ -2972,6 +3012,7 @@ fn freshness_error(freshness: Value, warnings: Vec<Value>) -> QghError {
 
 enum Ranking {
     Bm25(f32),
+    Vector { vector_distance: f32 },
     Exact,
 }
 
@@ -3026,11 +3067,18 @@ fn ranking_json(ranking: Ranking) -> Value {
     match ranking {
         Ranking::Bm25(score) => json!({
             "kind": "bm25",
-            "lexical_score": score
+            "lexical_score": score,
+            "vector_distance": Value::Null
+        }),
+        Ranking::Vector { vector_distance } => json!({
+            "kind": "vector",
+            "lexical_score": Value::Null,
+            "vector_distance": vector_distance
         }),
         Ranking::Exact => json!({
             "kind": "exact",
-            "lexical_score": Value::Null
+            "lexical_score": Value::Null,
+            "vector_distance": Value::Null
         }),
     }
 }
@@ -3173,7 +3221,7 @@ mod tests {
     use super::*;
     use crate::chunking::MarkdownChunk;
     use crate::embedding::PoolingKind;
-    use crate::model::IssueRecord;
+    use crate::model::{IssueRecord, VectorSearchFilters};
     use crate::paths::ProfilePaths;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3261,7 +3309,8 @@ mod tests {
             query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
         };
 
-        let outcome = refresh_chunk_embeddings(&mut store, &MockEmbeddingProvider, seed).unwrap();
+        let outcome =
+            refresh_chunk_embeddings(&mut store, "work", &MockEmbeddingProvider, seed).unwrap();
         let active = store.active_embedding_fingerprint().unwrap().unwrap();
 
         assert_eq!(outcome["embedded_chunks"], 2);
@@ -3379,6 +3428,115 @@ mod tests {
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
+    #[test]
+    fn vector_only_smoke_prefilters_and_round_trips_sources() {
+        let paths = temp_profile_paths("vector-only-smoke");
+        let mut store = Store::open(&paths).unwrap();
+        let issues = vec![
+            vector_issue("I_VECTOR_REPO", "other/repo", 1, "open", "bob", &["bug"]),
+            vector_issue(
+                "I_VECTOR_LABEL",
+                "owner/repo",
+                2,
+                "open",
+                "bob",
+                &["enhancement"],
+            ),
+            vector_issue("I_VECTOR_STATE", "owner/repo", 3, "closed", "bob", &["bug"]),
+            vector_issue(
+                "I_VECTOR_AUTHOR",
+                "owner/repo",
+                4,
+                "open",
+                "alice",
+                &["bug"],
+            ),
+            vector_issue("I_VECTOR_ALLOWED", "owner/repo", 5, "open", "bob", &["bug"]),
+        ];
+        store.upsert_sources(&issues, &[], 0, &[]).unwrap();
+
+        let vectors = [
+            vec![0.0, 0.0, 0.0],
+            vec![0.01, 0.0, 0.0],
+            vec![0.02, 0.0, 0.0],
+            vec![0.03, 0.0, 0.0],
+            vec![10.0, 0.0, 0.0],
+        ];
+        let mut embeddings = Vec::new();
+        for (issue, vector) in issues.iter().zip(vectors) {
+            let source_version_id = store
+                .latest_source_version_id(&issue.source_id)
+                .unwrap()
+                .unwrap();
+            let chunks = store
+                .replace_chunks_for_source_version(
+                    &issue.source_id,
+                    source_version_id,
+                    &[test_chunk(format!("vector smoke chunk {}", issue.node_id))],
+                )
+                .unwrap();
+            embeddings.push((chunks[0].chunk_id, vector));
+        }
+        let fingerprint = EmbeddingFingerprintSeed {
+            provider: "local".to_string(),
+            model_id: "Snowflake/snowflake-arctic-embed-l-v2.0".to_string(),
+            model_revision: "fixture-sha".to_string(),
+            pooling: PoolingKind::Cls,
+            query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
+        }
+        .with_dimension(3);
+        store
+            .replace_all_chunk_embeddings(&fingerprint, &embeddings)
+            .unwrap();
+
+        let filters = VectorSearchFilters {
+            repo: Some("owner/repo".to_string()),
+            labels: vec!["bug".to_string()],
+            state: Some("open".to_string()),
+            author: Some("bob".to_string()),
+            issue: None,
+            source_types: vec!["issue".to_string()],
+        };
+        let hits = store
+            .vector_only_search(&[0.0, 0.0, 0.0], &filters, 1)
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source_id, "qgh://github.com/issue/I_VECTOR_ALLOWED");
+        assert!(
+            hits[0].vector_distance.is_finite(),
+            "vector_distance must be finite"
+        );
+
+        let mut round_trip_successes = 0;
+        for hit in &hits {
+            let source = store.get_source(&hit.source_id).unwrap().unwrap();
+            let result = source_result(
+                source,
+                Ranking::Vector {
+                    vector_distance: hit.vector_distance,
+                },
+                "work",
+            );
+            let get_source = get_source_base(&store, &hit.source_id, None).unwrap();
+            assert_eq!(result["source_id"], get_source["source_id"]);
+            assert_eq!(result["canonical_url"], get_source["canonical_url"]);
+            assert_eq!(result["source_version"], get_source["source_version"]);
+            assert_eq!(result["get_args"]["source_id"], hit.source_id);
+            assert_eq!(result["get_args"]["profile_id"], "work");
+            assert_eq!(result["ranking"]["kind"], "vector");
+            assert!(result["ranking"]["lexical_score"].is_null());
+            assert_eq!(
+                result["ranking"]["vector_distance"],
+                json!(hit.vector_distance)
+            );
+            round_trip_successes += 1;
+        }
+        assert_eq!(round_trip_successes, hits.len());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
     fn temp_profile_paths(name: &str) -> ProfilePaths {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3396,6 +3554,49 @@ mod tests {
             log_dir,
             cache_dir,
             profile_dir,
+        }
+    }
+
+    fn vector_issue(
+        node_id: &str,
+        repo: &str,
+        number: i64,
+        state: &str,
+        author: &str,
+        labels: &[&str],
+    ) -> IssueRecord {
+        IssueRecord {
+            source_id: format!("qgh://github.com/issue/{node_id}"),
+            host: "github.com".to_string(),
+            repo: repo.to_string(),
+            node_id: node_id.to_string(),
+            github_id: number,
+            number,
+            title: format!("Vector smoke {node_id}"),
+            body: format!("Vector-only smoke body for {node_id}"),
+            state: state.to_string(),
+            labels: labels.iter().map(|label| label.to_string()).collect(),
+            milestone: None,
+            assignees: Vec::new(),
+            author: Some(author.to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            closed_at: None,
+            canonical_url: format!("https://github.com/{repo}/issues/{number}"),
+            body_hash: format!("body-hash-{node_id}"),
+            indexed_at: "2026-01-02T00:00:01Z".to_string(),
+        }
+    }
+
+    fn test_chunk(body: String) -> MarkdownChunk {
+        MarkdownChunk {
+            chunk_index: 0,
+            byte_start: 0,
+            byte_end: body.len(),
+            token_start: 0,
+            token_end: 1,
+            token_count: 1,
+            body,
         }
     }
 }

@@ -5,12 +5,14 @@ use crate::model::{
     BackoffView, CommentRecord, CoverageSnapshot, CursorUpdate, CursorView, IndexSource,
     IssueRecord, ParentIssueView, ReconciliationCandidate, ReconciliationRunView,
     SourceVersionView, StatusSnapshot, StoredChunk, StoredComment, StoredCursor, StoredIssue,
-    StoredSource, SyncSummary, TargetedSyncSummary, TombstoneView,
+    StoredSource, SyncSummary, TargetedSyncSummary, TombstoneView, VectorSearchFilters,
+    VectorSearchHit,
 };
 use crate::paths::ProfilePaths;
 use crate::paths::{ensure_private_dir, set_private_file};
 use crate::time::{now_rfc3339, now_run_id_suffix};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
@@ -965,6 +967,81 @@ impl Store {
         }
         tx.commit()?;
         Ok(rows.len())
+    }
+
+    pub fn vector_only_search(
+        &self,
+        query_vector: &[f32],
+        filters: &VectorSearchFilters,
+        limit: usize,
+    ) -> Result<Vec<VectorSearchHit>, QghError> {
+        if limit == 0 || filters.source_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        if query_vector.is_empty() {
+            return Err(QghError::validation(
+                "embedding.empty_vector",
+                "Vector-only search requires a non-empty query vector.",
+            ));
+        }
+        let Some(dimension) = vector_table_dimension(&self.conn)? else {
+            return Ok(Vec::new());
+        };
+        if dimension != query_vector.len() {
+            return Err(QghError::validation(
+                "embedding.dimension_mismatch",
+                "Query vector dimension does not match the active sqlite-vec table.",
+            )
+            .with_details(serde_json::json!({
+                "query_dimension": query_vector.len(),
+                "vector_table_dimension": dimension
+            })));
+        }
+
+        let candidate_limit = limit.saturating_mul(4).max(limit).max(1);
+        let mut params = vec![
+            Value::Blob(embedding_vector_blob(query_vector)),
+            Value::Integer(candidate_limit as i64),
+        ];
+        let mut prefilter_sql = String::from(
+            "SELECT c2.id
+             FROM chunks c2
+             JOIN source_entities se ON se.source_id = c2.source_id
+             LEFT JOIN issue_metadata im ON im.source_id = c2.source_id
+             LEFT JOIN comment_metadata cm ON cm.source_id = c2.source_id
+             JOIN embedding_fingerprints ef ON ef.active = 1
+             JOIN chunk_embeddings ce
+                ON ce.chunk_id = c2.id
+               AND ce.fingerprint_id = ef.id
+             WHERE se.lifecycle_state = 'active'
+               AND c2.source_version_id = coalesce(im.latest_version_id, cm.latest_version_id)",
+        );
+        push_vector_filter_sql(filters, &mut prefilter_sql, &mut params);
+        params.push(Value::Integer(limit as i64));
+
+        let sql = format!(
+            "WITH vector_candidates AS (
+                SELECT v.rowid AS chunk_id, v.distance AS vector_distance
+                FROM {CHUNK_EMBEDDING_VECTORS_TABLE} v
+                WHERE v.embedding MATCH ? AND v.k = ?
+                  AND v.rowid IN ({prefilter_sql})
+                ORDER BY v.distance
+             )
+             SELECT c.source_id, min(vector_candidates.vector_distance) AS vector_distance
+             FROM vector_candidates
+             JOIN chunks c ON c.id = vector_candidates.chunk_id
+             GROUP BY c.source_id
+             ORDER BY vector_distance ASC, c.source_id ASC
+             LIMIT ?"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+            Ok(VectorSearchHit {
+                source_id: row.get(0)?,
+                vector_distance: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
     }
 
     pub fn get_tombstone(&self, source_id: &str) -> Result<Option<TombstoneView>, QghError> {
@@ -2012,6 +2089,51 @@ fn upsert_vector_row(
         params![chunk_id, embedding_vector_blob(vector)],
     )?;
     Ok(())
+}
+
+fn push_vector_filter_sql(
+    filters: &VectorSearchFilters,
+    sql: &mut String,
+    params: &mut Vec<Value>,
+) {
+    sql.push_str(" AND se.entity_type IN (");
+    for (index, source_type) in filters.source_types.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('?');
+        params.push(Value::Text(source_type.clone()));
+    }
+    sql.push(')');
+    if let Some(repo) = &filters.repo {
+        sql.push_str(" AND se.repo = ?");
+        params.push(Value::Text(repo.clone()));
+    }
+    if let Some(issue) = filters.issue {
+        sql.push_str(" AND coalesce(im.issue_number, cm.issue_number) = ?");
+        params.push(Value::Integer(issue));
+    }
+    if let Some(author) = &filters.author {
+        sql.push_str(" AND coalesce(im.author, cm.author) = ?");
+        params.push(Value::Text(author.clone()));
+    }
+    if let Some(state) = &filters.state {
+        sql.push_str(" AND se.entity_type = 'issue' AND im.state = ?");
+        params.push(Value::Text(state.clone()));
+    }
+    if !filters.labels.is_empty() {
+        sql.push_str(" AND se.entity_type = 'issue'");
+        for label in &filters.labels {
+            sql.push_str(
+                " AND EXISTS (
+                    SELECT 1
+                    FROM json_each(im.labels_json)
+                    WHERE json_each.value = ?
+                )",
+            );
+            params.push(Value::Text(label.clone()));
+        }
+    }
 }
 
 fn upsert_alias(

@@ -1311,15 +1311,22 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         get_schema["$defs"]["source_version"]
     );
     let query_ranking = &query_schema["$defs"]["ranking"];
-    assert_eq!(query_ranking["required"], json!(["kind", "lexical_score"]));
+    assert_eq!(
+        query_ranking["required"],
+        json!(["kind", "lexical_score", "vector_distance"])
+    );
     assert_eq!(query_ranking["additionalProperties"], false);
     assert_eq!(
         schema_property_names(query_ranking),
-        BTreeSet::from(["kind".to_string(), "lexical_score".to_string()])
+        BTreeSet::from([
+            "kind".to_string(),
+            "lexical_score".to_string(),
+            "vector_distance".to_string()
+        ])
     );
     assert_eq!(
         query_ranking["properties"]["kind"]["enum"],
-        json!(["bm25", "exact"])
+        json!(["bm25", "vector", "exact"])
     );
     assert_eq!(
         query_ranking["properties"]["lexical_score"]["type"],
@@ -1329,6 +1336,16 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         .as_str()
         .unwrap()
         .contains("not confidence or probability"));
+    assert_eq!(
+        query_ranking["properties"]["vector_distance"]["type"],
+        json!(["number", "null"])
+    );
+    assert!(
+        query_ranking["properties"]["vector_distance"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("not confidence or probability")
+    );
     assert_eq!(
         status_schema["properties"]["resolution"]["$ref"],
         "#/$defs/resolution"
