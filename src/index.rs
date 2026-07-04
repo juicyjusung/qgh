@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{Field, IndexRecordOption, Schema, Value, STORED, STRING, TEXT};
-use tantivy::{doc, Index, TantivyDocument, Term};
+use tantivy::{Index, TantivyDocument, Term};
 
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -60,21 +60,7 @@ pub fn rebuild(
         .map_err(|e| QghError::index(e.to_string()))?;
     for source in sources {
         writer
-            .add_document(doc!(
-                fields.source_id => source.source_id.clone(),
-                fields.entity_type => source.entity_type.clone(),
-                fields.repo => source.repo.clone(),
-                fields.issue_number => source.issue_number.to_string(),
-                fields.state => source.state.clone(),
-                fields.labels => source.labels.join(" "),
-                fields.author => source.author.clone().unwrap_or_default(),
-                fields.title => source.title.clone(),
-                fields.body => source.body.clone(),
-                fields.parent_issue_title => source.parent_issue_title.clone(),
-                fields.cjk_ngrams => cjk_ngram_text(source),
-                fields.updated_at => source.github_updated_at.clone(),
-                fields.indexed_at => source.indexed_at.clone(),
-            ))
+            .add_document(index_source_document(&fields, source))
             .map_err(|e| QghError::index(e.to_string()))?;
     }
     writer
@@ -125,6 +111,15 @@ pub fn search_with_filters(
     let labels = schema
         .get_field("labels")
         .map_err(|e| QghError::index(e.to_string()))?;
+    let label_exact = if filters.labels.is_empty() {
+        None
+    } else {
+        Some(
+            schema
+                .get_field("label_exact")
+                .map_err(|e| QghError::index(e.to_string()))?,
+        )
+    };
     let repo = schema
         .get_field("repo")
         .map_err(|e| QghError::index(e.to_string()))?;
@@ -156,7 +151,7 @@ pub fn search_with_filters(
         repo,
         issue_number,
         state,
-        labels,
+        label_exact,
         author,
     };
     let query = filtered_query(query, &filter_fields, filters);
@@ -204,9 +199,9 @@ fn filtered_query(
     if let Some(state) = &filters.state {
         clauses.push((Occur::Must, term_query(fields.state, state)));
     }
-    for label in &filters.labels {
-        for term in label_terms(label) {
-            clauses.push((Occur::Must, term_query(fields.labels, &term)));
+    if let Some(label_exact) = fields.label_exact {
+        for label in &filters.labels {
+            clauses.push((Occur::Must, term_query(label_exact, label)));
         }
     }
     if clauses.len() == 1 {
@@ -246,25 +241,12 @@ fn term_query(field: Field, text: &str) -> Box<dyn Query> {
     ))
 }
 
-fn label_terms(label: &str) -> Vec<String> {
-    let terms = label
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|term| !term.is_empty())
-        .map(|term| term.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    if terms.is_empty() {
-        vec![label.to_ascii_lowercase()]
-    } else {
-        terms
-    }
-}
-
 struct FilterFields {
     entity_type: Field,
     repo: Field,
     issue_number: Field,
     state: Field,
-    labels: Field,
+    label_exact: Option<Field>,
     author: Field,
 }
 
@@ -275,6 +257,7 @@ struct Fields {
     issue_number: Field,
     state: Field,
     labels: Field,
+    label_exact: Field,
     author: Field,
     title: Field,
     body: Field,
@@ -292,6 +275,7 @@ fn schema() -> (Schema, Fields) {
     let issue_number = builder.add_text_field("issue_number", STRING | STORED);
     let state = builder.add_text_field("state", STRING | STORED);
     let labels = builder.add_text_field("labels", TEXT | STORED);
+    let label_exact = builder.add_text_field("label_exact", STRING);
     let author = builder.add_text_field("author", STRING | STORED);
     let title = builder.add_text_field("title", TEXT | STORED);
     let body = builder.add_text_field("body", TEXT | STORED);
@@ -308,6 +292,7 @@ fn schema() -> (Schema, Fields) {
             issue_number,
             state,
             labels,
+            label_exact,
             author,
             title,
             body,
@@ -317,6 +302,27 @@ fn schema() -> (Schema, Fields) {
             indexed_at,
         },
     )
+}
+
+fn index_source_document(fields: &Fields, source: &IndexSource) -> TantivyDocument {
+    let mut document = TantivyDocument::default();
+    document.add_text(fields.source_id, &source.source_id);
+    document.add_text(fields.entity_type, &source.entity_type);
+    document.add_text(fields.repo, &source.repo);
+    document.add_text(fields.issue_number, source.issue_number.to_string());
+    document.add_text(fields.state, &source.state);
+    document.add_text(fields.labels, source.labels.join(" "));
+    for label in &source.labels {
+        document.add_text(fields.label_exact, label);
+    }
+    document.add_text(fields.author, source.author.as_deref().unwrap_or_default());
+    document.add_text(fields.title, &source.title);
+    document.add_text(fields.body, &source.body);
+    document.add_text(fields.parent_issue_title, &source.parent_issue_title);
+    document.add_text(fields.cjk_ngrams, cjk_ngram_text(source));
+    document.add_text(fields.updated_at, &source.github_updated_at);
+    document.add_text(fields.indexed_at, &source.indexed_at);
+    document
 }
 
 fn cjk_ngram_text(source: &IndexSource) -> String {
@@ -467,6 +473,14 @@ mod tests {
                 "open",
                 "bob",
                 &["ready-for-human"],
+                &noisy_body,
+            ),
+            test_source(
+                "NOISY_LABEL_PARTS",
+                "owner/repo",
+                "open",
+                "bob",
+                &["ready", "for", "agent"],
                 &noisy_body,
             ),
             test_source(
