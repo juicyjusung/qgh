@@ -8,8 +8,8 @@ The MVP search-quality eval is a release/test harness, not a user-facing CLI or 
 - Harness: `tests/search_quality_eval.rs`.
 - Workflow under test: `sync -> query -> get`.
 - Wiki is post-MVP and excluded from the MVP eval fixture.
-- Hosted embedding, rerank, GPU/model availability, and model A/B are outside this gate.
-- Hybrid coverage uses deterministic local eval vectors so the gate does not download a model or create network egress.
+- Hosted embedding, rerank, GPU/model availability, and live model downloads are outside this gate.
+- Hybrid coverage and H4b model A/B use deterministic local eval vectors so the gate does not download a model or create network egress.
 - The source vectors and query vectors are authored as separate topic-axis fixtures; query vectors are not generated from Gold source_id labels.
 
 ## Labels
@@ -76,6 +76,38 @@ Current synthetic fixture result:
   "get_round_trip": 1.0,
   "section_8_3_triggers": [],
   "top_failures": [],
+  "recalibration_requires_prd_adr_update": false
+}
+```
+
+## H4b Model A/B Report
+
+`model_ab_report` is report-only. All rows use the same
+`search-quality-eval` fixture, same H4a protocol, same authored source
+vectors, and same authored query vectors. The default model remains
+`Snowflake/snowflake-arctic-embed-l-v2.0`; changing it still requires a
+PRD/ADR-backed human decision.
+
+The A/B path switches configured model fingerprints before each
+non-default candidate, verifies `embedding.fingerprint_mismatch` keeps
+BM25 fallback active, then replaces the active fingerprint and
+embeddings before rerunning the same hybrid eval.
+
+Current deterministic fixture result:
+
+| Candidate | Configured model id | Regression hybrid path | Semantic hybrid top-5 | Semantic delta vs BM25 | Cross-language hybrid top-5 | Cross-language delta vs BM25 | Section 8.3 triggers |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| arctic-embed-l-v2.0 | `Snowflake/snowflake-arctic-embed-l-v2.0` | 15/15 | 1.00 | 0.08 | 1.00 | 0.50 | `[]` |
+| dragonkue-ko | `dragonkue/snowflake-arctic-embed-l-v2.0-ko` | 15/15 | 1.00 | 0.08 | 1.00 | 0.50 | `[]` |
+| gte-modernbert-base | `Alibaba-NLP/gte-modernbert-base` | 15/15 | 1.00 | 0.08 | 1.00 | 0.50 | `[]` |
+
+Additional checks:
+
+```json
+{
+  "fingerprint_reembedding_checks": "2/2",
+  "hard_filter_violations": 0,
+  "combined_get_round_trip": 1.0,
   "recalibration_requires_prd_adr_update": false
 }
 ```

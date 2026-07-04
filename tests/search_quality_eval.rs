@@ -29,6 +29,8 @@ const CHUNK_EMBEDDING_VECTORS_TABLE: &str = "chunk_embedding_vectors";
 const EVAL_VECTOR_DIMENSION: usize = 32;
 const SEMANTIC_TOP5_TARGET: f64 = 0.70;
 const CROSS_LANGUAGE_TOP5_TARGET: f64 = 0.60;
+const DRAGONKUE_KO_MODEL_ID: &str = "dragonkue/snowflake-arctic-embed-l-v2.0-ko";
+const GTE_MODERNBERT_BASE_MODEL_ID: &str = "Alibaba-NLP/gte-modernbert-base";
 const AXIS_PAGINATION: usize = 0;
 const AXIS_RATE_LIMIT: usize = 1;
 const AXIS_SCHEMA: usize = 2;
@@ -48,6 +50,21 @@ const AXIS_SYNC: usize = 15;
 const AXIS_STATUS: usize = 16;
 const AXIS_OUTPUT_SCHEMA: usize = 17;
 
+const MODEL_AB_CANDIDATES: [EvalModelCandidate; 3] = [
+    EvalModelCandidate {
+        name: "arctic-embed-l-v2.0",
+        model_id: DEFAULT_HF_MODEL_ID,
+    },
+    EvalModelCandidate {
+        name: "dragonkue-ko",
+        model_id: DRAGONKUE_KO_MODEL_ID,
+    },
+    EvalModelCandidate {
+        name: "gte-modernbert-base",
+        model_id: GTE_MODERNBERT_BASE_MODEL_ID,
+    },
+];
+
 #[test]
 fn curated_search_quality_eval_gate_passes() {
     let fixture = EvalFixture::new("search-quality-eval");
@@ -56,6 +73,7 @@ fn curated_search_quality_eval_gate_passes() {
     assert_success(&fixture.qgh(&["sync", "--json"]));
 
     let regression_cases = bm25_regression_cases();
+    let semantic_cases = semantic_eval_cases();
     let bm25_regression = run_eval_cases(&fixture, EvalMode::Bm25Only, &regression_cases, None);
     assert!(
         bm25_regression.meets_bm25_regression_targets() && bm25_regression.meets_hard_gates(),
@@ -63,27 +81,6 @@ fn curated_search_quality_eval_gate_passes() {
         bm25_regression.summary("bm25 regression")
     );
 
-    let source_vectors = eval_source_vectors();
-    let query_vectors_json =
-        eval_query_vectors_json(regression_cases.iter().chain(semantic_eval_cases().iter()));
-    fixture.write_config_with_embedding(&server.base_url);
-    fixture.seed_eval_embeddings(&source_vectors);
-    fixture.materialize_eval_vector_table();
-    let hybrid_regression = run_eval_cases(
-        &fixture,
-        EvalMode::Hybrid,
-        &regression_cases,
-        Some(&query_vectors_json),
-    );
-    assert!(
-        hybrid_regression.meets_bm25_regression_targets()
-            && hybrid_regression.meets_hard_gates()
-            && hybrid_regression.meets_hybrid_path_gate(),
-        "{}",
-        hybrid_regression.summary("hybrid regression")
-    );
-
-    let semantic_cases = semantic_eval_cases();
     fixture.write_config(&server.base_url);
     let semantic_bm25 = run_eval_cases(&fixture, EvalMode::Bm25Only, &semantic_cases, None);
     assert!(
@@ -92,26 +89,93 @@ fn curated_search_quality_eval_gate_passes() {
         semantic_bm25.summary("semantic bm25-only")
     );
 
-    fixture.write_config_with_embedding(&server.base_url);
-    fixture.materialize_eval_vector_table();
-    let semantic_hybrid = run_eval_cases(
-        &fixture,
-        EvalMode::Hybrid,
-        &semantic_cases,
-        Some(&query_vectors_json),
+    let source_vectors = eval_source_vectors();
+    let query_vectors_json =
+        eval_query_vectors_json(regression_cases.iter().chain(semantic_cases.iter()));
+    fixture.seed_eval_chunks(&source_vectors);
+
+    let mut model_reports = Vec::new();
+    let mut previous_fingerprint_hash = None;
+    let mut fingerprint_reembedding_checks = 0;
+    for candidate in MODEL_AB_CANDIDATES {
+        fixture.write_config_with_embedding_model(&server.base_url, candidate.model_id);
+        if previous_fingerprint_hash.is_some() {
+            assert_fingerprint_mismatch_falls_back_to_bm25(&fixture);
+        }
+        let fingerprint_hash = fixture.replace_eval_embeddings(candidate, &source_vectors);
+        if let Some(previous) = previous_fingerprint_hash.as_ref() {
+            assert_ne!(
+                previous, &fingerprint_hash,
+                "model A/B must replace the active fingerprint when model id changes"
+            );
+            fingerprint_reembedding_checks += 1;
+        }
+        previous_fingerprint_hash = Some(fingerprint_hash.clone());
+        fixture.assert_active_eval_fingerprint(candidate, &fingerprint_hash, source_vectors.len());
+        assert_eq!(
+            fixture.materialize_eval_vector_table(),
+            source_vectors.len(),
+            "model A/B replacement must materialize every eval vector for the active fingerprint"
+        );
+
+        let hybrid_regression = run_eval_cases(
+            &fixture,
+            EvalMode::Hybrid,
+            &regression_cases,
+            Some(&query_vectors_json),
+        );
+        assert!(
+            hybrid_regression.meets_bm25_regression_targets()
+                && hybrid_regression.meets_hard_gates()
+                && hybrid_regression.meets_hybrid_path_gate(),
+            "{}",
+            hybrid_regression.summary("hybrid regression")
+        );
+
+        let semantic_hybrid = run_eval_cases(
+            &fixture,
+            EvalMode::Hybrid,
+            &semantic_cases,
+            Some(&query_vectors_json),
+        );
+        assert!(
+            semantic_hybrid.meets_hard_gates() && semantic_hybrid.meets_hybrid_path_gate(),
+            "{}",
+            semantic_hybrid.summary("semantic hybrid")
+        );
+        model_reports.push(ModelEvalReport {
+            candidate,
+            fingerprint_hash,
+            hybrid_regression,
+            semantic_hybrid,
+        });
+    }
+    assert_eq!(MODEL_AB_CANDIDATES[0].model_id, DEFAULT_HF_MODEL_ID);
+    assert_eq!(
+        fingerprint_reembedding_checks,
+        MODEL_AB_CANDIDATES.len() - 1,
+        "A/B must verify fingerprint replacement between model candidates"
     );
-    assert!(
-        semantic_hybrid.meets_hard_gates() && semantic_hybrid.meets_hybrid_path_gate(),
-        "{}",
-        semantic_hybrid.summary("semantic hybrid")
-    );
+    let default_model_report = model_reports
+        .iter()
+        .find(|report| report.candidate.model_id == DEFAULT_HF_MODEL_ID)
+        .expect("default model report");
     eprintln!(
         "{}",
         ab_summary(
             &bm25_regression,
-            &hybrid_regression,
+            &default_model_report.hybrid_regression,
             &semantic_bm25,
-            &semantic_hybrid,
+            &default_model_report.semantic_hybrid,
+        )
+    );
+    eprintln!(
+        "{}",
+        model_ab_summary(
+            &bm25_regression,
+            &semantic_bm25,
+            &model_reports,
+            fingerprint_reembedding_checks,
         )
     );
     assert_eq!(
@@ -134,9 +198,27 @@ fn curated_search_quality_eval_gate_passes() {
         "semantic/paraphrase",
         "cross-language",
         "section_8_3_triggers",
+        "model_ab_report",
+        "dragonkue/snowflake-arctic-embed-l-v2.0-ko",
+        "Alibaba-NLP/gte-modernbert-base",
+        "default model remains",
+        "fingerprint_reembedding_checks",
     ] {
         assert!(docs.contains(required), "missing docs phrase: {required}");
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EvalModelCandidate {
+    name: &'static str,
+    model_id: &'static str,
+}
+
+struct ModelEvalReport {
+    candidate: EvalModelCandidate,
+    fingerprint_hash: String,
+    hybrid_regression: EvalReport,
+    semantic_hybrid: EvalReport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -686,6 +768,36 @@ fn hard_filter_violation(result: &Value) -> Option<String> {
     None
 }
 
+fn assert_fingerprint_mismatch_falls_back_to_bm25(fixture: &EvalFixture) {
+    let query = fixture.qgh(&[
+        "query",
+        "pagination cursor duplicate etag",
+        "--limit",
+        "5",
+        "--json",
+    ]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    let warnings = query_json["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning["code"] == "embedding.fingerprint_mismatch"),
+        "model switch must warn before reembedding: {query_json}"
+    );
+    let results = query_json["data"]["results"].as_array().unwrap();
+    assert!(
+        !results.is_empty(),
+        "BM25 fallback should still return fixture results on mismatch"
+    );
+    assert!(
+        results
+            .iter()
+            .all(|result| result["ranking"]["kind"] == "bm25"),
+        "fingerprint mismatch must disable hybrid until reembedding: {query_json}"
+    );
+}
+
 fn ab_summary(
     bm25_regression: &EvalReport,
     hybrid_regression: &EvalReport,
@@ -722,7 +834,7 @@ fn ab_summary(
             + hybrid_regression.hard_filter_violations
             + semantic_bm25.hard_filter_violations
             + semantic_hybrid.hard_filter_violations,
-        combined_round_trip_rate([
+        combined_round_trip_rate(&[
             bm25_regression,
             hybrid_regression,
             semantic_bm25,
@@ -730,6 +842,84 @@ fn ab_summary(
         ]),
         section_8_3_triggers
     )
+}
+
+fn model_ab_summary(
+    bm25_regression: &EvalReport,
+    semantic_bm25: &EvalReport,
+    model_reports: &[ModelEvalReport],
+    fingerprint_reembedding_checks: usize,
+) -> String {
+    let mut reports = vec![bm25_regression, semantic_bm25];
+    for report in model_reports {
+        reports.push(&report.hybrid_regression);
+        reports.push(&report.semantic_hybrid);
+    }
+    let hard_filter_violations = reports
+        .iter()
+        .map(|report| report.hard_filter_violations)
+        .sum::<usize>();
+    let recalibration_requires_prd_adr_update = !bm25_regression.meets_bm25_regression_targets()
+        || !bm25_regression.meets_hard_gates()
+        || !semantic_bm25.meets_hard_gates()
+        || model_reports.iter().any(|report| {
+            let semantic_rate = report.semantic_hybrid.class_rate(QueryClass::Semantic);
+            let cross_language_rate = report.semantic_hybrid.class_rate(QueryClass::CrossLanguage);
+            !report.hybrid_regression.meets_bm25_regression_targets()
+                || !report.hybrid_regression.meets_hard_gates()
+                || !report.hybrid_regression.meets_hybrid_path_gate()
+                || !report.semantic_hybrid.meets_hard_gates()
+                || !report.semantic_hybrid.meets_hybrid_path_gate()
+                || !section_8_3_triggers(semantic_rate, cross_language_rate).is_empty()
+        });
+    let mut lines = vec![
+        "model_ab_report".to_string(),
+        format!(
+            "fixture=search-quality-eval protocol=H4a candidates={}",
+            model_reports.len()
+        ),
+        format!(
+            "fingerprint_reembedding_checks={}/{}",
+            fingerprint_reembedding_checks,
+            model_reports.len().saturating_sub(1)
+        ),
+        format!(
+            "bm25_semantic_top5={:.2}",
+            semantic_bm25.class_rate(QueryClass::Semantic)
+        ),
+        format!(
+            "bm25_cross_language_top5={:.2}",
+            semantic_bm25.class_rate(QueryClass::CrossLanguage)
+        ),
+        format!(
+            "combined_get_round_trip={:.2}",
+            combined_round_trip_rate(&reports)
+        ),
+        format!("hard_filter_violations={hard_filter_violations}"),
+        format!("recalibration_requires_prd_adr_update={recalibration_requires_prd_adr_update}"),
+    ];
+    for report in model_reports {
+        let semantic_rate = report.semantic_hybrid.class_rate(QueryClass::Semantic);
+        let cross_language_rate = report.semantic_hybrid.class_rate(QueryClass::CrossLanguage);
+        lines.push(format!(
+            "model={} model_id={} fingerprint={} regression_path_queries={}/{} semantic_hybrid_top5={:.2} semantic_delta={:.2} cross_language_hybrid_top5={:.2} cross_language_delta={:.2} section_8_3_triggers={:?}",
+            report.candidate.name,
+            report.candidate.model_id,
+            fingerprint_hash_prefix(&report.fingerprint_hash),
+            report.hybrid_regression.hybrid_path_query_hits,
+            report.hybrid_regression.hybrid_path_query_total,
+            semantic_rate,
+            semantic_rate - semantic_bm25.class_rate(QueryClass::Semantic),
+            cross_language_rate,
+            cross_language_rate - semantic_bm25.class_rate(QueryClass::CrossLanguage),
+            section_8_3_triggers(semantic_rate, cross_language_rate)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn fingerprint_hash_prefix(hash: &str) -> &str {
+    hash.get(..12).unwrap_or(hash)
 }
 
 fn section_8_3_triggers(
@@ -746,7 +936,7 @@ fn section_8_3_triggers(
     triggers
 }
 
-fn combined_round_trip_rate(reports: [&EvalReport; 4]) -> f64 {
+fn combined_round_trip_rate(reports: &[&EvalReport]) -> f64 {
     let total = reports
         .iter()
         .map(|report| report.round_trip_total)
@@ -1036,10 +1226,10 @@ fn topic_vector(weighted_axes: &[(usize, f32)]) -> Vec<f32> {
     vector
 }
 
-fn eval_embedding_fingerprint() -> qgh::embedding::EmbeddingFingerprint {
+fn eval_embedding_fingerprint(model_id: &str) -> qgh::embedding::EmbeddingFingerprint {
     EmbeddingFingerprintSeed {
         provider: "local".to_string(),
-        model_id: DEFAULT_HF_MODEL_ID.to_string(),
+        model_id: model_id.to_string(),
         model_revision: DEFAULT_HF_MODEL_REVISION.to_string(),
         pooling: PoolingKind::Cls,
         query_prefix: DEFAULT_QUERY_PREFIX.to_string(),
@@ -1113,7 +1303,7 @@ env = "QGH_TEST_TOKEN"
         fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
     }
 
-    fn write_config_with_embedding(&self, api_base_url: &str) {
+    fn write_config_with_embedding_model(&self, api_base_url: &str, model_id: &str) {
         let config = format!(
             r#"
 schema_version = "qgh.config.v1"
@@ -1130,7 +1320,7 @@ env = "QGH_TEST_TOKEN"
 
 [embedding]
 provider = "local"
-model = "hf:{DEFAULT_HF_MODEL_ID}"
+model = "hf:{model_id}"
 file = "onnx/model_quantized.onnx"
 pooling = "cls"
 query_prefix = "query: "
@@ -1168,19 +1358,49 @@ query_prefix = "query: "
         cmd.output().unwrap()
     }
 
-    fn seed_eval_embeddings(&self, source_vectors: &BTreeMap<&'static str, Vec<f32>>) {
+    fn seed_eval_chunks(&self, source_vectors: &BTreeMap<&'static str, Vec<f32>>) {
         register_sqlite_vec_extension();
         let conn = Connection::open(self.db_path()).unwrap();
-        conn.execute(
-            &format!("DROP TABLE IF EXISTS {CHUNK_EMBEDDING_VECTORS_TABLE}"),
-            [],
-        )
-        .unwrap();
         conn.execute("DELETE FROM chunk_embeddings", []).unwrap();
         conn.execute("DELETE FROM chunks", []).unwrap();
         conn.execute("UPDATE embedding_fingerprints SET active = 0", [])
             .unwrap();
-        let fingerprint = eval_embedding_fingerprint();
+
+        for source_id in source_vectors.keys() {
+            let source_version_id: i64 = conn
+                .query_row(
+                    "SELECT coalesce(im.latest_version_id, cm.latest_version_id)
+                     FROM source_entities se
+                     LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+                     LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+                     WHERE se.source_id = ?1 AND se.lifecycle_state = 'active'",
+                    [*source_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO chunks (source_id, source_version_id, body)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    *source_id,
+                    source_version_id,
+                    format!("eval embedding chunk for {source_id}")
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    fn replace_eval_embeddings(
+        &self,
+        candidate: EvalModelCandidate,
+        source_vectors: &BTreeMap<&'static str, Vec<f32>>,
+    ) -> String {
+        let conn = Connection::open(self.db_path()).unwrap();
+        conn.execute("DELETE FROM chunk_embeddings", []).unwrap();
+        conn.execute("UPDATE embedding_fingerprints SET active = 0", [])
+            .unwrap();
+        let fingerprint = eval_embedding_fingerprint(candidate.model_id);
         let fingerprint_hash = fingerprint.hash();
         let fingerprint_json = serde_json::to_string(&fingerprint).unwrap();
         conn.execute(
@@ -1206,28 +1426,13 @@ query_prefix = "query: "
         let fingerprint_id = conn.last_insert_rowid();
 
         for (source_id, vector) in source_vectors {
-            let source_version_id: i64 = conn
+            let chunk_id: i64 = conn
                 .query_row(
-                    "SELECT coalesce(im.latest_version_id, cm.latest_version_id)
-                     FROM source_entities se
-                     LEFT JOIN issue_metadata im ON im.source_id = se.source_id
-                     LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
-                     WHERE se.source_id = ?1 AND se.lifecycle_state = 'active'",
+                    "SELECT id FROM chunks WHERE source_id = ?1 ORDER BY id",
                     [*source_id],
                     |row| row.get(0),
                 )
                 .unwrap();
-            conn.execute(
-                "INSERT INTO chunks (source_id, source_version_id, body)
-                 VALUES (?1, ?2, ?3)",
-                params![
-                    *source_id,
-                    source_version_id,
-                    format!("eval embedding chunk for {source_id}")
-                ],
-            )
-            .unwrap();
-            let chunk_id = conn.last_insert_rowid();
             conn.execute(
                 "INSERT INTO chunk_embeddings
                     (chunk_id, fingerprint_id, vector_json, embedded_at)
@@ -1240,9 +1445,49 @@ query_prefix = "query: "
             )
             .unwrap();
         }
+        fingerprint_hash
     }
 
-    fn materialize_eval_vector_table(&self) {
+    fn assert_active_eval_fingerprint(
+        &self,
+        candidate: EvalModelCandidate,
+        fingerprint_hash: &str,
+        expected_embeddings: usize,
+    ) {
+        let conn = Connection::open(self.db_path()).unwrap();
+        let active_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM embedding_fingerprints WHERE active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_count, 1, "expected one active eval fingerprint");
+        let (active_hash, active_model_id): (String, String) = conn
+            .query_row(
+                "SELECT fingerprint_hash, model_id
+                 FROM embedding_fingerprints
+                 WHERE active = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(active_hash, fingerprint_hash);
+        assert_eq!(active_model_id, candidate.model_id);
+        let active_embedding_count: i64 = conn
+            .query_row(
+                "SELECT count(*)
+                 FROM chunk_embeddings ce
+                 JOIN embedding_fingerprints ef ON ef.id = ce.fingerprint_id
+                 WHERE ef.active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_embedding_count as usize, expected_embeddings);
+    }
+
+    fn materialize_eval_vector_table(&self) -> usize {
         register_sqlite_vec_extension();
         let conn = Connection::open(self.db_path()).unwrap();
         conn.execute(
@@ -1275,6 +1520,7 @@ query_prefix = "query: "
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
         };
+        let row_count = rows.len();
         for (chunk_id, vector_json) in rows {
             let vector: Vec<f32> = serde_json::from_str(&vector_json).unwrap();
             conn.execute(
@@ -1286,6 +1532,7 @@ query_prefix = "query: "
             )
             .unwrap();
         }
+        row_count
     }
 
     fn db_path(&self) -> PathBuf {
