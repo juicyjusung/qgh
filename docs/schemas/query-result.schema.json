@@ -243,23 +243,90 @@
       "additionalProperties": false
     },
     "ranking": {
-      "type": "object",
-      "required": ["kind", "lexical_score", "vector_distance"],
-      "properties": {
-        "kind": {
-          "type": "string",
-          "enum": ["bm25", "vector", "exact"]
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "lexical_score", "vector_distance"],
+          "properties": {
+            "kind": {
+              "const": "bm25"
+            },
+            "lexical_score": {
+              "type": "number",
+              "description": "BM25 lexical ordering signal. It is not confidence or probability."
+            },
+            "vector_distance": {
+              "type": "null"
+            }
+          },
+          "additionalProperties": false
         },
-        "lexical_score": {
-          "type": ["number", "null"],
-          "description": "Typed ordering signal. It is not confidence or probability."
+        {
+          "type": "object",
+          "required": ["kind", "lexical_score", "vector_distance"],
+          "properties": {
+            "kind": {
+              "const": "vector"
+            },
+            "lexical_score": {
+              "type": "null"
+            },
+            "vector_distance": {
+              "type": "number",
+              "description": "Vector ordering signal where lower is closer. It is not confidence or probability."
+            }
+          },
+          "additionalProperties": false
         },
-        "vector_distance": {
-          "type": ["number", "null"],
-          "description": "Vector ordering signal where lower is closer. It is not confidence or probability."
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "lexical_score",
+            "vector_distance",
+            "rrf_rank_score",
+            "final_order_score"
+          ],
+          "properties": {
+            "kind": {
+              "const": "hybrid"
+            },
+            "lexical_score": {
+              "type": ["number", "null"],
+              "description": "BM25 lexical ordering signal, when present. It is not confidence or probability."
+            },
+            "vector_distance": {
+              "type": ["number", "null"],
+              "description": "Vector ordering signal where lower is closer, when present. It is not confidence or probability."
+            },
+            "rrf_rank_score": {
+              "type": "number",
+              "description": "Reciprocal-rank fusion ordering signal. It is not confidence or probability."
+            },
+            "final_order_score": {
+              "type": "number",
+              "description": "Final ordering signal used for this result order. It is not confidence or probability."
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "lexical_score", "vector_distance"],
+          "properties": {
+            "kind": {
+              "const": "exact"
+            },
+            "lexical_score": {
+              "type": "null"
+            },
+            "vector_distance": {
+              "type": "null"
+            }
+          },
+          "additionalProperties": false
         }
-      },
-      "additionalProperties": false
+      ]
     }
   }
 }
