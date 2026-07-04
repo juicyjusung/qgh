@@ -514,6 +514,12 @@ fn render_status(data: &Value) -> String {
             display_at(data, &["freshness", "remote_checked"])
         ),
     );
+    if data.get("embedding").is_some() {
+        line(
+            &mut out,
+            format_args!("embedding: {}", embedding_status_summary(data)),
+        );
+    }
     line(
         &mut out,
         format_args!(
@@ -654,6 +660,19 @@ fn backoff_summary(backoff: Option<&Value>) -> String {
         ),
         _ => "none".to_string(),
     }
+}
+
+fn embedding_status_summary(data: &Value) -> String {
+    format!(
+        "{} chunks completed {}/{} missing {} mismatched {} fingerprint {} model {}",
+        display_at(data, &["embedding", "state"]),
+        display_at(data, &["embedding", "coverage", "completed_chunks"]),
+        display_at(data, &["embedding", "coverage", "total_chunks"]),
+        display_at(data, &["embedding", "coverage", "missing_chunks"]),
+        display_at(data, &["embedding", "coverage", "mismatched_chunks"]),
+        display_at(data, &["embedding", "fingerprint", "hash"]),
+        display_at(data, &["embedding", "configured_model", "model_id"])
+    )
 }
 
 fn lifecycle_summary(check: Option<&Value>) -> String {

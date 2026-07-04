@@ -121,7 +121,7 @@ it is optimized for a person reading the terminal:
   error state.
 - `status`: selected profile, local snapshot freshness, effective repo scope
   and repo source, DB path, Tantivy index path, source counts, default sync
-  scope, and `qgh sync --all` guidance.
+  scope, optional local embedding coverage, and `qgh sync --all` guidance.
 - `doctor`: failed checks first with actionable hints, then all checks and MCP
   exposure status.
 
