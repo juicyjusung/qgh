@@ -1197,9 +1197,12 @@ struct EmbeddingRuntime {
 
 #[cfg(debug_assertions)]
 const TEST_EMBEDDING_QUERY_VECTORS_ENV: &str = "QGH_TEST_EMBEDDING_QUERY_VECTORS";
+#[cfg(debug_assertions)]
+const TEST_EMBEDDING_DOCUMENT_VECTORS_ENV: &str = "QGH_TEST_EMBEDDING_DOCUMENT_VECTORS";
 
 #[cfg(debug_assertions)]
 struct TestEmbeddingProvider {
+    document_vectors: HashMap<String, EmbeddingVector>,
     query_vectors: HashMap<String, EmbeddingVector>,
 }
 
@@ -1207,12 +1210,19 @@ struct TestEmbeddingProvider {
 impl EmbeddingProvider for TestEmbeddingProvider {
     fn embed_documents(
         &self,
-        _texts: &[&str],
+        texts: &[&str],
     ) -> Result<Vec<EmbeddingVector>, EmbeddingProviderError> {
-        Err(EmbeddingProviderError::structured(
-            "embedding.test_provider_documents_unsupported",
-            "Test embedding provider supports query vectors only.",
-        ))
+        texts
+            .iter()
+            .map(|text| {
+                self.document_vectors.get(*text).cloned().ok_or_else(|| {
+                    EmbeddingProviderError::structured(
+                        "embedding.test_document_vector_missing",
+                        "Test embedding provider has no vector for this document.",
+                    )
+                })
+            })
+            .collect()
     }
 
     fn embed_query(&self, text: &str) -> Result<EmbeddingVector, EmbeddingProviderError> {
@@ -1246,35 +1256,41 @@ impl EmbeddingTokenizer for TestEmbeddingTokenizer {
 fn test_embedding_runtime(
     embedding: &EmbeddingConfig,
 ) -> Result<Option<EmbeddingRuntime>, QghError> {
-    let Ok(raw_vectors) = std::env::var(TEST_EMBEDDING_QUERY_VECTORS_ENV) else {
+    let query_vectors = test_embedding_vectors_from_env(TEST_EMBEDDING_QUERY_VECTORS_ENV)?;
+    let document_vectors = test_embedding_vectors_from_env(TEST_EMBEDDING_DOCUMENT_VECTORS_ENV)?;
+    if query_vectors.is_none() && document_vectors.is_none() {
         return Ok(None);
-    };
-    let query_vectors: HashMap<String, EmbeddingVector> =
-        serde_json::from_str(&raw_vectors).map_err(|error| {
-            QghError::validation(
-                "embedding.test_query_vectors_invalid",
-                format!("{TEST_EMBEDDING_QUERY_VECTORS_ENV} must be a JSON object of query vectors: {error}"),
-            )
-        })?;
-    let Some(dimension) = query_vectors.values().next().map(Vec::len) else {
+    }
+    let query_vectors = query_vectors.unwrap_or_default();
+    let document_vectors = document_vectors.unwrap_or_default();
+    let Some(dimension) = query_vectors
+        .values()
+        .chain(document_vectors.values())
+        .next()
+        .map(Vec::len)
+    else {
         return Err(QghError::validation(
-            "embedding.test_query_vectors_empty",
-            format!("{TEST_EMBEDDING_QUERY_VECTORS_ENV} must contain at least one query vector."),
+            "embedding.test_vectors_empty",
+            "Test embedding vector env vars must contain at least one vector.",
         ));
     };
     if dimension == 0
         || query_vectors
             .values()
+            .chain(document_vectors.values())
             .any(|vector| vector.len() != dimension)
     {
         return Err(QghError::validation(
-            "embedding.test_query_vectors_dimension_mismatch",
-            format!("{TEST_EMBEDDING_QUERY_VECTORS_ENV} vectors must be non-empty and share one dimension."),
+            "embedding.test_vectors_dimension_mismatch",
+            "Test embedding vectors must be non-empty and share one dimension.",
         ));
     }
     Ok(Some(EmbeddingRuntime {
         tokenizer: Box::new(TestEmbeddingTokenizer),
-        provider: Box::new(TestEmbeddingProvider { query_vectors }),
+        provider: Box::new(TestEmbeddingProvider {
+            document_vectors,
+            query_vectors,
+        }),
         fingerprint_seed: EmbeddingFingerprintSeed {
             provider: embedding_provider_name(embedding.provider).to_string(),
             model_id: configured_embedding_model_id(embedding)
@@ -1288,6 +1304,30 @@ fn test_embedding_runtime(
                 .unwrap_or_else(|| DEFAULT_QUERY_PREFIX.to_string()),
         },
     }))
+}
+
+#[cfg(debug_assertions)]
+fn test_embedding_vectors_from_env(
+    env: &str,
+) -> Result<Option<HashMap<String, EmbeddingVector>>, QghError> {
+    let raw_vectors = match std::env::var(env) {
+        Ok(raw_vectors) => raw_vectors,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => {
+            return Err(QghError::validation(
+                "embedding.test_vectors_invalid",
+                format!("{env} must be valid UTF-8: {error}"),
+            ));
+        }
+    };
+    serde_json::from_str(&raw_vectors)
+        .map(Some)
+        .map_err(|error| {
+            QghError::validation(
+                "embedding.test_vectors_invalid",
+                format!("{env} must be a JSON object of vectors: {error}"),
+            )
+        })
 }
 
 #[cfg(not(debug_assertions))]

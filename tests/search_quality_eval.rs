@@ -25,6 +25,7 @@ const AMBIGUOUS_EXCLUSION_RULE: &str =
     "Exclude ambiguous queries when more than one active source is a plausible gold answer.";
 const WIKI_EXCLUDED_REASON: &str = "Wiki is post-MVP and excluded from the MVP eval fixture.";
 const TEST_EMBEDDING_QUERY_VECTORS_ENV: &str = "QGH_TEST_EMBEDDING_QUERY_VECTORS";
+const TEST_EMBEDDING_DOCUMENT_VECTORS_ENV: &str = "QGH_TEST_EMBEDDING_DOCUMENT_VECTORS";
 const CHUNK_EMBEDDING_VECTORS_TABLE: &str = "chunk_embedding_vectors";
 const EVAL_VECTOR_DIMENSION: usize = 32;
 const SEMANTIC_TOP5_TARGET: f64 = 0.70;
@@ -49,6 +50,9 @@ const AXIS_AUTH: usize = 14;
 const AXIS_SYNC: usize = 15;
 const AXIS_STATUS: usize = 16;
 const AXIS_OUTPUT_SCHEMA: usize = 17;
+const AXIS_MODEL_ARCTIC: usize = 18;
+const AXIS_MODEL_DRAGONKUE: usize = 19;
+const AXIS_MODEL_GTE: usize = 20;
 
 const MODEL_AB_CANDIDATES: [EvalModelCandidate; 3] = [
     EvalModelCandidate {
@@ -89,10 +93,8 @@ fn curated_search_quality_eval_gate_passes() {
         semantic_bm25.summary("semantic bm25-only")
     );
 
-    let source_vectors = eval_source_vectors();
-    let query_vectors_json =
-        eval_query_vectors_json(regression_cases.iter().chain(semantic_cases.iter()));
-    fixture.seed_eval_chunks(&source_vectors);
+    let default_model_vectors = eval_model_vectors(MODEL_AB_CANDIDATES[0]);
+    fixture.seed_eval_chunks(&default_model_vectors.source_vectors);
 
     let mut model_reports = Vec::new();
     let mut previous_fingerprint_hash = None;
@@ -102,20 +104,29 @@ fn curated_search_quality_eval_gate_passes() {
         if previous_fingerprint_hash.is_some() {
             assert_fingerprint_mismatch_falls_back_to_bm25(&fixture);
         }
-        let fingerprint_hash = fixture.replace_eval_embeddings(candidate, &source_vectors);
+        let model_vectors = eval_model_vectors(candidate);
+        let query_vectors_json = eval_query_vectors_json(
+            regression_cases.iter().chain(semantic_cases.iter()),
+            &model_vectors.query_vectors,
+        );
+        let fingerprint_hash = fixture.embed_eval_vectors(candidate, &model_vectors.source_vectors);
         if let Some(previous) = previous_fingerprint_hash.as_ref() {
             assert_ne!(
                 previous, &fingerprint_hash,
-                "model A/B must replace the active fingerprint when model id changes"
+                "model A/B must replace the active fingerprint through qgh embed --force when model id changes"
             );
             fingerprint_reembedding_checks += 1;
         }
         previous_fingerprint_hash = Some(fingerprint_hash.clone());
-        fixture.assert_active_eval_fingerprint(candidate, &fingerprint_hash, source_vectors.len());
+        fixture.assert_active_eval_fingerprint(
+            candidate,
+            &fingerprint_hash,
+            model_vectors.source_vectors.len(),
+        );
         assert_eq!(
-            fixture.materialize_eval_vector_table(),
-            source_vectors.len(),
-            "model A/B replacement must materialize every eval vector for the active fingerprint"
+            fixture.active_eval_vector_table_count(),
+            model_vectors.source_vectors.len(),
+            "qgh embed --force must materialize every eval vector for the active fingerprint"
         );
 
         let hybrid_regression = run_eval_cases(
@@ -150,6 +161,8 @@ fn curated_search_quality_eval_gate_passes() {
             semantic_hybrid,
         });
     }
+    assert_candidate_vectors_are_distinct();
+    assert_candidate_metrics_are_distinct(&model_reports);
     assert_eq!(MODEL_AB_CANDIDATES[0].model_id, DEFAULT_HF_MODEL_ID);
     assert_eq!(
         fingerprint_reembedding_checks,
@@ -202,6 +215,8 @@ fn curated_search_quality_eval_gate_passes() {
         "dragonkue/snowflake-arctic-embed-l-v2.0-ko",
         "Alibaba-NLP/gte-modernbert-base",
         "default model remains",
+        "candidate-specific deterministic source and query vectors",
+        "qgh embed --force --json",
         "fingerprint_reembedding_checks",
     ] {
         assert!(docs.contains(required), "missing docs phrase: {required}");
@@ -219,6 +234,11 @@ struct ModelEvalReport {
     fingerprint_hash: String,
     hybrid_regression: EvalReport,
     semantic_hybrid: EvalReport,
+}
+
+struct EvalModelVectors {
+    source_vectors: BTreeMap<&'static str, Vec<f32>>,
+    query_vectors: BTreeMap<&'static str, Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -918,6 +938,42 @@ fn model_ab_summary(
     lines.join("\n")
 }
 
+fn assert_candidate_vectors_are_distinct() {
+    let arctic = eval_model_vectors(MODEL_AB_CANDIDATES[0]);
+    let dragonkue = eval_model_vectors(MODEL_AB_CANDIDATES[1]);
+    let gte = eval_model_vectors(MODEL_AB_CANDIDATES[2]);
+    assert_ne!(
+        arctic.source_vectors, dragonkue.source_vectors,
+        "model A/B source vectors must be candidate-specific"
+    );
+    assert_ne!(
+        arctic.source_vectors, gte.source_vectors,
+        "model A/B source vectors must be candidate-specific"
+    );
+    assert_ne!(
+        arctic.query_vectors, gte.query_vectors,
+        "model A/B query vectors must be candidate-specific"
+    );
+}
+
+fn assert_candidate_metrics_are_distinct(model_reports: &[ModelEvalReport]) {
+    let metric_signatures = model_reports
+        .iter()
+        .map(|report| {
+            (
+                report.semantic_hybrid.class_rate(QueryClass::Semantic),
+                report.semantic_hybrid.class_rate(QueryClass::CrossLanguage),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        metric_signatures
+            .windows(2)
+            .any(|window| window[0] != window[1]),
+        "model A/B report must not collapse to structurally identical semantic/cross-language metrics: {metric_signatures:?}"
+    );
+}
+
 fn fingerprint_hash_prefix(hash: &str) -> &str {
     hash.get(..12).unwrap_or(hash)
 }
@@ -951,7 +1007,38 @@ fn combined_round_trip_rate(reports: &[&EvalReport]) -> f64 {
     hits as f64 / total as f64
 }
 
-fn eval_source_vectors() -> BTreeMap<&'static str, Vec<f32>> {
+fn eval_model_vectors(candidate: EvalModelCandidate) -> EvalModelVectors {
+    let mut source_vectors = eval_base_source_vectors();
+    let mut query_vectors = eval_base_query_vectors();
+    let model_axis = match candidate.name {
+        "arctic-embed-l-v2.0" => AXIS_MODEL_ARCTIC,
+        "dragonkue-ko" => AXIS_MODEL_DRAGONKUE,
+        "gte-modernbert-base" => {
+            query_vectors.insert(
+                "페이지 반복 때 변경된 이슈 누락 방지",
+                topic_vector(&[(AXIS_SCHEMA, 10.0)]),
+            );
+            query_vectors.insert(
+                "스키마 출력에 추가 필드를 금지해야 하나",
+                topic_vector(&[(AXIS_DIRECT_LOCATOR, 10.0)]),
+            );
+            query_vectors.insert(
+                "토큰을 설정 파일이나 로그에 저장하지 않는 규칙",
+                topic_vector(&[(AXIS_PAGINATION, 10.0)]),
+            );
+            AXIS_MODEL_GTE
+        }
+        other => panic!("missing eval vector fixture for model candidate {other}"),
+    };
+    add_model_axis(&mut source_vectors, model_axis);
+    add_model_axis(&mut query_vectors, model_axis);
+    EvalModelVectors {
+        source_vectors,
+        query_vectors,
+    }
+}
+
+fn eval_base_source_vectors() -> BTreeMap<&'static str, Vec<f32>> {
     [
         (
             "qgh://github.com/issue/I_EVAL_101",
@@ -1022,8 +1109,10 @@ fn eval_source_vectors() -> BTreeMap<&'static str, Vec<f32>> {
     .collect()
 }
 
-fn eval_query_vectors_json<'a>(cases: impl Iterator<Item = &'a EvalCase>) -> String {
-    let authored_query_vectors = eval_query_vectors();
+fn eval_query_vectors_json<'a>(
+    cases: impl Iterator<Item = &'a EvalCase>,
+    authored_query_vectors: &BTreeMap<&'static str, Vec<f32>>,
+) -> String {
     let mut query_vectors = BTreeMap::<&str, Vec<f32>>::new();
     for case in cases {
         if let Some(vector) = authored_query_vectors.get(case.query) {
@@ -1039,7 +1128,20 @@ fn eval_query_vectors_json<'a>(cases: impl Iterator<Item = &'a EvalCase>) -> Str
     serde_json::to_string(&query_vectors).unwrap()
 }
 
-fn eval_query_vectors() -> BTreeMap<&'static str, Vec<f32>> {
+fn eval_document_vectors_json(source_vectors: &BTreeMap<&'static str, Vec<f32>>) -> String {
+    let document_vectors = source_vectors
+        .iter()
+        .map(|(source_id, vector)| {
+            (
+                format!("eval embedding chunk for {source_id}"),
+                vector.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    serde_json::to_string(&document_vectors).unwrap()
+}
+
+fn eval_base_query_vectors() -> BTreeMap<&'static str, Vec<f32>> {
     [
         (
             "Release gate schema drift",
@@ -1218,6 +1320,12 @@ fn eval_query_vectors() -> BTreeMap<&'static str, Vec<f32>> {
     .collect()
 }
 
+fn add_model_axis(vectors: &mut BTreeMap<&'static str, Vec<f32>>, axis: usize) {
+    for vector in vectors.values_mut() {
+        vector[axis] = 0.05;
+    }
+}
+
 fn topic_vector(weighted_axes: &[(usize, f32)]) -> Vec<f32> {
     let mut vector = vec![0.0; EVAL_VECTOR_DIMENSION];
     for (axis, weight) in weighted_axes {
@@ -1235,14 +1343,6 @@ fn eval_embedding_fingerprint(model_id: &str) -> qgh::embedding::EmbeddingFinger
         query_prefix: DEFAULT_QUERY_PREFIX.to_string(),
     }
     .with_dimension(EVAL_VECTOR_DIMENSION)
-}
-
-fn embedding_vector_blob(vector: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
-    for value in vector {
-        bytes.extend_from_slice(&value.to_ne_bytes());
-    }
-    bytes
 }
 
 fn register_sqlite_vec_extension() {
@@ -1330,10 +1430,19 @@ query_prefix = "query: "
     }
 
     fn qgh(&self, args: &[&str]) -> Output {
-        self.qgh_with_query_vectors(args, None)
+        self.qgh_with_embedding_vectors(args, None, None)
     }
 
     fn qgh_with_query_vectors(&self, args: &[&str], query_vectors_json: Option<&str>) -> Output {
+        self.qgh_with_embedding_vectors(args, query_vectors_json, None)
+    }
+
+    fn qgh_with_embedding_vectors(
+        &self,
+        args: &[&str],
+        query_vectors_json: Option<&str>,
+        document_vectors_json: Option<&str>,
+    ) -> Output {
         let binary = std::env::var("CARGO_BIN_EXE_qgh").unwrap_or_else(|_| {
             let mut path = std::env::current_exe().unwrap();
             path.pop();
@@ -1354,6 +1463,9 @@ query_prefix = "query: "
             .args(args);
         if let Some(query_vectors_json) = query_vectors_json {
             cmd.env(TEST_EMBEDDING_QUERY_VECTORS_ENV, query_vectors_json);
+        }
+        if let Some(document_vectors_json) = document_vectors_json {
+            cmd.env(TEST_EMBEDDING_DOCUMENT_VECTORS_ENV, document_vectors_json);
         }
         cmd.output().unwrap()
     }
@@ -1391,60 +1503,27 @@ query_prefix = "query: "
         }
     }
 
-    fn replace_eval_embeddings(
+    fn embed_eval_vectors(
         &self,
         candidate: EvalModelCandidate,
         source_vectors: &BTreeMap<&'static str, Vec<f32>>,
     ) -> String {
-        let conn = Connection::open(self.db_path()).unwrap();
-        conn.execute("DELETE FROM chunk_embeddings", []).unwrap();
-        conn.execute("UPDATE embedding_fingerprints SET active = 0", [])
-            .unwrap();
         let fingerprint = eval_embedding_fingerprint(candidate.model_id);
         let fingerprint_hash = fingerprint.hash();
-        let fingerprint_json = serde_json::to_string(&fingerprint).unwrap();
-        conn.execute(
-            "INSERT INTO embedding_fingerprints
-                (fingerprint_hash, fingerprint_json, provider, model_id, model_revision,
-                 dimension, pooling, query_prefix, chunker_version, source_schema_version,
-                 created_at, active)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '2026-01-04T00:00:00Z', 1)",
-            params![
-                fingerprint_hash,
-                fingerprint_json,
-                fingerprint.provider,
-                fingerprint.model_id,
-                fingerprint.model_revision,
-                fingerprint.dimension as i64,
-                fingerprint.pooling.as_str(),
-                fingerprint.query_prefix,
-                fingerprint.chunker_version,
-                fingerprint.source_schema_version
-            ],
-        )
-        .unwrap();
-        let fingerprint_id = conn.last_insert_rowid();
-
-        for (source_id, vector) in source_vectors {
-            let chunk_id: i64 = conn
-                .query_row(
-                    "SELECT id FROM chunks WHERE source_id = ?1 ORDER BY id",
-                    [*source_id],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            conn.execute(
-                "INSERT INTO chunk_embeddings
-                    (chunk_id, fingerprint_id, vector_json, embedded_at)
-                 VALUES (?1, ?2, ?3, '2026-01-04T00:00:00Z')",
-                params![
-                    chunk_id,
-                    fingerprint_id,
-                    serde_json::to_string(vector).unwrap()
-                ],
-            )
-            .unwrap();
-        }
+        let document_vectors_json = eval_document_vectors_json(source_vectors);
+        let embed = self.qgh_with_embedding_vectors(
+            &["embed", "--force", "--json"],
+            None,
+            Some(&document_vectors_json),
+        );
+        assert_success(&embed);
+        let embed_json = stdout_json(&embed);
+        assert_eq!(embed_json["data"]["embedding_state"], "refreshed");
+        assert_eq!(
+            embed_json["data"]["chunks"]["embedded"],
+            source_vectors.len(),
+            "qgh embed --force must embed every candidate document vector"
+        );
         fingerprint_hash
     }
 
@@ -1487,52 +1566,15 @@ query_prefix = "query: "
         assert_eq!(active_embedding_count as usize, expected_embeddings);
     }
 
-    fn materialize_eval_vector_table(&self) -> usize {
+    fn active_eval_vector_table_count(&self) -> usize {
         register_sqlite_vec_extension();
         let conn = Connection::open(self.db_path()).unwrap();
-        conn.execute(
-            &format!("DROP TABLE IF EXISTS {CHUNK_EMBEDDING_VECTORS_TABLE}"),
+        conn.query_row(
+            &format!("SELECT count(*) FROM {CHUNK_EMBEDDING_VECTORS_TABLE}"),
             [],
+            |row| row.get::<_, i64>(0),
         )
-        .unwrap();
-        conn.execute(
-            &format!(
-                "CREATE VIRTUAL TABLE {CHUNK_EMBEDDING_VECTORS_TABLE}
-                 USING vec0(embedding float[{EVAL_VECTOR_DIMENSION}])"
-            ),
-            [],
-        )
-        .unwrap();
-        let rows = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT ce.chunk_id, ce.vector_json
-                     FROM chunk_embeddings ce
-                     JOIN embedding_fingerprints ef ON ef.id = ce.fingerprint_id
-                     WHERE ef.active = 1
-                     ORDER BY ce.chunk_id",
-                )
-                .unwrap();
-            stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-        };
-        let row_count = rows.len();
-        for (chunk_id, vector_json) in rows {
-            let vector: Vec<f32> = serde_json::from_str(&vector_json).unwrap();
-            conn.execute(
-                &format!(
-                    "INSERT INTO {CHUNK_EMBEDDING_VECTORS_TABLE}(rowid, embedding)
-                     VALUES (?1, ?2)"
-                ),
-                params![chunk_id, embedding_vector_blob(&vector)],
-            )
-            .unwrap();
-        }
-        row_count
+        .unwrap() as usize
     }
 
     fn db_path(&self) -> PathBuf {

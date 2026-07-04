@@ -83,15 +83,17 @@ Current synthetic fixture result:
 ## H4b Model A/B Report
 
 `model_ab_report` is report-only. All rows use the same
-`search-quality-eval` fixture, same H4a protocol, same authored source
-vectors, and same authored query vectors. The default model remains
+`search-quality-eval` fixture and same H4a protocol. Each candidate uses
+candidate-specific deterministic source and query vectors so the harness
+compares model behavior without live model downloads. The default model remains
 `Snowflake/snowflake-arctic-embed-l-v2.0`; changing it still requires a
 PRD/ADR-backed human decision.
 
 The A/B path switches configured model fingerprints before each
 non-default candidate, verifies `embedding.fingerprint_mismatch` keeps
-BM25 fallback active, then replaces the active fingerprint and
-embeddings before rerunning the same hybrid eval.
+BM25 fallback active, then runs `qgh embed --force --json` through the
+debug test embedding provider to replace the active fingerprint and
+document embeddings before rerunning the same hybrid eval.
 
 Current deterministic fixture result:
 
@@ -99,12 +101,14 @@ Current deterministic fixture result:
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | arctic-embed-l-v2.0 | `Snowflake/snowflake-arctic-embed-l-v2.0` | 15/15 | 1.00 | 0.08 | 1.00 | 0.50 | `[]` |
 | dragonkue-ko | `dragonkue/snowflake-arctic-embed-l-v2.0-ko` | 15/15 | 1.00 | 0.08 | 1.00 | 0.50 | `[]` |
-| gte-modernbert-base | `Alibaba-NLP/gte-modernbert-base` | 15/15 | 1.00 | 0.08 | 1.00 | 0.50 | `[]` |
+| gte-modernbert-base | `Alibaba-NLP/gte-modernbert-base` | 15/15 | 1.00 | 0.08 | 0.75 | 0.25 | `[]` |
 
 Additional checks:
 
 ```json
 {
+  "candidate_specific_vectors": true,
+  "reembedding_route": "qgh embed --force --json",
   "fingerprint_reembedding_checks": "2/2",
   "hard_filter_violations": 0,
   "combined_get_round_trip": 1.0,
