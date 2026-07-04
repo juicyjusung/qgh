@@ -68,6 +68,7 @@ fn curated_search_quality_eval_gate_passes() {
         eval_query_vectors_json(regression_cases.iter().chain(semantic_eval_cases().iter()));
     fixture.write_config_with_embedding(&server.base_url);
     fixture.seed_eval_embeddings(&source_vectors);
+    fixture.materialize_eval_vector_table();
     let hybrid_regression = run_eval_cases(
         &fixture,
         EvalMode::Hybrid,

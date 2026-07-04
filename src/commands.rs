@@ -2396,15 +2396,27 @@ impl HybridAccumulator {
     }
 
     fn into_query_hit(self) -> QueryHit {
-        let rrf_rank_score = self.rrf_score();
-        QueryHit {
-            source_id: self.source_id,
-            ranking: Ranking::Hybrid {
+        // A candidate only carries genuine hybrid evidence when it actually
+        // received a vector contribution. Fusion still runs whenever the
+        // hybrid path is eligible (config + coverage), even for a query
+        // where the vector search legitimately returns zero hits (e.g. no
+        // sqlite-vec table yet) — those candidates are BM25-only in
+        // substance and must not report ranking.kind = hybrid, or eval/A-B
+        // evidence cannot distinguish real fusion from a BM25 fallback.
+        let ranking = if self.vector_rank.is_some() {
+            let rrf_rank_score = self.rrf_score();
+            Ranking::Hybrid {
                 lexical_score: self.bm25_score,
                 vector_distance: self.vector_distance,
                 rrf_rank_score,
                 final_order_score: rrf_rank_score,
-            },
+            }
+        } else {
+            Ranking::Bm25(self.bm25_score.unwrap_or(0.0))
+        };
+        QueryHit {
+            source_id: self.source_id,
+            ranking,
         }
     }
 }
