@@ -1,8 +1,14 @@
+use qgh::embedding::{
+    EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_HF_MODEL_REVISION,
+    DEFAULT_QUERY_PREFIX,
+};
+use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::{
@@ -18,6 +24,29 @@ const LABELING_RULE: &str =
 const AMBIGUOUS_EXCLUSION_RULE: &str =
     "Exclude ambiguous queries when more than one active source is a plausible gold answer.";
 const WIKI_EXCLUDED_REASON: &str = "Wiki is post-MVP and excluded from the MVP eval fixture.";
+const TEST_EMBEDDING_QUERY_VECTORS_ENV: &str = "QGH_TEST_EMBEDDING_QUERY_VECTORS";
+const CHUNK_EMBEDDING_VECTORS_TABLE: &str = "chunk_embedding_vectors";
+const EVAL_VECTOR_DIMENSION: usize = 32;
+const SEMANTIC_TOP5_TARGET: f64 = 0.70;
+const CROSS_LANGUAGE_TOP5_TARGET: f64 = 0.60;
+const AXIS_PAGINATION: usize = 0;
+const AXIS_RATE_LIMIT: usize = 1;
+const AXIS_SCHEMA: usize = 2;
+const AXIS_TOKEN_PRIVACY: usize = 3;
+const AXIS_DIRECT_LOCATOR: usize = 4;
+const AXIS_OAUTH_LOGIN: usize = 5;
+const AXIS_INDEX_REBUILD: usize = 6;
+const AXIS_CALLBACK: usize = 7;
+const AXIS_DEPLOY_ROLLBACK: usize = 8;
+const AXIS_CACHE_REPLAY: usize = 9;
+const AXIS_PUBLISH_RACE: usize = 10;
+const AXIS_PREVIOUS_INDEX: usize = 11;
+const AXIS_NO_HOSTED_VECTOR: usize = 12;
+const AXIS_KOREAN: usize = 13;
+const AXIS_AUTH: usize = 14;
+const AXIS_SYNC: usize = 15;
+const AXIS_STATUS: usize = 16;
+const AXIS_OUTPUT_SCHEMA: usize = 17;
 
 #[test]
 fn curated_search_quality_eval_gate_passes() {
@@ -26,61 +55,65 @@ fn curated_search_quality_eval_gate_passes() {
     fixture.write_config(&server.base_url);
     assert_success(&fixture.qgh(&["sync", "--json"]));
 
-    let mut report = EvalReport::default();
-    for case in eval_cases() {
-        assert!(!case.labeler.is_empty());
-        assert!(!case.labeling_rule.is_empty());
-        assert!(!case.ambiguous_exclusion_rule.is_empty());
+    let regression_cases = bm25_regression_cases();
+    let bm25_regression = run_eval_cases(&fixture, EvalMode::Bm25Only, &regression_cases, None);
+    assert!(
+        bm25_regression.meets_bm25_regression_targets() && bm25_regression.meets_hard_gates(),
+        "{}",
+        bm25_regression.summary("bm25 regression")
+    );
 
-        let query = fixture.qgh(&["query", case.query, "--limit", "5", "--json"]);
-        assert_success(&query);
-        let query_json = stdout_json(&query);
-        let results = query_json["data"]["results"].as_array().unwrap();
+    let source_vectors = eval_source_vectors();
+    let query_vectors_json =
+        eval_query_vectors_json(regression_cases.iter().chain(semantic_eval_cases().iter()));
+    fixture.write_config_with_embedding(&server.base_url);
+    fixture.seed_eval_embeddings(&source_vectors);
+    fixture.materialize_eval_vector_table();
+    let hybrid_regression = run_eval_cases(
+        &fixture,
+        EvalMode::Hybrid,
+        &regression_cases,
+        Some(&query_vectors_json),
+    );
+    assert!(
+        hybrid_regression.meets_bm25_regression_targets()
+            && hybrid_regression.meets_hard_gates()
+            && hybrid_regression.meets_hybrid_path_gate(),
+        "{}",
+        hybrid_regression.summary("hybrid regression")
+    );
 
-        let passed = match case.class {
-            QueryClass::Exact => results
-                .first()
-                .and_then(|result| result["source_id"].as_str())
-                .is_some_and(|source_id| case.gold_source_ids.contains(&source_id)),
-            QueryClass::Keyword | QueryClass::CjkMixed => results
-                .iter()
-                .take(5)
-                .filter_map(|result| result["source_id"].as_str())
-                .any(|source_id| case.gold_source_ids.contains(&source_id)),
-            QueryClass::Negative => results.is_empty(),
-        };
-        report.record_case(case.class, passed);
-        if !passed {
-            report.top_failures.push(format!(
-                "{} ({:?}) query `{}` returned {:?}, expected {:?}",
-                case.name,
-                case.class,
-                case.query,
-                results
-                    .iter()
-                    .take(5)
-                    .filter_map(|result| result["source_id"].as_str())
-                    .collect::<Vec<_>>(),
-                case.gold_source_ids
-            ));
-        }
+    let semantic_cases = semantic_eval_cases();
+    fixture.write_config(&server.base_url);
+    let semantic_bm25 = run_eval_cases(&fixture, EvalMode::Bm25Only, &semantic_cases, None);
+    assert!(
+        semantic_bm25.meets_hard_gates(),
+        "{}",
+        semantic_bm25.summary("semantic bm25-only")
+    );
 
-        for result in results.iter().take(5) {
-            let source_id = result["source_id"].as_str().unwrap();
-            assert_eq!(result["get_args"]["source_id"], source_id);
-            let get = fixture.qgh(&["get", source_id, "--json"]);
-            let get_ok = get.status.success()
-                && stdout_json(&get)["data"]["source"]["source_id"] == source_id;
-            report.record_round_trip(get_ok);
-            if !get_ok {
-                report
-                    .top_failures
-                    .push(format!("get round-trip failed for {source_id}"));
-            }
-        }
-    }
-
-    assert!(report.meets_targets(), "{}", report.summary());
+    fixture.write_config_with_embedding(&server.base_url);
+    fixture.materialize_eval_vector_table();
+    let semantic_hybrid = run_eval_cases(
+        &fixture,
+        EvalMode::Hybrid,
+        &semantic_cases,
+        Some(&query_vectors_json),
+    );
+    assert!(
+        semantic_hybrid.meets_hard_gates() && semantic_hybrid.meets_hybrid_path_gate(),
+        "{}",
+        semantic_hybrid.summary("semantic hybrid")
+    );
+    eprintln!(
+        "{}",
+        ab_summary(
+            &bm25_regression,
+            &hybrid_regression,
+            &semantic_bm25,
+            &semantic_hybrid,
+        )
+    );
     assert_eq!(
         WIKI_EXCLUDED_REASON,
         "Wiki is post-MVP and excluded from the MVP eval fixture."
@@ -97,6 +130,10 @@ fn curated_search_quality_eval_gate_passes() {
         "Gold source_id",
         "ambiguous",
         "recalibration_requires_prd_adr_update",
+        "BM25-only vs hybrid",
+        "semantic/paraphrase",
+        "cross-language",
+        "section_8_3_triggers",
     ] {
         assert!(docs.contains(required), "missing docs phrase: {required}");
     }
@@ -107,7 +144,24 @@ enum QueryClass {
     Exact,
     Keyword,
     CjkMixed,
+    Semantic,
+    CrossLanguage,
     Negative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalMode {
+    Bm25Only,
+    Hybrid,
+}
+
+impl EvalMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            EvalMode::Bm25Only => "bm25-only",
+            EvalMode::Hybrid => "hybrid",
+        }
+    }
 }
 
 struct EvalCase {
@@ -120,7 +174,7 @@ struct EvalCase {
     ambiguous_exclusion_rule: &'static str,
 }
 
-fn eval_cases() -> Vec<EvalCase> {
+fn bm25_regression_cases() -> Vec<EvalCase> {
     vec![
         exact(
             "issue number 101",
@@ -225,6 +279,111 @@ fn eval_cases() -> Vec<EvalCase> {
     ]
 }
 
+fn semantic_eval_cases() -> Vec<EvalCase> {
+    vec![
+        semantic(
+            "paraphrase pagination duplicates",
+            "sync misses changed issues when pages repeat",
+            &["qgh://github.com/issue/I_EVAL_101"],
+        ),
+        semantic(
+            "natural rollback recovery",
+            "how should workers recover after a bad blue deployment",
+            &["qgh://github.com/issue-comment/IC_EVAL_201"],
+        ),
+        semantic(
+            "natural throttling status",
+            "where is secondary API throttling surfaced during local search",
+            &["qgh://github.com/issue/I_EVAL_102"],
+        ),
+        semantic(
+            "symptom schema extra fields",
+            "why did JSON output reject an extra envelope field",
+            &["qgh://github.com/issue/I_EVAL_103"],
+        ),
+        semantic(
+            "privacy token persistence",
+            "what prevents saved secrets from leaking in logs",
+            &["qgh://github.com/issue/I_EVAL_104"],
+        ),
+        semantic(
+            "cause direct locator",
+            "why should issue number lookup avoid ambiguous text ranking",
+            &["qgh://github.com/issue/I_EVAL_105"],
+        ),
+        semantic(
+            "symptom login failure",
+            "why did login fail after the OAuth flow",
+            &["qgh://github.com/issue/I_EVAL_106"],
+        ),
+        semantic(
+            "index rebuild continuity",
+            "how are Korean search results preserved during an index rebuild",
+            &["qgh://github.com/issue/I_EVAL_107"],
+        ),
+        semantic(
+            "mixed callback analysis",
+            "which callback failure mixes Korean and English auth text",
+            &["qgh://github.com/issue/I_EVAL_108"],
+        ),
+        semantic(
+            "cache replay workaround",
+            "what fixes dirty index task replay after shard mapping changes",
+            &["qgh://github.com/issue-comment/IC_EVAL_202"],
+        ),
+        semantic(
+            "publish race reproduction",
+            "which note explains stale generation after a publish race",
+            &["qgh://github.com/issue-comment/IC_EVAL_203"],
+        ),
+        semantic(
+            "operator previous index",
+            "which handoff says to keep using the previous index generation",
+            &["qgh://github.com/issue-comment/IC_EVAL_204"],
+        ),
+        cross_language(
+            "ko to en pagination",
+            "페이지 반복 때 변경된 이슈 누락 방지",
+            &["qgh://github.com/issue/I_EVAL_101"],
+        ),
+        cross_language(
+            "ko to en rate limit",
+            "보조 rate limit 대기 상태는 어디에 보이나",
+            &["qgh://github.com/issue/I_EVAL_102"],
+        ),
+        cross_language(
+            "ko to en schema",
+            "스키마 출력에 추가 필드를 금지해야 하나",
+            &["qgh://github.com/issue/I_EVAL_103"],
+        ),
+        cross_language(
+            "ko to en token",
+            "토큰을 설정 파일이나 로그에 저장하지 않는 규칙",
+            &["qgh://github.com/issue/I_EVAL_104"],
+        ),
+        cross_language(
+            "en to ko rebuild",
+            "Korean comments disappear during index rebuild",
+            &["qgh://github.com/issue/I_EVAL_107"],
+        ),
+        cross_language(
+            "en to ko login cause",
+            "OAuth token refresh missing causes login failure",
+            &["qgh://github.com/issue/I_EVAL_106"],
+        ),
+        cross_language(
+            "en to ko deploy error",
+            "deployment error without hosted vector provider",
+            &["qgh://github.com/issue-comment/IC_EVAL_205"],
+        ),
+        cross_language(
+            "en to ko callback",
+            "Korean callback failure analysis",
+            &["qgh://github.com/issue/I_EVAL_108"],
+        ),
+    ]
+}
+
 fn exact(
     name: &'static str,
     query: &'static str,
@@ -247,6 +406,22 @@ fn cjk(
     gold_source_ids: &'static [&'static str],
 ) -> EvalCase {
     eval_case(name, QueryClass::CjkMixed, query, gold_source_ids)
+}
+
+fn semantic(
+    name: &'static str,
+    query: &'static str,
+    gold_source_ids: &'static [&'static str],
+) -> EvalCase {
+    eval_case(name, QueryClass::Semantic, query, gold_source_ids)
+}
+
+fn cross_language(
+    name: &'static str,
+    query: &'static str,
+    gold_source_ids: &'static [&'static str],
+) -> EvalCase {
+    eval_case(name, QueryClass::CrossLanguage, query, gold_source_ids)
 }
 
 fn negative(name: &'static str, query: &'static str) -> EvalCase {
@@ -276,6 +451,10 @@ struct EvalReport {
     class_hits: BTreeMap<QueryClass, usize>,
     round_trip_total: usize,
     round_trip_hits: usize,
+    hard_filter_violations: usize,
+    hybrid_ranked_results: usize,
+    hybrid_path_query_total: usize,
+    hybrid_path_query_hits: usize,
     top_failures: Vec<String>,
 }
 
@@ -287,6 +466,22 @@ impl EvalReport {
         }
     }
 
+    fn record_hard_filter_violation(&mut self, message: String) {
+        self.hard_filter_violations += 1;
+        self.top_failures.push(message);
+    }
+
+    fn record_hybrid_result(&mut self) {
+        self.hybrid_ranked_results += 1;
+    }
+
+    fn record_hybrid_path_query(&mut self, passed: bool) {
+        self.hybrid_path_query_total += 1;
+        if passed {
+            self.hybrid_path_query_hits += 1;
+        }
+    }
+
     fn record_round_trip(&mut self, passed: bool) {
         self.round_trip_total += 1;
         if passed {
@@ -294,23 +489,39 @@ impl EvalReport {
         }
     }
 
-    fn meets_targets(&self) -> bool {
+    fn meets_bm25_regression_targets(&self) -> bool {
         self.class_rate(QueryClass::Exact) >= 0.95
             && self.class_rate(QueryClass::Keyword) >= 0.80
             && self.class_rate(QueryClass::CjkMixed) >= 0.70
             && self.class_rate(QueryClass::Negative) >= 0.80
-            && self.round_trip_rate() >= 1.0
     }
 
-    fn summary(&self) -> String {
+    fn meets_hard_gates(&self) -> bool {
+        self.hard_filter_violations == 0 && self.round_trip_rate() >= 1.0
+    }
+
+    fn meets_hybrid_path_gate(&self) -> bool {
+        self.hybrid_path_query_total > 0
+            && self.hybrid_path_query_hits == self.hybrid_path_query_total
+    }
+
+    fn summary(&self, name: &str) -> String {
         format!(
-            "search quality eval failed\nexact_top1={:.2}\nkeyword_top5={:.2}\ncjk_top5={:.2}\nnegative_abstention={:.2}\nget_round_trip={:.2}\nrecalibration_requires_prd_adr_update={}\ntop_failures={:#?}",
+            "{name} search quality eval failed\nexact_top1={:.2}\nkeyword_top5={:.2}\ncjk_top5={:.2}\nsemantic_top5={:.2}\ncross_language_top5={:.2}\nnegative_abstention={:.2}\nhard_filter_violations={}\nget_round_trip={:.2}\nhybrid_ranked_results={}\nhybrid_path_queries={}/{}\nrecalibration_requires_prd_adr_update={}\ntop_failures={:#?}",
             self.class_rate(QueryClass::Exact),
             self.class_rate(QueryClass::Keyword),
             self.class_rate(QueryClass::CjkMixed),
+            self.class_rate(QueryClass::Semantic),
+            self.class_rate(QueryClass::CrossLanguage),
             self.class_rate(QueryClass::Negative),
+            self.hard_filter_violations,
             self.round_trip_rate(),
-            !self.meets_targets(),
+            self.hybrid_ranked_results,
+            self.hybrid_path_query_hits,
+            self.hybrid_path_query_total,
+            !self.meets_bm25_regression_targets()
+                || !self.meets_hard_gates()
+                || (self.hybrid_path_query_total > 0 && !self.meets_hybrid_path_gate()),
             self.top_failures
         )
     }
@@ -329,6 +540,534 @@ impl EvalReport {
         }
         self.round_trip_hits as f64 / self.round_trip_total as f64
     }
+}
+
+fn run_eval_cases(
+    fixture: &EvalFixture,
+    mode: EvalMode,
+    cases: &[EvalCase],
+    query_vectors_json: Option<&str>,
+) -> EvalReport {
+    let mut report = EvalReport::default();
+    for case in cases {
+        assert!(!case.labeler.is_empty());
+        assert!(!case.labeling_rule.is_empty());
+        assert!(!case.ambiguous_exclusion_rule.is_empty());
+
+        let query = fixture.qgh_with_query_vectors(
+            &["query", case.query, "--limit", "5", "--json"],
+            query_vectors_json,
+        );
+        assert_success(&query);
+        let query_json = stdout_json(&query);
+        let results = query_json["data"]["results"].as_array().unwrap();
+
+        let passed = case_passed(case, results);
+        report.record_case(case.class, passed);
+        if !passed {
+            report.top_failures.push(format!(
+                "{} {} ({:?}) query `{}` returned {:?}, expected {:?}",
+                mode.as_str(),
+                case.name,
+                case.class,
+                case.query,
+                results
+                    .iter()
+                    .take(5)
+                    .filter_map(|result| result["source_id"].as_str())
+                    .collect::<Vec<_>>(),
+                case.gold_source_ids
+            ));
+        }
+
+        let hybrid_ranked_results_before = report.hybrid_ranked_results;
+        for result in results.iter().take(5) {
+            if result["ranking"]["kind"] == "hybrid" {
+                report.record_hybrid_result();
+            }
+            if let Some(message) = hard_filter_violation(result) {
+                report.record_hard_filter_violation(format!(
+                    "{} query `{}` hard filter violation: {message}",
+                    mode.as_str(),
+                    case.query
+                ));
+            }
+            let source_id = result["source_id"].as_str().unwrap();
+            assert_eq!(result["get_args"]["source_id"], source_id);
+            let get = fixture.qgh(&["get", source_id, "--json"]);
+            let get_ok = get.status.success()
+                && stdout_json(&get)["data"]["source"]["source_id"] == source_id;
+            report.record_round_trip(get_ok);
+            if !get_ok {
+                report.top_failures.push(format!(
+                    "{} get round-trip failed for {source_id}",
+                    mode.as_str()
+                ));
+            }
+        }
+        if mode == EvalMode::Hybrid && case.requires_hybrid_path() {
+            let passed = report.hybrid_ranked_results > hybrid_ranked_results_before;
+            report.record_hybrid_path_query(passed);
+            if !passed {
+                report.top_failures.push(format!(
+                    "{} {} ({:?}) query `{}` did not return a hybrid-ranked result",
+                    mode.as_str(),
+                    case.name,
+                    case.class,
+                    case.query
+                ));
+            }
+        }
+    }
+    report
+}
+
+impl EvalCase {
+    fn requires_hybrid_path(&self) -> bool {
+        match self.class {
+            QueryClass::Negative => false,
+            QueryClass::Exact => !is_exact_locator_query(self.query),
+            QueryClass::Keyword
+            | QueryClass::CjkMixed
+            | QueryClass::Semantic
+            | QueryClass::CrossLanguage => true,
+        }
+    }
+}
+
+fn is_exact_locator_query(query: &str) -> bool {
+    query.starts_with("https://github.com/")
+        || query
+            .strip_prefix('#')
+            .unwrap_or(query)
+            .parse::<i64>()
+            .is_ok()
+}
+
+fn case_passed(case: &EvalCase, results: &[Value]) -> bool {
+    match case.class {
+        QueryClass::Exact => results
+            .first()
+            .and_then(|result| result["source_id"].as_str())
+            .is_some_and(|source_id| case.gold_source_ids.contains(&source_id)),
+        QueryClass::Keyword
+        | QueryClass::CjkMixed
+        | QueryClass::Semantic
+        | QueryClass::CrossLanguage => results
+            .iter()
+            .take(5)
+            .filter_map(|result| result["source_id"].as_str())
+            .any(|source_id| case.gold_source_ids.contains(&source_id)),
+        QueryClass::Negative => results.is_empty(),
+    }
+}
+
+fn hard_filter_violation(result: &Value) -> Option<String> {
+    let Some(repo) = result["repo"].as_str() else {
+        return Some("repo=<missing>".to_string());
+    };
+    if repo != "owner/repo" {
+        return Some(format!("repo={repo}"));
+    }
+    let Some(entity_type) = result["entity_type"].as_str() else {
+        return Some("entity_type=<missing>".to_string());
+    };
+    if !matches!(entity_type, "issue" | "issue_comment") {
+        return Some(format!("entity_type={entity_type}"));
+    }
+    let Some(source_id) = result["source_id"].as_str() else {
+        return Some("source_id=<missing>".to_string());
+    };
+    if !(source_id.starts_with("qgh://github.com/issue/I_EVAL_")
+        || source_id.starts_with("qgh://github.com/issue-comment/IC_EVAL_"))
+    {
+        return Some(format!("source_id={source_id}"));
+    }
+    None
+}
+
+fn ab_summary(
+    bm25_regression: &EvalReport,
+    hybrid_regression: &EvalReport,
+    semantic_bm25: &EvalReport,
+    semantic_hybrid: &EvalReport,
+) -> String {
+    let semantic_hybrid_rate = semantic_hybrid.class_rate(QueryClass::Semantic);
+    let cross_language_hybrid_rate = semantic_hybrid.class_rate(QueryClass::CrossLanguage);
+    let section_8_3_triggers =
+        section_8_3_triggers(semantic_hybrid_rate, cross_language_hybrid_rate);
+    format!(
+        "search_quality_eval_ab_report\nbm25_regression_exact_top1={:.2}\nbm25_regression_keyword_top5={:.2}\nbm25_regression_cjk_top5={:.2}\nbm25_regression_negative_abstention={:.2}\nhybrid_regression_exact_top1={:.2}\nhybrid_regression_keyword_top5={:.2}\nhybrid_regression_cjk_top5={:.2}\nhybrid_regression_negative_abstention={:.2}\nhybrid_regression_path_queries={}/{}\nsemantic_bm25_top5={:.2}\nsemantic_hybrid_top5={:.2}\nsemantic_hybrid_delta={:.2}\nsemantic_hybrid_target={:.2}\nsemantic_hybrid_path_queries={}/{}\ncross_language_bm25_top5={:.2}\ncross_language_hybrid_top5={:.2}\ncross_language_hybrid_delta={:.2}\ncross_language_hybrid_target={:.2}\nhard_filter_violations={}\nget_round_trip={:.2}\nsection_8_3_triggers={:?}",
+        bm25_regression.class_rate(QueryClass::Exact),
+        bm25_regression.class_rate(QueryClass::Keyword),
+        bm25_regression.class_rate(QueryClass::CjkMixed),
+        bm25_regression.class_rate(QueryClass::Negative),
+        hybrid_regression.class_rate(QueryClass::Exact),
+        hybrid_regression.class_rate(QueryClass::Keyword),
+        hybrid_regression.class_rate(QueryClass::CjkMixed),
+        hybrid_regression.class_rate(QueryClass::Negative),
+        hybrid_regression.hybrid_path_query_hits,
+        hybrid_regression.hybrid_path_query_total,
+        semantic_bm25.class_rate(QueryClass::Semantic),
+        semantic_hybrid_rate,
+        semantic_hybrid_rate - semantic_bm25.class_rate(QueryClass::Semantic),
+        SEMANTIC_TOP5_TARGET,
+        semantic_hybrid.hybrid_path_query_hits,
+        semantic_hybrid.hybrid_path_query_total,
+        semantic_bm25.class_rate(QueryClass::CrossLanguage),
+        cross_language_hybrid_rate,
+        cross_language_hybrid_rate - semantic_bm25.class_rate(QueryClass::CrossLanguage),
+        CROSS_LANGUAGE_TOP5_TARGET,
+        bm25_regression.hard_filter_violations
+            + hybrid_regression.hard_filter_violations
+            + semantic_bm25.hard_filter_violations
+            + semantic_hybrid.hard_filter_violations,
+        combined_round_trip_rate([
+            bm25_regression,
+            hybrid_regression,
+            semantic_bm25,
+            semantic_hybrid,
+        ]),
+        section_8_3_triggers
+    )
+}
+
+fn section_8_3_triggers(
+    semantic_hybrid_rate: f64,
+    cross_language_hybrid_rate: f64,
+) -> Vec<&'static str> {
+    let mut triggers = Vec::new();
+    if semantic_hybrid_rate < SEMANTIC_TOP5_TARGET {
+        triggers.push("semantic_rerank_review");
+    }
+    if cross_language_hybrid_rate < CROSS_LANGUAGE_TOP5_TARGET {
+        triggers.push("cross_language_rerank_review");
+    }
+    triggers
+}
+
+fn combined_round_trip_rate(reports: [&EvalReport; 4]) -> f64 {
+    let total = reports
+        .iter()
+        .map(|report| report.round_trip_total)
+        .sum::<usize>();
+    if total == 0 {
+        return 1.0;
+    }
+    let hits = reports
+        .iter()
+        .map(|report| report.round_trip_hits)
+        .sum::<usize>();
+    hits as f64 / total as f64
+}
+
+fn eval_source_vectors() -> BTreeMap<&'static str, Vec<f32>> {
+    [
+        (
+            "qgh://github.com/issue/I_EVAL_101",
+            topic_vector(&[(AXIS_PAGINATION, 1.0), (AXIS_SYNC, 0.7)]),
+        ),
+        (
+            "qgh://github.com/issue/I_EVAL_102",
+            topic_vector(&[(AXIS_RATE_LIMIT, 1.0), (AXIS_SYNC, 0.5), (AXIS_STATUS, 0.8)]),
+        ),
+        (
+            "qgh://github.com/issue/I_EVAL_103",
+            topic_vector(&[(AXIS_SCHEMA, 1.0), (AXIS_OUTPUT_SCHEMA, 0.9)]),
+        ),
+        (
+            "qgh://github.com/issue/I_EVAL_104",
+            topic_vector(&[(AXIS_TOKEN_PRIVACY, 1.0)]),
+        ),
+        (
+            "qgh://github.com/issue/I_EVAL_105",
+            topic_vector(&[(AXIS_DIRECT_LOCATOR, 1.0)]),
+        ),
+        (
+            "qgh://github.com/issue/I_EVAL_106",
+            topic_vector(&[
+                (AXIS_OAUTH_LOGIN, 1.0),
+                (AXIS_AUTH, 0.8),
+                (AXIS_KOREAN, 0.5),
+            ]),
+        ),
+        (
+            "qgh://github.com/issue/I_EVAL_107",
+            topic_vector(&[(AXIS_INDEX_REBUILD, 1.0), (AXIS_KOREAN, 0.8)]),
+        ),
+        (
+            "qgh://github.com/issue/I_EVAL_108",
+            topic_vector(&[(AXIS_CALLBACK, 1.0), (AXIS_AUTH, 0.7), (AXIS_KOREAN, 0.7)]),
+        ),
+        (
+            "qgh://github.com/issue-comment/IC_EVAL_201",
+            topic_vector(&[
+                (AXIS_DEPLOY_ROLLBACK, 1.0),
+                (AXIS_SYNC, 0.4),
+                (AXIS_PREVIOUS_INDEX, 0.3),
+            ]),
+        ),
+        (
+            "qgh://github.com/issue-comment/IC_EVAL_202",
+            topic_vector(&[(AXIS_CACHE_REPLAY, 1.0), (AXIS_INDEX_REBUILD, 0.5)]),
+        ),
+        (
+            "qgh://github.com/issue-comment/IC_EVAL_203",
+            topic_vector(&[(AXIS_PUBLISH_RACE, 1.0), (AXIS_INDEX_REBUILD, 0.4)]),
+        ),
+        (
+            "qgh://github.com/issue-comment/IC_EVAL_204",
+            topic_vector(&[(AXIS_PREVIOUS_INDEX, 1.0), (AXIS_INDEX_REBUILD, 0.8)]),
+        ),
+        (
+            "qgh://github.com/issue-comment/IC_EVAL_205",
+            topic_vector(&[
+                (AXIS_NO_HOSTED_VECTOR, 1.0),
+                (AXIS_KOREAN, 0.7),
+                (AXIS_DEPLOY_ROLLBACK, 0.3),
+            ]),
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn eval_query_vectors_json<'a>(cases: impl Iterator<Item = &'a EvalCase>) -> String {
+    let authored_query_vectors = eval_query_vectors();
+    let mut query_vectors = BTreeMap::<&str, Vec<f32>>::new();
+    for case in cases {
+        if let Some(vector) = authored_query_vectors.get(case.query) {
+            query_vectors.insert(case.query, vector.clone());
+        } else {
+            assert!(
+                !case.requires_hybrid_path(),
+                "missing deterministic eval query vector for `{}`",
+                case.query
+            );
+        }
+    }
+    serde_json::to_string(&query_vectors).unwrap()
+}
+
+fn eval_query_vectors() -> BTreeMap<&'static str, Vec<f32>> {
+    [
+        (
+            "Release gate schema drift",
+            topic_vector(&[(AXIS_SCHEMA, 1.0), (AXIS_OUTPUT_SCHEMA, 0.9)]),
+        ),
+        (
+            "Token source env fallback",
+            topic_vector(&[(AXIS_TOKEN_PRIVACY, 1.0)]),
+        ),
+        (
+            "pagination cursor duplicate etag",
+            topic_vector(&[(AXIS_PAGINATION, 1.0), (AXIS_SYNC, 0.7)]),
+        ),
+        (
+            "retry-after secondary rate limit backoff",
+            topic_vector(&[(AXIS_RATE_LIMIT, 1.0), (AXIS_SYNC, 0.5), (AXIS_STATUS, 0.8)]),
+        ),
+        (
+            "schema envelope validation strict additionalProperties",
+            topic_vector(&[(AXIS_SCHEMA, 1.0), (AXIS_OUTPUT_SCHEMA, 0.9)]),
+        ),
+        (
+            "env token source reference",
+            topic_vector(&[(AXIS_TOKEN_PRIVACY, 1.0)]),
+        ),
+        (
+            "blue deploy rollback playbook",
+            topic_vector(&[
+                (AXIS_DEPLOY_ROLLBACK, 1.0),
+                (AXIS_SYNC, 0.4),
+                (AXIS_PREVIOUS_INDEX, 0.3),
+            ]),
+        ),
+        (
+            "cache invalidation workaround shard map",
+            topic_vector(&[(AXIS_CACHE_REPLAY, 1.0), (AXIS_INDEX_REBUILD, 0.5)]),
+        ),
+        (
+            "race condition reproduction clock skew",
+            topic_vector(&[(AXIS_PUBLISH_RACE, 1.0), (AXIS_INDEX_REBUILD, 0.4)]),
+        ),
+        (
+            "operator handoff note stale generation",
+            topic_vector(&[(AXIS_PREVIOUS_INDEX, 1.0), (AXIS_INDEX_REBUILD, 0.8)]),
+        ),
+        (
+            "인증토큰",
+            topic_vector(&[
+                (AXIS_OAUTH_LOGIN, 1.0),
+                (AXIS_AUTH, 0.8),
+                (AXIS_KOREAN, 0.5),
+            ]),
+        ),
+        (
+            "로그인실패",
+            topic_vector(&[
+                (AXIS_OAUTH_LOGIN, 1.0),
+                (AXIS_AUTH, 0.8),
+                (AXIS_KOREAN, 0.5),
+            ]),
+        ),
+        (
+            "색인재빌드",
+            topic_vector(&[(AXIS_INDEX_REBUILD, 1.0), (AXIS_KOREAN, 0.8)]),
+        ),
+        (
+            "배포오류",
+            topic_vector(&[
+                (AXIS_NO_HOSTED_VECTOR, 1.0),
+                (AXIS_KOREAN, 0.7),
+                (AXIS_DEPLOY_ROLLBACK, 0.3),
+            ]),
+        ),
+        (
+            "OAuth콜백실패",
+            topic_vector(&[(AXIS_CALLBACK, 1.0), (AXIS_AUTH, 0.7), (AXIS_KOREAN, 0.7)]),
+        ),
+        (
+            "sync misses changed issues when pages repeat",
+            topic_vector(&[(AXIS_PAGINATION, 1.0), (AXIS_SYNC, 0.7)]),
+        ),
+        (
+            "how should workers recover after a bad blue deployment",
+            topic_vector(&[
+                (AXIS_DEPLOY_ROLLBACK, 1.0),
+                (AXIS_SYNC, 0.4),
+                (AXIS_PREVIOUS_INDEX, 0.3),
+            ]),
+        ),
+        (
+            "where is secondary API throttling surfaced during local search",
+            topic_vector(&[(AXIS_RATE_LIMIT, 1.0), (AXIS_SYNC, 0.5), (AXIS_STATUS, 0.8)]),
+        ),
+        (
+            "why did JSON output reject an extra envelope field",
+            topic_vector(&[(AXIS_SCHEMA, 1.0), (AXIS_OUTPUT_SCHEMA, 0.9)]),
+        ),
+        (
+            "what prevents saved secrets from leaking in logs",
+            topic_vector(&[(AXIS_TOKEN_PRIVACY, 1.0)]),
+        ),
+        (
+            "why should issue number lookup avoid ambiguous text ranking",
+            topic_vector(&[(AXIS_DIRECT_LOCATOR, 1.0)]),
+        ),
+        (
+            "why did login fail after the OAuth flow",
+            topic_vector(&[
+                (AXIS_OAUTH_LOGIN, 1.0),
+                (AXIS_AUTH, 0.8),
+                (AXIS_KOREAN, 0.5),
+            ]),
+        ),
+        (
+            "how are Korean search results preserved during an index rebuild",
+            topic_vector(&[(AXIS_INDEX_REBUILD, 1.0), (AXIS_KOREAN, 0.8)]),
+        ),
+        (
+            "which callback failure mixes Korean and English auth text",
+            topic_vector(&[(AXIS_CALLBACK, 1.0), (AXIS_AUTH, 0.7), (AXIS_KOREAN, 0.7)]),
+        ),
+        (
+            "what fixes dirty index task replay after shard mapping changes",
+            topic_vector(&[(AXIS_CACHE_REPLAY, 1.0), (AXIS_INDEX_REBUILD, 0.5)]),
+        ),
+        (
+            "which note explains stale generation after a publish race",
+            topic_vector(&[(AXIS_PUBLISH_RACE, 1.0), (AXIS_INDEX_REBUILD, 0.4)]),
+        ),
+        (
+            "which handoff says to keep using the previous index generation",
+            topic_vector(&[(AXIS_PREVIOUS_INDEX, 1.0), (AXIS_INDEX_REBUILD, 0.8)]),
+        ),
+        (
+            "페이지 반복 때 변경된 이슈 누락 방지",
+            topic_vector(&[(AXIS_PAGINATION, 1.0), (AXIS_SYNC, 0.7)]),
+        ),
+        (
+            "보조 rate limit 대기 상태는 어디에 보이나",
+            topic_vector(&[(AXIS_RATE_LIMIT, 1.0), (AXIS_SYNC, 0.5), (AXIS_STATUS, 0.8)]),
+        ),
+        (
+            "스키마 출력에 추가 필드를 금지해야 하나",
+            topic_vector(&[(AXIS_SCHEMA, 1.0), (AXIS_OUTPUT_SCHEMA, 0.9)]),
+        ),
+        (
+            "토큰을 설정 파일이나 로그에 저장하지 않는 규칙",
+            topic_vector(&[(AXIS_TOKEN_PRIVACY, 1.0)]),
+        ),
+        (
+            "Korean comments disappear during index rebuild",
+            topic_vector(&[(AXIS_INDEX_REBUILD, 1.0), (AXIS_KOREAN, 0.8)]),
+        ),
+        (
+            "OAuth token refresh missing causes login failure",
+            topic_vector(&[
+                (AXIS_OAUTH_LOGIN, 1.0),
+                (AXIS_AUTH, 0.8),
+                (AXIS_KOREAN, 0.5),
+            ]),
+        ),
+        (
+            "deployment error without hosted vector provider",
+            topic_vector(&[
+                (AXIS_NO_HOSTED_VECTOR, 1.0),
+                (AXIS_KOREAN, 0.7),
+                (AXIS_DEPLOY_ROLLBACK, 0.3),
+            ]),
+        ),
+        (
+            "Korean callback failure analysis",
+            topic_vector(&[(AXIS_CALLBACK, 1.0), (AXIS_AUTH, 0.7), (AXIS_KOREAN, 0.7)]),
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn topic_vector(weighted_axes: &[(usize, f32)]) -> Vec<f32> {
+    let mut vector = vec![0.0; EVAL_VECTOR_DIMENSION];
+    for (axis, weight) in weighted_axes {
+        vector[*axis] = *weight;
+    }
+    vector
+}
+
+fn eval_embedding_fingerprint() -> qgh::embedding::EmbeddingFingerprint {
+    EmbeddingFingerprintSeed {
+        provider: "local".to_string(),
+        model_id: DEFAULT_HF_MODEL_ID.to_string(),
+        model_revision: DEFAULT_HF_MODEL_REVISION.to_string(),
+        pooling: PoolingKind::Cls,
+        query_prefix: DEFAULT_QUERY_PREFIX.to_string(),
+    }
+    .with_dimension(EVAL_VECTOR_DIMENSION)
+}
+
+fn embedding_vector_blob(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
+    for value in vector {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    bytes
+}
+
+fn register_sqlite_vec_extension() {
+    type SqliteVecEntryPoint = unsafe extern "C" fn(
+        db: *mut rusqlite::ffi::sqlite3,
+        pz_err_msg: *mut *const c_char,
+        p_api: *const rusqlite::ffi::sqlite3_api_routines,
+    ) -> c_int;
+    let entry_point = unsafe {
+        std::mem::transmute::<unsafe extern "C" fn(), SqliteVecEntryPoint>(
+            sqlite_vec::sqlite3_vec_init,
+        )
+    };
+    let rc = unsafe { rusqlite::ffi::sqlite3_auto_extension(Some(entry_point)) };
+    assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
 }
 
 struct EvalFixture {
@@ -374,7 +1113,37 @@ env = "QGH_TEST_TOKEN"
         fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
     }
 
+    fn write_config_with_embedding(&self, api_base_url: &str) {
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+
+[embedding]
+provider = "local"
+model = "hf:{DEFAULT_HF_MODEL_ID}"
+file = "onnx/model_quantized.onnx"
+pooling = "cls"
+query_prefix = "query: "
+"#
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
+    }
+
     fn qgh(&self, args: &[&str]) -> Output {
+        self.qgh_with_query_vectors(args, None)
+    }
+
+    fn qgh_with_query_vectors(&self, args: &[&str], query_vectors_json: Option<&str>) -> Output {
         let binary = std::env::var("CARGO_BIN_EXE_qgh").unwrap_or_else(|_| {
             let mut path = std::env::current_exe().unwrap();
             path.pop();
@@ -393,7 +1162,134 @@ env = "QGH_TEST_TOKEN"
             .current_dir(&self.root)
             .args(["--profile", "work"])
             .args(args);
+        if let Some(query_vectors_json) = query_vectors_json {
+            cmd.env(TEST_EMBEDDING_QUERY_VECTORS_ENV, query_vectors_json);
+        }
         cmd.output().unwrap()
+    }
+
+    fn seed_eval_embeddings(&self, source_vectors: &BTreeMap<&'static str, Vec<f32>>) {
+        register_sqlite_vec_extension();
+        let conn = Connection::open(self.db_path()).unwrap();
+        conn.execute(
+            &format!("DROP TABLE IF EXISTS {CHUNK_EMBEDDING_VECTORS_TABLE}"),
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM chunk_embeddings", []).unwrap();
+        conn.execute("DELETE FROM chunks", []).unwrap();
+        conn.execute("UPDATE embedding_fingerprints SET active = 0", [])
+            .unwrap();
+        let fingerprint = eval_embedding_fingerprint();
+        let fingerprint_hash = fingerprint.hash();
+        let fingerprint_json = serde_json::to_string(&fingerprint).unwrap();
+        conn.execute(
+            "INSERT INTO embedding_fingerprints
+                (fingerprint_hash, fingerprint_json, provider, model_id, model_revision,
+                 dimension, pooling, query_prefix, chunker_version, source_schema_version,
+                 created_at, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '2026-01-04T00:00:00Z', 1)",
+            params![
+                fingerprint_hash,
+                fingerprint_json,
+                fingerprint.provider,
+                fingerprint.model_id,
+                fingerprint.model_revision,
+                fingerprint.dimension as i64,
+                fingerprint.pooling.as_str(),
+                fingerprint.query_prefix,
+                fingerprint.chunker_version,
+                fingerprint.source_schema_version
+            ],
+        )
+        .unwrap();
+        let fingerprint_id = conn.last_insert_rowid();
+
+        for (source_id, vector) in source_vectors {
+            let source_version_id: i64 = conn
+                .query_row(
+                    "SELECT coalesce(im.latest_version_id, cm.latest_version_id)
+                     FROM source_entities se
+                     LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+                     LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+                     WHERE se.source_id = ?1 AND se.lifecycle_state = 'active'",
+                    [*source_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO chunks (source_id, source_version_id, body)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    *source_id,
+                    source_version_id,
+                    format!("eval embedding chunk for {source_id}")
+                ],
+            )
+            .unwrap();
+            let chunk_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO chunk_embeddings
+                    (chunk_id, fingerprint_id, vector_json, embedded_at)
+                 VALUES (?1, ?2, ?3, '2026-01-04T00:00:00Z')",
+                params![
+                    chunk_id,
+                    fingerprint_id,
+                    serde_json::to_string(vector).unwrap()
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    fn materialize_eval_vector_table(&self) {
+        register_sqlite_vec_extension();
+        let conn = Connection::open(self.db_path()).unwrap();
+        conn.execute(
+            &format!("DROP TABLE IF EXISTS {CHUNK_EMBEDDING_VECTORS_TABLE}"),
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            &format!(
+                "CREATE VIRTUAL TABLE {CHUNK_EMBEDDING_VECTORS_TABLE}
+                 USING vec0(embedding float[{EVAL_VECTOR_DIMENSION}])"
+            ),
+            [],
+        )
+        .unwrap();
+        let rows = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT ce.chunk_id, ce.vector_json
+                     FROM chunk_embeddings ce
+                     JOIN embedding_fingerprints ef ON ef.id = ce.fingerprint_id
+                     WHERE ef.active = 1
+                     ORDER BY ce.chunk_id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        for (chunk_id, vector_json) in rows {
+            let vector: Vec<f32> = serde_json::from_str(&vector_json).unwrap();
+            conn.execute(
+                &format!(
+                    "INSERT INTO {CHUNK_EMBEDDING_VECTORS_TABLE}(rowid, embedding)
+                     VALUES (?1, ?2)"
+                ),
+                params![chunk_id, embedding_vector_blob(&vector)],
+            )
+            .unwrap();
+        }
+    }
+
+    fn db_path(&self) -> PathBuf {
+        self.data_home.join("qgh/profiles/work/qgh.sqlite3")
     }
 }
 
