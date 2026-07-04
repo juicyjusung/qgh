@@ -244,15 +244,19 @@
     },
     "ranking": {
       "type": "object",
-      "required": ["kind", "lexical_score"],
+      "required": ["kind", "lexical_score", "vector_distance"],
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["bm25", "exact"]
+          "enum": ["bm25", "vector", "exact"]
         },
         "lexical_score": {
           "type": ["number", "null"],
           "description": "Typed ordering signal. It is not confidence or probability."
+        },
+        "vector_distance": {
+          "type": ["number", "null"],
+          "description": "Vector ordering signal where lower is closer. It is not confidence or probability."
         }
       },
       "additionalProperties": false

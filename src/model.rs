@@ -102,6 +102,35 @@ pub struct StoredChunk {
 }
 
 #[derive(Debug, Clone)]
+pub struct VectorSearchFilters {
+    pub repo: Option<String>,
+    pub labels: Vec<String>,
+    pub state: Option<String>,
+    pub author: Option<String>,
+    pub issue: Option<i64>,
+    pub source_types: Vec<String>,
+}
+
+impl Default for VectorSearchFilters {
+    fn default() -> Self {
+        Self {
+            repo: None,
+            labels: Vec::new(),
+            state: None,
+            author: None,
+            issue: None,
+            source_types: vec!["issue".to_string(), "issue_comment".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorSearchHit {
+    pub source_id: String,
+    pub vector_distance: f32,
+}
+
+#[derive(Debug, Clone)]
 pub struct ReconciliationCandidate {
     pub source_id: String,
     pub entity_type: String,

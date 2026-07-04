@@ -178,6 +178,11 @@ use the policy later still apply normal profile resolution and allowlist checks.
 `--limit` must be greater than zero; invalid values fail with a structured
 validation error instead of silently returning an empty result set.
 `--issue` must also be greater than zero.
+`ranking.lexical_score` is populated for BM25 results and `null` for exact or
+vector-ranked results. `ranking.vector_distance` is populated for internal
+vector-ranked results and `null` for BM25 or exact results; lower distance is
+closer, and it is not confidence or probability. Vector-only ranking is not a
+user-facing CLI or MCP mode.
 
 Every result includes:
 
