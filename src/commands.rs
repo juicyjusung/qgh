@@ -951,6 +951,9 @@ fn refresh_incremental_chunk_embeddings_with_provider(
     let matching_active_fingerprint = store
         .active_embedding_fingerprint()?
         .filter(|fingerprint| fingerprint.matches_expectation(expectation));
+    if let Some(fingerprint) = matching_active_fingerprint.as_ref() {
+        store.ensure_vector_storage_for_fingerprint(fingerprint)?;
+    }
     let chunks = match matching_active_fingerprint.as_ref() {
         Some(fingerprint) => store.active_chunks_missing_embedding_for_fingerprint(fingerprint)?,
         None => store.active_embedding_chunks()?,

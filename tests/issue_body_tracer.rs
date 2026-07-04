@@ -5995,6 +5995,11 @@ limit = 10
             chunk_count, 0,
             "BM25-only sync must not materialize chunks without [embedding]"
         );
+        assert_eq!(
+            self.sqlite_vector_table_count(),
+            0,
+            "BM25-only sync must not create sqlite-vec tables without [embedding]"
+        );
     }
 
     fn sqlite_chunk_count(&self) -> i64 {
@@ -6002,6 +6007,19 @@ limit = 10
         let conn = rusqlite::Connection::open(db_path).unwrap();
         conn.query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))
             .unwrap()
+    }
+
+    fn sqlite_vector_table_count(&self) -> i64 {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT count(*)
+             FROM sqlite_schema
+             WHERE type = 'table' AND name LIKE 'chunk_embedding_vectors%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     fn insert_chunk_for_source(&self, source_id: &str, body: &str) -> i64 {

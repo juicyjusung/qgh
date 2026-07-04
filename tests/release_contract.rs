@@ -2070,7 +2070,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
 }
 
 #[test]
-fn bm25_only_build_keeps_embedding_runtime_dependencies_optional() {
+fn bm25_only_build_keeps_embedding_runtime_optional_and_links_sqlite_vec() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
     let manifest_toml: toml::Value = toml::from_str(&manifest).unwrap();
@@ -2098,9 +2098,10 @@ fn bm25_only_build_keeps_embedding_runtime_dependencies_optional() {
             "BM25-only build must not require embedding runtime crate `{crate_name}`"
         );
     }
-    assert!(
-        !dependencies.contains_key("sqlite-vec"),
-        "sqlite-vec is not part of this provider-only slice"
+    assert_eq!(
+        dependencies["sqlite-vec"].as_str(),
+        Some("=0.1.9"),
+        "sqlite-vec must stay pinned to the stable static-link crate"
     );
 }
 
