@@ -1817,6 +1817,29 @@ fn upsert_source_version(
     indexed_at: &str,
     sync_run_id: &str,
 ) -> Result<i64, rusqlite::Error> {
+    if let Some(version_id) = tx
+        .query_row(
+            "SELECT id FROM source_versions
+             WHERE source_id = ?1 AND body_hash = ?2
+             ORDER BY id DESC
+             LIMIT 1",
+            params![source_id, body_hash],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        tx.execute(
+            "UPDATE source_versions
+             SET github_updated_at = ?1,
+                 indexed_at = ?2,
+                 sync_run_id = ?3,
+                 lifecycle_state = 'active'
+             WHERE id = ?4",
+            params![github_updated_at, indexed_at, sync_run_id, version_id],
+        )?;
+        return Ok(version_id);
+    }
+
     tx.execute(
         "INSERT INTO source_versions
             (source_id, body_hash, github_updated_at, indexed_at, sync_run_id, lifecycle_state)

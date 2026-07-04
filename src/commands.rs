@@ -934,9 +934,23 @@ fn refresh_incremental_chunk_embeddings(
 ) -> Result<usize, QghError> {
     let runtime = embedding_runtime(embedding)?;
     let expectation = embedding_fingerprint_expectation(embedding);
+    refresh_incremental_chunk_embeddings_with_provider(
+        store,
+        runtime.provider.as_ref(),
+        runtime.fingerprint_seed,
+        &expectation,
+    )
+}
+
+fn refresh_incremental_chunk_embeddings_with_provider(
+    store: &mut Store,
+    provider: &dyn EmbeddingProvider,
+    fingerprint_seed: EmbeddingFingerprintSeed,
+    expectation: &EmbeddingFingerprintExpectation,
+) -> Result<usize, QghError> {
     let matching_active_fingerprint = store
         .active_embedding_fingerprint()?
-        .filter(|fingerprint| fingerprint.matches_expectation(&expectation));
+        .filter(|fingerprint| fingerprint.matches_expectation(expectation));
     let chunks = match matching_active_fingerprint.as_ref() {
         Some(fingerprint) => store.active_chunks_missing_embedding_for_fingerprint(fingerprint)?,
         None => store.active_embedding_chunks()?,
@@ -949,10 +963,7 @@ fn refresh_incremental_chunk_embeddings(
         .iter()
         .map(|chunk| chunk.body.as_str())
         .collect::<Vec<_>>();
-    let vectors = runtime
-        .provider
-        .embed_documents(&texts)
-        .map_err(embedding_error)?;
+    let vectors = provider.embed_documents(&texts).map_err(embedding_error)?;
     if vectors.len() != chunks.len() {
         return Err(QghError::validation(
             "embedding.vector_count_mismatch",
@@ -979,7 +990,7 @@ fn refresh_incremental_chunk_embeddings(
             }
             fingerprint
         }
-        None => runtime.fingerprint_seed.with_dimension(dimension),
+        None => fingerprint_seed.with_dimension(dimension),
     };
     let embeddings = chunks
         .iter()
@@ -3164,6 +3175,107 @@ mod tests {
                 .unwrap(),
             2
         );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn sync_incremental_embedding_persists_vectors_and_skips_completed_chunks() {
+        let paths = temp_profile_paths("sync-incremental-embedding");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_SYNC_EMBED";
+        let issue = IssueRecord {
+            source_id: source_id.to_string(),
+            host: "github.com".to_string(),
+            repo: "owner/repo".to_string(),
+            node_id: "I_SYNC_EMBED".to_string(),
+            github_id: 404,
+            number: 10,
+            title: "Sync embed".to_string(),
+            body: "sync alpha beta gamma delta".to_string(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone: None,
+            assignees: Vec::new(),
+            author: Some("alice".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            closed_at: None,
+            canonical_url: "https://github.com/owner/repo/issues/10".to_string(),
+            body_hash: "body-hash-sync-embed".to_string(),
+            indexed_at: "2026-01-02T00:00:01Z".to_string(),
+        };
+        store
+            .upsert_sources_for_run("sync-incremental-embed", &[issue], &[], 0, &[])
+            .unwrap();
+        let source_version_id = store.latest_source_version_id(source_id).unwrap().unwrap();
+        store
+            .replace_chunks_for_source_version(
+                source_id,
+                source_version_id,
+                &[
+                    MarkdownChunk {
+                        chunk_index: 0,
+                        byte_start: 0,
+                        byte_end: 15,
+                        token_start: 0,
+                        token_end: 3,
+                        token_count: 3,
+                        body: "sync alpha beta".to_string(),
+                    },
+                    MarkdownChunk {
+                        chunk_index: 1,
+                        byte_start: 16,
+                        byte_end: 27,
+                        token_start: 3,
+                        token_end: 5,
+                        token_count: 2,
+                        body: "gamma delta".to_string(),
+                    },
+                ],
+            )
+            .unwrap();
+        let seed = EmbeddingFingerprintSeed {
+            provider: "local".to_string(),
+            model_id: "Snowflake/snowflake-arctic-embed-l-v2.0".to_string(),
+            model_revision: "fixture-sha".to_string(),
+            pooling: PoolingKind::Cls,
+            query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
+        };
+        let expectation = EmbeddingFingerprintExpectation {
+            provider: "local".to_string(),
+            model_id: Some("Snowflake/snowflake-arctic-embed-l-v2.0".to_string()),
+            model_revision: Some("fixture-sha".to_string()),
+            pooling: Some(PoolingKind::Cls),
+            query_prefix: Some(crate::embedding::DEFAULT_QUERY_PREFIX.to_string()),
+        };
+
+        let embedded = refresh_incremental_chunk_embeddings_with_provider(
+            &mut store,
+            &MockEmbeddingProvider,
+            seed.clone(),
+            &expectation,
+        )
+        .unwrap();
+        let active = store.active_embedding_fingerprint().unwrap().unwrap();
+
+        assert_eq!(embedded, 2);
+        assert_eq!(active.dimension, 3);
+        assert_eq!(
+            store
+                .current_chunk_embedding_count_for_fingerprint(&active)
+                .unwrap(),
+            2
+        );
+
+        let skipped = refresh_incremental_chunk_embeddings_with_provider(
+            &mut store,
+            &MockEmbeddingProvider,
+            seed,
+            &expectation,
+        )
+        .unwrap();
+        assert_eq!(skipped, 0);
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }

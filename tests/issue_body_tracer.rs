@@ -2214,6 +2214,66 @@ query_prefix = "query: "
     assert_eq!(fixture.sqlite_chunk_embedding_count(), 0);
 }
 
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn embedding_sync_skips_when_body_hash_matches_despite_new_github_timestamp() {
+    let fixture = TestFixture::new("embedding-sync-body-hash-skip");
+    let server = EditingFakeGitHub::start();
+    let model_dir = fixture.write_local_embedding_tokenizer_model();
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        &format!(
+            r#"
+provider = "local"
+model_path = "{}"
+file = "onnx/model_quantized.onnx"
+pooling = "cls"
+query_prefix = "query: "
+"#,
+            model_dir.display()
+        ),
+    );
+
+    let first_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&first_sync);
+    assert_embedding_sync_warning(&stdout_json(&first_sync));
+    let issue_source_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    let first_issue = stdout_json(&fixture.qgh(["get", issue_source_id, "--json"]));
+    let first_source_version = first_issue["data"]["source"]["source_version"].clone();
+    let first_chunk_ids = fixture.sqlite_chunk_ids_for_source(issue_source_id);
+    assert!(
+        !first_chunk_ids.is_empty(),
+        "embedding-enabled seed sync must chunk the issue source"
+    );
+    fixture.assert_source_version_count(issue_source_id, 1);
+
+    server.set_mode(EDITING_SAME_BODY_NEW_TIMESTAMP);
+    let second_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&second_sync);
+    assert_embedding_sync_warning(&stdout_json(&second_sync));
+
+    let second_issue = stdout_json(&fixture.qgh(["get", issue_source_id, "--json"]));
+    let second_source_version = &second_issue["data"]["source"]["source_version"];
+    assert_eq!(
+        second_source_version["body_hash"], first_source_version["body_hash"],
+        "timestamp-only GitHub edits must keep the same content identity"
+    );
+    assert_eq!(
+        second_source_version["github_updated_at"],
+        "2026-01-05T00:00:00Z"
+    );
+    assert_ne!(
+        second_source_version["github_updated_at"],
+        first_source_version["github_updated_at"]
+    );
+    assert_eq!(
+        fixture.sqlite_chunk_ids_for_source(issue_source_id),
+        first_chunk_ids,
+        "body_hash-unchanged sync must reuse existing chunks instead of re-chunking"
+    );
+    fixture.assert_source_version_count(issue_source_id, 1);
+}
+
 #[test]
 fn embedding_fingerprint_mismatch_warns_and_keeps_bm25_results() {
     let fixture = TestFixture::new("embedding-fingerprint-mismatch");
@@ -5784,6 +5844,19 @@ limit = 10
     }
 
     #[cfg(feature = "fastembed-provider")]
+    fn sqlite_chunk_ids_for_source(&self, source_id: &str) -> Vec<i64> {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM chunks WHERE source_id = ?1 ORDER BY source_version_id, id")
+            .unwrap();
+        stmt.query_map([source_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[cfg(feature = "fastembed-provider")]
     fn sqlite_chunk_count_for_source(&self, source_id: &str) -> i64 {
         let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
         let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -7128,6 +7201,8 @@ fn assert_query_result_round_trips_to_get_result(result: &Value, source: &Value)
     assert_eq!(result["source_version"], source["source_version"]);
 }
 
+const EDITING_SAME_BODY_NEW_TIMESTAMP: usize = 3;
+
 struct EditingFakeGitHub {
     base_url: String,
     mode: Arc<AtomicUsize>,
@@ -7202,6 +7277,12 @@ fn handle_editing_connection(
     let (status, etag, body) = if request_line.starts_with("GET /repos/owner/repo/issues?") {
         if mode == 2 && lower.contains("if-none-match: \"issues-v2\"") {
             ("304 Not Modified", "\"issues-v2\"", "")
+        } else if mode == EDITING_SAME_BODY_NEW_TIMESTAMP {
+            (
+                "200 OK",
+                "\"issues-same-body-v3\"",
+                same_body_new_timestamp_issue_payload(),
+            )
         } else if mode == 2 {
             ("200 OK", "\"issues-v2\"", edited_issue_payload())
         } else {
@@ -7214,7 +7295,13 @@ fn handle_editing_connection(
             ("200 OK", "\"comments-v1\"", issue_comments_payload())
         }
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42 ") {
-        if mode == 2 {
+        if mode == EDITING_SAME_BODY_NEW_TIMESTAMP {
+            (
+                "200 OK",
+                "\"issue-same-body-v3\"",
+                same_body_new_timestamp_issue_object_payload(),
+            )
+        } else if mode == 2 {
             ("200 OK", "\"issue-v2\"", edited_issue_object_payload())
         } else {
             ("200 OK", "\"issue-v1\"", issue_object_payload())
@@ -7275,6 +7362,50 @@ fn edited_issue_object_payload() -> &'static str {
         "html_url": "https://github.com/owner/repo/issues/42",
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": "2026-01-04T00:00:00Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}, {"name": "mvp"}],
+        "milestone": {"title": "MVP"},
+        "assignees": [{"login": "alice"}]
+    }"#
+}
+
+fn same_body_new_timestamp_issue_payload() -> &'static str {
+    r#"[
+      {
+        "id": 1001,
+        "node_id": "I_kwDOISSUE1",
+        "number": 42,
+        "title": "Cache sync bug",
+        "body": "The BM25 issue body tracer must round-trip through get before citation.",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-05T00:00:00Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}, {"name": "mvp"}],
+        "milestone": {"title": "MVP"},
+        "assignees": [{"login": "alice"}]
+      }
+    ]"#
+}
+
+fn same_body_new_timestamp_issue_object_payload() -> &'static str {
+    r#"{
+        "id": 1001,
+        "node_id": "I_kwDOISSUE1",
+        "number": 42,
+        "title": "Cache sync bug",
+        "body": "The BM25 issue body tracer must round-trip through get before citation.",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-05T00:00:00Z",
         "closed_at": null,
         "user": {"login": "bob"},
         "labels": [{"name": "bug"}, {"name": "mvp"}],
