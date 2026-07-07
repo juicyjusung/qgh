@@ -12,13 +12,14 @@ use crate::embedding::FastembedTokenizer;
 use crate::embedding::{
     default_hf_model_reference, parse_hf_model_reference, EmbeddingFingerprint,
     EmbeddingFingerprintExpectation, EmbeddingFingerprintSeed, EmbeddingProvider,
-    EmbeddingProviderError, EmbeddingTokenizer, EmbeddingVector, PoolingKind, TokenSpan,
-    DEFAULT_QUERY_PREFIX, LOCAL_MODEL_REVISION,
+    EmbeddingProviderError, EmbeddingTokenizer, EmbeddingVector, LOCAL_MODEL_REVISION,
 };
 #[cfg(feature = "fastembed-provider")]
 use crate::embedding::{
     resolve_fastembed_snapshot, FastembedEngine, LocalEmbeddingProvider, ResolvedModelSnapshot,
 };
+#[cfg(debug_assertions)]
+use crate::embedding::{PoolingKind, TokenSpan, DEFAULT_QUERY_PREFIX};
 use crate::error::QghError;
 use crate::freshness::{self, FreshnessContext, FreshnessOverrides};
 use crate::github;
