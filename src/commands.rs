@@ -3,8 +3,8 @@ use crate::cli::{EmbedArgs, InitArgs, InitRepoArgs, InitTokenSourceArg, QueryArg
 use crate::config::{
     bootstrap_profile_repo, current_git_worktree_root, discover_repo_policy,
     git_remote_defaults_for_root, load_profile, load_repo_policy_at, parse_repo, resolve_token,
-    CommentsMode, EmbeddingConfig, EmbeddingProviderKind, GitRemote, Profile,
-    ProfileBootstrapInput, RepoPolicy, RepoRef, TokenSource,
+    suggest_init_profile_id, CommentsMode, EmbeddingConfig, EmbeddingProviderKind, GitRemote,
+    Profile, ProfileBootstrapInput, RepoPolicy, RepoRef, TokenSource,
 };
 use crate::coverage;
 #[cfg(feature = "fastembed-provider")]
@@ -1716,13 +1716,16 @@ fn init_custom_interactive(
             .map(|remote| remote.repo.clone())
             .ok_or_else(|| missing_init_value("--repo"))?,
     };
-    let profile_default = profile_arg.unwrap_or("work");
-    let profile_id = prompt_line("profile id", profile_default)?;
     let host_default = args
         .host
         .clone()
         .or_else(|| remote.map(|remote| remote.host.clone()))
         .ok_or_else(|| missing_init_value("--host"))?;
+    let profile_default = match profile_arg {
+        Some(profile_id) => profile_id.to_string(),
+        None => suggest_init_profile_id(&repo, &host_default)?,
+    };
+    let profile_id = prompt_line("profile id", &profile_default)?;
     let host = prompt_line("host", &host_default)?;
     let api_default = args
         .api_base_url
@@ -1813,12 +1816,15 @@ fn init_preset(
             .map(|remote| remote.repo.clone())
             .ok_or_else(|| missing_init_value("--repo"))?,
     };
-    let profile_id = profile_arg.unwrap_or("work").to_string();
     let host = args
         .host
         .clone()
         .or_else(|| remote.map(|remote| remote.host.clone()))
         .ok_or_else(|| missing_init_value("--host"))?;
+    let profile_id = match profile_arg {
+        Some(profile_id) => profile_id.to_string(),
+        None => suggest_init_profile_id(&repo, &host)?,
+    };
     let api_base_url = args
         .api_base_url
         .clone()
@@ -1928,6 +1934,23 @@ fn finish_profile_init(
     } else {
         Value::Null
     };
+    let mut warnings = Vec::new();
+    if !bootstrap.duplicate_profile_ids.is_empty() {
+        warnings.push(json!({
+            "code": "config.duplicate_repo_allowlist",
+            "severity": "warn",
+            "message": format!(
+                "Repo `{}` is also allowlisted in profile(s): {}. Profile auto-resolution will be ambiguous.",
+                repo,
+                bootstrap.duplicate_profile_ids.join(", ")
+            ),
+            "details": {
+                "repo": repo.clone(),
+                "duplicate_profile_ids": bootstrap.duplicate_profile_ids
+            },
+            "hint": "Run qgh with --profile <profile-id> or remove the repo from the other profile allowlists."
+        }));
+    }
     Ok(InitCommandOutcome {
         data: json!({
             "profile_config_path": bootstrap.config_path.to_string_lossy(),
@@ -1942,7 +1965,7 @@ fn finish_profile_init(
             },
             "next_steps": ["qgh sync", "qgh query <terms>"]
         }),
-        warnings: Vec::new(),
+        warnings,
         meta: json!({
             "profile_id": profile_id,
             "profile_source": "cli",

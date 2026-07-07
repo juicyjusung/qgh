@@ -1209,7 +1209,7 @@ fn init_preset_preview_accepts_defaults_with_enter_before_writing() {
     assert!(stderr.contains("Detected qgh init defaults"));
     assert!(stderr.contains("repo: owner/repo"));
     assert!(stderr.contains("host: github.com"));
-    assert!(stderr.contains("profile id: work"));
+    assert!(stderr.contains("profile id: github"));
     assert!(stderr.contains("token source: github_cli"));
     assert!(stderr.contains("config path:"));
     assert!(stderr.contains("repo policy path:"));
@@ -1217,7 +1217,7 @@ fn init_preset_preview_accepts_defaults_with_enter_before_writing() {
     assert!(stderr.contains("Use these defaults? [Y/n]"));
 
     let init_json = stdout_json(&init);
-    assert_eq!(init_json["data"]["profile_id"], "work");
+    assert_eq!(init_json["data"]["profile_id"], "github");
     assert_eq!(init_json["data"]["repo"], "owner/repo");
     assert_eq!(init_json["data"]["token_source"]["kind"], "github_cli");
     assert_eq!(init_json["data"]["repo_policy_action"], "created");
@@ -1260,7 +1260,7 @@ fn init_yes_applies_inferred_preset_without_preview_or_required_flags() {
     assert_success(&init);
     assert!(!stderr_text(&init).contains("Use these defaults?"));
     let init_json = stdout_json(&init);
-    assert_eq!(init_json["data"]["profile_id"], "work");
+    assert_eq!(init_json["data"]["profile_id"], "github");
     assert_eq!(init_json["data"]["repo"], "owner/repo");
     assert_eq!(init_json["data"]["token_source"]["kind"], "github_cli");
     assert_eq!(init_json["data"]["repo_policy_action"], "created");
@@ -1324,7 +1324,7 @@ fn init_without_json_prints_human_summary_for_profile_and_repo_policy_paths() {
     let stdout = stdout_text(&init);
     assert!(!stdout.starts_with('{'));
     assert!(stdout.contains("qgh init complete"));
-    assert!(stdout.contains("profile: work (created)"));
+    assert!(stdout.contains("profile: github (created)"));
     assert!(stdout.contains("repo: owner/repo (allowlist added)"));
     assert!(stdout.contains("token source: github_cli"));
     assert!(stdout.contains("config:"));
@@ -1353,13 +1353,105 @@ fn init_short_yes_alias_applies_inferred_preset() {
     let init = fixture.qgh_without_profile_in(&nested_worktree_dir, ["init", "-y", "--json"]);
     assert_success(&init);
     let init_json = stdout_json(&init);
-    assert_eq!(init_json["data"]["profile_id"], "work");
+    assert_eq!(init_json["data"]["profile_id"], "ghe");
     assert_eq!(init_json["data"]["repo"], "team/repo");
     assert_eq!(init_json["data"]["token_source"]["kind"], "github_cli");
 
     let config_text = fs::read_to_string(fixture.config_home.join("qgh/config.toml")).unwrap();
     assert!(config_text.contains(r#"host = "ghe.internal.example""#));
     assert!(config_text.contains(r#"api_base_url = "https://ghe.internal.example/api/v3""#));
+}
+
+#[test]
+fn init_default_profile_reuses_existing_profile_for_repo_and_host() {
+    let fixture = TestFixture::new("init-default-profile-reuse");
+    fixture.write_config_with_host("github.com", "https://api.github.com");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(&nested_worktree_dir, ["init", "--yes", "--json"]);
+    assert_success(&init);
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["data"]["profile_id"], "work");
+    assert_eq!(init_json["data"]["profile_action"], "updated");
+    assert_eq!(
+        init_json["data"]["repo_allowlist_action"],
+        "already_present"
+    );
+    assert_eq!(init_json["warnings"], json!([]));
+}
+
+#[test]
+fn init_warns_when_repo_already_allowlisted_in_other_profile() {
+    let fixture = TestFixture::new("init-duplicate-allowlist-warning");
+    fixture.write_config_with_host("github.com", "https://api.github.com");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        ["--profile", "fresh", "init", "--yes", "--json"],
+    );
+    assert_success(&init);
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["data"]["profile_id"], "fresh");
+    assert_eq!(init_json["data"]["profile_action"], "created");
+    assert_eq!(
+        init_json["warnings"][0]["code"],
+        "config.duplicate_repo_allowlist"
+    );
+    assert_eq!(
+        init_json["warnings"][0]["details"]["duplicate_profile_ids"],
+        json!(["work"])
+    );
+
+    let human_init = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        ["--profile", "fresh", "init", "--yes", "--force"],
+    );
+    assert_success(&human_init);
+    assert!(stdout_text(&human_init).contains("config.duplicate_repo_allowlist"));
+}
+
+#[test]
+fn repo_policy_scope_uses_git_remote_host_to_disambiguate_profiles() {
+    let fixture = TestFixture::new("policy-scope-remote-host");
+    fs::write(
+        fixture.config_home.join("qgh/config.toml"),
+        r#"
+schema_version = "qgh.config.v1"
+
+[profiles.ghe]
+host = "ghe.example.com"
+api_base_url = "https://ghe.example.com/api/v3"
+web_base_url = "https://ghe.example.com"
+repos = ["owner/repo"]
+
+[profiles.ghe.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+
+[profiles.hub]
+host = "github.com"
+api_base_url = "http://127.0.0.1:1"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.hub.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#,
+    )
+    .unwrap();
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+    fixture.write_repo_policy("owner/repo");
+
+    let status = fixture.qgh_without_profile_in(&nested_worktree_dir, ["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["meta"]["profile_id"], "hub");
+    assert_eq!(status_json["meta"]["profile_source"], "single_match");
 }
 
 #[test]

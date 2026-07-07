@@ -321,6 +321,7 @@ pub struct ProfileBootstrapOutcome {
     pub profile_action: &'static str,
     pub repo_allowlist_action: &'static str,
     pub token_source_kind: &'static str,
+    pub duplicate_profile_ids: Vec<String>,
 }
 
 pub fn bootstrap_profile_repo(
@@ -344,6 +345,8 @@ pub fn bootstrap_profile_repo(
         embedding: None,
         profiles: BTreeMap::new(),
     });
+    let duplicate_profile_ids =
+        profiles_allowlisting_repo(&config.profiles, &input.repo, Some(&input.profile_id));
     let profile_action;
     let repo_allowlist_action;
     let effective_token_source_kind;
@@ -412,7 +415,23 @@ pub fn bootstrap_profile_repo(
         profile_action,
         repo_allowlist_action,
         token_source_kind: effective_token_source_kind,
+        duplicate_profile_ids,
     })
+}
+
+fn profiles_allowlisting_repo(
+    profiles: &BTreeMap<String, RawProfile>,
+    repo: &str,
+    exclude_profile_id: Option<&str>,
+) -> Vec<String> {
+    profiles
+        .iter()
+        .filter(|(profile_id, raw)| {
+            exclude_profile_id != Some(profile_id.as_str())
+                && raw.repos.iter().any(|allowed| allowed == repo)
+        })
+        .map(|(profile_id, _)| profile_id.clone())
+        .collect()
 }
 
 pub struct GitRemote {
@@ -453,6 +472,71 @@ pub fn single_matching_profile_id(
         1 => Ok(matches.remove(0)),
         _ => Err(QghError::ambiguous_profile(repo_scope, matches)),
     }
+}
+
+pub fn suggest_init_profile_id(repo: &str, host: &str) -> Result<String, QghError> {
+    let profiles = load_config_file_optional()?
+        .map(|config| config.profiles)
+        .unwrap_or_default();
+    Ok(suggest_profile_id_from(&profiles, repo, host))
+}
+
+fn suggest_profile_id_from(
+    profiles: &BTreeMap<String, RawProfile>,
+    repo: &str,
+    host: &str,
+) -> String {
+    if let Some((profile_id, _)) = profiles
+        .iter()
+        .find(|(_, raw)| raw.host == host && raw.repos.iter().any(|allowed| allowed == repo))
+    {
+        return profile_id.clone();
+    }
+    if let Some((profile_id, _)) = profiles.iter().find(|(_, raw)| raw.host == host) {
+        return profile_id.clone();
+    }
+    let candidate = derive_profile_id_from_host(host);
+    match profiles.get(&candidate) {
+        Some(existing) if existing.host != host => sanitize_profile_id(host),
+        _ => candidate,
+    }
+}
+
+fn derive_profile_id_from_host(host: &str) -> String {
+    if host.eq_ignore_ascii_case("github.com") {
+        return "github".to_string();
+    }
+    sanitize_profile_id(host.split('.').next().unwrap_or(host))
+}
+
+fn sanitize_profile_id(value: &str) -> String {
+    let mut id: String = value
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .skip_while(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit())
+        .collect();
+    id.truncate(64);
+    if id.is_empty() {
+        "github".to_string()
+    } else {
+        id
+    }
+}
+
+/// Best-effort origin remote for profile disambiguation: unlike
+/// `origin_remote_from_current_worktree`, it runs even when `.qgh.toml`
+/// exists and swallows parse errors instead of failing resolution.
+pub(crate) fn origin_remote_best_effort() -> Option<GitRemote> {
+    let root = current_git_worktree_root()?;
+    let remote = origin_remote(&root).ok()?;
+    parse_github_remote(&remote).ok()
 }
 
 pub(crate) fn origin_remote_from_current_worktree() -> Result<Option<GitRemote>, QghError> {
@@ -915,7 +999,7 @@ pub fn resolve_token(profile: &Profile) -> Result<String, QghError> {
         }),
         TokenSource::GithubCli => {
             let output = Command::new("gh")
-                .args(["auth", "token"])
+                .args(github_cli_token_args(&profile.host))
                 .output()
                 .map_err(|error| {
                     QghError::auth(format!("Failed to run `gh auth token`: {error}"))
@@ -934,6 +1018,10 @@ pub fn resolve_token(profile: &Profile) -> Result<String, QghError> {
             "Token source must be `github_cli` or `env`.",
         )),
     }
+}
+
+fn github_cli_token_args(host: &str) -> [&str; 4] {
+    ["auth", "token", "--hostname", host]
 }
 
 fn validate_config_token_sources(config: &ConfigFile) -> Result<(), QghError> {
@@ -1070,4 +1158,104 @@ pub(crate) fn parse_repo(value: &str) -> Result<RepoRef, String> {
         owner: owner.to_string(),
         name: name.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_profile(host: &str, repos: &[&str]) -> RawProfile {
+        RawProfile {
+            host: host.to_string(),
+            api_base_url: format!("https://{host}/api/v3"),
+            web_base_url: format!("https://{host}"),
+            repos: repos.iter().map(|repo| repo.to_string()).collect(),
+            query_max_age: None,
+            query_stale_behavior: None,
+            active_issue_max_age: None,
+            reconcile_after: None,
+            reconcile_after_days: None,
+            max_in_flight_requests: None,
+            bootstrap_lookback: None,
+            sync_max_age: None,
+            comments_mode: None,
+            comment_parent_resolution_budget: None,
+            token_source: TokenSource::GithubCli,
+        }
+    }
+
+    fn profiles(entries: &[(&str, RawProfile)]) -> BTreeMap<String, RawProfile> {
+        entries
+            .iter()
+            .map(|(id, raw)| (id.to_string(), raw.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn github_cli_token_args_pass_profile_host() {
+        assert_eq!(
+            github_cli_token_args("oss.navercorp.com"),
+            ["auth", "token", "--hostname", "oss.navercorp.com"]
+        );
+    }
+
+    #[test]
+    fn suggest_profile_id_prefers_profile_already_allowlisting_repo() {
+        let profiles = profiles(&[
+            ("dogfood", raw_profile("github.com", &["owner/other"])),
+            ("github", raw_profile("github.com", &["owner/repo"])),
+        ]);
+        assert_eq!(
+            suggest_profile_id_from(&profiles, "owner/repo", "github.com"),
+            "github"
+        );
+    }
+
+    #[test]
+    fn suggest_profile_id_falls_back_to_host_match() {
+        let profiles = profiles(&[
+            ("work", raw_profile("oss.example.com", &["owner/other"])),
+            ("github", raw_profile("github.com", &["owner/other"])),
+        ]);
+        assert_eq!(
+            suggest_profile_id_from(&profiles, "owner/repo", "oss.example.com"),
+            "work"
+        );
+    }
+
+    #[test]
+    fn suggest_profile_id_derives_from_host_when_no_profile_matches() {
+        let profiles = profiles(&[("work", raw_profile("oss.example.com", &["owner/other"]))]);
+        assert_eq!(
+            suggest_profile_id_from(&profiles, "owner/repo", "github.com"),
+            "github"
+        );
+        assert_eq!(
+            suggest_profile_id_from(&BTreeMap::new(), "owner/repo", "oss.navercorp.com"),
+            "oss"
+        );
+    }
+
+    #[test]
+    fn suggest_profile_id_avoids_host_conflicting_default() {
+        let profiles = profiles(&[("oss", raw_profile("oss.other.com", &["owner/other"]))]);
+        assert_eq!(
+            suggest_profile_id_from(&profiles, "owner/repo", "oss.navercorp.com"),
+            "oss.navercorp.com"
+        );
+    }
+
+    #[test]
+    fn profiles_allowlisting_repo_excludes_target_profile() {
+        let profiles = profiles(&[
+            ("github", raw_profile("github.com", &["owner/repo"])),
+            ("test", raw_profile("github.com", &["owner/repo"])),
+            ("work", raw_profile("oss.example.com", &["owner/other"])),
+        ]);
+        assert_eq!(
+            profiles_allowlisting_repo(&profiles, "owner/repo", Some("github")),
+            vec!["test".to_string()]
+        );
+        assert!(profiles_allowlisting_repo(&profiles, "owner/none", None).is_empty());
+    }
 }

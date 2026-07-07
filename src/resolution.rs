@@ -1,6 +1,6 @@
 use crate::config::{
-    discover_repo_policy, load_profile, origin_remote_from_current_worktree,
-    single_matching_profile_id,
+    discover_repo_policy, load_profile, origin_remote_best_effort,
+    origin_remote_from_current_worktree, single_matching_profile_id, GitRemote,
 };
 use crate::error::QghError;
 use serde_json::{json, Value};
@@ -111,7 +111,8 @@ pub(crate) fn repo_scope_from_policy() -> Result<Option<ResolvedRepoScope>, QghE
 }
 
 pub(crate) fn repo_scope_from_worktree() -> Result<Option<ResolvedRepoScope>, QghError> {
-    if let Some(scope) = repo_scope_from_policy()? {
+    if let Some(mut scope) = repo_scope_from_policy()? {
+        merge_remote_host_into_policy_scope(&mut scope, origin_remote_best_effort());
         return Ok(Some(scope));
     }
     Ok(
@@ -122,6 +123,18 @@ pub(crate) fn repo_scope_from_worktree() -> Result<Option<ResolvedRepoScope>, Qg
             repo_policy_path: None,
         }),
     )
+}
+
+/// A `.qgh.toml` scope carries no host, so profiles that allowlist the same
+/// `owner/repo` name on different hosts cannot be told apart. Borrow the
+/// origin remote host, but only when the remote points at the policy repo —
+/// a fork or unrelated remote must not attach its host to the policy scope.
+fn merge_remote_host_into_policy_scope(scope: &mut ResolvedRepoScope, remote: Option<GitRemote>) {
+    if let Some(remote) = remote {
+        if remote.repo == scope.repo {
+            scope.host = Some(remote.host);
+        }
+    }
 }
 
 pub(crate) fn repo_scope_from_cli_arg(repo: &str) -> Result<ResolvedRepoScope, QghError> {
@@ -187,5 +200,55 @@ impl ResolvedCommandContext {
                 .map(|path| path.to_string_lossy().to_string()),
             "allowlist_match_count": self.allowlist_match_count
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy_scope(repo: &str) -> ResolvedRepoScope {
+        ResolvedRepoScope {
+            repo: repo.to_string(),
+            source: "repo_policy",
+            host: None,
+            repo_policy_path: Some(PathBuf::from(".qgh.toml")),
+        }
+    }
+
+    fn remote(host: &str, repo: &str) -> GitRemote {
+        GitRemote {
+            host: host.to_string(),
+            api_base_url: format!("https://{host}/api/v3"),
+            web_base_url: format!("https://{host}"),
+            repo: repo.to_string(),
+        }
+    }
+
+    #[test]
+    fn policy_scope_borrows_host_from_matching_remote() {
+        let mut scope = policy_scope("owner/repo");
+        merge_remote_host_into_policy_scope(
+            &mut scope,
+            Some(remote("oss.example.com", "owner/repo")),
+        );
+        assert_eq!(scope.host.as_deref(), Some("oss.example.com"));
+    }
+
+    #[test]
+    fn policy_scope_keeps_no_host_for_mismatched_remote() {
+        let mut scope = policy_scope("owner/repo");
+        merge_remote_host_into_policy_scope(
+            &mut scope,
+            Some(remote("oss.example.com", "fork-owner/repo")),
+        );
+        assert_eq!(scope.host, None);
+    }
+
+    #[test]
+    fn policy_scope_keeps_no_host_without_remote() {
+        let mut scope = policy_scope("owner/repo");
+        merge_remote_host_into_policy_scope(&mut scope, None);
+        assert_eq!(scope.host, None);
     }
 }
