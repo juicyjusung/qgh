@@ -38,14 +38,12 @@ This release artifact is for the qgh MVP contract. It does not define new produc
 - Release trigger: explicit `Cargo.toml` version bump commit plus matching
   `vX.Y.Z` tag push.
 - Release config: `dist-workspace.toml` pins `cargo-dist` 0.32.0, enables
-  `homebrew`, uses `sha256` checksums, enables GitHub Artifact Attestations,
-  keeps the customized CI workflow dirty because `actions/attest@v4` requires
-  `artifact-metadata: write`, and runs `./homebrew-smoke` after announcement.
+  `homebrew`, uses `sha256` checksums. GitHub Artifact Attestations are
+  disabled because user-owned private repositories cannot persist attestations.
+  The workflow runs `./homebrew-smoke` after announcement.
 - Release workflow: `.github/workflows/release.yml` builds local artifacts,
   global artifacts, checksum-backed installers, GitHub Release uploads, and
-  Homebrew formula publication. Its attestation job grants `id-token`,
-  `attestations`, and `artifact-metadata` write permissions required by
-  `actions/attest@v4`.
+  Homebrew formula publication.
 - Homebrew smoke workflow: `.github/workflows/homebrew-smoke.yml` validates the
   generated formula's versioned GitHub Release URL and Homebrew `sha256`, then
   installs the formula and runs `qgh --version` plus `qgh help`.
@@ -81,7 +79,7 @@ Excluded or post-MVP gates:
 | one-command install | `brew install juicyjusung/tap/qgh` installs a self-contained `qgh` binary that can run `qgh --version`, `qgh help`, `qgh init`, and local diagnostic commands. |
 | cargo-dist release automation | `cargo dist plan` and `cargo dist build` pass for macOS Apple Silicon, macOS Intel, and Linux x86_64 release targets. |
 | Homebrew formula smoke | `.github/workflows/homebrew-smoke.yml` checks the generated formula for versioned GitHub Release artifact URLs and Homebrew `sha256` values, then runs the installed `qgh` binary with `qgh --version` and `qgh help`. |
-| release integrity | Release artifacts include checksums and GitHub Artifact Attestations; separate `cosign`/`minisign` signing is not required for this release gate. |
+| release integrity | Release artifacts include checksums and Homebrew `sha256`; separate `cosign`/`minisign` signing is not required for this release gate. |
 
 ## Residual Risks
 

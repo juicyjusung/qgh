@@ -7,7 +7,7 @@ allow-dirty = ["ci"]
 tap = "juicyjusung/homebrew-tap"
 publish-jobs = ["homebrew"]
 post-announce-jobs = ["./homebrew-smoke"]
-github-attestations = true
+github-attestations = false
 checksum = "sha256"
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"

@@ -27,7 +27,7 @@
       "workflow": ".github/workflows/release.yml",
       "homebrew_smoke_workflow": ".github/workflows/homebrew-smoke.yml",
       "checksum": "sha256",
-      "ci_generated_config_policy": "allow-dirty ci preserves the actions/attest@v4 artifact-metadata permission",
+      "ci_generated_config_policy": "allow-dirty ci preserves the hand-edited vX.Y.Z tag trigger and Homebrew smoke workflow; GitHub Artifact Attestations are disabled because user-owned private repositories cannot persist attestations",
       "post_announce_jobs": ["./homebrew-smoke"]
     },
     "release_targets": [
@@ -37,9 +37,7 @@
     ],
     "release_integrity_gate": [
       "artifact checksums",
-      "Homebrew sha256",
-      "GitHub Artifact Attestations",
-      "actions/attest@v4 id-token/attestations/artifact-metadata permissions"
+      "Homebrew sha256"
     ],
     "tap_publish_credential": {
       "secret_name": "HOMEBREW_TAP_TOKEN",
@@ -148,7 +146,7 @@
     "one-command Homebrew install",
     "cargo-dist plan/build",
     "generated Homebrew formula smoke",
-    "release integrity attestations"
+    "release integrity checksums"
   ],
   "residual_risks": [
     "Wiki source connector is post-MVP",

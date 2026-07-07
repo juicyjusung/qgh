@@ -262,12 +262,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         artifact["contract"]["release_integrity_gate"],
-        json!([
-            "artifact checksums",
-            "Homebrew sha256",
-            "GitHub Artifact Attestations",
-            "actions/attest@v4 id-token/attestations/artifact-metadata permissions"
-        ])
+        json!(["artifact checksums", "Homebrew sha256"])
     );
     assert_eq!(
         artifact["contract"]["tap_publish_credential"]["secret_name"],
@@ -295,7 +290,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         artifact["contract"]["release_workflow"]["ci_generated_config_policy"],
-        "allow-dirty ci preserves the actions/attest@v4 artifact-metadata permission"
+        "allow-dirty ci preserves the hand-edited vX.Y.Z tag trigger and Homebrew smoke workflow; GitHub Artifact Attestations are disabled because user-owned private repositories cannot persist attestations"
     );
     assert_eq!(
         artifact["contract"]["release_workflow"]["post_announce_jobs"],
@@ -360,7 +355,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         dist_workspace["dist"]["github-attestations"].as_bool(),
-        Some(true)
+        Some(false)
     );
     assert_eq!(dist_workspace["dist"]["checksum"].as_str(), Some("sha256"));
     assert_eq!(
@@ -375,10 +370,6 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }}",
         "dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json \"--artifacts=global\"",
         "gh release create",
-        "actions/attest@v4",
-        "\"artifact-metadata\": \"write\"",
-        "\"attestations\": \"write\"",
-        "\"id-token\": \"write\"",
         "repository: \"juicyjusung/homebrew-tap\"",
         "token: ${{ secrets.HOMEBREW_TAP_TOKEN }}",
         "publish-homebrew-formula",
@@ -433,7 +424,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "one-command Homebrew install",
             "cargo-dist plan/build",
             "generated Homebrew formula smoke",
-            "release integrity attestations"
+            "release integrity checksums"
         ])
     );
     assert!(artifact["contract"]["init_behavior"]
@@ -2132,7 +2123,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "cargo-dist",
         "HOMEBREW_TAP_TOKEN",
         "Homebrew formula smoke",
-        "GitHub Artifact Attestations",
+        "disabled because user-owned private repositories cannot persist attestations",
         "Supported MVP token sources",
         "Product contract source of truth",
         "qgh query --json",
