@@ -43,12 +43,15 @@ This release artifact is for the qgh MVP contract. It does not define new produc
   The workflow runs `./homebrew-smoke` after announcement.
 - Release workflow: `.github/workflows/release.yml` builds local artifacts,
   global artifacts, checksum-backed installers, GitHub Release uploads, and
-  Homebrew formula publication.
+  Homebrew formula publication. For private `juicyjusung/qgh` release assets,
+  the workflow rewrites generated Homebrew URLs to GitHub REST release asset
+  URLs with token-aware `github_release_headers` before publishing the formula.
 - Homebrew smoke workflow: `.github/workflows/homebrew-smoke.yml` validates the
-  generated formula's versioned GitHub Release URL and Homebrew `sha256`, then
-  links the checked-out tap into Homebrew's tap directory, installs
-  `juicyjusung/tap/qgh` with `HOMEBREW_GITHUB_API_TOKEN` available for private
-  release asset downloads, and runs `qgh --version` plus `qgh help`.
+  generated formula's GitHub REST release asset URL, token-aware headers, and
+  Homebrew `sha256`, then links the checked-out tap into Homebrew's tap
+  directory, installs `juicyjusung/tap/qgh` with `HOMEBREW_GITHUB_API_TOKEN`
+  available for private release asset downloads, and runs `qgh --version` plus
+  `qgh help`.
 - Tap publication uses repo secret `HOMEBREW_TAP_TOKEN`, scoped to contents
   write on only `juicyjusung/homebrew-tap`.
 - Supported MVP token sources: `github_cli`, `env`; `credential_store` is

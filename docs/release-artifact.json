@@ -28,6 +28,7 @@
       "homebrew_smoke_workflow": ".github/workflows/homebrew-smoke.yml",
       "checksum": "sha256",
       "ci_generated_config_policy": "allow-dirty ci preserves the hand-edited vX.Y.Z tag trigger and Homebrew smoke workflow; GitHub Artifact Attestations are disabled because user-owned private repositories cannot persist attestations",
+      "homebrew_private_asset_policy": "published formula rewrites GitHub browser download URLs to REST release asset URLs with github_release_headers so private release assets can be fetched with HOMEBREW_GITHUB_API_TOKEN",
       "post_announce_jobs": ["./homebrew-smoke"]
     },
     "release_targets": [

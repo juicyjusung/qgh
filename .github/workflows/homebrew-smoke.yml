@@ -23,7 +23,10 @@ jobs:
         run: |
           formula="homebrew-tap/Formula/qgh.rb"
           test -f "$formula"
-          grep -Eq '^ *url "https://github\.com/juicyjusung/qgh/releases/download/v[0-9]+\.[0-9]+\.[0-9]+[^"]*/qgh-[^"]+\.(tar\.gz|tar\.xz|zip)"$' "$formula"
+          grep -Eq '^ *url "https://api\.github\.com/repos/juicyjusung/qgh/releases/assets/[0-9]+",$' "$formula"
+          grep -Fq 'headers: github_release_headers' "$formula"
+          grep -Fq 'Accept: application/octet-stream' "$formula"
+          grep -Fq 'Authorization: Bearer #{token}' "$formula"
           grep -Eq '^ *sha256 "[0-9a-f]{64}"$' "$formula"
           grep -Eq '^ *version "[0-9]+\.[0-9]+\.[0-9]+[^"]*"$' "$formula"
 
