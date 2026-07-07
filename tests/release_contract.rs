@@ -392,7 +392,9 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         formula_url_regex,
         r#"^ *sha256 "[0-9a-f]{64}"$"#,
         "HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}",
-        "brew install --formula ./homebrew-tap/Formula/qgh.rb",
+        "Library/Taps/juicyjusung/homebrew-tap",
+        "ln -s \"$PWD/homebrew-tap\" \"$tap_dir\"",
+        "brew install juicyjusung/tap/qgh",
         "qgh --version",
         "qgh help",
     ] {

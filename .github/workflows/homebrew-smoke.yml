@@ -32,6 +32,10 @@ jobs:
         env:
           HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
         run: |
-          brew install --formula ./homebrew-tap/Formula/qgh.rb
+          tap_dir="$(brew --repository)/Library/Taps/juicyjusung/homebrew-tap"
+          rm -rf "$tap_dir"
+          mkdir -p "$(dirname "$tap_dir")"
+          ln -s "$PWD/homebrew-tap" "$tap_dir"
+          brew install juicyjusung/tap/qgh
           qgh --version
           qgh help
