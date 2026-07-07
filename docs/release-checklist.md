@@ -38,8 +38,9 @@ This release artifact is for the qgh MVP contract. It does not define new produc
 - Release trigger: explicit `Cargo.toml` version bump commit plus matching
   `vX.Y.Z` tag push.
 - Release config: `dist-workspace.toml` pins `cargo-dist` 0.32.0, enables
-  `homebrew`, uses `sha256` checksums, and enables GitHub Artifact Attestations.
-  The workflow runs `./homebrew-smoke` after announcement.
+  `homebrew`, builds release binaries with `fastembed-provider`, uses `sha256`
+  checksums, and enables GitHub Artifact Attestations. The workflow runs
+  `./homebrew-smoke` after announcement.
 - Release workflow: `.github/workflows/release.yml` builds local artifacts,
   global artifacts, checksum-backed installers, GitHub Release uploads, and
   Homebrew formula publication.

@@ -11,6 +11,7 @@ github-attestations = true
 checksum = "sha256"
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
+features = ["fastembed-provider"]
 # CI backends to support
 ci = "github"
 # The installers to generate for each app

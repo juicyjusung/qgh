@@ -289,6 +289,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         ".github/workflows/homebrew-smoke.yml"
     );
     assert_eq!(
+        artifact["contract"]["release_workflow"]["cargo_features"],
+        json!(["fastembed-provider"])
+    );
+    assert_eq!(
         artifact["contract"]["release_workflow"]["checksum"],
         "sha256"
     );
@@ -330,6 +334,11 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert_eq!(
         dist_workspace["dist"]["cargo-dist-version"].as_str(),
         Some("0.32.0")
+    );
+    assert_eq!(
+        toml_array_strings(&dist_workspace["dist"]["features"]),
+        vec!["fastembed-provider"],
+        "release binaries must include the local embedding provider feature"
     );
     assert_eq!(dist_workspace["dist"]["ci"].as_str(), Some("github"));
     assert_eq!(dist_workspace["dist"]["hosting"].as_str(), Some("github"));

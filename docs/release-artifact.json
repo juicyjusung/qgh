@@ -26,6 +26,7 @@
       "config": "dist-workspace.toml",
       "workflow": ".github/workflows/release.yml",
       "homebrew_smoke_workflow": ".github/workflows/homebrew-smoke.yml",
+      "cargo_features": ["fastembed-provider"],
       "checksum": "sha256",
       "ci_generated_config_policy": "allow-dirty ci preserves the hand-edited vX.Y.Z tag trigger and Homebrew smoke workflow",
       "post_announce_jobs": ["./homebrew-smoke"]
