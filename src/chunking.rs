@@ -86,7 +86,11 @@ pub fn chunk_markdown_with_config(
         ));
     }
 
-    let tokens = tokenizer.tokenize(text)?;
+    // Chunk against the tokenizer's canonical text: token spans are only
+    // guaranteed to be valid byte ranges into it, not into the raw input.
+    let tokenized = tokenizer.tokenize_canonical(text)?;
+    let text = tokenized.text.as_str();
+    let tokens = tokenized.spans;
     validate_token_spans(text, &tokens)?;
     if tokens.is_empty() {
         return Ok(Vec::new());
@@ -378,6 +382,7 @@ fn is_heading(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::TokenizedText;
 
     struct WhitespaceTokenizer;
 
@@ -497,5 +502,57 @@ mod tests {
         let error = chunk_markdown("abc", &InvalidTokenizer).unwrap_err();
 
         assert!(error.to_string().contains("empty token span"));
+    }
+
+    #[test]
+    fn chunks_against_tokenizer_canonical_text_when_spans_target_normalized_form() {
+        // Simulates an SPM-style normalizer that collapses newline runs into
+        // single spaces: spans are only valid against the normalized text,
+        // never the raw input — the shape of the fastembed XLM-R tokenizer.
+        struct NewlineCollapsingTokenizer;
+
+        impl NewlineCollapsingTokenizer {
+            fn canonicalize(text: &str) -> String {
+                text.split('\n')
+                    .filter(|segment| !segment.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        }
+
+        impl EmbeddingTokenizer for NewlineCollapsingTokenizer {
+            fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError> {
+                Ok(self.tokenize_canonical(text)?.spans)
+            }
+
+            fn tokenize_canonical(
+                &self,
+                text: &str,
+            ) -> Result<TokenizedText, EmbeddingProviderError> {
+                let canonical = Self::canonicalize(text);
+                let spans = WhitespaceTokenizer.tokenize(&canonical)?;
+                Ok(TokenizedText {
+                    text: canonical,
+                    spans,
+                })
+            }
+        }
+
+        let text = "# 한국어 제목\n\n스토리지 리뷰 지적사항 반영 완료 본문입니다\n\n```swift\nlet key = contentKey\n```";
+        let canonical = NewlineCollapsingTokenizer::canonicalize(text);
+        let config = ChunkerConfig {
+            target_tokens: 4,
+            overlap_tokens: 1,
+            boundary_search_tokens: 1,
+        };
+
+        let chunks = chunk_markdown_with_config(text, &NewlineCollapsingTokenizer, config).unwrap();
+
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert_eq!(chunk.body, canonical[chunk.byte_start..chunk.byte_end]);
+        }
+        assert!(chunks.iter().any(|chunk| chunk.body.contains("지적사항")));
+        assert_eq!(chunks.last().unwrap().byte_end, canonical.len());
     }
 }

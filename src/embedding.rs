@@ -17,11 +17,17 @@ pub const DEFAULT_HF_MODEL_ID: &str = "Snowflake/snowflake-arctic-embed-l-v2.0";
 /// (model_id, model_revision) pair, silently invalidating stored
 /// embeddings. Users can opt into a moving revision via `@<revision>`.
 pub const DEFAULT_HF_MODEL_REVISION: &str = "ac6544c8a46e00af67e330e85a9028c66b8cfd9a";
-pub const DEFAULT_HF_MODEL_FILE: &str = "onnx/model_quantized.onnx";
+// fp32 rather than model_quantized.onnx: fastembed refuses batching for
+// dynamically quantized models (per-batch quantization ranges make
+// embeddings incompatible across batches), and single-batch inference over
+// a full corpus needs tens of GB. fp32 embeds with a small bounded batch.
+pub const DEFAULT_HF_MODEL_FILE: &str = "onnx/model.onnx";
 pub const DEFAULT_QUERY_PREFIX: &str = "query: ";
 pub const HUGGINGFACE_ENDPOINT: &str = "https://huggingface.co";
 pub const EMBEDDING_FINGERPRINT_SCHEMA_VERSION: &str = "qgh.embedding_fingerprint.v1";
-pub const CHUNKER_VERSION: &str = "qgh.chunker.v1";
+// v2: chunks slice the tokenizer's canonical (normalized) text instead of
+// the raw source body, so v1 chunk bodies and embeddings are not comparable.
+pub const CHUNKER_VERSION: &str = "qgh.chunker.v2";
 pub const SOURCE_SCHEMA_VERSION: &str = "qgh.source_schema.v1";
 pub const LOCAL_MODEL_REVISION: &str = "local_path";
 
@@ -53,8 +59,26 @@ pub trait EmbeddingEngine {
         -> Result<Vec<EmbeddingVector>, EmbeddingProviderError>;
 }
 
+/// Tokenization result whose `spans` are byte offsets into `text`, which may
+/// be a normalized form of the input rather than the input itself.
+pub struct TokenizedText {
+    pub text: String,
+    pub spans: Vec<TokenSpan>,
+}
+
 pub trait EmbeddingTokenizer {
     fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError>;
+
+    /// Tokenize and return the canonical text the spans are valid against.
+    /// Tokenizers whose offsets do not map back to the original input (e.g.
+    /// normalizers that drop bytes) must override this and return the
+    /// normalized text the offsets refer to.
+    fn tokenize_canonical(&self, text: &str) -> Result<TokenizedText, EmbeddingProviderError> {
+        Ok(TokenizedText {
+            text: text.to_string(),
+            spans: self.tokenize(text)?,
+        })
+    }
 
     fn count_tokens(&self, text: &str) -> Result<usize, EmbeddingProviderError> {
         Ok(self.tokenize(text)?.len())
@@ -465,6 +489,15 @@ pub fn resolve_hf_model_snapshot(
         paths.insert(file.to_string(), path);
     }
 
+    // ONNX graphs above 2GB ship their weights as an external `<model>_data`
+    // companion that ort resolves relative to the graph file, so it must be
+    // downloaded into the same snapshot directory or session init fails.
+    let companion = format!("{}_data", behavior.model_file);
+    if !paths.contains_key(&companion) && repo.list_files()?.iter().any(|file| file == &companion) {
+        let path = repo.get(&companion)?;
+        paths.insert(companion, path);
+    }
+
     Ok(ResolvedModelSnapshot {
         model_id: Some(model_id.to_string()),
         model_revision: repo.revision()?.unwrap_or_else(|| "unknown".to_string()),
@@ -612,15 +645,21 @@ impl FastembedEngine {
 }
 
 #[cfg(feature = "fastembed-provider")]
+const FASTEMBED_BATCH_SIZE: usize = 16;
+
+#[cfg(feature = "fastembed-provider")]
 impl EmbeddingEngine for FastembedEngine {
     fn embed_texts(
         &self,
         texts: &[String],
     ) -> Result<Vec<EmbeddingVector>, EmbeddingProviderError> {
+        // fastembed's default batch size (256) with ~900-token chunks blows
+        // past tens of GB of activation memory on the large model; keep CPU
+        // inference batches small so a full-corpus embed stays bounded.
         self.model
             .lock()
             .expect("fastembed mutex poisoned")
-            .embed(texts, None)
+            .embed(texts, Some(FASTEMBED_BATCH_SIZE))
             .map_err(|error| {
                 EmbeddingProviderError::structured(
                     "embedding.fastembed_failed",
@@ -657,23 +696,54 @@ impl FastembedTokenizer {
 #[cfg(feature = "fastembed-provider")]
 impl EmbeddingTokenizer for FastembedTokenizer {
     fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError> {
-        let encoding = self.tokenizer.encode(text, false).map_err(|error| {
+        Ok(self.tokenize_canonical(text)?.spans)
+    }
+
+    // The HF tokenizer reports offsets against its normalizer's output, and
+    // the XLM-R Precompiled normalizer drops bytes (e.g. collapses newlines)
+    // without adjusting offset alignment, so offsets drift against the
+    // original text. Normalizing first and encoding the normalized text makes
+    // the offsets valid byte ranges into that text; only the leading
+    // Metaspace meta-token can still overlap its successor, which the
+    // monotonic clamp below removes.
+    fn tokenize_canonical(&self, text: &str) -> Result<TokenizedText, EmbeddingProviderError> {
+        use tokenizers::Normalizer;
+
+        let tokenizer_failed = |error: tokenizers::Error| {
             EmbeddingProviderError::structured(
                 "embedding.tokenizer_failed",
                 "Embedding tokenizer failed to tokenize source text.",
             )
             .with_details(json!({ "error": error.to_string() }))
-        })?;
-        Ok(encoding
-            .get_offsets()
-            .iter()
-            .filter_map(|(start, end)| {
-                (start < end).then_some(TokenSpan {
-                    start: *start,
-                    end: *end,
-                })
-            })
-            .collect())
+        };
+        let canonical = match self.tokenizer.get_normalizer() {
+            Some(normalizer) => {
+                let mut normalized = tokenizers::NormalizedString::from(text);
+                normalizer
+                    .normalize(&mut normalized)
+                    .map_err(tokenizer_failed)?;
+                normalized.get().to_string()
+            }
+            None => text.to_string(),
+        };
+        let encoding = self
+            .tokenizer
+            .encode(canonical.as_str(), false)
+            .map_err(tokenizer_failed)?;
+        let mut spans = Vec::new();
+        let mut previous_end = 0usize;
+        for (start, end) in encoding.get_offsets() {
+            let start = (*start).max(previous_end);
+            if start >= *end {
+                continue;
+            }
+            spans.push(TokenSpan { start, end: *end });
+            previous_end = *end;
+        }
+        Ok(TokenizedText {
+            text: canonical,
+            spans,
+        })
     }
 }
 
@@ -982,10 +1052,10 @@ fn detect_onnx_file(
 fn detect_local_onnx_file(root: &Path) -> Option<String> {
     let candidates = [
         DEFAULT_HF_MODEL_FILE,
-        "onnx/model.onnx",
+        "onnx/model_quantized.onnx",
         "onnx/model.onnx_data",
-        "model_quantized.onnx",
         "model.onnx",
+        "model_quantized.onnx",
     ];
     candidates
         .into_iter()
@@ -999,11 +1069,7 @@ fn detect_onnx_candidate<'a>(files: impl Iterator<Item = &'a str>) -> Option<Str
         .filter(|file| !file.contains("q4"))
         .collect::<Vec<_>>();
     candidates.sort_unstable();
-    for preferred in [
-        DEFAULT_HF_MODEL_FILE,
-        "onnx/model_quantized.onnx",
-        "onnx/model.onnx",
-    ] {
+    for preferred in [DEFAULT_HF_MODEL_FILE, "onnx/model_quantized.onnx"] {
         if candidates.contains(&preferred) {
             return Some(preferred.to_string());
         }
