@@ -38,19 +38,15 @@ This release artifact is for the qgh MVP contract. It does not define new produc
 - Release trigger: explicit `Cargo.toml` version bump commit plus matching
   `vX.Y.Z` tag push.
 - Release config: `dist-workspace.toml` pins `cargo-dist` 0.32.0, enables
-  `homebrew`, uses `sha256` checksums. GitHub Artifact Attestations are
-  disabled because user-owned private repositories cannot persist attestations.
+  `homebrew`, uses `sha256` checksums, and enables GitHub Artifact Attestations.
   The workflow runs `./homebrew-smoke` after announcement.
 - Release workflow: `.github/workflows/release.yml` builds local artifacts,
   global artifacts, checksum-backed installers, GitHub Release uploads, and
-  Homebrew formula publication. For private `juicyjusung/qgh` release assets,
-  the workflow rewrites generated Homebrew URLs to GitHub REST release asset
-  URLs with token-aware `github_release_headers` before publishing the formula.
+  Homebrew formula publication.
 - Homebrew smoke workflow: `.github/workflows/homebrew-smoke.yml` validates the
-  generated formula's GitHub REST release asset URL, token-aware headers, and
-  Homebrew `sha256`, then links the checked-out tap into Homebrew's tap
-  directory, installs `juicyjusung/tap/qgh` with `HOMEBREW_GITHUB_API_TOKEN`
-  available for private release asset downloads, and runs `qgh --version` plus
+  generated formula's versioned GitHub Release URL and Homebrew `sha256`, then
+  links the checked-out tap into Homebrew's tap directory, installs
+  `juicyjusung/tap/qgh` without a GitHub token, and runs `qgh --version` plus
   `qgh help`.
 - Tap publication uses repo secret `HOMEBREW_TAP_TOKEN`, scoped to contents
   write on only `juicyjusung/homebrew-tap`.
@@ -96,9 +92,8 @@ Excluded or post-MVP gates:
 - GHES compatibility is best-effort until a dedicated compatibility pass.
 - Linux ARM64, Windows packages, and `homebrew/core` submission are later
   distribution targets.
-- Public unauthenticated Homebrew installs require the `juicyjusung/qgh` release
-  assets to be public; while the repo is private, users need GitHub access and a
-  Homebrew-compatible GitHub token.
+- Public unauthenticated Homebrew installs require the `juicyjusung/qgh`
+  repository and release assets to remain public.
 - Live dogfood against `juicyjusung/qgh` is a manual first-use checklist item,
   not a blocking CI gate.
 

@@ -262,7 +262,11 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         artifact["contract"]["release_integrity_gate"],
-        json!(["artifact checksums", "Homebrew sha256"])
+        json!([
+            "artifact checksums",
+            "Homebrew sha256",
+            "GitHub Artifact Attestations"
+        ])
     );
     assert_eq!(
         artifact["contract"]["tap_publish_credential"]["secret_name"],
@@ -290,11 +294,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         artifact["contract"]["release_workflow"]["ci_generated_config_policy"],
-        "allow-dirty ci preserves the hand-edited vX.Y.Z tag trigger and Homebrew smoke workflow; GitHub Artifact Attestations are disabled because user-owned private repositories cannot persist attestations"
-    );
-    assert_eq!(
-        artifact["contract"]["release_workflow"]["homebrew_private_asset_policy"],
-        "published formula rewrites GitHub browser download URLs to REST release asset URLs with github_release_headers so private release assets can be fetched with HOMEBREW_GITHUB_API_TOKEN"
+        "allow-dirty ci preserves the hand-edited vX.Y.Z tag trigger and Homebrew smoke workflow"
     );
     assert_eq!(
         artifact["contract"]["release_workflow"]["post_announce_jobs"],
@@ -359,7 +359,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         dist_workspace["dist"]["github-attestations"].as_bool(),
-        Some(false)
+        Some(true)
     );
     assert_eq!(dist_workspace["dist"]["checksum"].as_str(), Some("sha256"));
     assert_eq!(
@@ -377,9 +377,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "repository: \"juicyjusung/homebrew-tap\"",
         "token: ${{ secrets.HOMEBREW_TAP_TOKEN }}",
         "Formula/${filename} unchanged",
-        "gh api \"repos/juicyjusung/qgh/releases/tags/${tag}\"",
-        "github_release_headers",
-        "Authorization: Bearer #{token}",
+        "actions/attest@v4",
         "publish-homebrew-formula",
         "custom-homebrew-smoke",
         "uses: ./.github/workflows/homebrew-smoke.yml",
@@ -392,17 +390,12 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
 
     let smoke_workflow =
         fs::read_to_string(root.join(".github/workflows/homebrew-smoke.yml")).unwrap();
-    let formula_url_regex =
-        r#"^ *url "https://api\.github\.com/repos/juicyjusung/qgh/releases/assets/[0-9]+",$"#;
+    let formula_url_regex = r#"^ *url "https://github\.com/juicyjusung/qgh/releases/download/v[0-9]+\.[0-9]+\.[0-9]+[^"]*/qgh-[^"]+\.(tar\.gz|tar\.xz|zip)"$"#;
     for required in [
         "workflow_call:",
         "repository: juicyjusung/homebrew-tap",
         formula_url_regex,
-        "headers: github_release_headers",
-        "Accept: application/octet-stream",
-        "Authorization: Bearer #{token}",
         r#"^ *sha256 "[0-9a-f]{64}"$"#,
-        "HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}",
         "Library/Taps/juicyjusung/homebrew-tap",
         "ln -s \"$PWD/homebrew-tap\" \"$tap_dir\"",
         "brew install juicyjusung/tap/qgh",
@@ -416,11 +409,11 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     }
     assert_grep_regex_matches(
         formula_url_regex,
-        r#"  url "https://api.github.com/repos/juicyjusung/qgh/releases/assets/123456","#,
+        r#"  url "https://github.com/juicyjusung/qgh/releases/download/v0.1.0/qgh-aarch64-apple-darwin.tar.gz""#,
     );
     assert_grep_regex_matches(
         formula_url_regex,
-        r#"    url "https://api.github.com/repos/juicyjusung/qgh/releases/assets/123456","#,
+        r#"    url "https://github.com/juicyjusung/qgh/releases/download/v0.1.0/qgh-x86_64-unknown-linux-gnu.tar.xz""#,
     );
     assert_eq!(
         artifact["verification"],
@@ -2137,9 +2130,9 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "juicyjusung/homebrew-tap",
         "cargo-dist",
         "HOMEBREW_TAP_TOKEN",
-        "HOMEBREW_GITHUB_API_TOKEN",
         "Homebrew formula smoke",
-        "disabled because user-owned private repositories cannot persist attestations",
+        "GitHub Artifact Attestations",
+        "without a GitHub token",
         "Supported MVP token sources",
         "Product contract source of truth",
         "qgh query --json",
@@ -2155,7 +2148,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "shared server",
         "write-back",
         "user-facing eval",
-        "users need GitHub access",
+        "repository and release assets to remain public",
     ] {
         assert!(
             checklist.contains(required),

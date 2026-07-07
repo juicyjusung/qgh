@@ -116,7 +116,10 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     permissions:
+      "artifact-metadata": "write"
+      "attestations": "write"
       "contents": "read"
+      "id-token": "write"
     steps:
       - name: enable windows longpaths
         run: |
@@ -149,6 +152,10 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      - name: Attest
+        uses: actions/attest@v4
+        with:
+          subject-path: "target/distrib/*${{ join(matrix.targets, ', ') }}*"
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
@@ -323,43 +330,6 @@ jobs:
             brew update
             # We avoid reformatting user-provided data such as the app description and homepage.
             brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}" || true
-
-            tag=$(echo "$PLAN" | jq .announcement_tag --raw-output)
-            gh api "repos/juicyjusung/qgh/releases/tags/${tag}" > release.json
-            ruby -rjson -e '
-              formula_path = ARGV.fetch(0)
-              release_path = ARGV.fetch(1)
-              assets = JSON.parse(File.read(release_path)).fetch("assets")
-              asset_urls = assets.to_h { |asset| [asset.fetch("name"), asset.fetch("url")] }
-              formula = File.read(formula_path)
-
-              helper = [
-                "",
-                "  def self.github_release_headers",
-                "    headers = [\"Accept: application/octet-stream\"]",
-                "    token = ENV[\"HOMEBREW_GITHUB_API_TOKEN\"]",
-                %q(    headers << "Authorization: Bearer #{token}" unless token.to_s.empty?),
-                "    headers",
-                "  end",
-                "",
-              ].join("\n") + "\n"
-
-              unless formula.include?("def self.github_release_headers")
-                abort("missing version line in #{formula_path}") unless formula.sub!(/(  version "[^"]+"\n)/, "\\1#{helper}")
-              end
-
-              replacement_count = 0
-              formula.gsub!(%r{^(\s*)url "https://github\.com/juicyjusung/qgh/releases/download/[^"]+/([^"]+)"}) do
-                indent = Regexp.last_match(1)
-                asset_name = Regexp.last_match(2)
-                api_url = asset_urls.fetch(asset_name) { abort("missing release asset for #{asset_name}") }
-                replacement_count += 1
-                %(#{indent}url "#{api_url}",\n#{indent}    headers: github_release_headers)
-              end
-              abort("no release asset URLs rewritten in #{formula_path}") if replacement_count.zero?
-
-              File.write(formula_path, formula)
-            ' "Formula/${filename}" release.json
 
             git add "Formula/${filename}"
             if git diff --cached --quiet; then

@@ -27,8 +27,7 @@
       "workflow": ".github/workflows/release.yml",
       "homebrew_smoke_workflow": ".github/workflows/homebrew-smoke.yml",
       "checksum": "sha256",
-      "ci_generated_config_policy": "allow-dirty ci preserves the hand-edited vX.Y.Z tag trigger and Homebrew smoke workflow; GitHub Artifact Attestations are disabled because user-owned private repositories cannot persist attestations",
-      "homebrew_private_asset_policy": "published formula rewrites GitHub browser download URLs to REST release asset URLs with github_release_headers so private release assets can be fetched with HOMEBREW_GITHUB_API_TOKEN",
+      "ci_generated_config_policy": "allow-dirty ci preserves the hand-edited vX.Y.Z tag trigger and Homebrew smoke workflow",
       "post_announce_jobs": ["./homebrew-smoke"]
     },
     "release_targets": [
@@ -38,7 +37,8 @@
     ],
     "release_integrity_gate": [
       "artifact checksums",
-      "Homebrew sha256"
+      "Homebrew sha256",
+      "GitHub Artifact Attestations"
     ],
     "tap_publish_credential": {
       "secret_name": "HOMEBREW_TAP_TOKEN",
@@ -155,7 +155,7 @@
     "shared server and GitHub App token operations require separate ACL and audit design",
     "GHES remains best-effort until a dedicated compatibility pass",
     "Linux ARM64, Windows packages, and homebrew/core submission are later distribution targets",
-    "Public unauthenticated Homebrew installs require public qgh release assets; private repo installs require GitHub access and a Homebrew-compatible token",
+    "Public unauthenticated Homebrew installs require the qgh repository and release assets to remain public",
     "Live dogfood against juicyjusung/qgh is manual and not a blocking CI gate"
   ]
 }
