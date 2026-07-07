@@ -29,7 +29,9 @@ jobs:
 
       - name: Install generated formula
         shell: bash
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
         run: |
-          brew install --formula homebrew-tap/Formula/qgh.rb
+          brew install --formula ./homebrew-tap/Formula/qgh.rb
           qgh --version
           qgh help

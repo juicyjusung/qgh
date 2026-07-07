@@ -154,6 +154,7 @@
     "shared server and GitHub App token operations require separate ACL and audit design",
     "GHES remains best-effort until a dedicated compatibility pass",
     "Linux ARM64, Windows packages, and homebrew/core submission are later distribution targets",
+    "Public unauthenticated Homebrew installs require public qgh release assets; private repo installs require GitHub access and a Homebrew-compatible token",
     "Live dogfood against juicyjusung/qgh is manual and not a blocking CI gate"
   ]
 }

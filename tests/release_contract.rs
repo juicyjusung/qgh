@@ -372,6 +372,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "gh release create",
         "repository: \"juicyjusung/homebrew-tap\"",
         "token: ${{ secrets.HOMEBREW_TAP_TOKEN }}",
+        "Formula/${filename} unchanged",
         "publish-homebrew-formula",
         "custom-homebrew-smoke",
         "uses: ./.github/workflows/homebrew-smoke.yml",
@@ -390,7 +391,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "repository: juicyjusung/homebrew-tap",
         formula_url_regex,
         r#"^ *sha256 "[0-9a-f]{64}"$"#,
-        "brew install --formula homebrew-tap/Formula/qgh.rb",
+        "HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}",
+        "brew install --formula ./homebrew-tap/Formula/qgh.rb",
         "qgh --version",
         "qgh help",
     ] {
@@ -2122,6 +2124,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "juicyjusung/homebrew-tap",
         "cargo-dist",
         "HOMEBREW_TAP_TOKEN",
+        "HOMEBREW_GITHUB_API_TOKEN",
         "Homebrew formula smoke",
         "disabled because user-owned private repositories cannot persist attestations",
         "Supported MVP token sources",
@@ -2139,6 +2142,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "shared server",
         "write-back",
         "user-facing eval",
+        "users need GitHub access",
     ] {
         assert!(
             checklist.contains(required),
