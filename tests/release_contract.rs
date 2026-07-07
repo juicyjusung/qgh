@@ -254,11 +254,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert_eq!(artifact["contract"]["release_automation"], "cargo-dist");
     assert_eq!(
         artifact["contract"]["release_targets"],
-        json!([
-            "aarch64-apple-darwin",
-            "x86_64-apple-darwin",
-            "x86_64-unknown-linux-gnu"
-        ])
+        json!(["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"])
     );
     assert_eq!(
         artifact["contract"]["release_integrity_gate"],
@@ -348,11 +344,12 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         toml_array_strings(&dist_workspace["dist"]["targets"]),
-        vec![
-            "aarch64-apple-darwin",
-            "x86_64-apple-darwin",
-            "x86_64-unknown-linux-gnu",
-        ]
+        vec!["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+    );
+    assert_eq!(
+        dist_workspace["dist"]["github-custom-runners"]["x86_64-unknown-linux-gnu"].as_str(),
+        Some("ubuntu-24.04"),
+        "ort prebuilt Linux binaries need a glibc 2.38+ runner"
     );
     assert_eq!(
         dist_workspace["dist"]["tap"].as_str(),

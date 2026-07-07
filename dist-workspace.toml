@@ -16,7 +16,14 @@ features = ["fastembed-provider"]
 ci = "github"
 # The installers to generate for each app
 installers = ["homebrew"]
-# Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Target platforms to build apps for (Rust target-triple syntax).
+# x86_64-apple-darwin is dropped: ort 2.0.0-rc.12 ships no Intel-mac
+# prebuilt ONNX Runtime, so the fastembed-provider feature cannot build.
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Where to host releases
 hosting = "github"
+
+# ort's prebuilt Linux ONNX Runtime links glibc 2.38+ symbols (__isoc23_*),
+# so the Linux artifact must build on a runner with a recent glibc.
+[dist.github-custom-runners]
+x86_64-unknown-linux-gnu = "ubuntu-24.04"
