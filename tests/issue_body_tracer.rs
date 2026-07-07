@@ -2724,9 +2724,25 @@ query_prefix = "query: "
 }
 
 #[test]
+fn embed_without_embedding_config_reports_not_configured_before_force() {
+    let fixture = TestFixture::new("embed-missing-embedding-config");
+    fixture.write_config("http://127.0.0.1:1");
+
+    let embed = fixture.qgh(["embed", "--json"]);
+
+    assert_eq!(embed.status.code(), Some(2));
+    let embed_json = stdout_json(&embed);
+    assert_eq!(embed_json["error"]["code"], "embedding.not_configured");
+    assert!(embed_json["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .contains("qgh embed --force"));
+}
+
+#[test]
 fn embed_requires_force_for_full_refresh() {
     let fixture = TestFixture::new("embed-requires-force");
-    fixture.write_config("http://127.0.0.1:1");
+    fixture.write_default_embedding_config("http://127.0.0.1:1");
 
     let embed = fixture.qgh(["embed", "--json"]);
 

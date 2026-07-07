@@ -1151,14 +1151,6 @@ fn target_issue_sync_json(
 }
 
 pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, QghError> {
-    if !args.force {
-        return Err(QghError::validation(
-            "embedding.force_required",
-            "`qgh embed` requires --force for this full-refresh slice.",
-        )
-        .with_hint("Run `qgh embed --force` to recompute every stored chunk embedding."));
-    }
-
     let profile = load_profile(profile_id)?;
     let Some(embedding) = profile.embedding.as_ref() else {
         return Err(QghError::validation(
@@ -1167,6 +1159,15 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
         )
         .with_hint("Add an [embedding] section before running `qgh embed --force`."));
     };
+
+    if !args.force {
+        return Err(QghError::validation(
+            "embedding.force_required",
+            "`qgh embed` requires --force for this full-refresh slice.",
+        )
+        .with_hint("Run `qgh embed --force` to recompute every stored chunk embedding."));
+    }
+
     let mut store = Store::open(&profile.paths)?;
     let runtime = embedding_runtime(embedding)?;
     let progress = StderrSyncProgress::new(false);
