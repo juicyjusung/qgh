@@ -1052,13 +1052,15 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
     let source_sync_run_id = store
         .latest_successful_sync_run_id()?
         .unwrap_or_else(|| "embedding-sync".to_string());
+    let model_manifest_hash = fingerprint.hash();
+    let context_template_version = "qgh.context.v1".to_string();
     let spec = crate::store::EmbeddingGenerationSpec {
-        model_manifest_hash: fingerprint.hash(),
+        model_manifest_hash: model_manifest_hash.clone(),
         chunker_fingerprint: chunks
             .first()
             .map(|chunk| chunk.chunker_fingerprint.clone())
             .unwrap_or_else(|| "none".to_string()),
-        context_template_version: "qgh.context.v1".to_string(),
+        context_template_version: context_template_version.clone(),
         output_dimension: dimension,
         source_sync_run_id: source_sync_run_id.clone(),
         source_snapshot_hash: source_sync_run_id,
@@ -1076,7 +1078,12 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
                     source_version_hash: store
                         .source_version_hash(chunk.source_version_id)?
                         .ok_or_else(|| QghError::storage("Missing source version hash."))?,
-                    context_hash: chunk.chunker_fingerprint.clone(),
+                    context_hash: crate::store::embedding_context_hash(
+                        &model_manifest_hash,
+                        &chunk.chunker_fingerprint,
+                        &context_template_version,
+                        &chunk.body,
+                    ),
                     vector: (*vector).clone(),
                 })
             })
@@ -1594,13 +1601,15 @@ fn refresh_chunk_embeddings(
     let source_sync_run_id = store
         .latest_successful_sync_run_id()?
         .unwrap_or_else(|| "embedding-embed".to_string());
+    let model_manifest_hash = fingerprint.hash();
+    let context_template_version = "qgh.context.v1".to_string();
     let spec = crate::store::EmbeddingGenerationSpec {
-        model_manifest_hash: fingerprint.hash(),
+        model_manifest_hash: model_manifest_hash.clone(),
         chunker_fingerprint: chunks
             .first()
             .map(|chunk| chunk.chunker_fingerprint.clone())
             .unwrap_or_else(|| "none".to_string()),
-        context_template_version: "qgh.context.v1".to_string(),
+        context_template_version: context_template_version.clone(),
         output_dimension: dimension,
         source_sync_run_id: source_sync_run_id.clone(),
         source_snapshot_hash: source_sync_run_id,
@@ -1617,7 +1626,12 @@ fn refresh_chunk_embeddings(
                     source_version_hash: store
                         .source_version_hash(chunk.source_version_id)?
                         .ok_or_else(|| QghError::storage("Missing source version hash."))?,
-                    context_hash: chunk.chunker_fingerprint.clone(),
+                    context_hash: crate::store::embedding_context_hash(
+                        &model_manifest_hash,
+                        &chunk.chunker_fingerprint,
+                        &context_template_version,
+                        &chunk.body,
+                    ),
                     vector: vector.clone(),
                 })
             })

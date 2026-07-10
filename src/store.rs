@@ -62,6 +62,27 @@ pub struct RetrievalPublicationView {
     pub output_dimension: Option<usize>,
 }
 
+pub fn embedding_context_hash(
+    model_manifest_hash: &str,
+    chunker_fingerprint: &str,
+    context_template_version: &str,
+    embedding_input: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(model_manifest_hash.as_bytes());
+    hasher.update([0]);
+    hasher.update(chunker_fingerprint.as_bytes());
+    hasher.update([0]);
+    hasher.update(context_template_version.as_bytes());
+    hasher.update([0]);
+    hasher.update(embedding_input.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -2035,20 +2056,31 @@ impl Store {
     }
 
     pub fn validate_embedding_generation(&mut self, generation_id: i64) -> Result<(), QghError> {
-        let (state, dimension, total_chunks, completed_chunks): (String, usize, i64, i64) =
-            self.conn.query_row(
-                "SELECT state, output_dimension, total_chunks, completed_chunks
+        let (
+            state,
+            dimension,
+            total_chunks,
+            completed_chunks,
+            model_manifest_hash,
+            chunker_fingerprint,
+            context_template_version,
+        ): (String, usize, i64, i64, String, String, String) = self.conn.query_row(
+            "SELECT state, output_dimension, total_chunks, completed_chunks,
+                        model_manifest_hash, chunker_fingerprint, context_template_version
                  FROM embedding_generations WHERE id = ?1",
-                params![generation_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get::<_, i64>(1)? as usize,
-                        row.get(2)?,
-                        row.get(3)?,
-                    ))
-                },
-            )?;
+            params![generation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )?;
         if state != "building" || completed_chunks != total_chunks {
             return self.fail_embedding_generation(
                 generation_id,
@@ -2059,9 +2091,10 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT gc.vector_blob, gc.vector_checksum, gc.vector_dimension,
                     gc.source_version_id, gc.source_version_hash, gc.context_hash,
-                    sv.body_hash, coalesce(im.latest_version_id, cm.latest_version_id)
+                    sv.body_hash, coalesce(im.latest_version_id, cm.latest_version_id), c.body
              FROM embedding_generation_chunks gc
              JOIN source_versions sv ON sv.id = gc.source_version_id
+             JOIN chunks c ON c.id = gc.chunk_id
              LEFT JOIN issue_metadata im ON im.source_id = sv.source_id
              LEFT JOIN comment_metadata cm ON cm.source_id = sv.source_id
              WHERE gc.generation_id = ?1",
@@ -2076,6 +2109,7 @@ impl Store {
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, Option<i64>>(7)?,
+                row.get::<_, String>(8)?,
             ))
         })?;
         let mut invalid = false;
@@ -2089,13 +2123,20 @@ impl Store {
                 context_hash,
                 body_hash,
                 latest_version_id,
+                embedding_input,
             ) = row?;
             if stored_dimension != dimension
                 || decode_embedding_blob(&bytes, dimension).is_err()
                 || embedding_blob_checksum(&bytes) != checksum
                 || source_hash != body_hash
                 || latest_version_id != Some(source_version_id)
-                || context_hash.is_empty()
+                || context_hash
+                    != embedding_context_hash(
+                        &model_manifest_hash,
+                        &chunker_fingerprint,
+                        &context_template_version,
+                        &embedding_input,
+                    )
             {
                 invalid = true;
                 break;
@@ -3746,7 +3787,12 @@ mod tests {
                     chunk_id,
                     source_version_id,
                     source_version_hash: "body-hash-generation-sync".to_string(),
-                    context_hash: "context-hash-a".to_string(),
+                    context_hash: embedding_context_hash(
+                        "manifest-a",
+                        "chunker-a",
+                        "context-v1",
+                        "alpha beta",
+                    ),
                     vector: vec![1.0, 2.0],
                 }],
             )
@@ -3765,6 +3811,31 @@ mod tests {
             store.embedding_generation_state(generation_id).unwrap(),
             "ready"
         );
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_generation_chunks SET context_hash = 'wrong' WHERE generation_id = ?1",
+                params![generation_id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_generations SET state = 'building' WHERE id = ?1",
+                params![generation_id],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .validate_embedding_generation(generation_id)
+                .unwrap_err()
+                .code,
+            "embedding.generation_validation_failed"
+        );
+        assert_eq!(
+            store.embedding_generation_state(generation_id).unwrap(),
+            "failed"
+        );
         assert!(table_names(&store.conn)
             .iter()
             .any(|name| name == "chunk_embedding_vectors"));
@@ -3781,7 +3852,12 @@ mod tests {
                     chunk_id,
                     source_version_id,
                     source_version_hash: "body-hash-generation-sync".to_string(),
-                    context_hash: "context-hash-b".to_string(),
+                    context_hash: embedding_context_hash(
+                        "manifest-b",
+                        "chunker-a",
+                        "context-v1",
+                        "alpha beta",
+                    ),
                     vector: vec![1.0, 2.0, 3.0],
                 }],
             )
@@ -3870,7 +3946,12 @@ mod tests {
                     chunk_id,
                     source_version_id,
                     source_version_hash: "body-hash-generation-bad".to_string(),
-                    context_hash: "context-hash".to_string(),
+                    context_hash: embedding_context_hash(
+                        "manifest-bad",
+                        "chunker-bad",
+                        "context-v1",
+                        "alpha beta",
+                    ),
                     vector: vec![1.0, 2.0],
                 }],
             )
