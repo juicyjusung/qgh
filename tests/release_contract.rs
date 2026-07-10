@@ -18,14 +18,87 @@ fn released_error_schema_covers_stable_embedding_error_codes() {
         .iter()
         .map(|code| code.as_str().unwrap().to_string())
         .collect::<BTreeSet<_>>();
+    let published_embedding = published
+        .iter()
+        .filter(|code| code.starts_with("embedding."))
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let emitted = stable_embedding_error_codes_from_source(&root);
-    let missing = emitted.difference(&published).cloned().collect::<Vec<_>>();
-
-    assert!(
-        missing.is_empty(),
-        "released error schema is missing stable embedding errors: {missing:?}"
+    assert_eq!(
+        published_embedding, emitted,
+        "released error schema embedding codes must exactly match stable externally emitted source codes"
     );
     assert_eq!(error_schema["additionalProperties"], false);
+}
+
+#[cfg(not(feature = "vector-search"))]
+#[test]
+fn bm25_binary_emits_published_vector_capability_error_envelope() {
+    let root = std::env::temp_dir().join(format!(
+        "qgh-release-contract-vector-capability-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_home = root.join("config");
+    let data_home = root.join("data");
+    fs::create_dir_all(config_home.join("qgh")).unwrap();
+    fs::create_dir_all(&data_home).unwrap();
+    fs::write(
+        config_home.join("qgh/config.toml"),
+        r#"schema_version = "qgh.config.v1"
+
+[embedding]
+provider = "local"
+model_path = "/not-opened-before-vector-capability-check"
+file = "onnx/model.onnx"
+pooling = "cls"
+query_prefix = "query: "
+quantization = "none"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["juicyjusung/qgh"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_RELEASE_CONTRACT_TOKEN"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(binary())
+        .args(["--profile", "work", "embed", "--force", "--json"])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_DATA_HOME", &data_home)
+        .env("QGH_RELEASE_CONTRACT_TOKEN", "not-a-real-token")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr_text(&output).is_empty());
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["error"]["code"],
+        "embedding.vector_capability_unavailable"
+    );
+    assert_eq!(envelope["error"]["retryable"], false);
+    assert_eq!(envelope["error"]["exit_code"], 2);
+    let schema: Value = serde_json::from_str(
+        &fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/schemas/error.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(schema["$defs"]["error_code"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&envelope["error"]["code"]));
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -570,7 +643,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "sync.commit_page_failed",
         "sync.transfer_cycle",
         "sync.transfer_chain_too_long",
-        "embedding.source_snapshot_missing",
+        "embedding.source_snapshot_incomplete",
         "purge.failed",
         "purge.retry_failed",
         "purge.read_fenced",
@@ -2481,7 +2554,9 @@ fn stable_embedding_error_codes_from_source(root: &std::path::Path) -> BTreeSet<
         "embedding.vector_init_failed",
         "embedding.vector_search_failed",
     ];
+    const TEST_ONLY_CODES: &[&str] = &["embedding.generation_cleanup_injected_failure"];
     let warning_codes = WARNING_CODES.iter().copied().collect::<BTreeSet<_>>();
+    let test_only_codes = TEST_ONLY_CODES.iter().copied().collect::<BTreeSet<_>>();
     let mut codes = BTreeSet::new();
     for entry in fs::read_dir(root.join("src")).unwrap() {
         let path = entry.unwrap().path();
@@ -2489,19 +2564,38 @@ fn stable_embedding_error_codes_from_source(root: &std::path::Path) -> BTreeSet<
             continue;
         }
         let source = fs::read_to_string(path).unwrap();
-        let production = source.split("#[cfg(test)]").next().unwrap();
+        let production = production_source_before_top_level_test_module(&source);
         let mut rest = production;
         while let Some(offset) = rest.find("\"embedding.") {
             rest = &rest[offset + 1..];
             let end = rest.find('"').expect("embedding code literal is closed");
             let code = &rest[..end];
-            if !code.starts_with("embedding.test_") && !warning_codes.contains(code) {
+            if !code.starts_with("embedding.test_")
+                && !warning_codes.contains(code)
+                && !test_only_codes.contains(code)
+            {
                 codes.insert(code.to_string());
             }
             rest = &rest[end + 1..];
         }
     }
     codes
+}
+
+fn production_source_before_top_level_test_module(source: &str) -> &str {
+    let mut offset = 0;
+    let lines = source.split_inclusive('\n').collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim_end() == "#[cfg(test)]"
+            && lines
+                .get(index + 1)
+                .is_some_and(|next| next.trim_start().starts_with("mod tests"))
+        {
+            return &source[..offset];
+        }
+        offset += line.len();
+    }
+    source
 }
 
 fn binary() -> String {
