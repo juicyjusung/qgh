@@ -1275,12 +1275,7 @@ fn run_sync_purge_preflight(profile: &Profile, store: &mut Store) -> Result<(), 
         Err(_) => failed = true,
     }
 
-    let configured = profile
-        .repos
-        .iter()
-        .map(RepoRef::full_name)
-        .map(|repo| github_repo_identity_key(&repo))
-        .collect::<BTreeSet<_>>();
+    let configured = configured_repository_identity_keys(profile);
     let remaining_before_reconciliation = store
         .pending_purges()?
         .into_iter()
@@ -1403,6 +1398,15 @@ fn canonicalize_purge_requests(
 
 fn github_repo_identity_key(repo: &str) -> String {
     repo.to_ascii_lowercase()
+}
+
+fn configured_repository_identity_keys(profile: &Profile) -> BTreeSet<String> {
+    profile
+        .repos
+        .iter()
+        .map(RepoRef::full_name)
+        .map(|repo| github_repo_identity_key(&repo))
+        .collect()
 }
 
 fn purge_retry_error(remaining: &[PendingPurgeView]) -> QghError {
@@ -3212,6 +3216,8 @@ pub fn query(
     let filters = QueryFilters::from_args(&args, &profile, repo_policy.as_ref(), repo_scope)?;
     let limit = effective_limit(&args, repo_policy.as_ref())?;
     let mut store = Store::open(&profile.paths)?;
+    let allowed_repository_keys = configured_repository_identity_keys(&profile);
+    store.validate_profile_read_allowlist(&allowed_repository_keys)?;
     let mut vector_open_warnings = Vec::new();
     let vector_enabled = if profile.embedding.is_some() {
         match store.enable_vector() {
@@ -3227,7 +3233,7 @@ pub fn query(
     } else {
         false
     };
-    let fence = store.begin_read_snapshot()?;
+    let fence = store.begin_profile_read_snapshot(&allowed_repository_keys)?;
     let outcome = (|| -> Result<LocalReadOutcome, QghError> {
         let overrides = freshness_overrides(args.max_age.as_deref(), args.require_fresh)?;
         let publication = store.active_retrieval_publication()?;
@@ -4660,12 +4666,14 @@ pub async fn get(
 ) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
     let mut store = Store::open(&profile.paths)?;
+    let allowed_repository_keys = configured_repository_identity_keys(&profile);
+    store.validate_profile_read_allowlist(&allowed_repository_keys)?;
     let lifecycle_check = if verify_lifecycle {
         lifecycle_check_for_get(&profile, &mut store, source_id).await?
     } else {
         lifecycle_not_requested()
     };
-    let fence = store.begin_read_snapshot()?;
+    let fence = store.begin_profile_read_snapshot(&allowed_repository_keys)?;
     let outcome =
         get_source_for_get(&store, source_id, repo_scope, lifecycle_check).map(|source| {
             json!({
@@ -4708,6 +4716,8 @@ pub async fn get_cli(
 
     let profile = load_profile(profile_id)?;
     let mut store = Store::open(&profile.paths)?;
+    let allowed_repository_keys = configured_repository_identity_keys(&profile);
+    store.validate_profile_read_allowlist(&allowed_repository_keys)?;
     let mut lifecycle_checks = Vec::with_capacity(source_ids.len());
     for source_id in source_ids {
         let check = if verify_lifecycle {
@@ -4722,7 +4732,7 @@ pub async fn get_cli(
         }
     }
 
-    let fence = store.begin_read_snapshot()?;
+    let fence = store.begin_profile_read_snapshot(&allowed_repository_keys)?;
     let mut items = Vec::with_capacity(source_ids.len());
     let mut returned = 0;
     let mut failed = 0;

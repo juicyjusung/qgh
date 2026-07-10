@@ -305,6 +305,29 @@ impl Store {
     }
 
     pub fn begin_read_snapshot(&self) -> Result<ReadSnapshotFence, QghError> {
+        self.begin_read_snapshot_with_repository_allowlist(None)
+    }
+
+    pub fn validate_profile_read_allowlist(
+        &self,
+        allowed_repository_keys: &BTreeSet<String>,
+    ) -> Result<(), QghError> {
+        let _fence =
+            self.begin_read_snapshot_with_repository_allowlist(Some(allowed_repository_keys))?;
+        self.rollback_read_snapshot()
+    }
+
+    pub fn begin_profile_read_snapshot(
+        &self,
+        allowed_repository_keys: &BTreeSet<String>,
+    ) -> Result<ReadSnapshotFence, QghError> {
+        self.begin_read_snapshot_with_repository_allowlist(Some(allowed_repository_keys))
+    }
+
+    fn begin_read_snapshot_with_repository_allowlist(
+        &self,
+        allowed_repository_keys: Option<&BTreeSet<String>>,
+    ) -> Result<ReadSnapshotFence, QghError> {
         self.conn.execute_batch("BEGIN")?;
         let state = self.conn.query_row(
             "SELECT CAST(value AS INTEGER),
@@ -323,6 +346,23 @@ impl Store {
         if purge_pending {
             let _ = self.conn.execute_batch("ROLLBACK");
             return Err(read_fence_error());
+        }
+        if let Some(allowed_repository_keys) = allowed_repository_keys {
+            let repositories = match self.known_repositories() {
+                Ok(repositories) => repositories,
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
+            };
+            if repositories
+                .iter()
+                .map(|repo| repo.to_ascii_lowercase())
+                .any(|repo| !allowed_repository_keys.contains(&repo))
+            {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(allowlist_reconciliation_required_error());
+            }
         }
         Ok(ReadSnapshotFence {
             content_write_epoch,
@@ -1651,7 +1691,7 @@ impl Store {
                 let mappings = owned_generation_vector_mappings
                     .get(generation_id)
                     .ok_or_else(purge_error)?;
-                for (table, dimension, rowid) in mappings {
+                for (table, _dimension, rowid) in mappings {
                     #[cfg(feature = "vector-search")]
                     {
                         tx.execute(
@@ -1660,7 +1700,7 @@ impl Store {
                         )?;
                     }
                     #[cfg(not(feature = "vector-search"))]
-                    delete_vec0_shadow_row(&tx, table, *dimension, *rowid)?;
+                    delete_vec0_shadow_row(&tx, table, *_dimension, *rowid)?;
                 }
                 tx.execute(
                     "DELETE FROM embedding_generation_vector_rows WHERE generation_id = ?1",
@@ -8550,6 +8590,15 @@ fn read_fence_error() -> QghError {
         "Loaded content was fenced by lifecycle purge state.",
         6,
     )
+}
+
+fn allowlist_reconciliation_required_error() -> QghError {
+    QghError::new(
+        "purge.allowlist_reconciliation_required",
+        "Stored repository state no longer matches the configured profile allowlist.",
+        6,
+    )
+    .with_hint("Run qgh sync to reconcile removed repositories before reading this profile.")
 }
 
 fn invalidate_publications_for_pending_purge(conn: &Connection) -> Result<(), QghError> {

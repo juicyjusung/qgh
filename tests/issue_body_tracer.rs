@@ -982,6 +982,176 @@ fn sync_purges_repo_removed_from_profile_allowlist_and_preserves_other_repo() {
 }
 
 #[test]
+fn query_fails_closed_until_removed_profile_repository_is_reconciled() {
+    let fixture = TestFixture::new("allowlist-removal-read-fence-query");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let profile_wide = fixture.qgh(["query", "shared repo policy tracer", "--json"]);
+    assert_success(&profile_wide);
+    let profile_wide_json = stdout_json(&profile_wide);
+    let profile_wide_repos = profile_wide_json["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["repo"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        profile_wide_repos,
+        BTreeSet::from(["other/repo", "owner/repo"])
+    );
+
+    let private_query = "PRIVATE_REMOVED_ALLOWLIST_QUERY_8d31";
+    fixture.write_config_with_repos_and_embedding(
+        &server.base_url,
+        &["owner/repo"],
+        r#"
+[embedding]
+provider = "local"
+model_path = "/definitely/not/a/model"
+file = "onnx/model.onnx"
+pooling = "cls"
+query_prefix = "query: "
+quantization = "none"
+"#,
+    );
+    server.clear_requests();
+    let query = fixture.qgh(["query", private_query, "--json"]);
+
+    let removed_id = "qgh://github.com/issue/I_POLICY_OTHER";
+    let retained_id = "qgh://github.com/issue/I_POLICY_OWNER";
+    let removed_get = fixture.qgh(["get", removed_id, "--verify-lifecycle", "--json"]);
+    let retained_get = fixture.qgh(["get", retained_id, "--json"]);
+    let batch_get = fixture.qgh(["get", retained_id, removed_id, "--json"]);
+    for output in [&query, &removed_get, &retained_get, &batch_get] {
+        assert_eq!(output.status.code(), Some(6));
+        let json = stdout_json(output);
+        assert_eq!(
+            json["error"]["code"],
+            "purge.allowlist_reconciliation_required"
+        );
+        let serialized = serde_json::to_string(&json).unwrap();
+        for forbidden in [
+            private_query,
+            "other/repo",
+            "owner/repo",
+            "I_POLICY_OTHER",
+            "I_POLICY_OWNER",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
+    assert!(
+        server.requests().is_empty(),
+        "allowlist fencing must run before lifecycle network access"
+    );
+
+    let mcp = fixture.mcp([
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "qgh-test", "version": "0" }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": { "query": private_query }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "get",
+                "arguments": { "source_id": removed_id }
+            }
+        }),
+    ]);
+    assert_success(&mcp);
+    assert!(stderr_text(&mcp).is_empty());
+    let messages = stdout_json_lines(&mcp);
+    for response in [&messages[1], &messages[2]] {
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["code"],
+            "purge.allowlist_reconciliation_required"
+        );
+        let serialized = serde_json::to_string(response).unwrap();
+        for forbidden in [private_query, "other/repo", removed_id] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
+
+    let db_path = fixture.data_home.join("qgh/profiles/work/qgh.sqlite3");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let pending_purges: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM purge_requests WHERE purge_pending = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        pending_purges, 0,
+        "read fencing must not mutate purge state"
+    );
+    let removed_active: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM source_entities
+             WHERE source_id = ?1 AND lifecycle_state = 'active'",
+            rusqlite::params![removed_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(removed_active, 1);
+    #[cfg(feature = "vector-search")]
+    {
+        let vector_migration: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM schema_migrations WHERE version = 'qgh.vector.v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            vector_migration, 0,
+            "allowlist fencing must run before vector schema initialization"
+        );
+    }
+    drop(conn);
+
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+    let removed_after_sync = fixture.qgh(["get", removed_id, "--json"]);
+    assert_eq!(removed_after_sync.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&removed_after_sync)["error"]["details"]["reason"],
+        "allowlist_removal"
+    );
+    let retained_after_sync = fixture.qgh(["query", "shared repo policy tracer", "--json"]);
+    assert_success(&retained_after_sync);
+    assert!(stdout_json(&retained_after_sync)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|result| result["repo"] == "owner/repo"));
+}
+
+#[test]
 fn casing_only_profile_allowlist_change_preserves_github_repository() {
     let fixture = TestFixture::new("allowlist-repo-casing-preserved");
     let server = MultiRepoFakeGitHub::start();
@@ -990,6 +1160,13 @@ fn casing_only_profile_allowlist_change_preserves_github_repository() {
 
     fixture.write_config_with_repos(&server.base_url, &["OWNER/REPO"]);
     server.clear_requests();
+    let retained_before_sync =
+        fixture.qgh(["get", "qgh://github.com/issue/I_POLICY_OWNER", "--json"]);
+    assert_success(&retained_before_sync);
+    let query_before_sync = fixture.qgh(["query", "shared repo policy tracer", "--json"]);
+    assert_success(&query_before_sync);
+    assert!(server.requests().is_empty());
+
     let sync = fixture.qgh(["sync", "--if-stale", "--json"]);
     assert_success(&sync);
     assert_eq!(stdout_json(&sync)["data"]["sync_state"], "skipped_fresh");
