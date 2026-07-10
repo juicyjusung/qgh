@@ -100,6 +100,7 @@ impl Store {
         set_private_file(&paths.db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "secure_delete", "ON")?;
         let mut store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -1339,10 +1340,13 @@ impl Store {
         )?;
         // Tombstoned content must fail closed and must not remain in qgh-managed
         // derived storage. Keep only the minimal identity/tombstone metadata.
-        let chunk_ids = tx
-            .prepare("SELECT id FROM chunks WHERE source_id = ?1")?
-            .query_map(params![source_id], |row| row.get::<_, i64>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
+        let chunk_ids = if table_exists(&tx, "chunks")? {
+            tx.prepare("SELECT id FROM chunks WHERE source_id = ?1")?
+                .query_map(params![source_id], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         if !chunk_ids.is_empty() {
             let placeholders = std::iter::repeat_n("?", chunk_ids.len())
                 .collect::<Vec<_>>()
@@ -1364,11 +1368,12 @@ impl Store {
                 }
             }
         }
-        tx.execute(
-            "DELETE FROM chunks WHERE source_id = ?1",
-            params![source_id],
-        )?;
-        tx.execute_batch("PRAGMA secure_delete = ON")?;
+        if table_exists(&tx, "chunks")? {
+            tx.execute(
+                "DELETE FROM chunks WHERE source_id = ?1",
+                params![source_id],
+            )?;
+        }
         if changed > 0 {
             tx.execute(
                 "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
@@ -3726,7 +3731,9 @@ mod tests {
         assert_eq!(chunk_embedding_row_count(&store.conn), 1);
 
         store.tombstone_source(source_id, "deleted").unwrap();
-        assert_eq!(store.cleanup_inactive_embedding_artifacts().unwrap(), 1);
+        // Tombstoning purges the chunk and its derived vectors eagerly; the
+        // background cleanup remains idempotent.
+        assert_eq!(store.cleanup_inactive_embedding_artifacts().unwrap(), 0);
 
         assert_eq!(vector_row_count(&store.conn), 0);
         assert_eq!(chunk_embedding_row_count(&store.conn), 0);
