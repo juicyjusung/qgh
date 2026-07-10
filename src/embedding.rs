@@ -19,6 +19,10 @@ thread_local! {
         const { std::cell::RefCell::new(BTreeMap::new()) };
     static SNAPSHOT_DIRECTORY_SYNC_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    static DURABLE_CREATE_SYNC_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static SNAPSHOT_FILE_SYNC_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 pub use crate::context::{
@@ -402,6 +406,16 @@ fn record_tokenizer_only_artifact_bytes(role: ArtifactRole, bytes: u64) {
 #[cfg(test)]
 fn fail_snapshot_directory_sync_after(successful_syncs: usize) {
     SNAPSHOT_DIRECTORY_SYNC_FAILURE_AFTER.set(Some(successful_syncs));
+}
+
+#[cfg(test)]
+fn fail_durable_create_sync_after(successful_syncs: usize) {
+    DURABLE_CREATE_SYNC_FAILURE_AFTER.set(Some(successful_syncs));
+}
+
+#[cfg(test)]
+fn fail_snapshot_file_sync_after(successful_syncs: usize) {
+    SNAPSHOT_FILE_SYNC_FAILURE_AFTER.set(Some(successful_syncs));
 }
 
 fn validate_tokenizer_artifact_sizes(
@@ -1616,8 +1630,16 @@ impl PreparedModelStore {
 
     #[cfg(feature = "fastembed-provider")]
     fn ensure_requests_root(&self) -> Result<PathBuf, EmbeddingProviderError> {
-        fs::create_dir_all(&self.root)?;
-        fs::create_dir_all(self.root.join("requests"))?;
+        create_dir_all_durable(
+            &self.root,
+            "embedding.acquisition_pin_invalid",
+            "Prepared model acquisition pin storage could not be created durably.",
+        )?;
+        create_dir_all_durable(
+            &self.root.join("requests"),
+            "embedding.acquisition_pin_invalid",
+            "Prepared model acquisition pin storage could not be created durably.",
+        )?;
         canonical_store_subdirectory(
             &self.root,
             "requests",
@@ -2083,6 +2105,22 @@ impl PreparedModelStore {
         Ok(())
     }
 
+    fn make_existing_snapshot_durable(
+        &self,
+        snapshot_root: &Path,
+        snapshots_root: &Path,
+        manifest: &ModelManifestV1,
+    ) -> Result<(), EmbeddingProviderError> {
+        sync_snapshot_file(&snapshot_root.join("manifest.json"))?;
+        for artifact in &manifest.artifacts {
+            let relative_path = confined_relative_path(&artifact.relative_path)?;
+            sync_snapshot_file(&snapshot_root.join(relative_path))?;
+        }
+        sync_snapshot_tree_leaf_first(snapshot_root)?;
+        sync_snapshot_directory(snapshots_root)?;
+        self.verify_snapshot_matches(snapshot_root, manifest)
+    }
+
     fn publish_or_reuse_snapshot(
         &self,
         staging: &Path,
@@ -2113,6 +2151,7 @@ impl PreparedModelStore {
                     .verify_snapshot_matches(snapshot_root, manifest)
                     .is_ok() =>
             {
+                self.make_existing_snapshot_durable(snapshot_root, snapshots_root, manifest)?;
                 fs::remove_dir_all(staging).map_err(|_| {
                     EmbeddingProviderError::structured(
                         "embedding.acquisition_staging_cleanup_failed",
@@ -2120,6 +2159,7 @@ impl PreparedModelStore {
                     )
                 })?;
                 sync_snapshot_directory(&self.root)?;
+                sync_snapshot_directory(snapshots_root)?;
                 return Ok(());
             }
             Some(_) => {
@@ -3420,13 +3460,42 @@ fn create_dir_all_durable(
         }
     };
     if missing.is_empty() {
+        sync_durable_directory(path, code, message)?;
+        if let Some(parent) = path.parent() {
+            sync_durable_directory(parent, code, message)?;
+        }
         return Ok(());
     }
     fs::create_dir_all(path).map_err(|_| EmbeddingProviderError::structured(code, message))?;
     for directory in &missing {
-        sync_directory(directory, code, message)?;
+        sync_durable_directory(directory, code, message)?;
     }
-    sync_directory(&existing_parent, code, message)
+    sync_durable_directory(&existing_parent, code, message)
+}
+
+fn sync_durable_directory(
+    path: &Path,
+    code: &str,
+    message: &str,
+) -> Result<(), EmbeddingProviderError> {
+    #[cfg(test)]
+    {
+        let fail = DURABLE_CREATE_SYNC_FAILURE_AFTER.with(|remaining| match remaining.get() {
+            Some(0) => {
+                remaining.set(None);
+                true
+            }
+            Some(value) => {
+                remaining.set(Some(value - 1));
+                false
+            }
+            None => false,
+        });
+        if fail {
+            return Err(EmbeddingProviderError::structured(code, message));
+        }
+    }
+    sync_directory(path, code, message)
 }
 
 fn sync_snapshot_directory(path: &Path) -> Result<(), EmbeddingProviderError> {
@@ -3455,6 +3524,49 @@ fn sync_snapshot_directory(path: &Path) -> Result<(), EmbeddingProviderError> {
         "embedding.acquisition_artifact_invalid",
         "Prepared model snapshot directory sync failed.",
     )
+}
+
+fn sync_snapshot_file(path: &Path) -> Result<(), EmbeddingProviderError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        EmbeddingProviderError::structured(
+            "embedding.acquisition_artifact_invalid",
+            "Prepared model snapshot file could not be inspected for durability.",
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.acquisition_artifact_invalid",
+            "Prepared model snapshot durability requires regular files.",
+        ));
+    }
+    #[cfg(test)]
+    {
+        let fail = SNAPSHOT_FILE_SYNC_FAILURE_AFTER.with(|remaining| match remaining.get() {
+            Some(0) => {
+                remaining.set(None);
+                true
+            }
+            Some(value) => {
+                remaining.set(Some(value - 1));
+                false
+            }
+            None => false,
+        });
+        if fail {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.acquisition_artifact_invalid",
+                "Prepared model snapshot file sync failed.",
+            ));
+        }
+    }
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| {
+            EmbeddingProviderError::structured(
+                "embedding.acquisition_artifact_invalid",
+                "Prepared model snapshot file sync failed.",
+            )
+        })
 }
 
 fn sync_snapshot_tree_leaf_first(root: &Path) -> Result<(), EmbeddingProviderError> {
@@ -5736,6 +5848,41 @@ mod tests {
         assert_eq!(error.code(), "embedding.acquisition_pin_invalid");
     }
 
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn pin_creation_reasserts_store_root_parent_durability_on_retry() {
+        let root = temp_dir("qgh-pin-root-parent-sync");
+        let store = PreparedModelStore::new(root.join("prepared"));
+        let options = FastembedProviderOptions {
+            model: Some("hf:example/model@main".to_string()),
+            ..FastembedProviderOptions::default()
+        };
+        let reference = HfModelReference {
+            model_id: "example/model".to_string(),
+            revision: "main".to_string(),
+        };
+
+        fail_durable_create_sync_after(1);
+        let error = store
+            .publish_acquisition_pin(&options, &reference, "a".repeat(40))
+            .unwrap_err();
+
+        assert_eq!(error.code(), "embedding.acquisition_pin_invalid");
+        assert!(store.root.is_dir());
+        assert!(!store.acquisition_pin_path(&options).exists());
+        assert!(!store.alias_path(&options).exists());
+        assert!(!error
+            .details()
+            .to_string()
+            .contains(&root.to_string_lossy()[..]));
+
+        let pinned = store
+            .publish_acquisition_pin(&options, &reference, "a".repeat(40))
+            .expect("retry re-syncs the already visible store root and its parent");
+        assert_eq!(pinned.revision, "a".repeat(40));
+        assert!(store.acquisition_pin_path(&options).is_file());
+    }
+
     #[cfg(all(feature = "fastembed-provider", unix))]
     #[test]
     fn pin_retire_failure_is_returned_and_keeps_pin() {
@@ -6275,6 +6422,141 @@ mod tests {
             .is_file());
         assert!(store.alias_path(&options).is_file());
         assert!(!store.acquisition_pin_path(&options).exists());
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn retry_reasserts_destination_durability_after_post_rename_sync_failure() {
+        let root = temp_dir("qgh-snapshot-post-rename-sync-retry");
+        let source = root.join("source");
+        let manifest_path = write_runtime_payload_fixture(&source);
+        let verifier = PreparedModelStore::new(root.join("verifier"));
+        let verified = verifier.load_manifest(&manifest_path).unwrap();
+        let store = PreparedModelStore::new(root.join("store"));
+        let options = FastembedProviderOptions {
+            model: Some("hf:example/model@main".to_string()),
+            ..FastembedProviderOptions::default()
+        };
+        let reference = HfModelReference {
+            model_id: "example/model".to_string(),
+            revision: "main".to_string(),
+        };
+        let pinned = store
+            .publish_acquisition_pin(&options, &reference, "a".repeat(40))
+            .unwrap();
+        let tokenizer = load_unmanifested_tokenizer_with_evidence(
+            &source,
+            tokenizer_artifact_paths(|file| Ok(source.join(file))).unwrap(),
+        )
+        .unwrap();
+        store
+            .finalize_acquisition_pin(&options, &reference, &pinned, &tokenizer.artifacts)
+            .unwrap();
+        let expected_pin = store
+            .read_acquisition_pin_record_at(&store.acquisition_pin_path(&options))
+            .unwrap()
+            .unwrap();
+        let mut manifest = verified.manifest.clone();
+        manifest.model_source = ModelSourceV1::Hf {
+            model_id: reference.model_id.clone(),
+            resolved_revision: pinned.revision.clone(),
+        };
+        manifest.artifacts.clear();
+
+        fail_snapshot_directory_sync_after(5);
+        let first = store
+            .materialize_hf(
+                &options,
+                &reference,
+                manifest.clone(),
+                runtime_artifact_sources_from_prepared(&verified),
+            )
+            .unwrap_err();
+        assert_eq!(first.code(), "embedding.acquisition_artifact_invalid");
+        assert!(!store.alias_path(&options).exists());
+
+        fail_snapshot_directory_sync_after(5);
+        let second = store
+            .materialize_hf(
+                &options,
+                &reference,
+                manifest.clone(),
+                runtime_artifact_sources_from_prepared(&verified),
+            )
+            .unwrap_err();
+        assert_eq!(second.code(), "embedding.acquisition_artifact_invalid");
+        assert!(!store.alias_path(&options).exists());
+        assert_eq!(
+            store
+                .read_acquisition_pin_record_at(&store.acquisition_pin_path(&options))
+                .unwrap(),
+            Some(expected_pin)
+        );
+
+        let acquired = store
+            .materialize_hf(
+                &options,
+                &reference,
+                manifest,
+                runtime_artifact_sources_from_prepared(&verified),
+            )
+            .expect("third attempt durably reuses the verified snapshot");
+        assert!(acquired
+            .path_for_role(ArtifactRole::OnnxModel)
+            .unwrap()
+            .is_file());
+        assert!(store.alias_path(&options).is_file());
+        assert!(!store.acquisition_pin_path(&options).exists());
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn verified_nested_existing_snapshot_syncs_files_before_aliasing() {
+        let root = temp_dir("qgh-existing-nested-snapshot-durability");
+        let source = root.join("source");
+        let manifest_path = write_runtime_payload_fixture(&source);
+        let mut manifest =
+            ModelManifestV1::from_json_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.role == ArtifactRole::OnnxModel)
+            .unwrap()
+            .relative_path = "onnx/model.onnx".to_string();
+        fs::create_dir(source.join("onnx")).unwrap();
+        fs::rename(source.join("model.onnx"), source.join("onnx/model.onnx")).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let store = PreparedModelStore::new(root.join("store"));
+        let snapshot_root = store.root.join("snapshots").join(manifest.hash());
+        seed_existing_snapshot(&source, &snapshot_root, &manifest);
+        let options = FastembedProviderOptions {
+            manifest_path: Some(manifest_path),
+            ..FastembedProviderOptions::default()
+        };
+
+        fail_snapshot_file_sync_after(0);
+        let error = store.acquire(&options).unwrap_err();
+
+        assert_eq!(error.code(), "embedding.acquisition_artifact_invalid");
+        assert!(snapshot_root.join("onnx/model.onnx").is_file());
+        assert!(!store.alias_path(&options).exists());
+        assert!(!error
+            .details()
+            .to_string()
+            .contains(&root.to_string_lossy()[..]));
+
+        let acquired = store
+            .acquire(&options)
+            .expect("retry makes the verified older snapshot durable");
+        assert!(acquired
+            .path_for_role(ArtifactRole::OnnxModel)
+            .unwrap()
+            .is_file());
+        assert!(store.alias_path(&options).is_file());
     }
 
     #[test]
