@@ -2,7 +2,8 @@ use crate::embedding::{EmbeddingProviderError, EmbeddingTokenizer, TokenSpan};
 use std::error::Error;
 use std::fmt;
 
-pub const CHUNKER_VERSION: &str = "markdown-token-v1";
+pub const CHUNKER_VERSION: &str = "markdown-token-v2";
+pub const CHUNKER_FINGERPRINT: &str = "markdown-token-v2:heading-code-fence-overlap";
 pub const DEFAULT_TARGET_TOKENS: usize = 900;
 pub const DEFAULT_BOUNDARY_SEARCH_TOKENS: usize = 200;
 pub const DEFAULT_OVERLAP_TOKENS: usize = 135;
@@ -33,6 +34,9 @@ pub struct MarkdownChunk {
     pub token_end: usize,
     pub token_count: usize,
     pub body: String,
+    pub chunker_version: String,
+    pub chunker_fingerprint: String,
+    pub heading_path: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,12 +90,20 @@ pub fn chunk_markdown_with_config(
         ));
     }
 
-    // Chunk against the tokenizer's canonical text: token spans are only
-    // guaranteed to be valid byte ranges into it, not into the raw input.
+    // Chunk against canonical text while retaining exact source spans for
+    // match-aware previews.
     let tokenized = tokenizer.tokenize_canonical(text)?;
+    if tokenized.spans.len() != tokenized.original_spans.len() {
+        return Err(ChunkingError::new(
+            "tokenizer did not provide one original span per normalized token.",
+        ));
+    }
     let text = tokenized.text.as_str();
+    let original_text = tokenized.original_text.as_str();
     let tokens = tokenized.spans;
+    let original_tokens = tokenized.original_spans;
     validate_token_spans(text, &tokens)?;
+    validate_token_spans(original_text, &original_tokens)?;
     if tokens.is_empty() {
         return Ok(Vec::new());
     }
@@ -109,8 +121,18 @@ pub fn chunk_markdown_with_config(
             &code_fence_token_ranges,
             config,
         );
-        let byte_start = tokens[token_start].start;
-        let byte_end = tokens[token_end - 1].end;
+        let normalized_byte_start = tokens[token_start].start;
+        let byte_start = original_tokens[token_start].start;
+        let byte_end = original_tokens[token_end - 1].end;
+        if byte_start >= byte_end
+            || byte_end > original_text.len()
+            || !original_text.is_char_boundary(byte_start)
+            || !original_text.is_char_boundary(byte_end)
+        {
+            return Err(ChunkingError::new(
+                "tokenizer produced an unmappable original UTF-8 span.",
+            ));
+        }
         chunks.push(MarkdownChunk {
             chunk_index: chunks.len(),
             byte_start,
@@ -118,7 +140,10 @@ pub fn chunk_markdown_with_config(
             token_start,
             token_end,
             token_count: token_end - token_start,
-            body: text[byte_start..byte_end].to_string(),
+            body: original_text[byte_start..byte_end].to_string(),
+            chunker_version: CHUNKER_VERSION.to_string(),
+            chunker_fingerprint: CHUNKER_FINGERPRINT.to_string(),
+            heading_path: heading_path(text, normalized_byte_start),
         });
 
         if token_end == tokens.len() {
@@ -379,6 +404,32 @@ fn is_heading(line: &str) -> bool {
             .is_some_and(|character| character.is_whitespace())
 }
 
+fn heading_path(text: &str, byte_offset: usize) -> Vec<String> {
+    let mut path: Vec<(usize, String)> = Vec::new();
+    let prefix = text.get(..byte_offset).unwrap_or(text);
+    for line in prefix.lines() {
+        let trimmed = line.trim_start();
+        let level = trimmed
+            .chars()
+            .take_while(|character| *character == '#')
+            .count();
+        if !(1..=6).contains(&level)
+            || !trimmed
+                .chars()
+                .nth(level)
+                .is_some_and(|character| character.is_whitespace())
+        {
+            continue;
+        }
+        while path.last().is_some_and(|(current, _)| *current >= level) {
+            path.pop();
+        }
+        let title = trimmed[level..].trim().to_string();
+        path.push((level, title));
+    }
+    path.into_iter().map(|(_, title)| title).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,15 +582,34 @@ mod tests {
             ) -> Result<TokenizedText, EmbeddingProviderError> {
                 let canonical = Self::canonicalize(text);
                 let spans = WhitespaceTokenizer.tokenize(&canonical)?;
+                let mut cursor = 0;
+                let original_spans = spans
+                    .iter()
+                    .map(|span| {
+                        let token = &canonical[span.start..span.end];
+                        let relative = text[cursor..].find(token)?;
+                        let start = cursor + relative;
+                        let end = start + token.len();
+                        cursor = end;
+                        Some(TokenSpan { start, end })
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| {
+                        EmbeddingProviderError::structured(
+                            "embedding.tokenizer_unmappable_offset",
+                            "fixture tokenizer could not map normalized token to source",
+                        )
+                    })?;
                 Ok(TokenizedText {
                     text: canonical,
                     spans,
+                    original_text: text.to_string(),
+                    original_spans,
                 })
             }
         }
 
         let text = "# 한국어 제목\n\n스토리지 리뷰 지적사항 반영 완료 본문입니다\n\n```swift\nlet key = contentKey\n```";
-        let canonical = NewlineCollapsingTokenizer::canonicalize(text);
         let config = ChunkerConfig {
             target_tokens: 4,
             overlap_tokens: 1,
@@ -550,9 +620,83 @@ mod tests {
 
         assert!(!chunks.is_empty());
         for chunk in &chunks {
-            assert_eq!(chunk.body, canonical[chunk.byte_start..chunk.byte_end]);
+            assert_eq!(chunk.body, text[chunk.byte_start..chunk.byte_end]);
         }
         assert!(chunks.iter().any(|chunk| chunk.body.contains("지적사항")));
-        assert_eq!(chunks.last().unwrap().byte_end, canonical.len());
+        assert_eq!(chunks.last().unwrap().byte_end, text.len());
+    }
+
+    #[test]
+    fn chunks_keep_original_utf8_span_when_tokenizer_normalizes_whitespace() {
+        struct CollapsingTokenizer;
+
+        impl EmbeddingTokenizer for CollapsingTokenizer {
+            fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError> {
+                Ok(self.tokenize_canonical(text)?.spans)
+            }
+
+            fn tokenize_canonical(
+                &self,
+                text: &str,
+            ) -> Result<TokenizedText, EmbeddingProviderError> {
+                Ok(TokenizedText {
+                    text: "alpha beta".to_string(),
+                    spans: vec![
+                        TokenSpan { start: 0, end: 5 },
+                        TokenSpan { start: 6, end: 10 },
+                    ],
+                    original_text: text.to_string(),
+                    original_spans: vec![
+                        TokenSpan { start: 0, end: 5 },
+                        TokenSpan { start: 8, end: 12 },
+                    ],
+                })
+            }
+        }
+
+        let source = "alpha\n\n beta";
+        let chunks = chunk_markdown_with_config(
+            source,
+            &CollapsingTokenizer,
+            ChunkerConfig {
+                target_tokens: 2,
+                overlap_tokens: 0,
+                boundary_search_tokens: 0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].byte_start, 0);
+        assert_eq!(chunks[0].byte_end, source.len());
+        assert_eq!(chunks[0].body, source);
+    }
+
+    #[test]
+    fn rejects_unmappable_normalized_span_instead_of_storing_approximation() {
+        struct BrokenTokenizer;
+
+        impl EmbeddingTokenizer for BrokenTokenizer {
+            fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError> {
+                Ok(self.tokenize_canonical(text)?.spans)
+            }
+
+            fn tokenize_canonical(
+                &self,
+                _text: &str,
+            ) -> Result<TokenizedText, EmbeddingProviderError> {
+                Ok(TokenizedText {
+                    text: "normalized".to_string(),
+                    spans: vec![TokenSpan { start: 0, end: 10 }],
+                    original_text: "source".to_string(),
+                    original_spans: Vec::new(),
+                })
+            }
+        }
+
+        let error = chunk_markdown("source", &BrokenTokenizer).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("one original span per normalized token"));
     }
 }

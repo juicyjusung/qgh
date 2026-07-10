@@ -74,6 +74,10 @@ pub trait EmbeddingEngine: Send + Sync {
 pub struct TokenizedText {
     pub text: String,
     pub spans: Vec<TokenSpan>,
+    /// Original source text and one source span for every normalized token.
+    /// The spans are byte offsets into `original_text`.
+    pub original_text: String,
+    pub original_spans: Vec<TokenSpan>,
 }
 
 pub trait EmbeddingTokenizer: Send + Sync {
@@ -84,9 +88,12 @@ pub trait EmbeddingTokenizer: Send + Sync {
     /// normalizers that drop bytes) must override this and return the
     /// normalized text the offsets refer to.
     fn tokenize_canonical(&self, text: &str) -> Result<TokenizedText, EmbeddingProviderError> {
+        let spans = self.tokenize(text)?;
         Ok(TokenizedText {
             text: text.to_string(),
-            spans: self.tokenize(text)?,
+            spans: spans.clone(),
+            original_text: text.to_string(),
+            original_spans: spans,
         })
     }
 
@@ -2058,33 +2065,61 @@ impl EmbeddingTokenizer for FastembedTokenizer {
             )
             .with_details(json!({ "error": error.to_string() }))
         };
-        let canonical = match self.tokenizer.get_normalizer() {
+        let normalized = match self.tokenizer.get_normalizer() {
             Some(normalizer) => {
                 let mut normalized = tokenizers::NormalizedString::from(text);
                 normalizer
                     .normalize(&mut normalized)
                     .map_err(tokenizer_failed)?;
-                normalized.get().to_string()
+                normalized
             }
-            None => text.to_string(),
+            None => tokenizers::NormalizedString::from(text),
         };
+        let canonical = normalized.get().to_string();
         let encoding = self
             .tokenizer
             .encode(canonical.as_str(), false)
             .map_err(tokenizer_failed)?;
         let mut spans = Vec::new();
+        let mut original_spans = Vec::new();
         let mut previous_end = 0usize;
         for (start, end) in encoding.get_offsets() {
             let start = (*start).max(previous_end);
             if start >= *end {
                 continue;
             }
+            let original = normalized
+                .convert_offsets(tokenizers::tokenizer::normalizer::Range::Normalized(
+                    start..*end,
+                ))
+                .ok_or_else(|| {
+                    EmbeddingProviderError::structured(
+                        "embedding.tokenizer_unmappable_offset",
+                        "Embedding tokenizer produced a span that cannot map to the original source.",
+                    )
+                })?;
+            if original.start >= original.end
+                || original.end > text.len()
+                || !text.is_char_boundary(original.start)
+                || !text.is_char_boundary(original.end)
+            {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.tokenizer_unmappable_offset",
+                    "Embedding tokenizer produced an invalid original-source span.",
+                ));
+            }
             spans.push(TokenSpan { start, end: *end });
+            original_spans.push(TokenSpan {
+                start: original.start,
+                end: original.end,
+            });
             previous_end = *end;
         }
         Ok(TokenizedText {
             text: canonical,
             spans,
+            original_text: text.to_string(),
+            original_spans,
         })
     }
 }

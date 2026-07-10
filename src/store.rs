@@ -583,10 +583,29 @@ impl Store {
             params![source_version_id],
         )?;
         for chunk in chunks {
+            let heading_path_json =
+                serde_json::to_string(&chunk.heading_path).map_err(|error| {
+                    QghError::storage(format!("Failed to serialize chunk heading path: {error}"))
+                })?;
             tx.execute(
-                "INSERT INTO chunks (source_id, source_version_id, body)
-                 VALUES (?1, ?2, ?3)",
-                params![source_id, source_version_id, chunk.body],
+                "INSERT INTO chunks
+                    (source_id, source_version_id, body, chunk_index, token_start,
+                     token_end, byte_start, byte_end, chunker_version,
+                     chunker_fingerprint, heading_path_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    source_id,
+                    source_version_id,
+                    chunk.body,
+                    chunk.chunk_index as i64,
+                    chunk.token_start as i64,
+                    chunk.token_end as i64,
+                    chunk.byte_start as i64,
+                    chunk.byte_end as i64,
+                    chunk.chunker_version,
+                    chunk.chunker_fingerprint,
+                    heading_path_json,
+                ],
             )?;
         }
         tx.commit()?;
@@ -597,24 +616,25 @@ impl Store {
         &self,
         source_version_id: i64,
     ) -> Result<Vec<StoredChunk>, QghError> {
+        if !embedding_schema_exists(&self.conn)? {
+            return Ok(Vec::new());
+        }
         let mut stmt = self.conn.prepare(
-            "SELECT id, source_id, source_version_id, body
+            "SELECT id, source_id, source_version_id, body, chunk_index, token_start,
+                     token_end, byte_start, byte_end, chunker_version,
+                     chunker_fingerprint, heading_path_json
              FROM chunks
              WHERE source_version_id = ?1
              ORDER BY id",
         )?;
-        let rows = stmt.query_map(params![source_version_id], |row| {
-            Ok(StoredChunk {
-                chunk_id: row.get(0)?,
-                source_id: row.get(1)?,
-                source_version_id: row.get(2)?,
-                body: row.get(3)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![source_version_id], stored_chunk_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
     }
 
     pub fn source_version_has_chunks(&self, source_version_id: i64) -> Result<bool, QghError> {
+        if !embedding_schema_exists(&self.conn)? {
+            return Ok(false);
+        }
         let count: i64 = self.conn.query_row(
             "SELECT count(*) FROM chunks WHERE source_version_id = ?1",
             params![source_version_id],
@@ -624,6 +644,9 @@ impl Store {
     }
 
     pub fn cleanup_inactive_embedding_artifacts(&mut self) -> Result<usize, QghError> {
+        if !embedding_schema_exists(&self.conn)? {
+            return Ok(0);
+        }
         const STALE_CHUNK_FILTER: &str = "SELECT c.id
              FROM chunks c
              LEFT JOIN source_entities se ON se.source_id = c.source_id
@@ -661,8 +684,13 @@ impl Store {
     }
 
     pub fn active_embedding_chunks(&self) -> Result<Vec<StoredChunk>, QghError> {
+        if !embedding_schema_exists(&self.conn)? {
+            return Ok(Vec::new());
+        }
         let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.source_id, c.source_version_id, c.body
+            "SELECT c.id, c.source_id, c.source_version_id, c.body, c.chunk_index,
+                     c.token_start, c.token_end, c.byte_start, c.byte_end,
+                     c.chunker_version, c.chunker_fingerprint, c.heading_path_json
              FROM chunks c
              JOIN source_entities se ON se.source_id = c.source_id
              LEFT JOIN issue_metadata im ON im.source_id = c.source_id
@@ -671,14 +699,7 @@ impl Store {
                AND c.source_version_id = coalesce(im.latest_version_id, cm.latest_version_id)
              ORDER BY c.id",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(StoredChunk {
-                chunk_id: row.get(0)?,
-                source_id: row.get(1)?,
-                source_version_id: row.get(2)?,
-                body: row.get(3)?,
-            })
-        })?;
+        let rows = stmt.query_map([], stored_chunk_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
     }
 
@@ -705,9 +726,14 @@ impl Store {
         &self,
         fingerprint: &EmbeddingFingerprint,
     ) -> Result<Vec<StoredChunk>, QghError> {
+        if !embedding_schema_exists(&self.conn)? {
+            return Ok(Vec::new());
+        }
         let fingerprint_hash = fingerprint.hash();
         let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.source_id, c.source_version_id, c.body
+            "SELECT c.id, c.source_id, c.source_version_id, c.body, c.chunk_index,
+                     c.token_start, c.token_end, c.byte_start, c.byte_end,
+                     c.chunker_version, c.chunker_fingerprint, c.heading_path_json
              FROM chunks c
              JOIN source_entities se ON se.source_id = c.source_id
              LEFT JOIN issue_metadata im ON im.source_id = c.source_id
@@ -721,14 +747,7 @@ impl Store {
                AND ce.chunk_id IS NULL
              ORDER BY c.id",
         )?;
-        let rows = stmt.query_map(params![fingerprint_hash], |row| {
-            Ok(StoredChunk {
-                chunk_id: row.get(0)?,
-                source_id: row.get(1)?,
-                source_version_id: row.get(2)?,
-                body: row.get(3)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![fingerprint_hash], stored_chunk_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
     }
 
@@ -1099,18 +1118,49 @@ impl Store {
                   AND v.rowid IN ({prefilter_sql})
                 ORDER BY v.distance
              )
-             SELECT c.source_id, min(vector_candidates.vector_distance) AS vector_distance
-             FROM vector_candidates
-             JOIN chunks c ON c.id = vector_candidates.chunk_id
-             GROUP BY c.source_id
-             ORDER BY vector_distance ASC, c.source_id ASC
+             SELECT source_id, chunk_id, source_version_hash, vector_distance,
+                    body, source_version_id, chunk_index, token_start, token_end,
+                    byte_start, byte_end, chunker_version, chunker_fingerprint,
+                    heading_path_json
+             FROM (
+                 SELECT c.source_id, c.id AS chunk_id, sv.body_hash AS source_version_hash,
+                        vector_candidates.vector_distance, c.body, c.source_version_id,
+                        c.chunk_index, c.token_start, c.token_end, c.byte_start,
+                        c.byte_end, c.chunker_version, c.chunker_fingerprint,
+                        c.heading_path_json,
+                        row_number() OVER (
+                            PARTITION BY c.source_id
+                            ORDER BY vector_candidates.vector_distance ASC, c.id ASC
+                        ) AS source_rank
+                 FROM vector_candidates
+                 JOIN chunks c ON c.id = vector_candidates.chunk_id
+                 JOIN source_versions sv ON sv.id = c.source_version_id
+             )
+             WHERE source_rank = 1
+             ORDER BY vector_distance ASC, source_id ASC
              LIMIT ?"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+            let heading_path_json: String = row.get(13)?;
             Ok(VectorSearchHit {
                 source_id: row.get(0)?,
-                vector_distance: row.get(1)?,
+                chunk: StoredChunk {
+                    chunk_id: row.get(1)?,
+                    source_id: row.get(0)?,
+                    source_version_id: row.get(5)?,
+                    body: row.get(4)?,
+                    chunk_index: row.get::<_, i64>(6)? as usize,
+                    token_start: row.get::<_, i64>(7)? as usize,
+                    token_end: row.get::<_, i64>(8)? as usize,
+                    byte_start: row.get::<_, i64>(9)? as usize,
+                    byte_end: row.get::<_, i64>(10)? as usize,
+                    chunker_version: row.get(11)?,
+                    chunker_fingerprint: row.get(12)?,
+                    heading_path: serde_json::from_str(&heading_path_json).unwrap_or_default(),
+                },
+                source_version_hash: row.get(2)?,
+                vector_distance: row.get(3)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
@@ -1786,7 +1836,15 @@ impl Store {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id TEXT NOT NULL,
                 source_version_id INTEGER NOT NULL,
-                body TEXT NOT NULL
+                body TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL DEFAULT 0,
+                token_start INTEGER NOT NULL DEFAULT 0,
+                token_end INTEGER NOT NULL DEFAULT 0,
+                byte_start INTEGER NOT NULL DEFAULT 0,
+                byte_end INTEGER NOT NULL DEFAULT 0,
+                chunker_version TEXT NOT NULL DEFAULT 'markdown-token-v1',
+                chunker_fingerprint TEXT NOT NULL DEFAULT 'legacy',
+                heading_path_json TEXT NOT NULL DEFAULT '[]'
             );
 
             CREATE TABLE IF NOT EXISTS embedding_fingerprints (
@@ -2058,6 +2116,56 @@ impl Store {
             "latest_version_id",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        if table_exists(&self.conn, "chunks")? {
+            ensure_column(
+                &self.conn,
+                "chunks",
+                "chunk_index",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &self.conn,
+                "chunks",
+                "token_start",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &self.conn,
+                "chunks",
+                "token_end",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &self.conn,
+                "chunks",
+                "byte_start",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &self.conn,
+                "chunks",
+                "byte_end",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &self.conn,
+                "chunks",
+                "chunker_version",
+                "TEXT NOT NULL DEFAULT 'markdown-token-v1'",
+            )?;
+            ensure_column(
+                &self.conn,
+                "chunks",
+                "chunker_fingerprint",
+                "TEXT NOT NULL DEFAULT 'legacy'",
+            )?;
+            ensure_column(
+                &self.conn,
+                "chunks",
+                "heading_path_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )?;
+        }
         ensure_column(
             &self.conn,
             "sync_runs",
@@ -2342,6 +2450,25 @@ fn issue_repo_from_cursor_endpoint(endpoint: &str) -> Option<&str> {
     endpoint.strip_prefix("issues:")
 }
 
+fn stored_chunk_from_row(row: &rusqlite::Row<'_>) -> Result<StoredChunk, rusqlite::Error> {
+    let heading_path_json: String = row.get(11)?;
+    let heading_path = serde_json::from_str(&heading_path_json).unwrap_or_default();
+    Ok(StoredChunk {
+        chunk_id: row.get(0)?,
+        source_id: row.get(1)?,
+        source_version_id: row.get(2)?,
+        body: row.get(3)?,
+        chunk_index: row.get::<_, i64>(4)? as usize,
+        token_start: row.get::<_, i64>(5)? as usize,
+        token_end: row.get::<_, i64>(6)? as usize,
+        byte_start: row.get::<_, i64>(7)? as usize,
+        byte_end: row.get::<_, i64>(8)? as usize,
+        chunker_version: row.get(9)?,
+        chunker_fingerprint: row.get(10)?,
+        heading_path,
+    })
+}
+
 fn stored_issue_from_row(row: &rusqlite::Row<'_>) -> Result<StoredIssue, rusqlite::Error> {
     let labels_json: String = row.get(6)?;
     let labels = serde_json::from_str(&labels_json).unwrap_or_default();
@@ -2608,6 +2735,9 @@ mod tests {
                 token_end: 2,
                 token_count: 2,
                 body: "alpha beta".to_string(),
+                chunker_version: crate::chunking::CHUNKER_VERSION.to_string(),
+                chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+                heading_path: Vec::new(),
             },
             MarkdownChunk {
                 chunk_index: 1,
@@ -2617,6 +2747,9 @@ mod tests {
                 token_end: 4,
                 token_count: 3,
                 body: "beta gamma delta".to_string(),
+                chunker_version: crate::chunking::CHUNKER_VERSION.to_string(),
+                chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+                heading_path: Vec::new(),
             },
         ];
 
@@ -2690,6 +2823,9 @@ mod tests {
             token_end: 2,
             token_count: 2,
             body: "alpha beta".to_string(),
+            chunker_version: crate::chunking::CHUNKER_VERSION.to_string(),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            heading_path: Vec::new(),
         }];
         let stored_chunks = store
             .replace_chunks_for_source_version(source_id, source_version_id, &chunks)
@@ -2855,6 +2991,9 @@ mod tests {
             token_end: 2,
             token_count: 2,
             body: "alpha beta".to_string(),
+            chunker_version: crate::chunking::CHUNKER_VERSION.to_string(),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            heading_path: Vec::new(),
         }];
         store
             .replace_chunks_for_source_version(source_id, source_version_id, &chunks)

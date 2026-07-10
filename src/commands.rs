@@ -25,7 +25,7 @@ use crate::freshness::{self, FreshnessContext, FreshnessOverrides};
 use crate::github;
 use crate::index;
 use crate::model::{
-    ReconciliationCandidate, StoredComment, StoredIssue, StoredSource, SyncSummary,
+    ReconciliationCandidate, StoredChunk, StoredComment, StoredIssue, StoredSource, SyncSummary,
     TargetedSyncSummary, VectorSearchFilters,
 };
 use crate::paths::ProfilePaths;
@@ -1566,6 +1566,7 @@ fn ensure_vector_only_smoke(
             vector_distance: hit.vector_distance,
         },
         profile_id,
+        None,
     );
     let get_source = get_source_base(store, &hit.source_id, None)?;
     for key in ["source_id", "canonical_url", "source_version"] {
@@ -2264,7 +2265,7 @@ pub fn query(
     };
     let mut results = QueryResults::default();
     let mut unresolvable_hits = 0;
-    for hit in hits {
+    for mut hit in hits {
         let Some(source) = store.get_source(&hit.source_id)? else {
             unresolvable_hits += 1;
             continue;
@@ -2272,7 +2273,12 @@ pub fn query(
         if !filters.matches(&source) {
             continue;
         }
-        results.push(source, hit.ranking, &profile.id);
+        hit.lexical_evidence = lexical_evidence(&store, &source, &args.query)?;
+        let evidence = hit
+            .vector_evidence
+            .as_ref()
+            .or(hit.lexical_evidence.as_ref());
+        results.push(source, hit.ranking, &profile.id, evidence);
     }
     let last_successful_sync_at = query_freshness_sync_time(&store, &profile, &filters, &results)?;
     let freshness = freshness::evaluate(
@@ -2518,6 +2524,18 @@ impl QueryFilters {
 struct QueryHit {
     source_id: String,
     ranking: Ranking,
+    vector_evidence: Option<MatchedChunkEvidence>,
+    lexical_evidence: Option<MatchedChunkEvidence>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct MatchedChunkEvidence {
+    chunk: StoredChunk,
+    source_version_hash: String,
+    retriever_kind: &'static str,
+    rank: usize,
+    score_or_distance: f32,
 }
 
 impl QueryHit {
@@ -2525,6 +2543,8 @@ impl QueryHit {
         Self {
             source_id: hit.source_id,
             ranking: Ranking::Bm25(hit.score),
+            vector_evidence: None,
+            lexical_evidence: None,
         }
     }
 }
@@ -2536,6 +2556,7 @@ struct HybridAccumulator {
     bm25_score: Option<f32>,
     vector_rank: Option<usize>,
     vector_distance: Option<f32>,
+    vector_evidence: Option<MatchedChunkEvidence>,
 }
 
 impl HybridAccumulator {
@@ -2553,10 +2574,18 @@ impl HybridAccumulator {
         }
     }
 
-    fn record_vector(&mut self, rank: usize, vector_distance: f32) {
+    fn record_vector(&mut self, rank: usize, hit: crate::model::VectorSearchHit) {
+        let vector_distance = hit.vector_distance;
         if self.vector_rank.is_none_or(|current| rank < current) {
             self.vector_rank = Some(rank);
             self.vector_distance = Some(vector_distance);
+            self.vector_evidence = Some(MatchedChunkEvidence {
+                chunk: hit.chunk,
+                source_version_hash: hit.source_version_hash,
+                retriever_kind: "vector",
+                rank,
+                score_or_distance: vector_distance,
+            });
         }
     }
 
@@ -2594,6 +2623,8 @@ impl HybridAccumulator {
         QueryHit {
             source_id: self.source_id,
             ranking,
+            vector_evidence: self.vector_evidence,
+            lexical_evidence: None,
         }
     }
 }
@@ -2620,10 +2651,11 @@ fn fuse_hybrid_hits(
             .record_bm25(rank + 1, hit.score);
     }
     for (rank, hit) in vector_hits.into_iter().enumerate() {
+        let source_id = hit.source_id.clone();
         candidates
-            .entry(hit.source_id.clone())
-            .or_insert_with(|| HybridAccumulator::new(hit.source_id))
-            .record_vector(rank + 1, hit.vector_distance);
+            .entry(source_id)
+            .or_insert_with_key(|source_id| HybridAccumulator::new(source_id.clone()))
+            .record_vector(rank + 1, hit);
     }
 
     let mut candidates = candidates.into_values().collect::<Vec<_>>();
@@ -2949,7 +2981,13 @@ struct QueryResults {
 }
 
 impl QueryResults {
-    fn push(&mut self, source: StoredSource, ranking: Ranking, profile_id: &str) {
+    fn push(
+        &mut self,
+        source: StoredSource,
+        ranking: Ranking,
+        profile_id: &str,
+        evidence: Option<&MatchedChunkEvidence>,
+    ) {
         if matches!(&source, StoredSource::Issue(issue) if issue.state == "open") {
             self.includes_open_issue = true;
         }
@@ -2960,7 +2998,8 @@ impl QueryResults {
         if !self.repos.contains(repo) {
             self.repos.push(repo.clone());
         }
-        self.items.push(source_result(source, ranking, profile_id));
+        self.items
+            .push(source_result(source, ranking, profile_id, evidence));
     }
 }
 
@@ -3177,7 +3216,7 @@ fn exact_results(
     if let Some(source) = exact_url_result(store, query_text)? {
         let mut results = QueryResults::default();
         if filters.matches(&source) {
-            results.push(source, Ranking::Exact, profile_id);
+            results.push(source, Ranking::Exact, profile_id, None);
         }
         return Ok(Some(results));
     }
@@ -3202,7 +3241,7 @@ fn exact_results(
     let mut results = QueryResults::default();
     for source in matches.into_iter().map(StoredSource::Issue) {
         if filters.matches(&source) {
-            results.push(source, Ranking::Exact, profile_id);
+            results.push(source, Ranking::Exact, profile_id, None);
         }
     }
     Ok(Some(results))
@@ -3685,14 +3724,24 @@ enum Ranking {
     Exact,
 }
 
-fn source_result(source: StoredSource, ranking: Ranking, profile_id: &str) -> Value {
+fn source_result(
+    source: StoredSource,
+    ranking: Ranking,
+    profile_id: &str,
+    evidence: Option<&MatchedChunkEvidence>,
+) -> Value {
     match source {
-        StoredSource::Issue(issue) => issue_result(issue, ranking, profile_id),
-        StoredSource::Comment(comment) => comment_result(comment, ranking, profile_id),
+        StoredSource::Issue(issue) => issue_result(issue, ranking, profile_id, evidence),
+        StoredSource::Comment(comment) => comment_result(comment, ranking, profile_id, evidence),
     }
 }
 
-fn issue_result(issue: StoredIssue, ranking: Ranking, profile_id: &str) -> Value {
+fn issue_result(
+    issue: StoredIssue,
+    ranking: Ranking,
+    profile_id: &str,
+    evidence: Option<&MatchedChunkEvidence>,
+) -> Value {
     let source_id = issue.source_id;
     json!({
         "source_id": source_id,
@@ -3701,7 +3750,7 @@ fn issue_result(issue: StoredIssue, ranking: Ranking, profile_id: &str) -> Value
         "issue_number": issue.number,
         "title": issue.title,
         "canonical_url": issue.canonical_url,
-        "snippet": snippet(&issue.body),
+        "snippet": matched_snippet(&issue.body, &issue.source_version, evidence),
         "get_args": {
             "source_id": source_id,
             "profile_id": profile_id
@@ -3712,7 +3761,12 @@ fn issue_result(issue: StoredIssue, ranking: Ranking, profile_id: &str) -> Value
     })
 }
 
-fn comment_result(comment: StoredComment, ranking: Ranking, profile_id: &str) -> Value {
+fn comment_result(
+    comment: StoredComment,
+    ranking: Ranking,
+    profile_id: &str,
+    evidence: Option<&MatchedChunkEvidence>,
+) -> Value {
     let source_id = comment.source_id;
     json!({
         "source_id": source_id,
@@ -3722,7 +3776,7 @@ fn comment_result(comment: StoredComment, ranking: Ranking, profile_id: &str) ->
         "author": comment.author,
         "canonical_url": comment.canonical_url,
         "parent_issue": comment.parent_issue,
-        "snippet": snippet(&comment.body),
+        "snippet": matched_snippet(&comment.body, &comment.source_version, evidence),
         "get_args": {
             "source_id": source_id,
             "profile_id": profile_id
@@ -3897,9 +3951,97 @@ fn snippet(body: &str) -> String {
     format!("{}...", &body[..end])
 }
 
+fn matched_snippet(
+    body: &str,
+    source_version: &crate::model::SourceVersionView,
+    evidence: Option<&MatchedChunkEvidence>,
+) -> String {
+    let Some(evidence) = evidence else {
+        return snippet(body);
+    };
+    if evidence.source_version_hash != source_version.body_hash {
+        return snippet(body);
+    }
+    let Some(matched) = body.get(evidence.chunk.byte_start..evidence.chunk.byte_end) else {
+        return snippet(body);
+    };
+    if matched.is_empty() {
+        return snippet(body);
+    }
+    snippet(matched)
+}
+
+fn lexical_evidence(
+    store: &Store,
+    source: &StoredSource,
+    query: &str,
+) -> Result<Option<MatchedChunkEvidence>, QghError> {
+    let source_id = match source {
+        StoredSource::Issue(issue) => &issue.source_id,
+        StoredSource::Comment(comment) => &comment.source_id,
+    };
+    let source_version_hash = match source {
+        StoredSource::Issue(issue) => issue.source_version.body_hash.clone(),
+        StoredSource::Comment(comment) => comment.source_version.body_hash.clone(),
+    };
+    let Some(version_id) = store.latest_source_version_id(source_id)? else {
+        return Ok(None);
+    };
+    let terms = query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return Ok(None);
+    }
+    let mut best: Option<(usize, StoredChunk)> = None;
+    for chunk in store.chunks_for_source_version(version_id)? {
+        let body = chunk.body.to_lowercase();
+        let matched = terms
+            .iter()
+            .filter(|term| body.contains(term.as_str()))
+            .count();
+        if matched == 0 {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(current, current_chunk)| {
+            matched > *current
+                || (matched == *current && chunk.chunk_index < current_chunk.chunk_index)
+        }) {
+            best = Some((matched, chunk));
+        }
+    }
+    Ok(best.map(|(_, chunk)| MatchedChunkEvidence {
+        chunk,
+        source_version_hash,
+        retriever_kind: "lexical",
+        rank: 0,
+        score_or_distance: 0.0,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SourceVersionView;
+
+    fn test_stored_chunk(source_id: &str) -> StoredChunk {
+        StoredChunk {
+            chunk_id: 1,
+            source_id: source_id.to_string(),
+            source_version_id: 1,
+            body: "matched evidence".to_string(),
+            chunk_index: 0,
+            token_start: 0,
+            token_end: 2,
+            byte_start: 0,
+            byte_end: 16,
+            chunker_version: crate::chunking::CHUNKER_VERSION.to_string(),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            heading_path: Vec::new(),
+        }
+    }
     #[cfg(feature = "vector-search")]
     use crate::chunking::MarkdownChunk;
     #[cfg(feature = "vector-search")]
@@ -3962,14 +4104,20 @@ mod tests {
         let vector_hits = vec![
             crate::model::VectorSearchHit {
                 source_id: "source-c".to_string(),
+                chunk: test_stored_chunk("source-c"),
+                source_version_hash: "test-version".to_string(),
                 vector_distance: 0.01,
             },
             crate::model::VectorSearchHit {
                 source_id: "source-a".to_string(),
+                chunk: test_stored_chunk("source-a"),
+                source_version_hash: "test-version".to_string(),
                 vector_distance: 0.02,
             },
             crate::model::VectorSearchHit {
                 source_id: "source-c".to_string(),
+                chunk: test_stored_chunk("source-c"),
+                source_version_hash: "test-version".to_string(),
                 vector_distance: 0.03,
             },
         ];
@@ -4079,6 +4227,9 @@ mod tests {
                         token_end: 2,
                         token_count: 2,
                         body: "alpha beta".to_string(),
+                        chunker_version: crate::chunking::CHUNKER_VERSION.to_string(),
+                        chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+                        heading_path: Vec::new(),
                     },
                     MarkdownChunk {
                         chunk_index: 1,
@@ -4088,6 +4239,9 @@ mod tests {
                         token_end: 4,
                         token_count: 2,
                         body: "gamma delta".to_string(),
+                        chunker_version: crate::chunking::CHUNKER_VERSION.to_string(),
+                        chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+                        heading_path: Vec::new(),
                     },
                 ],
             )
@@ -4163,6 +4317,9 @@ mod tests {
                         token_end: 3,
                         token_count: 3,
                         body: "sync alpha beta".to_string(),
+                        chunker_version: crate::chunking::CHUNKER_VERSION.to_string(),
+                        chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+                        heading_path: Vec::new(),
                     },
                     MarkdownChunk {
                         chunk_index: 1,
@@ -4172,6 +4329,9 @@ mod tests {
                         token_end: 5,
                         token_count: 2,
                         body: "gamma delta".to_string(),
+                        chunker_version: crate::chunking::CHUNKER_VERSION.to_string(),
+                        chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+                        heading_path: Vec::new(),
                     },
                 ],
             )
@@ -4310,6 +4470,8 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].source_id, "qgh://github.com/issue/I_VECTOR_ALLOWED");
         assert_eq!(hits[0].vector_distance, 0.0);
+        assert_eq!(hits[0].chunk.body, "best allowed chunk");
+        assert_eq!(hits[0].source_version_hash, "body-hash-I_VECTOR_ALLOWED");
         assert!(
             hits[0].vector_distance.is_finite(),
             "vector_distance must be finite"
@@ -4324,6 +4486,7 @@ mod tests {
                     vector_distance: hit.vector_distance,
                 },
                 "work",
+                None,
             );
             let get_source = get_source_base(&store, &hit.source_id, None).unwrap();
             assert_eq!(result["source_id"], get_source["source_id"]);
@@ -4342,6 +4505,40 @@ mod tests {
         assert_eq!(round_trip_successes, hits.len());
 
         let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn matched_snippet_uses_valid_current_span_and_rejects_stale_span() {
+        let source_version = SourceVersionView {
+            body_hash: "current".to_string(),
+            github_updated_at: "2026-01-01T00:00:00Z".to_string(),
+            indexed_at: "2026-01-01T00:00:00Z".to_string(),
+            sync_run_id: "sync-test".to_string(),
+            lifecycle_state: "active".to_string(),
+        };
+        let mut chunk = test_stored_chunk("source");
+        chunk.byte_start = 7;
+        chunk.byte_end = 14;
+        let evidence = MatchedChunkEvidence {
+            chunk,
+            source_version_hash: "current".to_string(),
+            retriever_kind: "vector",
+            rank: 1,
+            score_or_distance: 0.1,
+        };
+        assert_eq!(
+            matched_snippet("prefix matched suffix", &source_version, Some(&evidence)),
+            "matched"
+        );
+
+        let stale = MatchedChunkEvidence {
+            source_version_hash: "old".to_string(),
+            ..evidence
+        };
+        assert_eq!(
+            matched_snippet("prefix matched suffix", &source_version, Some(&stale)),
+            "prefix matched suffix"
+        );
     }
 
     #[cfg(feature = "vector-search")]
@@ -4407,6 +4604,9 @@ mod tests {
             token_end: 1,
             token_count: 1,
             body,
+            chunker_version: crate::chunking::CHUNKER_VERSION.to_string(),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            heading_path: Vec::new(),
         }
     }
 }

@@ -99,6 +99,14 @@ pub struct StoredChunk {
     pub source_id: String,
     pub source_version_id: i64,
     pub body: String,
+    pub chunk_index: usize,
+    pub token_start: usize,
+    pub token_end: usize,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub chunker_version: String,
+    pub chunker_fingerprint: String,
+    pub heading_path: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +135,8 @@ impl Default for VectorSearchFilters {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorSearchHit {
     pub source_id: String,
+    pub chunk: StoredChunk,
+    pub source_version_hash: String,
     pub vector_distance: f32,
 }
 
