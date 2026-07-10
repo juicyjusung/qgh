@@ -1646,6 +1646,16 @@ fn refresh_chunk_embeddings(
             Some(generation_id),
             Some(publication.publication_id),
         )?;
+    } else if let Some(tantivy_generation) = store.active_index_generation()? {
+        let sync_run_id = store
+            .latest_successful_sync_run_id()?
+            .unwrap_or_else(|| "embedding-embed".to_string());
+        store.activate_retrieval_publication(
+            &sync_run_id,
+            tantivy_generation,
+            Some(generation_id),
+            None,
+        )?;
     }
     let embedded_chunks = embeddings.len();
     let usable_embeddings = embedded_chunks;

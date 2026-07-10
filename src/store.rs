@@ -1804,6 +1804,17 @@ impl Store {
         })
     }
 
+    pub fn active_index_generation(&self) -> Result<Option<i64>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT generation FROM index_generations WHERE active = 1 ORDER BY generation DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(QghError::from)
+    }
+
     pub fn latest_successful_sync_run_id(&self) -> Result<Option<String>, QghError> {
         self.conn
             .query_row(
