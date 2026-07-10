@@ -1,5 +1,6 @@
 #![cfg(feature = "vector-search")]
 
+use qgh::chunking::{CHUNKER_FINGERPRINT, CHUNKER_VERSION};
 use qgh::context::{prepare_embedding_input, EmbeddingSourceContext};
 use qgh::embedding::{
     EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_HF_MODEL_REVISION,
@@ -1604,13 +1605,23 @@ query_prefix = "query: "
                     |row| row.get(0),
                 )
                 .unwrap();
+            let body = format!("eval embedding chunk for {source_id}");
+            let token_count = i64::from(!body.is_empty());
+            let byte_end = i64::try_from(body.len()).unwrap();
             conn.execute(
-                "INSERT INTO chunks (source_id, source_version_id, body)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO chunks (
+                    source_id, source_version_id, body, chunk_index,
+                    token_start, token_end, byte_start, byte_end,
+                    chunker_version, chunker_fingerprint, heading_path_json
+                 ) VALUES (?1, ?2, ?3, 0, 0, ?4, 0, ?5, ?6, ?7, '[]')",
                 params![
                     *source_id,
                     source_version_id,
-                    format!("eval embedding chunk for {source_id}")
+                    body,
+                    token_count,
+                    byte_end,
+                    CHUNKER_VERSION,
+                    CHUNKER_FINGERPRINT,
                 ],
             )
             .unwrap();

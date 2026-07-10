@@ -6018,13 +6018,23 @@ limit = 10
                 [&source.source_id],
                 |row| row.get(0),
             )?;
+            let body = hard_filter_chunk_body(&source.source_id);
+            let token_count = i64::from(!body.is_empty());
+            let byte_end = i64::try_from(body.len())?;
             connection.execute(
-                "INSERT INTO chunks (source_id, source_version_id, body)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO chunks (
+                    source_id, source_version_id, body, chunk_index,
+                    token_start, token_end, byte_start, byte_end,
+                    chunker_version, chunker_fingerprint, heading_path_json
+                 ) VALUES (?1, ?2, ?3, 0, 0, ?4, 0, ?5, ?6, ?7, '[]')",
                 params![
                     source.source_id,
                     source_version_id,
-                    hard_filter_chunk_body(&source.source_id),
+                    body,
+                    token_count,
+                    byte_end,
+                    CHUNKER_VERSION,
+                    CHUNKER_FINGERPRINT,
                 ],
             )?;
         }
