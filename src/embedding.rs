@@ -621,6 +621,23 @@ pub struct PreparedModelInspection {
     artifact_stamp: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedManifestInspection {
+    manifest: ModelManifestV1,
+    manifest_hash: String,
+    root: PathBuf,
+}
+
+impl PreparedManifestInspection {
+    pub fn manifest(&self) -> &ModelManifestV1 {
+        &self.manifest
+    }
+
+    pub fn manifest_hash(&self) -> &str {
+        &self.manifest_hash
+    }
+}
+
 impl PreparedModelInspection {
     pub fn manifest(&self) -> &ModelManifestV1 {
         &self.manifest
@@ -1142,11 +1159,21 @@ impl PreparedModelStore {
         read_manifest_contract(manifest_path).map(|_| ())
     }
 
+    pub fn inspect_manifest_contract(
+        &self,
+        manifest_path: &Path,
+    ) -> Result<PreparedManifestInspection, EmbeddingProviderError> {
+        read_manifest_contract(manifest_path)
+    }
+
     pub fn inspect_manifest(
         &self,
         manifest_path: &Path,
     ) -> Result<PreparedModelInspection, EmbeddingProviderError> {
-        let (manifest, manifest_hash, canonical_root) = read_manifest_contract(manifest_path)?;
+        let contract = read_manifest_contract(manifest_path)?;
+        let manifest = contract.manifest;
+        let manifest_hash = contract.manifest_hash;
+        let canonical_root = contract.root;
         let mut artifacts = Vec::with_capacity(manifest.artifacts.len());
         for artifact in &manifest.artifacts {
             let relative = confined_relative_path(&artifact.relative_path)?;
@@ -1209,7 +1236,7 @@ impl PreparedModelStore {
 
 fn read_manifest_contract(
     manifest_path: &Path,
-) -> Result<(ModelManifestV1, String, PathBuf), EmbeddingProviderError> {
+) -> Result<PreparedManifestInspection, EmbeddingProviderError> {
     let metadata = fs::symlink_metadata(manifest_path).map_err(|error| {
         EmbeddingProviderError::structured(
             "embedding.prepared_manifest_missing",
@@ -1248,7 +1275,11 @@ fn read_manifest_contract(
     for artifact in &manifest.artifacts {
         confined_relative_path(&artifact.relative_path)?;
     }
-    Ok((manifest, manifest_hash, canonical_root))
+    Ok(PreparedManifestInspection {
+        manifest,
+        manifest_hash,
+        root: canonical_root,
+    })
 }
 
 impl PreparedModelStore {

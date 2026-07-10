@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use qgh::embedding::ModelManifestV1;
 use serde_json::json;
 #[cfg(feature = "fastembed-provider")]
 use sha2::{Digest, Sha256};
@@ -81,10 +82,16 @@ fn explicit_manifest_artifact_readiness_does_not_block_status_or_get() {
         String::from_utf8_lossy(&missing.stdout)
     );
     let missing_json: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
-    assert!(matches!(
-        missing_json["data"]["embedding"]["state"].as_str(),
-        Some("missing" | "corrupt")
-    ));
+    let manifest = ModelManifestV1::from_json_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(missing_json["data"]["embedding"]["state"], "missing");
+    assert_eq!(
+        missing_json["data"]["embedding"]["configured_model"]["model_id"],
+        "local:fixture"
+    );
+    assert_eq!(
+        missing_json["data"]["embedding"]["configured_model"]["model_revision"],
+        manifest.hash()
+    );
 
     fs::write(model_root.join("model.onnx"), b"x").unwrap();
     let truncated = fixture.status(true);
@@ -99,6 +106,44 @@ fn explicit_manifest_artifact_readiness_does_not_block_status_or_get() {
     assert_eq!(get.status.code(), Some(4));
     let get_json: serde_json::Value = serde_json::from_slice(&get.stdout).unwrap();
     assert_eq!(get_json["error"]["code"], "source.not_found");
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn existing_explicit_manifest_must_match_its_prepared_alias() {
+    let fixture = CliFixture::new("manifest-alias-drift");
+    let manifest_path = write_invalid_tokenizer_manifest(&fixture.root.join("prepared-model"));
+    let original = fs::read(&manifest_path).unwrap();
+    fixture.write_config_with_manifest(&manifest_path);
+    assert!(!fixture.embed(true).status.success());
+
+    let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    changed["model_source"]["declared_id"] = json!("changed-existing-source");
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+    let drifted = fixture.status(true);
+    assert_eq!(drifted.status.code(), Some(2));
+    let drifted_json: serde_json::Value = serde_json::from_slice(&drifted.stdout).unwrap();
+    assert_eq!(
+        drifted_json["error"]["code"],
+        "embedding.prepared_alias_mismatch"
+    );
+
+    fs::write(&manifest_path, b"{").unwrap();
+    let malformed = fixture.status(true);
+    assert_eq!(malformed.status.code(), Some(2));
+    let malformed_json: serde_json::Value = serde_json::from_slice(&malformed.stdout).unwrap();
+    assert_eq!(
+        malformed_json["error"]["code"],
+        "embedding.manifest_invalid"
+    );
+
+    fs::remove_file(&manifest_path).unwrap();
+    let offline_alias = fixture.status(true);
+    assert!(
+        offline_alias.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline_alias.stdout)
+    );
 }
 
 #[cfg(feature = "fastembed-provider")]

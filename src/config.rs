@@ -154,7 +154,6 @@ pub struct EmbeddingConfig {
     pub token_source: Option<EmbeddingTokenSource>,
 }
 
-#[cfg(feature = "fastembed-provider")]
 impl EmbeddingConfig {
     pub fn fastembed_options(&self) -> FastembedProviderOptions {
         let token_source_env = match &self.token_source {
@@ -1119,29 +1118,27 @@ fn parse_embedding_config(raw: &RawEmbeddingConfig) -> Result<(), QghError> {
             token_source_env: None,
             cache_dir: None,
         };
-        if let Err(prepared_error) =
-            default_prepared_model_store().and_then(|store| store.inspect(&options))
-        {
-            if let Err(source_error) =
-                PreparedModelStore::new(PathBuf::new()).validate_manifest_contract(manifest_path)
-            {
-                let error = if matches!(
-                    prepared_error.code(),
-                    "embedding.manifest_invalid"
-                        | "embedding.manifest_schema_unsupported"
-                        | "embedding.manifest_revision_invalid"
-                        | "embedding.manifest_contract_invalid"
-                        | "embedding.manifest_context_template_unsupported"
-                        | "embedding.dynamic_quantization_unsupported"
-                        | "embedding.manifest_artifacts_invalid"
-                        | "embedding.artifact_path_invalid"
-                ) {
-                    prepared_error
-                } else {
-                    source_error
-                };
-                return Err(QghError::validation(error.code(), error.message())
-                    .with_details(error.details().clone()));
+        let prepared = default_prepared_model_store().and_then(|store| store.inspect(&options));
+        let source_store = PreparedModelStore::new(PathBuf::new());
+        match fs::symlink_metadata(manifest_path) {
+            Ok(_) => {
+                let source = source_store
+                    .inspect_manifest_contract(manifest_path)
+                    .map_err(embedding_config_error)?;
+                if let Ok(prepared) = &prepared {
+                    if prepared.manifest_hash() != source.manifest_hash() {
+                        return Err(QghError::validation(
+                            "embedding.prepared_alias_mismatch",
+                            "Prepared model alias does not match the configured manifest.",
+                        ));
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && prepared.is_ok() => {}
+            Err(_) => {
+                source_store
+                    .inspect_manifest_contract(manifest_path)
+                    .map_err(embedding_config_error)?;
             }
         }
         return Ok(());
@@ -1182,6 +1179,10 @@ fn parse_embedding_config(raw: &RawEmbeddingConfig) -> Result<(), QghError> {
         validate_embedding_token_source(token_source)?;
     }
     Ok(())
+}
+
+fn embedding_config_error(error: crate::embedding::EmbeddingProviderError) -> QghError {
+    QghError::validation(error.code(), error.message()).with_details(error.details().clone())
 }
 
 fn validate_hf_model_reference(model: &str) -> Result<(), QghError> {

@@ -8,16 +8,16 @@ use crate::config::{
 };
 use crate::coverage;
 use crate::embedding::{
-    builtin_preset_hf_reference, default_hf_model_reference, parse_hf_model_reference,
-    EmbeddingFingerprint, EmbeddingFingerprintExpectation, EmbeddingFingerprintSeed,
-    EmbeddingProvider, EmbeddingProviderError, EmbeddingTokenizer, EmbeddingVector,
-    LOCAL_MODEL_REVISION,
+    builtin_preset_hf_reference, default_hf_model_reference, default_prepared_model_store,
+    parse_hf_model_reference, EmbeddingFingerprint, EmbeddingFingerprintExpectation,
+    EmbeddingFingerprintSeed, EmbeddingProvider, EmbeddingProviderError, EmbeddingTokenizer,
+    EmbeddingVector, ModelManifestV1, ModelSourceV1, PreparedManifestInspection,
+    PreparedModelInspection, PreparedModelStore, LOCAL_MODEL_REVISION,
 };
 #[cfg(feature = "fastembed-provider")]
 use crate::embedding::{
-    default_prepared_model_store, validate_batch_comparability, FastembedEngine,
-    FastembedTokenizer, LocalEmbeddingProvider, ModelManifestV1, ModelSourceV1,
-    PreparedModelInspection, PreparedModelSnapshot, PreparedModelStore,
+    validate_batch_comparability, FastembedEngine, FastembedTokenizer, LocalEmbeddingProvider,
+    PreparedModelSnapshot,
 };
 #[cfg(debug_assertions)]
 use crate::embedding::{PoolingKind, TokenSpan, DEFAULT_QUERY_PREFIX};
@@ -2480,7 +2480,6 @@ fn prepared_model_id(snapshot: &PreparedModelSnapshot) -> String {
     prepared_manifest_model_id(&snapshot.manifest)
 }
 
-#[cfg(feature = "fastembed-provider")]
 fn prepared_manifest_model_id(manifest: &ModelManifestV1) -> String {
     match &manifest.model_source {
         ModelSourceV1::Hf { model_id, .. } => model_id.clone(),
@@ -4429,7 +4428,6 @@ fn embedding_fingerprint_expectation_from_snapshot(
 }
 
 fn configured_embedding_snapshot(embedding: &EmbeddingConfig) -> ConfiguredEmbeddingSnapshot {
-    #[cfg(feature = "fastembed-provider")]
     let prepared_runtime = {
         let mut prepared_runtime = PreparedRuntimeAvailability::Missing;
         if let Ok(store) = default_prepared_model_store() {
@@ -4438,21 +4436,17 @@ fn configured_embedding_snapshot(embedding: &EmbeddingConfig) -> ConfiguredEmbed
                 Ok(inspection) => {
                     return configured_snapshot_from_inspection(
                         &inspection,
-                        PreparedRuntimeAvailability::Available,
+                        configured_available_runtime(),
                     );
                 }
                 Err(error) => {
-                    let availability = if error.code() == "embedding.prepared_snapshot_missing" {
-                        PreparedRuntimeAvailability::Missing
-                    } else {
-                        PreparedRuntimeAvailability::Corrupt
-                    };
+                    let availability = configured_runtime_error_availability(error.code());
                     prepared_runtime = availability;
                     if let Some(manifest_path) = options.manifest_path.as_deref() {
-                        if let Ok(inspection) =
-                            PreparedModelStore::new(PathBuf::new()).inspect_manifest(manifest_path)
+                        if let Ok(inspection) = PreparedModelStore::new(PathBuf::new())
+                            .inspect_manifest_contract(manifest_path)
                         {
-                            return configured_snapshot_from_inspection(&inspection, availability);
+                            return configured_snapshot_from_contract(&inspection, availability);
                         }
                     }
                 }
@@ -4460,8 +4454,6 @@ fn configured_embedding_snapshot(embedding: &EmbeddingConfig) -> ConfiguredEmbed
         }
         prepared_runtime
     };
-    #[cfg(not(feature = "fastembed-provider"))]
-    let prepared_runtime = PreparedRuntimeAvailability::Missing;
 
     #[cfg(debug_assertions)]
     let prepared_runtime = if std::env::var_os(TEST_EMBEDDING_QUERY_VECTORS_ENV).is_some()
@@ -4488,18 +4480,69 @@ fn configured_embedding_snapshot(embedding: &EmbeddingConfig) -> ConfiguredEmbed
     }
 }
 
-#[cfg(feature = "fastembed-provider")]
 fn configured_snapshot_from_inspection(
     inspection: &PreparedModelInspection,
     prepared_runtime: PreparedRuntimeAvailability,
 ) -> ConfiguredEmbeddingSnapshot {
-    let manifest = inspection.manifest();
+    configured_snapshot_from_manifest(
+        inspection.manifest(),
+        inspection.manifest_hash(),
+        prepared_runtime,
+    )
+}
+
+fn configured_snapshot_from_contract(
+    inspection: &PreparedManifestInspection,
+    prepared_runtime: PreparedRuntimeAvailability,
+) -> ConfiguredEmbeddingSnapshot {
+    configured_snapshot_from_manifest(
+        inspection.manifest(),
+        inspection.manifest_hash(),
+        prepared_runtime,
+    )
+}
+
+fn configured_snapshot_from_manifest(
+    manifest: &ModelManifestV1,
+    manifest_hash: &str,
+    prepared_runtime: PreparedRuntimeAvailability,
+) -> ConfiguredEmbeddingSnapshot {
     ConfiguredEmbeddingSnapshot {
         model_id: Some(prepared_manifest_model_id(manifest)),
-        model_revision: Some(inspection.manifest_hash().to_string()),
+        model_revision: Some(manifest_hash.to_string()),
         pooling: Some(manifest.pooling),
         query_prefix: Some(manifest.query_prefix.clone().unwrap_or_default()),
         prepared_runtime,
+    }
+}
+
+fn configured_runtime_error_availability(code: &str) -> PreparedRuntimeAvailability {
+    #[cfg(feature = "fastembed-provider")]
+    {
+        if matches!(
+            code,
+            "embedding.prepared_snapshot_missing" | "embedding.artifact_missing"
+        ) {
+            PreparedRuntimeAvailability::Missing
+        } else {
+            PreparedRuntimeAvailability::Corrupt
+        }
+    }
+    #[cfg(not(feature = "fastembed-provider"))]
+    {
+        let _ = code;
+        PreparedRuntimeAvailability::Missing
+    }
+}
+
+fn configured_available_runtime() -> PreparedRuntimeAvailability {
+    #[cfg(feature = "fastembed-provider")]
+    {
+        PreparedRuntimeAvailability::Available
+    }
+    #[cfg(not(feature = "fastembed-provider"))]
+    {
+        PreparedRuntimeAvailability::Missing
     }
 }
 
