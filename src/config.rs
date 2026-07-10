@@ -574,8 +574,13 @@ fn load_config_file() -> Result<ConfigFile, QghError> {
             config_file.display()
         ))
     })?;
-    let config: ConfigFile = toml::from_str(&text)
-        .map_err(|error| QghError::config(format!("Invalid config TOML: {error}")))?;
+    let config: ConfigFile = toml::from_str(&text).map_err(|error| {
+        QghError::config(redacted_toml_error(
+            "Invalid config TOML",
+            &text,
+            error.span(),
+        ))
+    })?;
     if config.schema_version != "qgh.config.v1" {
         return Err(QghError::config("Unsupported config schema_version."));
     }
@@ -793,7 +798,11 @@ pub(crate) fn load_repo_policy_at(path: &Path) -> Result<RepoPolicy, QghError> {
         ))
     })?;
     let policy: RepoPolicyFile = toml::from_str(&text).map_err(|error| {
-        QghError::invalid_repo_policy(format!("Invalid repo policy TOML: {error}"))
+        QghError::invalid_repo_policy(redacted_toml_error(
+            "Invalid repo policy TOML",
+            &text,
+            error.span(),
+        ))
     })?;
     if policy.schema_version != "qgh.repo.v1" {
         return Err(QghError::invalid_repo_policy(
@@ -810,6 +819,26 @@ pub(crate) fn load_repo_policy_at(path: &Path) -> Result<RepoPolicy, QghError> {
         defaults,
         query,
     })
+}
+
+fn redacted_toml_error(
+    context: &str,
+    source: &str,
+    span: Option<std::ops::Range<usize>>,
+) -> String {
+    let Some(start) = span
+        .map(|span| span.start)
+        .filter(|start| *start <= source.len())
+    else {
+        return format!("{context}: syntax or schema violation.");
+    };
+    let prefix = &source[..start];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map(|(_, line_prefix)| line_prefix.chars().count() + 1)
+        .unwrap_or_else(|| prefix.chars().count() + 1);
+    format!("{context} at line {line}, column {column}: syntax or schema violation.")
 }
 
 fn parse_repo_policy_defaults(raw: RawRepoPolicyDefaults) -> Result<RepoPolicyDefaults, QghError> {
