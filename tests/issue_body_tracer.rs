@@ -864,6 +864,97 @@ fn scoped_reconcile_does_not_probe_other_repos_without_all() {
             .all(|request| !request.contains("/repos/other/repo/")),
         "scoped reconciliation must not touch unrelated repos: {requests:?}"
     );
+    let other_get = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        [
+            "get",
+            "qgh://github.com/issue/I_POLICY_OTHER",
+            "--profile-id",
+            "work",
+            "--json",
+        ],
+    );
+    assert_success(&other_get);
+    assert_eq!(
+        stdout_json(&other_get)["data"]["source"]["repo"],
+        "other/repo"
+    );
+}
+
+#[test]
+fn sync_purges_repo_removed_from_profile_allowlist_and_preserves_other_repo() {
+    let fixture = TestFixture::new("explicit-allowlist-removal-purge");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    server.clear_requests();
+
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo"]);
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+
+    let removed_id = "qgh://github.com/issue/I_POLICY_OTHER";
+    let removed_get = fixture.qgh(["get", removed_id, "--json"]);
+    assert_eq!(removed_get.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&removed_get)["error"]["details"]["reason"],
+        "allowlist_removal"
+    );
+
+    let retained = fixture.qgh(["query", "shared repo policy tracer", "--json"]);
+    assert_success(&retained);
+    let retained_json = stdout_json(&retained);
+    let results = retained_json["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["repo"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results, ["owner/repo"]);
+    assert!(server
+        .requests()
+        .iter()
+        .all(|request| !request.contains("/repos/other/repo/")));
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_purge_is_retried_by_next_sync_without_touching_user_backup() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("pending-purge-report-and-retry");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let profile_dir = fixture.data_home.join("qgh/profiles/work");
+    let index_root = profile_dir.join("tantivy");
+    let saved_index_root = profile_dir.join("tantivy-before-purge");
+    fs::rename(&index_root, &saved_index_root).unwrap();
+    let user_backup = fixture.root.join("user-created-index-backup");
+    fs::create_dir_all(user_backup.join("generation-999")).unwrap();
+    let backup_marker = user_backup.join("generation-999/private-backup-marker");
+    fs::write(&backup_marker, "user-managed").unwrap();
+    symlink(&user_backup, &index_root).unwrap();
+
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo"]);
+    server.clear_requests();
+    let failed = fixture.qgh(["sync", "--json"]);
+    assert_eq!(failed.status.code(), Some(6));
+    assert_eq!(stdout_json(&failed)["error"]["code"], "purge.retry_failed");
+    assert!(
+        server.requests().is_empty(),
+        "purge preflight precedes network"
+    );
+
+    assert!(backup_marker.exists());
+
+    fs::remove_file(&index_root).unwrap();
+    fs::rename(&saved_index_root, &index_root).unwrap();
+    let retry = fixture.qgh(["sync", "--json"]);
+    assert_success(&retry);
+    assert!(backup_marker.exists());
+    assert_success(&fixture.qgh(["query", "shared repo policy tracer", "--json"]));
 }
 
 #[test]
@@ -2020,15 +2111,16 @@ fn get_tombstones_unavailable_issue_and_filters_active_query() {
     let query_json = stdout_json(&query);
     assert_eq!(query_json["data"]["results"].as_array().unwrap().len(), 0);
     assert_eq!(
-        query_json["data"]["result_filtering"]["unresolvable_hits"],
-        1
+        query_json["data"]["result_filtering"]["unresolvable_hits"], 0,
+        "purge publishes a lexical successor without the removed source"
     );
 
     let status = fixture.qgh(["status", "--json"]);
     assert_success(&status);
     assert_eq!(
         stdout_json(&status)["data"]["sources"]["tombstone_count"],
-        1
+        2,
+        "confirmed issue deletion cascades to its comments"
     );
 }
 
