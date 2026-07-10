@@ -62,6 +62,7 @@ const FILTER_PROBE_TARGET_ISSUE: u64 = 900_001;
 const FILTER_PROBE_SENTINEL: &str = "bounded-adversarial-filter-sentinel";
 const FILTER_PROBE_PRESET: &str = "arctic-l-v2-fp32";
 const CONTRACT_GATE_BUNDLE_FILE: &str = "contract-gate-bundle.json";
+const FINAL_REPORT_ARTIFACT: &str = "live-model-eval-report.json";
 
 struct ContractGateSpec {
     name: &'static str,
@@ -145,6 +146,7 @@ const REQUIRED_CONTRACT_GATES: [ContractGateSpec; 7] = [
 
 type DynError = Box<dyn Error>;
 static STDERR_AUDIT: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+static STDOUT_AUDIT: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DevQueryProtocol {
@@ -676,10 +678,48 @@ pub(super) fn verify_contract_gate_bundle_path_for_test(
 
 #[derive(Debug, Serialize)]
 struct RedactionEvidence {
+    stdout_streams_checked: usize,
     stderr_streams_checked: usize,
     artifact_files_checked: usize,
+    path_markers_checked: usize,
     violation_artifacts: Vec<String>,
+    sensitive_payload_passed: bool,
+    path_privacy_passed: bool,
     passed: bool,
+}
+
+#[derive(Debug, Default)]
+struct PathPrivacyGuard {
+    markers: BTreeSet<String>,
+}
+
+impl PathPrivacyGuard {
+    fn for_run(root: &Path, repo_root: &Path, binary: &Path) -> Result<Self, DynError> {
+        let mut guard = Self::default();
+        guard.add_path(root)?;
+        guard.add_path(repo_root)?;
+        guard.add_path(binary)?;
+        if let Some(home) = std::env::var_os("HOME") {
+            guard.add_path(Path::new(&home))?;
+        }
+        Ok(guard)
+    }
+
+    fn add_path(&mut self, path: &Path) -> Result<(), DynError> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let absolute = absolute.canonicalize().unwrap_or(absolute);
+        let marker = absolute
+            .to_str()
+            .ok_or("path privacy marker is not UTF-8")?;
+        if marker != std::path::MAIN_SEPARATOR_STR && marker.len() >= 8 {
+            self.markers.insert(marker.to_string());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -904,7 +944,7 @@ struct FrozenLexicalProfile {
     corpus_sha256: String,
     qrels_dev_sha256: String,
     active_tantivy_generation: i64,
-    active_tantivy_path: PathBuf,
+    active_tantivy_path: String,
     tantivy_schema_fingerprint: String,
     tantivy_generation_files_sha256: String,
     tantivy_generation_files: Vec<SnapshotFileDigest>,
@@ -961,7 +1001,7 @@ pub(super) fn lexical_profile_freeze_for_test() -> Value {
         corpus_sha256: "corpus-sha256".to_string(),
         qrels_dev_sha256: "dev-sha256".to_string(),
         active_tantivy_generation: 7,
-        active_tantivy_path: PathBuf::from("/frozen/tantivy/generation-7"),
+        active_tantivy_path: "bm25-live/data/qgh/profiles/work/tantivy/generation-7".to_string(),
         tantivy_schema_fingerprint: "schema-sha256".to_string(),
         tantivy_generation_files_sha256: "files-sha256".to_string(),
         tantivy_generation_files: vec![SnapshotFileDigest {
@@ -1417,6 +1457,7 @@ struct FullReport {
     selected_light_candidate: Option<String>,
     selected_quality_candidate: Option<String>,
     raw_query_or_body_logged: bool,
+    absolute_path_logged: bool,
     redaction: RedactionEvidence,
     evaluation_state: String,
     promotion_eligible: bool,
@@ -1568,6 +1609,7 @@ struct SmokeReport {
     ranked_source_count: usize,
     get_round_trip: f64,
     raw_query_or_body_logged: bool,
+    absolute_path_logged: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1580,6 +1622,7 @@ struct ContextProbeSmokeReport {
     context_contract: ContextContractEvidence,
     evaluation_state: &'static str,
     raw_query_or_body_logged: bool,
+    absolute_path_logged: bool,
     redaction: RedactionEvidence,
 }
 
@@ -2552,11 +2595,56 @@ pub(super) fn target_root_allowed_for_test(cwd: &Path, root: &Path) -> bool {
     target_root_allowed(cwd, root)
 }
 
-fn reset_stderr_audit() {
+fn confined_root_relative_identity(root: &Path, path: &Path) -> Result<String, DynError> {
+    let root = root.canonicalize()?;
+    let path = path.canonicalize()?;
+    let relative = path
+        .strip_prefix(&root)
+        .map_err(|_| "artifact identity escapes the live-eval root")?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("artifact identity must be a non-empty confined relative path".into());
+    }
+    relative
+        .to_str()
+        .map(|relative| relative.replace(std::path::MAIN_SEPARATOR, "/"))
+        .ok_or_else(|| "artifact identity is not UTF-8".into())
+}
+
+fn resolve_confined_root_relative_identity(
+    root: &Path,
+    identity: &str,
+) -> Result<PathBuf, DynError> {
+    let relative = Path::new(identity);
+    if relative.is_absolute()
+        || relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("artifact identity must be a non-empty confined relative path".into());
+    }
+    let root = root.canonicalize()?;
+    let path = root.join(relative).canonicalize()?;
+    if !path.starts_with(&root) {
+        return Err("artifact identity escapes the live-eval root".into());
+    }
+    Ok(path)
+}
+
+fn reset_redaction_audit() {
     STDERR_AUDIT
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .expect("stderr audit lock")
+        .clear();
+    STDOUT_AUDIT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("stdout audit lock")
         .clear();
 }
 
@@ -2568,19 +2656,61 @@ fn record_stderr(stderr: &[u8]) {
         .push(stderr.to_vec());
 }
 
+fn record_stdout(stdout: &[u8]) {
+    STDOUT_AUDIT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("stdout audit lock")
+        .push(stdout.to_vec());
+}
+
+fn record_output(output: &Output) {
+    record_stdout(&output.stdout);
+    record_stderr(&output.stderr);
+}
+
 fn verify_redaction(
     root: &Path,
     corpus: &[CorpusRecord],
     qrels: &[&QrelRecord],
+    path_guard: &PathPrivacyGuard,
 ) -> Result<RedactionEvidence, DynError> {
+    let stdout = STDOUT_AUDIT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .map_err(|_| "stdout audit lock poisoned")?;
     let stderr = STDERR_AUDIT
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .map_err(|_| "stderr audit lock poisoned")?;
+    audit_redaction(root, corpus, qrels, &path_guard.markers, &stdout, &stderr)
+}
+
+fn audit_redaction(
+    root: &Path,
+    corpus: &[CorpusRecord],
+    qrels: &[&QrelRecord],
+    path_markers: &BTreeSet<String>,
+    stdout: &[Vec<u8>],
+    stderr: &[Vec<u8>],
+) -> Result<RedactionEvidence, DynError> {
     let mut violation_artifacts = Vec::new();
+    let mut sensitive_payload_passed = true;
+    let mut path_privacy_passed = true;
+    for (index, stream) in stdout.iter().enumerate() {
+        if contains_path_marker(stream, path_markers) {
+            path_privacy_passed = false;
+            push_unique(&mut violation_artifacts, format!("stdout-stream-{index}"));
+        }
+    }
     for (index, stream) in stderr.iter().enumerate() {
         if contains_sensitive_payload(stream, corpus, qrels) {
-            violation_artifacts.push(format!("stderr-stream-{index}"));
+            sensitive_payload_passed = false;
+            push_unique(&mut violation_artifacts, format!("stderr-stream-{index}"));
+        }
+        if contains_path_marker(stream, path_markers) {
+            path_privacy_passed = false;
+            push_unique(&mut violation_artifacts, format!("stderr-stream-{index}"));
         }
     }
     let mut artifact_files = Vec::new();
@@ -2588,17 +2718,34 @@ fn verify_redaction(
     artifact_files.sort();
     for path in &artifact_files {
         let bytes = fs::read(path)?;
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        let relative = relative.to_string_lossy().to_string();
         if contains_sensitive_payload(&bytes, corpus, qrels) {
-            let relative = path.strip_prefix(root).unwrap_or(path);
-            violation_artifacts.push(relative.to_string_lossy().to_string());
+            sensitive_payload_passed = false;
+            push_unique(&mut violation_artifacts, relative.clone());
+        }
+        if contains_path_marker(&bytes, path_markers) {
+            path_privacy_passed = false;
+            push_unique(&mut violation_artifacts, relative);
         }
     }
+    let passed = sensitive_payload_passed && path_privacy_passed;
     Ok(RedactionEvidence {
+        stdout_streams_checked: stdout.len(),
         stderr_streams_checked: stderr.len(),
         artifact_files_checked: artifact_files.len(),
-        passed: violation_artifacts.is_empty(),
+        path_markers_checked: path_markers.len(),
         violation_artifacts,
+        sensitive_payload_passed,
+        path_privacy_passed,
+        passed,
     })
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
 }
 
 fn contains_sensitive_payload(
@@ -2630,6 +2777,13 @@ fn contains_sensitive_text(rendered: &str, sensitive: &str) -> bool {
         .is_some_and(|escaped| !escaped.is_empty() && rendered.contains(&escaped))
 }
 
+fn contains_path_marker(bytes: &[u8], markers: &BTreeSet<String>) -> bool {
+    let rendered = String::from_utf8_lossy(bytes);
+    markers
+        .iter()
+        .any(|marker| contains_sensitive_text(&rendered, marker))
+}
+
 fn collect_redaction_artifacts(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), DynError> {
     if !root.exists() {
         return Ok(());
@@ -2658,27 +2812,52 @@ pub(super) fn redaction_file_scan_for_test(
     root: &Path,
     sensitive: &str,
 ) -> Result<Value, DynError> {
-    let mut files = Vec::new();
-    collect_redaction_artifacts(root, &mut files)?;
-    files.sort();
-    let violation_artifacts = files
+    let corpus = [CorpusRecord {
+        schema_version: String::new(),
+        source_id: String::new(),
+        entity_type: String::new(),
+        repo: String::new(),
+        issue_number: 0,
+        title: String::new(),
+        body: sensitive.to_string(),
+        body_sha256: String::new(),
+        canonical_url: String::new(),
+        github_updated_at: String::new(),
+        snapshot_at: String::new(),
+        license: String::new(),
+    }];
+    Ok(serde_json::to_value(audit_redaction(
+        root,
+        &corpus,
+        &[],
+        &BTreeSet::new(),
+        &[],
+        &[],
+    )?)?)
+}
+
+pub(super) fn path_redaction_scan_for_test(
+    root: &Path,
+    markers: &[&str],
+    stdout: &[Vec<u8>],
+    stderr: &[Vec<u8>],
+) -> Result<Value, DynError> {
+    let markers = markers
         .iter()
-        .filter_map(|path| {
-            let bytes = fs::read(path).ok()?;
-            contains_sensitive_text(&String::from_utf8_lossy(&bytes), sensitive).then(|| {
-                path.strip_prefix(root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string()
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(serde_json::to_value(RedactionEvidence {
-        stderr_streams_checked: 0,
-        artifact_files_checked: files.len(),
-        passed: violation_artifacts.is_empty(),
-        violation_artifacts,
-    })?)
+        .map(|marker| (*marker).to_string())
+        .collect::<BTreeSet<_>>();
+    Ok(serde_json::to_value(audit_redaction(
+        root,
+        &[],
+        &[],
+        &markers,
+        stdout,
+        stderr,
+    )?)?)
+}
+
+pub(super) fn final_report_artifact_for_test() -> &'static str {
+    FINAL_REPORT_ARTIFACT
 }
 
 struct WarmEvidence {
@@ -2729,12 +2908,7 @@ fn frozen_prepared_candidate_state(
         .parent()
         .ok_or("prepared candidate manifest parent missing")?;
     let snapshot = prepared_snapshot_digest(snapshot_root)?;
-    let relative = prepared
-        .manifest_path
-        .strip_prefix(root)?
-        .to_str()
-        .ok_or("prepared candidate manifest path is not UTF-8")?
-        .replace(std::path::MAIN_SEPARATOR, "/");
+    let relative = confined_root_relative_identity(root, &prepared.manifest_path)?;
     Ok(FrozenCandidateState {
         candidate: prepared.candidate.clone(),
         model_id: prepared.model_id.clone(),
@@ -2807,13 +2981,8 @@ fn frozen_blocked_candidate_state(
                 .parent()
                 .ok_or("prepared candidate manifest parent missing")?,
         )?;
-        frozen.manifest_relative_path = Some(
-            manifest_path
-                .strip_prefix(root)?
-                .to_str()
-                .ok_or("prepared candidate manifest path is not UTF-8")?
-                .replace(std::path::MAIN_SEPARATOR, "/"),
-        );
+        frozen.manifest_relative_path =
+            Some(confined_root_relative_identity(root, &manifest_path)?);
         frozen.manifest_hash = Some(manifest.hash());
         frozen.manifest_file_sha256 = Some(format!("{:x}", Sha256::digest(&manifest_bytes)));
         frozen.artifact_set_sha256 = Some(format!(
@@ -3039,7 +3208,7 @@ impl FrozenRunGuard {
             let Some(relative) = frozen.manifest_relative_path.as_deref() else {
                 continue;
             };
-            let manifest_path = root.join(relative);
+            let manifest_path = resolve_confined_root_relative_identity(root, relative)?;
             let manifest_bytes = fs::read(&manifest_path)?;
             let manifest = ModelManifestV1::from_json_slice(&manifest_bytes)?;
             let snapshot = prepared_snapshot_digest(
@@ -3338,7 +3507,7 @@ pub(super) fn run(
     provenance_raw: &str,
 ) -> Result<(), DynError> {
     ensure_target_root(root)?;
-    reset_stderr_audit();
+    reset_redaction_audit();
     fs::create_dir_all(root)?;
     for stale in [
         "bm25-live",
@@ -3358,6 +3527,8 @@ pub(super) fn run(
     } = validate_runtime_fixture_preflight(corpus_raw, dev_raw, test_raw, provenance_raw)?;
     let repo_root = std::env::current_dir()?.canonicalize()?;
     let binary = eval_binary()?;
+    let mut path_guard = PathPrivacyGuard::for_run(root, &repo_root, &binary)?;
+    path_guard.add_path(&root.join("models"))?;
     let host = host_record(&binary)?;
     let (integrated_git_head, worktree_clean) = repository_identity(&repo_root)?;
     if integrated_git_head != host.git_sha || !worktree_clean {
@@ -3396,17 +3567,20 @@ pub(super) fn run(
         &bm25_dev_evidence,
         &root.join("bm25-live/dev-events.jsonl"),
     )?;
-    let (lexical_profile_dev, frozen_lexical_profile) = run_lexical_profile_dev_ab(
-        root,
-        &bm25_fixture,
-        &corpus,
-        &dev,
-        &bm25_dev_evidence,
-        &integrated_git_head,
-        &corpus_sha256,
-        &qrels_dev_sha256,
-        &tantivy_schema_fingerprint,
-    )?;
+    let (lexical_profile_dev, frozen_lexical_profile, bm25_tantivy_snapshot) =
+        run_lexical_profile_dev_ab(
+            root,
+            &bm25_fixture,
+            &corpus,
+            &dev,
+            &bm25_dev_evidence,
+            &integrated_git_head,
+            &corpus_sha256,
+            &qrels_dev_sha256,
+            &tantivy_schema_fingerprint,
+            &path_guard,
+        )?;
+    path_guard.add_path(&bm25_tantivy_snapshot.path)?;
 
     let mut candidate_states = Vec::new();
     for (candidate, model_id, revision, manifest) in [
@@ -3446,7 +3620,7 @@ pub(super) fn run(
     // deployable frozen values are the actual source constants: k=60 and
     // TOP_K(20) * overfetch(4) = 80.  The k/window grid above is diagnostic.
     let frozen = FrozenConfig {
-        schema_version: "qgh.live_model_eval_config.v2",
+        schema_version: "qgh.live_model_eval_config.v3",
         integrated_git_head: integrated_git_head.clone(),
         worktree_clean,
         release_binary_sha256: host.binary_sha256.clone(),
@@ -3488,15 +3662,7 @@ pub(super) fn run(
         candidate_states: frozen_candidate_states,
         lexical_profile_report_sha256: frozen_lexical_profile.dev_report_sha256.clone(),
         bm25_database_path: bm25_fixture.db_path(),
-        bm25_tantivy_snapshot: ActiveTantivySnapshot {
-            generation: frozen_lexical_profile.active_tantivy_generation,
-            path: frozen_lexical_profile.active_tantivy_path.clone(),
-            tantivy_schema_fingerprint: frozen_lexical_profile.tantivy_schema_fingerprint.clone(),
-            generation_files_sha256: frozen_lexical_profile
-                .tantivy_generation_files_sha256
-                .clone(),
-            generation_files: frozen_lexical_profile.tantivy_generation_files.clone(),
-        },
+        bm25_tantivy_snapshot,
     };
 
     frozen_guard.revalidate_before_heldout(root, &binary)?;
@@ -3561,7 +3727,7 @@ pub(super) fn run(
         });
     }
     let audited_qrels = dev.iter().chain(&held_out).collect::<Vec<_>>();
-    let redaction = verify_redaction(root, &corpus, &audited_qrels)?;
+    let redaction = verify_redaction(root, &corpus, &audited_qrels, &path_guard)?;
     for candidate in &mut candidates {
         candidate
             .light_gate_failures
@@ -3577,13 +3743,21 @@ pub(super) fn run(
                 .quality_resource_gate_failures
                 .push("pooled_judgment_coverage_required".to_string());
         }
-        if !redaction.passed {
+        if !redaction.sensitive_payload_passed {
             candidate
                 .light_gate_failures
                 .push("raw_query_or_body_logged".to_string());
             candidate
                 .quality_resource_gate_failures
                 .push("raw_query_or_body_logged".to_string());
+        }
+        if !redaction.path_privacy_passed {
+            candidate
+                .light_gate_failures
+                .push("absolute_path_logged".to_string());
+            candidate
+                .quality_resource_gate_failures
+                .push("absolute_path_logged".to_string());
         }
     }
 
@@ -3595,8 +3769,11 @@ pub(super) fn run(
     if !judgment_pool_verified {
         promotion_blockers.push("pooled_judgment_coverage_required".to_string());
     }
-    if !redaction.passed {
+    if !redaction.sensitive_payload_passed {
         promotion_blockers.push("raw_query_or_body_logged".to_string());
+    }
+    if !redaction.path_privacy_passed {
+        promotion_blockers.push("absolute_path_logged".to_string());
     }
     let GlobalEvaluationDecision {
         promotion_eligible,
@@ -3614,7 +3791,7 @@ pub(super) fn run(
     );
     frozen_guard.revalidate_before_final_report(root, &binary)?;
     let mut report = FullReport {
-        schema_version: "qgh.live_model_eval_report.v1",
+        schema_version: "qgh.live_model_eval_report.v2",
         run_finished_at: command_output("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
         corpus_snapshot_at: provenance.snapshot_at,
         host,
@@ -3626,7 +3803,8 @@ pub(super) fn run(
         candidates,
         selected_light_candidate,
         selected_quality_candidate,
-        raw_query_or_body_logged: !redaction.passed,
+        raw_query_or_body_logged: !redaction.sensitive_payload_passed,
+        absolute_path_logged: !redaction.path_privacy_passed,
         redaction,
         evaluation_state,
         promotion_eligible,
@@ -3634,35 +3812,40 @@ pub(super) fn run(
         host_protocol_failures,
         contract_gate_bundle,
     };
-    let report_path = root.join("live-model-eval-report.json");
+    let report_path = root.join(FINAL_REPORT_ARTIFACT);
     let preflight_bytes = with_newline(serde_json::to_vec_pretty(&report)?);
-    if contains_sensitive_payload(&preflight_bytes, &corpus, &audited_qrels) {
+    if contains_sensitive_payload(&preflight_bytes, &corpus, &audited_qrels)
+        || contains_path_marker(&preflight_bytes, &path_guard.markers)
+    {
         return Err("final report redaction preflight failed".into());
     }
     report.redaction.artifact_files_checked += 1;
     let report_bytes = with_newline(serde_json::to_vec_pretty(&report)?);
-    if contains_sensitive_payload(&report_bytes, &corpus, &audited_qrels) {
+    if contains_sensitive_payload(&report_bytes, &corpus, &audited_qrels)
+        || contains_path_marker(&report_bytes, &path_guard.markers)
+    {
         return Err("final report redaction verification failed".into());
     }
     fs::write(&report_path, report_bytes)?;
-    println!(
-        "{}",
-        serde_json::to_string(&json!({
-            "artifact": root.join("live-model-eval-report.json"),
-            "candidate_statuses": report.candidates.iter().map(|candidate| json!({
-                "candidate": candidate.candidate,
-                "status": candidate.status,
-            })).collect::<Vec<_>>(),
-            "selected_light_candidate": report.selected_light_candidate,
-            "selected_quality_candidate": report.selected_quality_candidate,
-        }))?
-    );
+    let summary = serde_json::to_string(&json!({
+        "artifact": FINAL_REPORT_ARTIFACT,
+        "candidate_statuses": report.candidates.iter().map(|candidate| json!({
+            "candidate": candidate.candidate,
+            "status": candidate.status,
+        })).collect::<Vec<_>>(),
+        "selected_light_candidate": report.selected_light_candidate,
+        "selected_quality_candidate": report.selected_quality_candidate,
+    }))?;
+    if contains_path_marker(summary.as_bytes(), &path_guard.markers) {
+        return Err("final stdout path redaction failed".into());
+    }
+    println!("{summary}");
     Ok(())
 }
 
 pub(super) fn run_smoke(root: &Path, corpus_raw: &str, dev_raw: &str) -> Result<(), DynError> {
     ensure_target_root(root)?;
-    reset_stderr_audit();
+    reset_redaction_audit();
     fs::create_dir_all(root)?;
     let corpus = parse_jsonl::<CorpusRecord>(corpus_raw);
     let dev = parse_jsonl::<QrelRecord>(dev_raw);
@@ -3671,16 +3854,19 @@ pub(super) fn run_smoke(root: &Path, corpus_raw: &str, dev_raw: &str) -> Result<
         .find(|qrel| qrel.query_class == QueryClass::ExactIdentifier)
         .ok_or("exact smoke qrel missing")?;
     let binary = eval_binary()?;
+    let repo_root = std::env::current_dir()?.canonicalize()?;
+    let mut path_guard = PathPrivacyGuard::for_run(root, &repo_root, &binary)?;
     let server = PublicSnapshotServer::start(&corpus)?;
     let fixture = CliFixture::new(
         root.join("qgh-only-runtime-smoke"),
-        binary,
+        binary.clone(),
         server.base_url.clone(),
     )?;
     fixture.write_config(None)?;
     fixture.sync()?;
     let (database_schema_fingerprint, tantivy_schema_fingerprint) =
         fixture.schema_fingerprints()?;
+    path_guard.add_path(&fixture.active_tantivy_snapshot()?.path)?;
     let evidence = run_single_pass(&fixture, std::slice::from_ref(qrel))?;
     let ranked_source_count = evidence.rankings.get(&qrel.query_id).map_or(0, Vec::len);
     if ranked_source_count == 0
@@ -3689,9 +3875,9 @@ pub(super) fn run_smoke(root: &Path, corpus_raw: &str, dev_raw: &str) -> Result<
     {
         return Err("qgh-only runtime smoke did not query -> get round-trip".into());
     }
-    let redaction = verify_redaction(root, &corpus, &[qrel])?;
+    let redaction = verify_redaction(root, &corpus, &[qrel], &path_guard)?;
     let report = SmokeReport {
-        schema_version: "qgh.live_model_eval_smoke.v1",
+        schema_version: "qgh.live_model_eval_smoke.v2",
         corpus_sha256: digest_hex(corpus_raw),
         corpus_source_count: corpus.len(),
         database_schema_fingerprint,
@@ -3700,7 +3886,8 @@ pub(super) fn run_smoke(root: &Path, corpus_raw: &str, dev_raw: &str) -> Result<
         query_sha256: digest_hex(&qrel.query),
         ranked_source_count,
         get_round_trip: evidence.get_success as f64 / evidence.get_total as f64,
-        raw_query_or_body_logged: !redaction.passed,
+        raw_query_or_body_logged: !redaction.sensitive_payload_passed,
+        absolute_path_logged: !redaction.path_privacy_passed,
     };
     write_pretty(root.join("qgh-only-runtime-smoke.json"), &report)?;
     Ok(())
@@ -3712,7 +3899,7 @@ pub(super) fn run_context_probe_smoke(
     manifest_path: &Path,
 ) -> Result<(), DynError> {
     ensure_target_root(root)?;
-    reset_stderr_audit();
+    reset_redaction_audit();
     fs::create_dir_all(root)?;
     let corpus = parse_jsonl::<CorpusRecord>(corpus_raw);
     let comment = corpus
@@ -3731,6 +3918,9 @@ pub(super) fn run_context_probe_smoke(
     let manifest = ModelManifestV1::from_json_slice(&fs::read(manifest_path)?)?;
     let manifest_hash = manifest.hash();
     let binary = eval_binary()?;
+    let repo_root = std::env::current_dir()?.canonicalize()?;
+    let mut path_guard = PathPrivacyGuard::for_run(root, &repo_root, &binary)?;
+    path_guard.add_path(manifest_path)?;
     let server = PublicSnapshotServer::start(&subset)?;
     let fixture = CliFixture::new(
         root.join("context-contract-runtime-smoke"),
@@ -3751,11 +3941,12 @@ pub(super) fn run_context_probe_smoke(
     }
     let (candidate_database_schema_fingerprint, candidate_tantivy_schema_fingerprint) =
         fixture.schema_fingerprints()?;
+    path_guard.add_path(&fixture.active_tantivy_snapshot()?.path)?;
     let context_contract =
         probe_context_contract(&fixture.db_path(), &manifest.context_template_version)?;
-    let redaction = verify_redaction(root, &subset, &[])?;
+    let redaction = verify_redaction(root, &subset, &[], &path_guard)?;
     let report = ContextProbeSmokeReport {
-        schema_version: "qgh.live_model_eval_context_probe.v1",
+        schema_version: "qgh.live_model_eval_context_probe.v2",
         corpus_source_count: subset.len(),
         manifest_hash,
         candidate_database_schema_fingerprint,
@@ -3765,7 +3956,8 @@ pub(super) fn run_context_probe_smoke(
         } else {
             "blocked_context_contract"
         },
-        raw_query_or_body_logged: !redaction.passed,
+        raw_query_or_body_logged: !redaction.sensitive_payload_passed,
+        absolute_path_logged: !redaction.path_privacy_passed,
         redaction,
         context_contract,
     };
@@ -4869,10 +5061,20 @@ fn run_single_pass(fixture: &CliFixture, qrels: &[QrelRecord]) -> Result<QueryEv
     Ok(evidence)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveTantivySnapshot {
     generation: i64,
     path: PathBuf,
+    tantivy_schema_fingerprint: String,
+    generation_files_sha256: String,
+    generation_files: Vec<SnapshotFileDigest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActiveTantivySnapshotIdentity {
+    generation: i64,
+    path: String,
     tantivy_schema_fingerprint: String,
     generation_files_sha256: String,
     generation_files: Vec<SnapshotFileDigest>,
@@ -4938,8 +5140,13 @@ fn revalidate_tantivy_snapshot(
 }
 
 pub(super) fn freeze_tantivy_snapshot_for_test(db_path: &Path) -> Result<Value, DynError> {
-    Ok(serde_json::to_value(load_active_tantivy_snapshot(
-        db_path,
+    let snapshot = load_active_tantivy_snapshot(db_path)?;
+    let profile_root = db_path
+        .parent()
+        .ok_or("live-eval database parent is unavailable")?;
+    Ok(serde_json::to_value(tantivy_snapshot_identity(
+        profile_root,
+        &snapshot,
     )?)?)
 }
 
@@ -4947,7 +5154,40 @@ pub(super) fn revalidate_tantivy_snapshot_for_test(
     db_path: &Path,
     frozen: Value,
 ) -> Result<(), DynError> {
-    revalidate_tantivy_snapshot(db_path, &serde_json::from_value(frozen)?)
+    let profile_root = db_path
+        .parent()
+        .ok_or("live-eval database parent is unavailable")?;
+    let identity: ActiveTantivySnapshotIdentity = serde_json::from_value(frozen)?;
+    revalidate_tantivy_snapshot(
+        db_path,
+        &active_tantivy_snapshot_from_identity(profile_root, identity)?,
+    )
+}
+
+fn tantivy_snapshot_identity(
+    root: &Path,
+    snapshot: &ActiveTantivySnapshot,
+) -> Result<ActiveTantivySnapshotIdentity, DynError> {
+    Ok(ActiveTantivySnapshotIdentity {
+        generation: snapshot.generation,
+        path: confined_root_relative_identity(root, &snapshot.path)?,
+        tantivy_schema_fingerprint: snapshot.tantivy_schema_fingerprint.clone(),
+        generation_files_sha256: snapshot.generation_files_sha256.clone(),
+        generation_files: snapshot.generation_files.clone(),
+    })
+}
+
+fn active_tantivy_snapshot_from_identity(
+    root: &Path,
+    identity: ActiveTantivySnapshotIdentity,
+) -> Result<ActiveTantivySnapshot, DynError> {
+    Ok(ActiveTantivySnapshot {
+        generation: identity.generation,
+        path: resolve_confined_root_relative_identity(root, &identity.path)?,
+        tantivy_schema_fingerprint: identity.tantivy_schema_fingerprint,
+        generation_files_sha256: identity.generation_files_sha256,
+        generation_files: identity.generation_files,
+    })
 }
 
 fn verify_rankings_with_get(
@@ -5054,7 +5294,15 @@ fn run_lexical_profile_dev_ab(
     corpus_sha256: &str,
     qrels_dev_sha256: &str,
     tantivy_schema_fingerprint: &str,
-) -> Result<(LexicalProfileAbReport, FrozenLexicalProfile), DynError> {
+    path_guard: &PathPrivacyGuard,
+) -> Result<
+    (
+        LexicalProfileAbReport,
+        FrozenLexicalProfile,
+        ActiveTantivySnapshot,
+    ),
+    DynError,
+> {
     eprintln!("live-eval phase=lexical-profile-dev-ab status=running");
     let plan = LexicalProfileComparisonPlan::for_current_production();
     let (production_snapshot, production_profile_evidence) = run_lexical_profile_pass(
@@ -5108,7 +5356,7 @@ fn run_lexical_profile_dev_ab(
         }
     };
     let dev_refs = dev.iter().collect::<Vec<_>>();
-    let redaction = verify_redaction(root, corpus, &dev_refs)?;
+    let redaction = verify_redaction(root, corpus, &dev_refs, path_guard)?;
     let mut report = LexicalProfileAbReport {
         schema_version: "qgh.lexical_profile_ab.v1",
         integrated_git_head: integrated_git_head.to_string(),
@@ -5142,14 +5390,14 @@ fn run_lexical_profile_dev_ab(
         corpus_sha256: corpus_sha256.to_string(),
         qrels_dev_sha256: qrels_dev_sha256.to_string(),
         active_tantivy_generation: production_snapshot.generation,
-        active_tantivy_path: production_snapshot.path.clone(),
+        active_tantivy_path: confined_root_relative_identity(root, &production_snapshot.path)?,
         tantivy_schema_fingerprint: production_snapshot.tantivy_schema_fingerprint.clone(),
         tantivy_generation_files_sha256: production_snapshot.generation_files_sha256.clone(),
         tantivy_generation_files: production_snapshot.generation_files.clone(),
         heldout_confirmation_required: report.selection.selected_profile != plan.production_profile,
         heldout_fallback_profile: plan.production_profile,
     };
-    Ok((report, frozen))
+    Ok((report, frozen, production_snapshot))
 }
 
 fn run_dev_mcp(fixture: &CliFixture, dev: &[QrelRecord]) -> Result<DevRunEvidence, DynError> {
@@ -5763,7 +6011,7 @@ fn run_timed_command(
         peak_rss_bytes: 0,
         embedded_chunks: None,
     })?;
-    record_stderr(&output.stderr);
+    record_output(&output);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
     let peak_rss_bytes = parse_peak_rss(&String::from_utf8_lossy(&output.stderr));
     if !output.status.success() {
@@ -5998,7 +6246,7 @@ limit = 10
             command.env(TEST_EMBEDDING_DOCUMENT_VECTORS_ENV, document_vectors_json);
         }
         let output = command.output()?;
-        record_stderr(&output.stderr);
+        record_output(&output);
         if !output.status.success() {
             return Err(command_failure(&output).into());
         }
@@ -6051,7 +6299,7 @@ limit = 10
         self.apply_env(&mut command);
         let started = Instant::now();
         let output = command.output()?;
-        record_stderr(&output.stderr);
+        record_output(&output);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
         if !output.status.success() {
             return Err(command_failure(&output).into());
@@ -6104,7 +6352,7 @@ limit = 10
         self.apply_env(&mut command);
         let started = Instant::now();
         let output = command.output()?;
-        record_stderr(&output.stderr);
+        record_output(&output);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
         if !output.status.success() {
             return Err(command_failure(&output).into());
@@ -6255,6 +6503,7 @@ impl McpClient {
         if read == 0 {
             return Err("MCP server closed stdout".into());
         }
+        record_stdout(line.as_bytes());
         Ok(serde_json::from_str(&line)?)
     }
 

@@ -824,7 +824,7 @@ fn lexical_profile_freeze_contains_a_selected_profile_and_dev_report_binding() {
             "corpus_sha256": "corpus-sha256",
             "qrels_dev_sha256": "dev-sha256",
             "active_tantivy_generation": 7,
-            "active_tantivy_path": "/frozen/tantivy/generation-7",
+            "active_tantivy_path": "bm25-live/data/qgh/profiles/work/tantivy/generation-7",
             "tantivy_schema_fingerprint": "schema-sha256",
             "tantivy_generation_files_sha256": "files-sha256",
             "tantivy_generation_files": [{
@@ -1646,6 +1646,16 @@ fn frozen_bm25_snapshot_rejects_an_active_publication_pointer_switch() {
 
     let frozen = live_model_eval_runtime::freeze_tantivy_snapshot_for_test(&db_path)
         .expect("active snapshot freezes");
+    assert_eq!(frozen["path"], "generation-7");
+    assert!(!serde_json::to_string(&frozen)
+        .unwrap()
+        .contains(root.to_string_lossy().as_ref()));
+    let mut absolute_identity = frozen.clone();
+    absolute_identity["path"] = json!(generation_a.to_string_lossy());
+    assert!(
+        live_model_eval_runtime::revalidate_tantivy_snapshot_for_test(&db_path, absolute_identity,)
+            .is_err()
+    );
     let connection = rusqlite::Connection::open(&db_path).unwrap();
     connection
         .execute_batch(
@@ -2127,7 +2137,7 @@ fn frozen_heldout_open_validates_classes_gold_adjudication_and_thread_split() {
 #[test]
 fn lexical_profile_is_selected_and_report_bound_before_heldout_then_never_reselected() {
     let dev_ab = RUNTIME_SUPPORT
-        .find("let (lexical_profile_dev, frozen_lexical_profile) = run_lexical_profile_dev_ab")
+        .find("run_lexical_profile_dev_ab(")
         .expect("dev A/B exists");
     let freeze = RUNTIME_SUPPORT
         .find("fs::write(root.join(\"frozen-config.json\")")
@@ -2496,6 +2506,51 @@ fn redaction_audit_detects_json_escaped_sensitive_values() {
         json!(["escaped-report.json"])
     );
     assert_eq!(evidence["passed"], false);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn path_redaction_scans_artifacts_stdout_and_stderr() {
+    let root = std::env::temp_dir().join(format!(
+        "qgh-live-model-path-redaction-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let marker = root.join("unique-worktree-marker");
+    let marker = marker.to_string_lossy().to_string();
+    std::fs::write(
+        root.join("path-report.json"),
+        serde_json::to_vec(&json!({"nested": {"tantivy": &marker}})).unwrap(),
+    )
+    .unwrap();
+    let stdout = serde_json::to_vec(&json!({"model": &marker})).unwrap();
+    let stderr = format!("runtime path={marker}").into_bytes();
+
+    let evidence = live_model_eval_runtime::path_redaction_scan_for_test(
+        &root,
+        &[marker.as_str()],
+        &[stdout],
+        &[stderr],
+    )
+    .expect("path redaction scan completes");
+    assert_eq!(evidence["stdout_streams_checked"], 1);
+    assert_eq!(evidence["stderr_streams_checked"], 1);
+    assert_eq!(evidence["path_markers_checked"], 1);
+    assert_eq!(
+        evidence["violation_artifacts"],
+        json!(["stdout-stream-0", "stderr-stream-0", "path-report.json"])
+    );
+    assert_eq!(evidence["path_privacy_passed"], false);
+    assert_eq!(evidence["passed"], false);
+    assert_eq!(
+        live_model_eval_runtime::final_report_artifact_for_test(),
+        "live-model-eval-report.json"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
