@@ -1809,6 +1809,7 @@ fn refresh_incremental_chunk_embeddings_for_snapshot(
     refresh_incremental_chunk_embeddings_with_provider_and_generation(
         store,
         runtime.provider.as_ref(),
+        runtime.model_manifest_hash.clone(),
         runtime.fingerprint_seed.clone(),
         &expectation,
         snapshot,
@@ -1818,6 +1819,7 @@ fn refresh_incremental_chunk_embeddings_for_snapshot(
 fn refresh_incremental_chunk_embeddings_with_provider(
     store: &mut Store,
     provider: &dyn EmbeddingProvider,
+    model_manifest_hash: String,
     fingerprint_seed: EmbeddingFingerprintSeed,
     expectation: &EmbeddingFingerprintExpectation,
 ) -> Result<usize, QghError> {
@@ -1828,6 +1830,7 @@ fn refresh_incremental_chunk_embeddings_with_provider(
         refresh_incremental_chunk_embeddings_with_provider_and_generation(
             store,
             provider,
+            model_manifest_hash,
             fingerprint_seed,
             expectation,
             &snapshot,
@@ -1839,6 +1842,7 @@ fn refresh_incremental_chunk_embeddings_with_provider(
 fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
     store: &mut Store,
     provider: &dyn EmbeddingProvider,
+    model_manifest_hash: String,
     fingerprint_seed: EmbeddingFingerprintSeed,
     _expectation: &EmbeddingFingerprintExpectation,
     snapshot: &RetrievalBuildSnapshot,
@@ -1865,10 +1869,11 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
     }
     let dimension = embedding_dimension(&vectors)?;
     let fingerprint = fingerprint_seed.with_dimension(dimension);
-    let model_manifest_hash = fingerprint.hash();
+    let runtime_fingerprint_hash = fingerprint.hash();
     let context_template_version = crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string();
     let spec = crate::store::EmbeddingGenerationSpec {
         model_manifest_hash: model_manifest_hash.clone(),
+        runtime_fingerprint_hash,
         chunker_fingerprint: chunks
             .first()
             .map(|chunk| chunk.chunk.chunker_fingerprint.clone())
@@ -2094,6 +2099,7 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
         &mut store,
         &profile.paths,
         runtime.provider.as_ref(),
+        runtime.model_manifest_hash.clone(),
         runtime.fingerprint_seed.clone(),
         &snapshot,
     )?;
@@ -2130,6 +2136,7 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
 struct EmbeddingRuntime {
     tokenizer: Box<dyn EmbeddingTokenizer>,
     provider: Box<dyn EmbeddingProvider>,
+    model_manifest_hash: String,
     fingerprint_seed: EmbeddingFingerprintSeed,
 }
 
@@ -2233,6 +2240,8 @@ fn test_embedding_runtime(
             document_vectors,
             query_vectors,
         }),
+        model_manifest_hash: "f4f58582f743f03f94eb63915d7bb93f54328dd9a9b0c258eb6eb578456f7946"
+            .to_string(),
         fingerprint_seed: EmbeddingFingerprintSeed {
             provider: embedding_provider_name(embedding.provider).to_string(),
             model_id: configured_embedding_model_id(embedding)
@@ -2345,6 +2354,7 @@ fn embedding_runtime_with_access(
             let runtime = Arc::new(EmbeddingRuntime {
                 tokenizer,
                 provider: Box::new(provider),
+                model_manifest_hash: snapshot.manifest.hash(),
                 fingerprint_seed: embedding_fingerprint_seed(embedding, &snapshot),
             });
             if let (Some(profile_id), Some(cache_key)) = (cache_profile_id, cache_key) {
@@ -2418,6 +2428,7 @@ fn refresh_chunk_embeddings(
     store: &mut Store,
     paths: &ProfilePaths,
     provider: &dyn EmbeddingProvider,
+    model_manifest_hash: String,
     fingerprint_seed: EmbeddingFingerprintSeed,
     snapshot: &RetrievalBuildSnapshot,
 ) -> Result<Value, QghError> {
@@ -2447,12 +2458,13 @@ fn refresh_chunk_embeddings(
     }
     let dimension = embedding_dimension(&vectors)?;
     let fingerprint = fingerprint_seed.with_dimension(dimension);
+    let runtime_fingerprint_hash = fingerprint.hash();
     let embeddings = chunks.iter().zip(vectors).collect::<Vec<_>>();
     let source_sync_run_id = snapshot.identity().sync_run_id().to_string();
-    let model_manifest_hash = fingerprint.hash();
     let context_template_version = crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string();
     let spec = crate::store::EmbeddingGenerationSpec {
         model_manifest_hash: model_manifest_hash.clone(),
+        runtime_fingerprint_hash,
         chunker_fingerprint: chunks
             .first()
             .map(|chunk| chunk.chunk.chunker_fingerprint.clone())
@@ -3680,6 +3692,42 @@ fn fuse_hybrid_hits(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HybridQueryEncodingError {
+    FingerprintMismatch,
+    EncodingFailed,
+    DimensionMismatch,
+}
+
+fn encode_hybrid_query(
+    runtime: &EmbeddingRuntime,
+    publication: Option<&RetrievalPublicationView>,
+    query_text: &str,
+) -> Result<EmbeddingVector, HybridQueryEncodingError> {
+    let publication = publication.ok_or(HybridQueryEncodingError::FingerprintMismatch)?;
+    let dimension = publication
+        .output_dimension
+        .ok_or(HybridQueryEncodingError::FingerprintMismatch)?;
+    let expected_runtime_hash = runtime
+        .fingerprint_seed
+        .clone()
+        .with_dimension(dimension)
+        .hash();
+    if publication.model_manifest_hash.as_deref() != Some(runtime.model_manifest_hash.as_str())
+        || publication.runtime_fingerprint_hash.as_deref() != Some(expected_runtime_hash.as_str())
+    {
+        return Err(HybridQueryEncodingError::FingerprintMismatch);
+    }
+    let vector = runtime
+        .provider
+        .embed_query(query_text)
+        .map_err(|_| HybridQueryEncodingError::EncodingFailed)?;
+    if vector.len() != dimension {
+        return Err(HybridQueryEncodingError::DimensionMismatch);
+    }
+    Ok(vector)
+}
+
 fn hybrid_vector_hits(
     profile: &Profile,
     store: &Store,
@@ -3709,34 +3757,19 @@ fn hybrid_vector_hits(
             ));
         }
     };
-    let publication_matches_runtime = publication.is_some_and(|publication| {
-        publication.output_dimension.is_some_and(|dimension| {
-            publication
-                .model_manifest_hash
-                .as_ref()
-                .is_some_and(|hash| {
-                    *hash
-                        == runtime
-                            .fingerprint_seed
-                            .clone()
-                            .with_dimension(dimension)
-                            .hash()
-                })
-        })
-    });
-    if !publication_matches_runtime {
-        return Ok((
-            None,
-            vec![json!({
-                "code": "embedding.fingerprint_mismatch",
-                "severity": "warn_strong",
-                "message": "Stored embeddings were created with a different embedding fingerprint and will not be used for vector search. BM25 results are still returned."
-            })],
-        ));
-    }
-    let query_vector = match runtime.provider.embed_query(query_text) {
+    let query_vector = match encode_hybrid_query(&runtime, publication, query_text) {
         Ok(vector) => vector,
-        Err(_) => {
+        Err(HybridQueryEncodingError::FingerprintMismatch) => {
+            return Ok((
+                None,
+                vec![json!({
+                    "code": "embedding.fingerprint_mismatch",
+                    "severity": "warn_strong",
+                    "message": "Stored embeddings were created with a different embedding fingerprint and will not be used for vector search. BM25 results are still returned."
+                })],
+            ));
+        }
+        Err(HybridQueryEncodingError::EncodingFailed) => {
             return Ok((
                 None,
                 vec![embedding_warning(
@@ -3745,19 +3778,16 @@ fn hybrid_vector_hits(
                 )],
             ));
         }
+        Err(HybridQueryEncodingError::DimensionMismatch) => {
+            return Ok((
+                None,
+                vec![embedding_warning(
+                    "embedding.query_dimension_mismatch",
+                    "Query embedding dimension did not match the active generation. BM25 results are still returned.",
+                )],
+            ));
+        }
     };
-    if publication
-        .and_then(|publication| publication.output_dimension)
-        .is_some_and(|dimension| dimension != query_vector.len())
-    {
-        return Ok((
-            None,
-            vec![embedding_warning(
-                "embedding.query_dimension_mismatch",
-                "Query embedding dimension did not match the active generation. BM25 results are still returned.",
-            )],
-        ));
-    }
     let Some(generation_id) =
         publication.and_then(|publication| publication.embedding_generation_id)
     else {
@@ -3872,7 +3902,7 @@ fn embedding_coverage_state(
                 .and_then(|publication| {
                     publication
                         .output_dimension
-                        .zip(publication.model_manifest_hash)
+                        .zip(publication.runtime_fingerprint_hash)
                 })
                 .is_some_and(|(dimension, hash)| hash == seed.with_dimension(dimension).hash())
         });
@@ -5350,6 +5380,46 @@ mod tests {
     }
 
     #[cfg(feature = "vector-search")]
+    fn pinned_embedding_profile(paths: &ProfilePaths, model_revision: &str) -> Profile {
+        Profile {
+            id: "identity-test-profile".to_string(),
+            host: "github.com".to_string(),
+            api_base_url: "https://api.github.com".to_string(),
+            web_base_url: "https://github.com".to_string(),
+            repos: vec![crate::config::RepoRef {
+                owner: "owner".to_string(),
+                name: "repo".to_string(),
+            }],
+            embedding: Some(EmbeddingConfig {
+                provider: EmbeddingProviderKind::Local,
+                manifest_path: None,
+                model: Some(format!("hf:fixture/model@{model_revision}")),
+                model_path: None,
+                file: None,
+                pooling: Some(PoolingKind::Cls),
+                query_prefix: Some(crate::embedding::DEFAULT_QUERY_PREFIX.to_string()),
+                quantization: None,
+                token_source: None,
+            }),
+            reconcile_after_seconds: None,
+            freshness: crate::config::FreshnessSettings {
+                query_max_age_seconds: 1,
+                query_stale_behavior: crate::config::StaleBehavior::Warn,
+                active_issue_max_age_seconds: None,
+            },
+            bootstrap: crate::config::BootstrapSettings {
+                lookback_seconds: 1,
+            },
+            sync_max_age_seconds: None,
+            comments_mode: CommentsMode::PerIssue,
+            comment_parent_resolution_budget: 1,
+            max_in_flight_requests: 1,
+            token_source: TokenSource::GithubCli,
+            paths: paths.clone(),
+        }
+    }
+
+    #[cfg(feature = "vector-search")]
     impl EmbeddingProvider for RecordingEmbeddingProvider {
         fn embed_documents(
             &self,
@@ -5506,6 +5576,98 @@ mod tests {
     }
 
     #[cfg(feature = "vector-search")]
+    struct PanicQueryEmbeddingProvider;
+
+    #[cfg(feature = "vector-search")]
+    impl EmbeddingProvider for PanicQueryEmbeddingProvider {
+        fn embed_documents(
+            &self,
+            _texts: &[&str],
+        ) -> Result<Vec<EmbeddingVector>, EmbeddingProviderError> {
+            panic!("document encoding is not part of this query test")
+        }
+
+        fn embed_query(&self, _text: &str) -> Result<EmbeddingVector, EmbeddingProviderError> {
+            panic!("runtime mismatch must be rejected before query encoding")
+        }
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn runtime_fingerprint_mismatch_blocks_query_encoding_before_bm25_fallback() {
+        let runtime = EmbeddingRuntime {
+            tokenizer: Box::new(TestEmbeddingTokenizer),
+            provider: Box::new(PanicQueryEmbeddingProvider),
+            model_manifest_hash: "manifest-query-runtime-check".to_string(),
+            fingerprint_seed: EmbeddingFingerprintSeed {
+                provider: "local".to_string(),
+                model_id: "fixture/model".to_string(),
+                model_revision: "fixture-sha".to_string(),
+                pooling: PoolingKind::Cls,
+                query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
+            },
+        };
+        let publication = RetrievalPublicationView {
+            publication_id: 1,
+            source_snapshot_sync_run_id: "sync-query-runtime-check".to_string(),
+            source_snapshot_epoch: 1,
+            tantivy_generation: 1,
+            embedding_generation_id: Some(1),
+            model_manifest_hash: Some("manifest-query-runtime-check".to_string()),
+            runtime_fingerprint_hash: Some("wrong-runtime-fingerprint".to_string()),
+            chunker_fingerprint: Some(crate::chunking::CHUNKER_FINGERPRINT.to_string()),
+            context_template_version: Some(
+                crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            ),
+            output_dimension: Some(3),
+        };
+
+        let error = encode_hybrid_query(&runtime, Some(&publication), "query-not-logged")
+            .expect_err("runtime mismatch must fail closed");
+        assert_eq!(error, HybridQueryEncodingError::FingerprintMismatch);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn fresh_distinct_identity_reaches_hybrid_query_encoding() {
+        let fingerprint_seed = EmbeddingFingerprintSeed {
+            provider: "local".to_string(),
+            model_id: "fixture/model".to_string(),
+            model_revision: "fixture-sha".to_string(),
+            pooling: PoolingKind::Cls,
+            query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
+        };
+        let runtime_fingerprint_hash = fingerprint_seed.clone().with_dimension(3).hash();
+        let model_manifest_hash = "manifest-distinct-from-runtime";
+        assert_ne!(model_manifest_hash, runtime_fingerprint_hash);
+        let runtime = EmbeddingRuntime {
+            tokenizer: Box::new(TestEmbeddingTokenizer),
+            provider: Box::new(RecordingEmbeddingProvider::default()),
+            model_manifest_hash: model_manifest_hash.to_string(),
+            fingerprint_seed,
+        };
+        let publication = RetrievalPublicationView {
+            publication_id: 1,
+            source_snapshot_sync_run_id: "sync-fresh-hybrid-identity".to_string(),
+            source_snapshot_epoch: 1,
+            tantivy_generation: 1,
+            embedding_generation_id: Some(1),
+            model_manifest_hash: Some(model_manifest_hash.to_string()),
+            runtime_fingerprint_hash: Some(runtime_fingerprint_hash),
+            chunker_fingerprint: Some(crate::chunking::CHUNKER_FINGERPRINT.to_string()),
+            context_template_version: Some(
+                crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            ),
+            output_dimension: Some(3),
+        };
+
+        assert_eq!(
+            encode_hybrid_query(&runtime, Some(&publication), "query-not-logged").unwrap(),
+            vec![1.0, 2.0, 3.0]
+        );
+    }
+
+    #[cfg(feature = "vector-search")]
     #[test]
     fn sync_embedding_provider_receives_production_issue_context() {
         let paths = temp_profile_paths("sync-embedding-context");
@@ -5545,6 +5707,7 @@ mod tests {
         refresh_incremental_chunk_embeddings_with_provider(
             &mut store,
             &provider,
+            "manifest-context-sync".to_string(),
             seed,
             &expectation,
         )
@@ -5613,15 +5776,26 @@ mod tests {
         store.mark_sync_run_completed("sync-force-context").unwrap();
         let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
         let provider = RecordingEmbeddingProvider::default();
+        let model_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let seed = EmbeddingFingerprintSeed {
             provider: "local".to_string(),
             model_id: "fixture/model".to_string(),
-            model_revision: "fixture-sha".to_string(),
+            model_revision: model_revision.to_string(),
             pooling: PoolingKind::Cls,
             query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
         };
+        let model_manifest_hash = "manifest-context-force";
+        let expected_runtime_fingerprint_hash = seed.clone().with_dimension(3).hash();
 
-        refresh_chunk_embeddings(&mut store, &paths, &provider, seed, &snapshot).unwrap();
+        refresh_chunk_embeddings(
+            &mut store,
+            &paths,
+            &provider,
+            model_manifest_hash.to_string(),
+            seed,
+            &snapshot,
+        )
+        .unwrap();
 
         let expected_input = "Repository: github.com/owner/repo\nComment on issue #48: Vector smoke I_CONTEXT_FORCE\n\nunchanged comment chunk";
         assert_eq!(
@@ -5635,22 +5809,35 @@ mod tests {
             "unchanged comment chunk"
         );
         let connection = rusqlite::Connection::open(&paths.db_path).unwrap();
-        let (stored_hash, manifest_hash, chunker_fingerprint, template_version): (
-            String,
-            String,
-            String,
-            String,
-        ) = connection
+        let (
+            stored_hash,
+            manifest_hash,
+            runtime_fingerprint_hash,
+            chunker_fingerprint,
+            template_version,
+        ): (String, String, String, String, String) = connection
             .query_row(
                 "SELECT egc.context_hash, eg.model_manifest_hash,
+                        eg.runtime_fingerprint_hash,
                         eg.chunker_fingerprint, eg.context_template_version
                  FROM embedding_generation_chunks egc
                  JOIN embedding_generations eg ON eg.id = egc.generation_id
                  ORDER BY eg.id DESC LIMIT 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
+        assert_eq!(manifest_hash, model_manifest_hash);
+        assert_eq!(runtime_fingerprint_hash, expected_runtime_fingerprint_hash);
+        assert_ne!(manifest_hash, runtime_fingerprint_hash);
         assert_eq!(
             stored_hash,
             crate::context::embedding_context_hash(
@@ -5660,6 +5847,21 @@ mod tests {
                 expected_input,
             )
         );
+        assert_ne!(
+            stored_hash,
+            crate::context::embedding_context_hash(
+                &runtime_fingerprint_hash,
+                &chunker_fingerprint,
+                &template_version,
+                expected_input,
+            )
+        );
+        let profile = pinned_embedding_profile(&paths, model_revision);
+        let coverage = embedding_coverage_state(&profile, &store)
+            .unwrap()
+            .expect("configured embedding coverage");
+        assert_eq!(coverage.state(), "complete");
+        assert!(coverage.hybrid_ready());
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -5867,6 +6069,7 @@ mod tests {
             &mut store,
             &paths,
             &MockEmbeddingProvider,
+            "manifest-command-embed".to_string(),
             seed,
             &force_snapshot,
         )
@@ -5979,6 +6182,7 @@ mod tests {
         let embedded = refresh_incremental_chunk_embeddings_with_provider(
             &mut store,
             &MockEmbeddingProvider,
+            "manifest-sync-embed".to_string(),
             seed.clone(),
             &expectation,
         )
@@ -5995,6 +6199,7 @@ mod tests {
         let skipped = refresh_incremental_chunk_embeddings_with_provider(
             &mut store,
             &MockEmbeddingProvider,
+            "manifest-sync-embed".to_string(),
             seed,
             &expectation,
         )

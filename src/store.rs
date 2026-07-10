@@ -32,6 +32,7 @@ const CHUNK_EMBEDDING_VECTOR_CHUNKS_TABLE: &str = "chunk_embedding_vectors_vecto
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingGenerationSpec {
     pub model_manifest_hash: String,
+    pub runtime_fingerprint_hash: String,
     pub chunker_fingerprint: String,
     pub context_template_version: String,
     pub output_dimension: usize,
@@ -42,6 +43,7 @@ type EmbeddingGenerationValidationRow = (
     i64,
     i64,
     i64,
+    String,
     String,
     String,
     String,
@@ -76,6 +78,7 @@ pub struct RetrievalPublicationView {
     pub tantivy_generation: i64,
     pub embedding_generation_id: Option<i64>,
     pub model_manifest_hash: Option<String>,
+    pub runtime_fingerprint_hash: Option<String>,
     pub chunker_fingerprint: Option<String>,
     pub context_template_version: Option<String>,
     pub output_dimension: Option<usize>,
@@ -373,6 +376,7 @@ impl Store {
         };
         store.migrate()?;
         store.detach_unbound_tantivy_publication()?;
+        store.detach_legacy_embedding_publication_identity()?;
         store.enforce_pending_purge_guards()?;
         store.content_write_epoch = read_content_write_epoch(&store.conn)?;
         Ok(store)
@@ -467,6 +471,115 @@ impl Store {
                 )?;
             }
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replaces an active legacy vector publication whose embedding identity
+    /// cannot prove both the prepared manifest and runtime fingerprint. The
+    /// trusted source/Tantivy snapshot remains queryable through a new
+    /// BM25-only publication; embedding payloads stay intact for diagnosis.
+    fn detach_legacy_embedding_publication_identity(&mut self) -> Result<(), QghError> {
+        if !table_exists(&self.conn, "embedding_generations")? {
+            return Ok(());
+        }
+        type LegacyPublication = (i64, String, i64, i64, i64);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let legacy = tx
+            .query_row(
+                "SELECT rp.publication_id, rp.source_snapshot_sync_run_id,
+                        rp.source_snapshot_epoch, rp.tantivy_generation,
+                        rp.embedding_generation_id
+                 FROM retrieval_publication_pointer p
+                 JOIN retrieval_publications rp
+                   ON rp.publication_id = p.publication_id
+                 LEFT JOIN embedding_generations eg
+                   ON eg.id = rp.embedding_generation_id
+                 WHERE p.id = 1
+                   AND rp.embedding_generation_id IS NOT NULL
+                   AND (
+                       rp.model_manifest_hash IS NULL
+                       OR rp.model_manifest_hash = ''
+                       OR rp.runtime_fingerprint_hash IS NULL
+                       OR rp.runtime_fingerprint_hash = ''
+                       OR rp.chunker_fingerprint IS NULL
+                       OR rp.chunker_fingerprint = ''
+                       OR rp.context_template_version IS NULL
+                       OR rp.context_template_version = ''
+                       OR rp.output_dimension IS NULL
+                       OR rp.output_dimension <= 0
+                       OR eg.id IS NULL
+                       OR eg.model_manifest_hash IS NULL
+                       OR eg.model_manifest_hash = ''
+                       OR eg.runtime_fingerprint_hash IS NULL
+                       OR eg.runtime_fingerprint_hash = ''
+                       OR eg.chunker_fingerprint IS NULL
+                       OR eg.chunker_fingerprint = ''
+                       OR eg.context_template_version IS NULL
+                       OR eg.context_template_version = ''
+                       OR eg.output_dimension IS NULL
+                       OR eg.output_dimension <= 0
+                       OR rp.model_manifest_hash IS NOT eg.model_manifest_hash
+                       OR rp.runtime_fingerprint_hash IS NOT eg.runtime_fingerprint_hash
+                       OR rp.chunker_fingerprint IS NOT eg.chunker_fingerprint
+                       OR rp.context_template_version IS NOT eg.context_template_version
+                       OR rp.output_dimension IS NOT eg.output_dimension
+                   )",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((legacy_publication_id, source_sync_run_id, source_epoch, tantivy, generation_id)):
+            Option<LegacyPublication> = legacy
+        else {
+            tx.commit()?;
+            return Ok(());
+        };
+        tx.execute(
+            "INSERT INTO retrieval_publications
+                (source_snapshot_sync_run_id, tantivy_generation,
+                 source_snapshot_epoch, active, created_at)
+             VALUES (?1, ?2, ?3, 1, ?4)",
+            params![source_sync_run_id, tantivy, source_epoch, now_rfc3339()],
+        )?;
+        let successor_id = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE retrieval_publications
+             SET active = CASE WHEN publication_id = ?1 THEN 1 ELSE 0 END",
+            params![successor_id],
+        )?;
+        let pointer_moved = tx.execute(
+            "UPDATE retrieval_publication_pointer
+             SET publication_id = ?1
+             WHERE id = 1 AND publication_id = ?2",
+            params![successor_id, legacy_publication_id],
+        )?;
+        if pointer_moved != 1 {
+            return Err(QghError::validation(
+                "publication.cas_conflict",
+                "Retrieval publication changed during legacy identity repair.",
+            ));
+        }
+        tx.execute(
+            "UPDATE embedding_generations
+             SET state = 'failed', failure_code = ?2, updated_at = ?3
+             WHERE id = ?1",
+            params![
+                generation_id,
+                "embedding.legacy_identity_incomplete",
+                now_rfc3339()
+            ],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -4453,6 +4566,15 @@ impl Store {
                 "Embedding generation dimension must be positive.",
             ));
         }
+        if spec.model_manifest_hash.is_empty()
+            || spec.runtime_fingerprint_hash.is_empty()
+            || spec.chunker_fingerprint.is_empty()
+        {
+            return Err(QghError::validation(
+                "embedding.generation_invalid_spec",
+                "Embedding generation identity fields must be non-empty.",
+            ));
+        }
         if spec.context_template_version != crate::context::METADATA_CONTEXT_TEMPLATE_VERSION {
             return Err(QghError::validation(
                 "embedding.context_template_unsupported",
@@ -4490,18 +4612,20 @@ impl Store {
                 "SELECT id FROM embedding_generations
                  WHERE state = 'building'
                    AND model_manifest_hash = ?1
-                   AND chunker_fingerprint = ?2
-                   AND context_template_version = ?3
-                   AND output_dimension = ?4
-                   AND source_sync_run_id = ?5
-                   AND source_snapshot_hash = ?6
-                   AND write_epoch = ?7
-                   AND source_snapshot_epoch = ?8
-                   AND total_chunks = ?9
-                   AND embedding_inventory_hash = ?10
+                   AND runtime_fingerprint_hash = ?2
+                   AND chunker_fingerprint = ?3
+                   AND context_template_version = ?4
+                   AND output_dimension = ?5
+                   AND source_sync_run_id = ?6
+                   AND source_snapshot_hash = ?7
+                   AND write_epoch = ?8
+                   AND source_snapshot_epoch = ?9
+                   AND total_chunks = ?10
+                   AND embedding_inventory_hash = ?11
                  ORDER BY id DESC LIMIT 1",
                 params![
                     spec.model_manifest_hash,
+                    spec.runtime_fingerprint_hash,
                     spec.chunker_fingerprint,
                     spec.context_template_version,
                     spec.output_dimension as i64,
@@ -4522,13 +4646,14 @@ impl Store {
         let now = now_rfc3339();
         tx.execute(
             "INSERT INTO embedding_generations
-                (state, model_manifest_hash, chunker_fingerprint,
+                (state, model_manifest_hash, runtime_fingerprint_hash, chunker_fingerprint,
                  context_template_version, output_dimension, source_sync_run_id,
                  source_snapshot_hash, embedding_inventory_hash, total_chunks,
                  created_at, updated_at, write_epoch, source_snapshot_epoch)
-             VALUES ('building', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11)",
+             VALUES ('building', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12)",
             params![
                 spec.model_manifest_hash,
+                spec.runtime_fingerprint_hash,
                 spec.chunker_fingerprint,
                 spec.context_template_version,
                 spec.output_dimension as i64,
@@ -4738,6 +4863,7 @@ impl Store {
             total_chunks,
             completed_chunks,
             model_manifest_hash,
+            runtime_fingerprint_hash,
             chunker_fingerprint,
             context_template_version,
             generation_epoch,
@@ -4747,7 +4873,8 @@ impl Store {
             generation_inventory_hash,
         ): EmbeddingGenerationValidationRow = tx.query_row(
             "SELECT state, output_dimension, total_chunks, completed_chunks,
-                        model_manifest_hash, chunker_fingerprint, context_template_version,
+                        model_manifest_hash, runtime_fingerprint_hash,
+                        chunker_fingerprint, context_template_version,
                         write_epoch, source_sync_run_id, source_snapshot_hash,
                         source_snapshot_epoch, embedding_inventory_hash
                  FROM embedding_generations WHERE id = ?1",
@@ -4766,6 +4893,7 @@ impl Store {
                     row.get(9)?,
                     row.get(10)?,
                     row.get(11)?,
+                    row.get(12)?,
                 ))
             },
         )?;
@@ -4775,6 +4903,9 @@ impl Store {
             .ok_or_else(embedding_generation_corrupt_error)?;
         let building = state == "building";
         if !building && !matches!(state.as_str(), "ready" | "active") {
+            return Err(embedding_generation_corrupt_error());
+        }
+        if model_manifest_hash.is_empty() || runtime_fingerprint_hash.is_empty() {
             return Err(embedding_generation_corrupt_error());
         }
         if generation_epoch != expected_epoch {
@@ -5058,38 +5189,86 @@ impl Store {
         }
         let current_source_snapshot_epoch = read_source_snapshot_epoch(&tx)?;
         let embedding_metadata = if let Some(generation_id) = embedding_generation_id {
-            Some(tx.query_row(
-                "SELECT state, model_manifest_hash, chunker_fingerprint,
-                        context_template_version, output_dimension, total_chunks,
-                        completed_chunks, write_epoch, source_sync_run_id,
-                        source_snapshot_hash, source_snapshot_epoch,
-                        embedding_inventory_hash
-                 FROM embedding_generations WHERE id = ?1",
-                params![generation_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)? as usize,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, i64>(7)?,
-                        row.get::<_, String>(8)?,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, Option<i64>>(10)?,
-                        row.get::<_, Option<String>>(11)?,
-                    ))
-                },
-            )?)
+            let raw_metadata = tx
+                .query_row(
+                    "SELECT state, model_manifest_hash, runtime_fingerprint_hash,
+                            chunker_fingerprint,
+                            context_template_version, output_dimension, total_chunks,
+                            completed_chunks, write_epoch, source_sync_run_id,
+                            source_snapshot_hash, source_snapshot_epoch,
+                            embedding_inventory_hash
+                     FROM embedding_generations WHERE id = ?1",
+                    params![generation_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<i64>>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, String>(9)?,
+                            row.get::<_, String>(10)?,
+                            row.get::<_, Option<i64>>(11)?,
+                            row.get::<_, Option<String>>(12)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                state,
+                Some(manifest),
+                Some(runtime),
+                Some(chunker),
+                Some(context),
+                Some(stored_dimension),
+                total_chunks,
+                completed_chunks,
+                generation_epoch,
+                sync_run_id,
+                snapshot_hash,
+                source_epoch,
+                inventory_hash,
+            )) = raw_metadata
+            else {
+                drop(tx);
+                self.cleanup_owned_index_generation(tantivy_generation)?;
+                return Err(embedding_snapshot_mismatch_error());
+            };
+            let Some(dimension) = usize::try_from(stored_dimension)
+                .ok()
+                .filter(|dimension| *dimension > 0)
+            else {
+                drop(tx);
+                self.cleanup_owned_index_generation(tantivy_generation)?;
+                return Err(embedding_snapshot_mismatch_error());
+            };
+            Some((
+                state,
+                manifest,
+                runtime,
+                chunker,
+                context,
+                dimension,
+                total_chunks,
+                completed_chunks,
+                generation_epoch,
+                sync_run_id,
+                snapshot_hash,
+                source_epoch,
+                inventory_hash,
+            ))
         } else {
             None
         };
         if let Some((
             state,
-            _,
-            _,
+            model_manifest_hash,
+            runtime_fingerprint_hash,
+            chunker_fingerprint,
             context_template_version,
             dimension,
             total_chunks,
@@ -5121,7 +5300,11 @@ impl Store {
                 });
                 epoch == current_source_snapshot_epoch && generation_snapshot_hash == &expected_hash
             });
-            if context_template_version != crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
+            if model_manifest_hash.is_empty()
+                || runtime_fingerprint_hash.is_empty()
+                || chunker_fingerprint.is_empty()
+                || *dimension == 0
+                || context_template_version != crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
                 || generation_sync_run_id != source_snapshot_sync_run_id
                 || !embedding_snapshot_matches
                 || usize::try_from(*total_chunks).ok() != Some(authoritative_embedding_chunks.len())
@@ -5298,31 +5481,34 @@ impl Store {
             }
         }
         let now = now_rfc3339();
-        let (manifest, chunker, context, dimension) = embedding_metadata
+        let (manifest, runtime, chunker, context, dimension) = embedding_metadata
             .as_ref()
             .map(
-                |(_, manifest, chunker, context, dimension, _, _, _, _, _, _, _)| {
+                |(_, manifest, runtime, chunker, context, dimension, _, _, _, _, _, _, _)| {
                     (
                         Some(manifest.as_str()),
+                        Some(runtime.as_str()),
                         Some(chunker.as_str()),
                         Some(context.as_str()),
                         Some(*dimension as i64),
                     )
                 },
             )
-            .unwrap_or((None, None, None, None));
+            .unwrap_or((None, None, None, None, None));
         tx.execute(
             "INSERT INTO retrieval_publications
                 (source_snapshot_sync_run_id, tantivy_generation,
                  embedding_generation_id, model_manifest_hash,
-                 chunker_fingerprint, context_template_version,
-                 output_dimension, source_snapshot_epoch, active, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)",
+                 runtime_fingerprint_hash, chunker_fingerprint,
+                 context_template_version, output_dimension,
+                 source_snapshot_epoch, active, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10)",
             params![
                 source_snapshot_sync_run_id,
                 tantivy_generation,
                 embedding_generation_id,
                 manifest,
+                runtime,
                 chunker,
                 context,
                 dimension,
@@ -5391,7 +5577,8 @@ impl Store {
                 "SELECT rp.publication_id, rp.source_snapshot_sync_run_id,
                         rp.source_snapshot_epoch, rp.tantivy_generation,
                         rp.embedding_generation_id,
-                        rp.model_manifest_hash, rp.chunker_fingerprint,
+                        rp.model_manifest_hash, rp.runtime_fingerprint_hash,
+                        rp.chunker_fingerprint,
                         rp.context_template_version, rp.output_dimension
                  FROM retrieval_publication_pointer p
                  JOIN retrieval_publications rp ON rp.publication_id = p.publication_id
@@ -5405,9 +5592,12 @@ impl Store {
                         tantivy_generation: row.get(3)?,
                         embedding_generation_id: row.get(4)?,
                         model_manifest_hash: row.get(5)?,
-                        chunker_fingerprint: row.get(6)?,
-                        context_template_version: row.get(7)?,
-                        output_dimension: row.get::<_, Option<i64>>(8)?.map(|value| value as usize),
+                        runtime_fingerprint_hash: row.get(6)?,
+                        chunker_fingerprint: row.get(7)?,
+                        context_template_version: row.get(8)?,
+                        output_dimension: row
+                            .get::<_, Option<i64>>(9)?
+                            .and_then(|value| usize::try_from(value).ok()),
                     })
                 },
             )
@@ -5474,14 +5664,21 @@ impl Store {
         }) {
             return Err(changed_source_snapshot_error());
         }
+        let identity_field_count = [
+            publication.embedding_generation_id.is_some(),
+            publication.model_manifest_hash.is_some(),
+            publication.runtime_fingerprint_hash.is_some(),
+            publication.chunker_fingerprint.is_some(),
+            publication.context_template_version.is_some(),
+            publication.output_dimension.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        if identity_field_count != 0 && identity_field_count != 6 {
+            return Err(embedding_snapshot_mismatch_error());
+        }
         let Some(embedding_generation_id) = publication.embedding_generation_id else {
-            if publication.model_manifest_hash.is_some()
-                || publication.chunker_fingerprint.is_some()
-                || publication.context_template_version.is_some()
-                || publication.output_dimension.is_some()
-            {
-                return Err(embedding_snapshot_mismatch_error());
-            }
             return Ok(());
         };
         if !table_exists(&self.conn, "embedding_generations")? {
@@ -5490,7 +5687,8 @@ impl Store {
         let embedding = self
             .conn
             .query_row(
-                "SELECT state, model_manifest_hash, chunker_fingerprint,
+                "SELECT state, model_manifest_hash, runtime_fingerprint_hash,
+                        chunker_fingerprint,
                         context_template_version, output_dimension,
                         source_sync_run_id, source_snapshot_hash,
                         source_snapshot_epoch, embedding_inventory_hash,
@@ -5500,16 +5698,17 @@ impl Store {
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)? as usize,
-                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
                         row.get::<_, String>(6)?,
-                        row.get::<_, Option<i64>>(7)?,
-                        row.get::<_, Option<String>>(8)?,
-                        row.get::<_, i64>(9)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
                         row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
                     ))
                 },
             )
@@ -5522,6 +5721,7 @@ impl Store {
             |(
                 state,
                 manifest,
+                runtime,
                 chunker,
                 context,
                 dimension,
@@ -5532,12 +5732,23 @@ impl Store {
                 total_chunks,
                 completed_chunks,
             )| {
+                let dimension = dimension.and_then(|value| usize::try_from(value).ok());
                 state == "active"
-                    && manifest.as_str() == publication.model_manifest_hash.as_deref().unwrap_or("")
-                    && chunker.as_str() == publication.chunker_fingerprint.as_deref().unwrap_or("")
-                    && context == crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
-                    && publication.context_template_version.as_deref() == Some(context.as_str())
-                    && publication.output_dimension == Some(dimension)
+                    && manifest.as_deref().is_some_and(|manifest| {
+                        !manifest.is_empty()
+                            && Some(manifest) == publication.model_manifest_hash.as_deref()
+                    })
+                    && runtime.as_deref().is_some_and(|runtime| {
+                        !runtime.is_empty()
+                            && Some(runtime) == publication.runtime_fingerprint_hash.as_deref()
+                    })
+                    && chunker.as_deref().is_some_and(|chunker| {
+                        !chunker.is_empty()
+                            && Some(chunker) == publication.chunker_fingerprint.as_deref()
+                    })
+                    && context.as_deref() == Some(crate::context::METADATA_CONTEXT_TEMPLATE_VERSION)
+                    && publication.context_template_version.as_deref() == context.as_deref()
+                    && publication.output_dimension == dimension.filter(|dimension| *dimension > 0)
                     && sync_run_id == publication.source_snapshot_sync_run_id
                     && snapshot_hash == expected_snapshot_hash
                     && epoch == Some(current_epoch)
@@ -5688,11 +5899,13 @@ impl Store {
                 "INSERT INTO retrieval_publications
                     (source_snapshot_sync_run_id, tantivy_generation,
                      embedding_generation_id, model_manifest_hash,
-                     chunker_fingerprint, context_template_version,
-                     output_dimension, source_snapshot_epoch, active, created_at)
+                     runtime_fingerprint_hash, chunker_fingerprint,
+                     context_template_version, output_dimension,
+                     source_snapshot_epoch, active, created_at)
                  SELECT source_sync_run_id, 0, id, model_manifest_hash,
-                        chunker_fingerprint, context_template_version,
-                        output_dimension, source_snapshot_epoch, 1, ?2
+                        runtime_fingerprint_hash, chunker_fingerprint,
+                        context_template_version, output_dimension,
+                        source_snapshot_epoch, 1, ?2
                  FROM embedding_generations WHERE id = ?1",
                 params![generation_id, now_rfc3339()],
             )?;
@@ -5874,6 +6087,7 @@ impl Store {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 state TEXT NOT NULL,
                 model_manifest_hash TEXT NOT NULL,
+                runtime_fingerprint_hash TEXT NOT NULL,
                 chunker_fingerprint TEXT NOT NULL,
                 context_template_version TEXT NOT NULL,
                 output_dimension INTEGER NOT NULL,
@@ -5921,6 +6135,7 @@ impl Store {
                 tantivy_generation INTEGER NOT NULL,
                 embedding_generation_id INTEGER,
                 model_manifest_hash TEXT,
+                runtime_fingerprint_hash TEXT,
                 chunker_fingerprint TEXT,
                 context_template_version TEXT,
                 output_dimension INTEGER,
@@ -5944,6 +6159,36 @@ impl Store {
         ensure_column(
             &self.conn,
             "embedding_generations",
+            "model_manifest_hash",
+            "TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "embedding_generations",
+            "runtime_fingerprint_hash",
+            "TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "embedding_generations",
+            "chunker_fingerprint",
+            "TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "embedding_generations",
+            "context_template_version",
+            "TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "embedding_generations",
+            "output_dimension",
+            "INTEGER",
+        )?;
+        ensure_column(
+            &self.conn,
+            "embedding_generations",
             "write_epoch",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
@@ -5957,6 +6202,12 @@ impl Store {
             &self.conn,
             "embedding_generations",
             "embedding_inventory_hash",
+            "TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "retrieval_publications",
+            "runtime_fingerprint_hash",
             "TEXT",
         )?;
         ensure_column(
@@ -6205,6 +6456,7 @@ impl Store {
                 tantivy_generation INTEGER NOT NULL,
                 embedding_generation_id INTEGER,
                 model_manifest_hash TEXT,
+                runtime_fingerprint_hash TEXT,
                 chunker_fingerprint TEXT,
                 context_template_version TEXT,
                 output_dimension INTEGER,
@@ -6333,6 +6585,36 @@ impl Store {
             ensure_column(
                 &self.conn,
                 "embedding_generations",
+                "model_manifest_hash",
+                "TEXT",
+            )?;
+            ensure_column(
+                &self.conn,
+                "embedding_generations",
+                "runtime_fingerprint_hash",
+                "TEXT",
+            )?;
+            ensure_column(
+                &self.conn,
+                "embedding_generations",
+                "chunker_fingerprint",
+                "TEXT",
+            )?;
+            ensure_column(
+                &self.conn,
+                "embedding_generations",
+                "context_template_version",
+                "TEXT",
+            )?;
+            ensure_column(
+                &self.conn,
+                "embedding_generations",
+                "output_dimension",
+                "INTEGER",
+            )?;
+            ensure_column(
+                &self.conn,
+                "embedding_generations",
                 "write_epoch",
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
@@ -6410,6 +6692,12 @@ impl Store {
             "index_build_leases",
             "source_snapshot_epoch",
             "INTEGER",
+        )?;
+        ensure_column(
+            &self.conn,
+            "retrieval_publications",
+            "runtime_fingerprint_hash",
+            "TEXT",
         )?;
         ensure_column(
             &self.conn,
@@ -10113,6 +10401,7 @@ mod tests {
                 &snapshot,
                 &EmbeddingGenerationSpec {
                     model_manifest_hash: "manifest-stale-builder".to_string(),
+                    runtime_fingerprint_hash: "runtime-stale-builder".to_string(),
                     chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
                     context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
                         .to_string(),
@@ -10188,6 +10477,7 @@ mod tests {
                 &snapshot,
                 &EmbeddingGenerationSpec {
                     model_manifest_hash: manifest.to_string(),
+                    runtime_fingerprint_hash: format!("runtime-{manifest}"),
                     chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
                     context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
                         .to_string(),
@@ -12672,6 +12962,7 @@ mod tests {
         let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
         let spec = EmbeddingGenerationSpec {
             model_manifest_hash: "manifest-a".to_string(),
+            runtime_fingerprint_hash: "runtime-a".to_string(),
             chunker_fingerprint: "chunker-a".to_string(),
             context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
             output_dimension: 2,
@@ -12970,6 +13261,411 @@ mod tests {
                 .publication_id,
             second
         );
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn fresh_embedding_identity_keeps_manifest_runtime_and_context_distinct_after_reopen() {
+        let paths = temp_profile_paths("embedding-distinct-persisted-identity");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let source_id = "qgh://github.com/issue/I_DISTINCT_EMBEDDING_IDENTITY";
+        let chunk_id =
+            insert_test_issue_chunk(&mut store, source_id, "sync-distinct-embedding-identity");
+        let source_version_id = store.latest_source_version_id(source_id).unwrap().unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let model_manifest_hash = "manifest-distinct-identity";
+        let runtime_fingerprint_hash = "runtime-distinct-identity";
+        let spec = EmbeddingGenerationSpec {
+            model_manifest_hash: model_manifest_hash.to_string(),
+            runtime_fingerprint_hash: runtime_fingerprint_hash.to_string(),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            output_dimension: 2,
+        };
+        let generation_id = store.begin_embedding_generation(&snapshot, &spec).unwrap();
+        let expected_context_hash = production_context_hash_for_chunk(
+            &store,
+            model_manifest_hash,
+            crate::chunking::CHUNKER_FINGERPRINT,
+            chunk_id,
+        );
+        let runtime_keyed_context_hash = production_context_hash_for_chunk(
+            &store,
+            runtime_fingerprint_hash,
+            crate::chunking::CHUNKER_FINGERPRINT,
+            chunk_id,
+        );
+        assert_ne!(expected_context_hash, runtime_keyed_context_hash);
+        store
+            .stage_embedding_generation_batch(
+                generation_id,
+                &[EmbeddingGenerationChunk {
+                    chunk_id,
+                    source_version_id,
+                    source_version_hash: store
+                        .source_version_hash(source_version_id)
+                        .unwrap()
+                        .unwrap(),
+                    context_hash: expected_context_hash.clone(),
+                    vector: vec![1.0, 2.0],
+                }],
+            )
+            .unwrap();
+        store.validate_embedding_generation(generation_id).unwrap();
+        let (tantivy_generation, _) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, tantivy_generation, snapshot.sources()).unwrap();
+        store
+            .activate_retrieval_publication(
+                snapshot.identity().sync_run_id(),
+                tantivy_generation,
+                Some(generation_id),
+                snapshot.expected_publication_id(),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT model_manifest_hash, runtime_fingerprint_hash
+                     FROM embedding_generations WHERE id = ?1",
+                    params![generation_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            (
+                model_manifest_hash.to_string(),
+                runtime_fingerprint_hash.to_string(),
+            )
+        );
+        assert_eq!(
+            store
+                .embedding_generation_chunk_blob(generation_id, chunk_id)
+                .unwrap()
+                .dimension,
+            2
+        );
+        let stored_context_hash: String = store
+            .conn
+            .query_row(
+                "SELECT context_hash FROM embedding_generation_chunks
+                 WHERE generation_id = ?1 AND chunk_id = ?2",
+                params![generation_id, chunk_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_context_hash, expected_context_hash);
+        drop(store);
+
+        let reopened = Store::open(&paths).unwrap();
+        let publication = reopened.active_retrieval_publication().unwrap().unwrap();
+        assert_eq!(publication.embedding_generation_id, Some(generation_id));
+        assert_eq!(
+            publication.model_manifest_hash.as_deref(),
+            Some(model_manifest_hash)
+        );
+        assert_eq!(
+            publication.runtime_fingerprint_hash.as_deref(),
+            Some(runtime_fingerprint_hash)
+        );
+        reopened
+            .validate_query_publication_snapshot(Some(&publication))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn partial_embedding_publication_identity_fails_closed() {
+        let (paths, mut store, _, generation_id, _) =
+            ready_generation_fixture("partial-embedding-publication-identity");
+        publish_test_retrieval(&mut store, &paths, Some(generation_id));
+        store
+            .conn
+            .execute(
+                "UPDATE retrieval_publications
+                 SET runtime_fingerprint_hash = NULL WHERE active = 1",
+                [],
+            )
+            .unwrap();
+
+        let publication = store.active_retrieval_publication().unwrap().unwrap();
+        let error = store
+            .validate_query_publication_snapshot(Some(&publication))
+            .unwrap_err();
+        assert_eq!(error.code, "publication.embedding_snapshot_mismatch");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn activation_rejects_empty_runtime_identity_with_structured_error() {
+        let (paths, mut store, _, generation_id, _) =
+            ready_generation_fixture("partial-embedding-generation-identity");
+        let (snapshot, tantivy_generation) = reserve_test_retrieval(&mut store, &paths);
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_generations
+                 SET runtime_fingerprint_hash = '' WHERE id = ?1",
+                params![generation_id],
+            )
+            .unwrap();
+
+        let error = store
+            .activate_retrieval_publication(
+                snapshot.identity().sync_run_id(),
+                tantivy_generation,
+                Some(generation_id),
+                snapshot.expected_publication_id(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "publication.embedding_snapshot_mismatch");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn base_open_detaches_legacy_embedding_identity_and_preserves_bm25_payload_idempotently() {
+        let paths = temp_profile_paths("legacy-embedding-identity-base-migration");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_LEGACY_EMBEDDING_IDENTITY";
+        store
+            .upsert_sources_for_run(
+                "sync-legacy-embedding-identity",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "legacy-embedding-identity-searchable",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-legacy-embedding-identity")
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (tantivy_generation, generation_path) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, tantivy_generation, snapshot.sources()).unwrap();
+        let legacy_publication_id = store
+            .activate_retrieval_publication(
+                snapshot.identity().sync_run_id(),
+                tantivy_generation,
+                None,
+                snapshot.expected_publication_id(),
+            )
+            .unwrap();
+        let source_snapshot_epoch = snapshot.identity.epoch;
+        drop(store);
+
+        let legacy = Connection::open(&paths.db_path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE embedding_generations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    state TEXT NOT NULL,
+                    model_manifest_hash TEXT NOT NULL,
+                    chunker_fingerprint TEXT NOT NULL,
+                    context_template_version TEXT NOT NULL,
+                    output_dimension INTEGER NOT NULL,
+                    source_sync_run_id TEXT NOT NULL,
+                    source_snapshot_hash TEXT NOT NULL,
+                    embedding_inventory_hash TEXT,
+                    total_chunks INTEGER NOT NULL,
+                    completed_chunks INTEGER NOT NULL DEFAULT 0,
+                    checkpoint_chunk_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    failure_code TEXT,
+                    write_epoch INTEGER NOT NULL DEFAULT 0,
+                    source_snapshot_epoch INTEGER
+                 );
+                 CREATE TABLE embedding_generation_chunks (
+                    generation_id INTEGER NOT NULL,
+                    chunk_id INTEGER NOT NULL,
+                    source_version_id INTEGER NOT NULL,
+                    source_version_hash TEXT NOT NULL,
+                    context_hash TEXT NOT NULL,
+                    vector_blob BLOB NOT NULL,
+                    vector_checksum TEXT NOT NULL,
+                    vector_dimension INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE embedding_generation_vector_rows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    generation_id INTEGER NOT NULL,
+                    chunk_id INTEGER NOT NULL,
+                    dimension INTEGER NOT NULL,
+                    vector_table TEXT NOT NULL,
+                    vector_rowid INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO embedding_generations
+                    (id, state, model_manifest_hash, chunker_fingerprint,
+                     context_template_version, output_dimension, source_sync_run_id,
+                     source_snapshot_hash, total_chunks, completed_chunks,
+                     created_at, updated_at, source_snapshot_epoch)
+                 VALUES (77, 'active', 'legacy-runtime-hash-in-manifest-column',
+                         'legacy-chunker', 'qgh.context.v1', 2,
+                         'sync-legacy-embedding-identity', 'legacy-snapshot', 1, 1,
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?1)",
+                params![source_snapshot_epoch],
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO embedding_generation_chunks
+                    (generation_id, chunk_id, source_version_id, source_version_hash,
+                     context_hash, vector_blob, vector_checksum, vector_dimension, created_at)
+                 VALUES (77, 901, 902, 'legacy-version', 'legacy-raw-context-collision',
+                         X'0000803F00000040', 'legacy-checksum', 2,
+                         '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO embedding_generation_vector_rows
+                    (generation_id, chunk_id, dimension, vector_table, vector_rowid)
+                 VALUES (77, 901, 2, 'embedding_generation_vectors_d2', 903)",
+                [],
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "UPDATE retrieval_publications
+                 SET embedding_generation_id = 77,
+                     model_manifest_hash = 'legacy-runtime-hash-in-manifest-column',
+                     chunker_fingerprint = 'legacy-chunker',
+                     context_template_version = 'qgh.context.v1',
+                     output_dimension = 2
+                 WHERE publication_id = ?1",
+                params![legacy_publication_id],
+            )
+            .unwrap();
+        drop(legacy);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let repairs = [paths.clone(), paths.clone()]
+            .into_iter()
+            .map(|paths| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(&paths)
+                        .unwrap()
+                        .active_retrieval_publication()
+                        .unwrap()
+                        .unwrap()
+                        .publication_id
+                })
+            })
+            .collect::<Vec<_>>();
+        let repaired_publication_ids = repairs
+            .into_iter()
+            .map(|repair| repair.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(repaired_publication_ids[0], repaired_publication_ids[1]);
+
+        let reopened = Store::open(&paths).unwrap();
+        let successor = reopened.active_retrieval_publication().unwrap().unwrap();
+        assert_ne!(successor.publication_id, legacy_publication_id);
+        assert_eq!(successor.tantivy_generation, tantivy_generation);
+        assert_eq!(
+            successor.source_snapshot_sync_run_id,
+            "sync-legacy-embedding-identity"
+        );
+        assert_eq!(successor.embedding_generation_id, None);
+        assert_eq!(successor.model_manifest_hash, None);
+        assert_eq!(successor.runtime_fingerprint_hash, None);
+        assert_eq!(successor.chunker_fingerprint, None);
+        assert_eq!(successor.context_template_version, None);
+        assert_eq!(successor.output_dimension, None);
+        reopened
+            .validate_query_publication_snapshot(Some(&successor))
+            .unwrap();
+        assert_eq!(
+            reopened
+                .conn
+                .query_row(
+                    "SELECT state, failure_code FROM embedding_generations WHERE id = 77",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            (
+                "failed".to_string(),
+                "embedding.legacy_identity_incomplete".to_string(),
+            )
+        );
+        for table in [
+            "embedding_generation_chunks",
+            "embedding_generation_vector_rows",
+        ] {
+            assert_eq!(
+                reopened
+                    .conn
+                    .query_row(
+                        &format!("SELECT count(*) FROM {table} WHERE generation_id = 77"),
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+        assert!(generation_path.exists());
+        let hits = crate::index::search(&generation_path, "searchable", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source_id, source_id);
+        assert!(!reopened
+            .conn
+            .query_row(
+                "SELECT active FROM retrieval_publications WHERE publication_id = ?1",
+                params![legacy_publication_id],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap());
+        let successor_id = successor.publication_id;
+        let publication_count: i64 = reopened
+            .conn
+            .query_row("SELECT count(*) FROM retrieval_publications", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(publication_count, 2);
+        drop(reopened);
+
+        let reopened_again = Store::open(&paths).unwrap();
+        assert_eq!(
+            reopened_again
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            successor_id
+        );
+        assert_eq!(
+            reopened_again
+                .conn
+                .query_row("SELECT count(*) FROM retrieval_publications", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            publication_count
+        );
+
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
@@ -13445,6 +14141,7 @@ mod tests {
                 &embedding_snapshot,
                 &EmbeddingGenerationSpec {
                     model_manifest_hash: "manifest-mixed".to_string(),
+                    runtime_fingerprint_hash: "runtime-mixed".to_string(),
                     chunker_fingerprint: "chunker-mixed".to_string(),
                     context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
                         .to_string(),
@@ -13543,6 +14240,7 @@ mod tests {
                 &snapshot,
                 &EmbeddingGenerationSpec {
                     model_manifest_hash: "manifest-zero-row".to_string(),
+                    runtime_fingerprint_hash: "runtime-zero-row".to_string(),
                     chunker_fingerprint: "chunker-zero-row".to_string(),
                     context_template_version: "qgh.context.legacy".to_string(),
                     output_dimension: 2,
@@ -13554,11 +14252,12 @@ mod tests {
             .conn
             .execute(
                 "INSERT INTO embedding_generations
-                    (state, model_manifest_hash, chunker_fingerprint,
+                    (state, model_manifest_hash, runtime_fingerprint_hash,
+                     chunker_fingerprint,
                      context_template_version, output_dimension, source_sync_run_id,
                      source_snapshot_hash, total_chunks, completed_chunks,
                      created_at, updated_at, write_epoch, source_snapshot_epoch)
-                 VALUES ('ready', 'manifest-zero-row', 'chunker-zero-row',
+                 VALUES ('ready', 'manifest-zero-row', 'runtime-zero-row', 'chunker-zero-row',
                          'qgh.context.legacy', 2, ?1, ?2, 0, 0, ?3, ?3, ?4, NULL)",
                 params![
                     identity.sync_run_id,
@@ -13608,6 +14307,7 @@ mod tests {
                 &snapshot,
                 &EmbeddingGenerationSpec {
                     model_manifest_hash: "manifest-inventory".to_string(),
+                    runtime_fingerprint_hash: "runtime-inventory".to_string(),
                     chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
                     context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
                         .to_string(),
@@ -13666,6 +14366,7 @@ mod tests {
                 &snapshot,
                 &EmbeddingGenerationSpec {
                     model_manifest_hash: "manifest-bad".to_string(),
+                    runtime_fingerprint_hash: "runtime-bad".to_string(),
                     chunker_fingerprint: "chunker-bad".to_string(),
                     context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
                         .to_string(),
@@ -13790,14 +14491,9 @@ mod tests {
             store.embedding_generation_state(generation_id).unwrap(),
             "active"
         );
-        assert_eq!(
-            store
-                .active_retrieval_publication()
-                .unwrap()
-                .unwrap()
-                .embedding_generation_id,
-            Some(generation_id)
-        );
+        let publication = store.active_retrieval_publication().unwrap().unwrap();
+        assert_eq!(publication.embedding_generation_id, Some(generation_id));
+        assert!(publication.runtime_fingerprint_hash.is_some());
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -14313,6 +15009,7 @@ mod tests {
                 &snapshot,
                 &EmbeddingGenerationSpec {
                     model_manifest_hash: "manifest-retention".to_string(),
+                    runtime_fingerprint_hash: "runtime-retention".to_string(),
                     chunker_fingerprint: "chunker-retention".to_string(),
                     context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
                         .to_string(),
@@ -14377,6 +15074,7 @@ mod tests {
                 &snapshot,
                 &EmbeddingGenerationSpec {
                     model_manifest_hash: model_manifest_hash.to_string(),
+                    runtime_fingerprint_hash: format!("runtime-{model_manifest_hash}"),
                     chunker_fingerprint: before.chunk.chunker_fingerprint.clone(),
                     context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
                         .to_string(),
@@ -14536,6 +15234,7 @@ mod tests {
         let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
         let spec = EmbeddingGenerationSpec {
             model_manifest_hash: manifest.to_string(),
+            runtime_fingerprint_hash: format!("runtime-{manifest}"),
             chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
             context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
             output_dimension: 2,
