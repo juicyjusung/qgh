@@ -518,11 +518,17 @@ fn weighted_quality_uses_the_frozen_class_weights() {
 #[cfg(feature = "fastembed-provider")]
 #[test]
 fn production_hard_filter_contract_excludes_competing_sources() {
-    live_model_eval_runtime::run_hard_filter_contract_probe(
+    let evidence = live_model_eval_runtime::run_hard_filter_contract_probe(
         std::path::Path::new(env!("CARGO_BIN_EXE_qgh")),
         CORPUS_JSONL,
     )
     .expect("production hard-filter contract probe passes");
+    assert_eq!(evidence.active_competing_sources, 7);
+    assert_eq!(evidence.bm25_filtered_queries, 4);
+    assert_eq!(evidence.hybrid_filtered_queries, 4);
+    assert_eq!(evidence.hybrid_ranked_results, 17);
+    assert_eq!(evidence.hybrid_results_with_both_branches, 17);
+    assert_eq!(evidence.exact_issue_queries, 2);
 }
 
 #[test]

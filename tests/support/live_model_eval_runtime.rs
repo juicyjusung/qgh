@@ -41,6 +41,13 @@ const EFFECTIVE_BATCH_SIZE: usize = 16;
 const REQUIRED_INTRA_OP_THREADS: usize = 4;
 const DRAGONKUE_MODEL_ID: &str = "dragonkue/snowflake-arctic-embed-l-v2.0-ko";
 const DRAGONKUE_REVISION: &str = "55ec6e9358a56d56af759bc8372e970caf8c305f";
+const TEST_EMBEDDING_QUERY_VECTORS_ENV: &str = "QGH_TEST_EMBEDDING_QUERY_VECTORS";
+const TEST_EMBEDDING_DOCUMENT_VECTORS_ENV: &str = "QGH_TEST_EMBEDDING_DOCUMENT_VECTORS";
+const FILTER_PROBE_TARGET_REPO: &str = "juicyjusung/qgh";
+const FILTER_PROBE_COMPETING_REPO: &str = "competing/filter-probe";
+const FILTER_PROBE_TARGET_ISSUE: u64 = 900_001;
+const FILTER_PROBE_SENTINEL: &str = "bounded-adversarial-filter-sentinel";
+const FILTER_PROBE_PRESET: &str = "arctic-l-v2-fp32";
 
 type DynError = Box<dyn Error>;
 static STDERR_AUDIT: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
@@ -575,15 +582,33 @@ pub(super) fn weighted_score_for_test(values: [f64; 6]) -> f64 {
     weighted_score(values)
 }
 
+pub(super) struct HardFilterProbeEvidence {
+    pub(super) active_competing_sources: usize,
+    pub(super) bm25_filtered_queries: usize,
+    pub(super) hybrid_filtered_queries: usize,
+    pub(super) hybrid_ranked_results: usize,
+    pub(super) hybrid_results_with_both_branches: usize,
+    pub(super) exact_issue_queries: usize,
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedRankingPath {
+    Bm25,
+    Hybrid,
+    Exact,
+}
+
+#[derive(Default)]
+struct HardFilterQuerySetEvidence {
+    query_count: usize,
+    ranked_results: usize,
+    results_with_both_branches: usize,
+}
+
 pub(super) fn run_hard_filter_contract_probe(
     binary: &Path,
     corpus_raw: &str,
-) -> Result<(), DynError> {
-    const TARGET_REPO: &str = "juicyjusung/qgh";
-    const COMPETING_REPO: &str = "competing/filter-probe";
-    const TARGET_ISSUE: u64 = 900_001;
-    const SENTINEL: &str = "bounded-adversarial-filter-sentinel";
-
+) -> Result<HardFilterProbeEvidence, DynError> {
     let corpus = parse_jsonl::<CorpusRecord>(corpus_raw);
     let issue_seed = corpus
         .iter()
@@ -601,30 +626,55 @@ pub(super) fn run_hard_filter_contract_probe(
         source.repo = repo.to_string();
         source.issue_number = issue_number;
         source.canonical_url = format!("https://github.com/{repo}/issues/{issue_number}");
-        source.title = SENTINEL.to_string();
-        source.body = SENTINEL.to_string();
-        source.body_sha256 = digest_hex(SENTINEL);
+        source.title = format!("Filter probe {node_id}");
+        source.body = format!("{FILTER_PROBE_SENTINEL} {node_id}");
+        source.body_sha256 = digest_hex(&source.body);
         source
     };
     let mut competing_comment = comment_seed.clone();
     competing_comment.source_id =
         "qgh://github.com/issue-comment/IC_FILTER_TARGET_COMMENT".to_string();
     competing_comment.entity_type = "issue_comment".to_string();
-    competing_comment.repo = TARGET_REPO.to_string();
-    competing_comment.issue_number = TARGET_ISSUE;
-    competing_comment.canonical_url =
-        format!("https://github.com/{TARGET_REPO}/issues/{TARGET_ISSUE}#issuecomment-9900001");
-    competing_comment.title = SENTINEL.to_string();
-    competing_comment.body = SENTINEL.to_string();
-    competing_comment.body_sha256 = digest_hex(SENTINEL);
+    competing_comment.repo = FILTER_PROBE_TARGET_REPO.to_string();
+    competing_comment.issue_number = FILTER_PROBE_TARGET_ISSUE;
+    competing_comment.canonical_url = format!(
+        "https://github.com/{FILTER_PROBE_TARGET_REPO}/issues/{FILTER_PROBE_TARGET_ISSUE}#issuecomment-9900001"
+    );
+    competing_comment.title = "Comment on filter probe target".to_string();
+    competing_comment.body = format!("{FILTER_PROBE_SENTINEL} IC_FILTER_TARGET_COMMENT");
+    competing_comment.body_sha256 = digest_hex(&competing_comment.body);
 
     let sources = vec![
-        issue(TARGET_REPO, TARGET_ISSUE, "I_FILTER_TARGET"),
-        issue(TARGET_REPO, TARGET_ISSUE + 1, "I_FILTER_WRONG_LABEL"),
-        issue(TARGET_REPO, TARGET_ISSUE + 2, "I_FILTER_WRONG_STATE"),
-        issue(TARGET_REPO, TARGET_ISSUE + 3, "I_FILTER_WRONG_AUTHOR"),
-        issue(TARGET_REPO, TARGET_ISSUE + 4, "I_FILTER_OTHER_ISSUE"),
-        issue(COMPETING_REPO, TARGET_ISSUE, "I_FILTER_OTHER_REPO"),
+        issue(
+            FILTER_PROBE_TARGET_REPO,
+            FILTER_PROBE_TARGET_ISSUE,
+            "I_FILTER_TARGET",
+        ),
+        issue(
+            FILTER_PROBE_TARGET_REPO,
+            FILTER_PROBE_TARGET_ISSUE + 1,
+            "I_FILTER_WRONG_LABEL",
+        ),
+        issue(
+            FILTER_PROBE_TARGET_REPO,
+            FILTER_PROBE_TARGET_ISSUE + 2,
+            "I_FILTER_WRONG_STATE",
+        ),
+        issue(
+            FILTER_PROBE_TARGET_REPO,
+            FILTER_PROBE_TARGET_ISSUE + 3,
+            "I_FILTER_WRONG_AUTHOR",
+        ),
+        issue(
+            FILTER_PROBE_TARGET_REPO,
+            FILTER_PROBE_TARGET_ISSUE + 4,
+            "I_FILTER_OTHER_ISSUE",
+        ),
+        issue(
+            FILTER_PROBE_COMPETING_REPO,
+            FILTER_PROBE_TARGET_ISSUE,
+            "I_FILTER_OTHER_REPO",
+        ),
         competing_comment,
     ];
     let metadata = |state: &str, author: &str, labels: &[&str]| IssueApiMetadata {
@@ -662,7 +712,12 @@ pub(super) fn run_hard_filter_contract_probe(
     let root = PathBuf::from("target/qgh-eval/hard-filter-contract");
     ensure_target_root(&root)?;
     let fixture = CliFixture::new(root, binary.to_path_buf(), server.base_url.clone())?;
-    fixture.write_hard_filter_probe_config(TARGET_REPO, COMPETING_REPO)?;
+    fixture.init_git_worktree()?;
+    fixture.write_hard_filter_probe_config(
+        FILTER_PROBE_TARGET_REPO,
+        FILTER_PROBE_COMPETING_REPO,
+        false,
+    )?;
     fixture.sync()?;
 
     let connection = Connection::open(fixture.db_path())?;
@@ -680,80 +735,301 @@ pub(super) fn run_hard_filter_contract_probe(
     }
     drop(connection);
 
-    assert_hard_filter_results(
-        &fixture,
+    let bm25 = run_hard_filter_query_set(&fixture, None, ExpectedRankingPath::Bm25)?;
+
+    fixture.write_hard_filter_probe_config(
+        FILTER_PROBE_TARGET_REPO,
+        FILTER_PROBE_COMPETING_REPO,
+        true,
+    )?;
+    let query_vectors_json = serde_json::to_string(&BTreeMap::from([
+        ("prepare vector schema", vec![0.0_f32, 1.0, 0.0, 0.0]),
+        (FILTER_PROBE_SENTINEL, vec![1.0_f32, 0.0, 0.0, 0.0]),
+    ]))?;
+    let _ = fixture.qgh_with_test_vectors(
         &[
             "query",
-            SENTINEL,
+            "prepare vector schema",
             "--repo",
-            TARGET_REPO,
-            "--label",
-            "target-label",
-            "--state",
-            "open",
-            "--author",
-            "target-author",
-            "--limit",
-            "10",
+            FILTER_PROBE_TARGET_REPO,
             "--json",
         ],
-        &[
-            ("qgh://github.com/issue/I_FILTER_TARGET", TARGET_ISSUE),
-            (
-                "qgh://github.com/issue/I_FILTER_OTHER_ISSUE",
-                TARGET_ISSUE + 4,
-            ),
-        ],
-        TARGET_REPO,
+        Some(&query_vectors_json),
+        None,
     )?;
-    assert_hard_filter_results(
+    fixture.seed_hard_filter_chunks(&sources)?;
+    let document_vectors_json = hard_filter_document_vectors_json(&sources)?;
+    let embed = fixture.qgh_with_test_vectors(
+        &["embed", "--force", "--json"],
+        None,
+        Some(&document_vectors_json),
+    )?;
+    let embed: Value = serde_json::from_slice(&embed.stdout)?;
+    if embed["data"]["embedding_state"].as_str() != Some("refreshed")
+        || embed["data"]["chunks"]["embedded"].as_u64() != Some(sources.len() as u64)
+    {
+        return Err("deterministic local embed did not publish every filter source".into());
+    }
+    let hybrid = run_hard_filter_query_set(
         &fixture,
-        &[
-            "query",
-            SENTINEL,
-            "--repo",
-            TARGET_REPO,
-            "--issue",
-            "900001",
-            "--limit",
-            "10",
-            "--json",
-        ],
-        &[("qgh://github.com/issue/I_FILTER_TARGET", TARGET_ISSUE)],
-        TARGET_REPO,
+        Some(&query_vectors_json),
+        ExpectedRankingPath::Hybrid,
     )?;
-    assert_hard_filter_results(
-        &fixture,
-        &[
-            "query",
-            SENTINEL,
-            "--repo",
-            TARGET_REPO,
-            "--label",
-            "target-label",
-            "--state",
-            "open",
-            "--author",
-            "target-author",
-            "--issue",
-            "900001",
-            "--limit",
-            "10",
-            "--json",
-        ],
-        &[("qgh://github.com/issue/I_FILTER_TARGET", TARGET_ISSUE)],
-        TARGET_REPO,
-    )?;
-    Ok(())
+    let exact_issue_queries = run_exact_issue_filter_queries(&fixture, &query_vectors_json)?;
+
+    Ok(HardFilterProbeEvidence {
+        active_competing_sources: source_count,
+        bm25_filtered_queries: bm25.query_count,
+        hybrid_filtered_queries: hybrid.query_count,
+        hybrid_ranked_results: hybrid.ranked_results,
+        hybrid_results_with_both_branches: hybrid.results_with_both_branches,
+        exact_issue_queries,
+    })
+}
+
+fn hard_filter_document_vectors_json(sources: &[CorpusRecord]) -> Result<String, DynError> {
+    let document_vectors = sources
+        .iter()
+        .map(|source| {
+            let vector = match source.source_id.as_str() {
+                "qgh://github.com/issue/I_FILTER_TARGET" => vec![0.8_f32, 0.2, 0.0, 0.0],
+                "qgh://github.com/issue/I_FILTER_OTHER_ISSUE" => {
+                    vec![0.7_f32, 0.3, 0.0, 0.0]
+                }
+                _ => vec![1.0_f32, 0.0, 0.0, 0.0],
+            };
+            (hard_filter_chunk_body(&source.source_id), vector)
+        })
+        .collect::<BTreeMap<_, _>>();
+    Ok(serde_json::to_string(&document_vectors)?)
+}
+
+fn hard_filter_chunk_body(source_id: &str) -> String {
+    format!("hard-filter vector chunk for {source_id}")
+}
+
+fn run_hard_filter_query_set(
+    fixture: &CliFixture,
+    query_vectors_json: Option<&str>,
+    expected_ranking: ExpectedRankingPath,
+) -> Result<HardFilterQuerySetEvidence, DynError> {
+    let mut evidence = HardFilterQuerySetEvidence::default();
+    for result in [
+        assert_hard_filter_results(
+            fixture,
+            &[
+                "query",
+                FILTER_PROBE_SENTINEL,
+                "--repo",
+                FILTER_PROBE_TARGET_REPO,
+                "--label",
+                "target-label",
+                "--limit",
+                "10",
+                "--json",
+            ],
+            &[
+                (
+                    "qgh://github.com/issue/I_FILTER_TARGET",
+                    FILTER_PROBE_TARGET_ISSUE,
+                ),
+                (
+                    "qgh://github.com/issue/I_FILTER_WRONG_STATE",
+                    FILTER_PROBE_TARGET_ISSUE + 2,
+                ),
+                (
+                    "qgh://github.com/issue/I_FILTER_WRONG_AUTHOR",
+                    FILTER_PROBE_TARGET_ISSUE + 3,
+                ),
+                (
+                    "qgh://github.com/issue/I_FILTER_OTHER_ISSUE",
+                    FILTER_PROBE_TARGET_ISSUE + 4,
+                ),
+            ],
+            query_vectors_json,
+            expected_ranking,
+        ),
+        assert_hard_filter_results(
+            fixture,
+            &[
+                "query",
+                FILTER_PROBE_SENTINEL,
+                "--repo",
+                FILTER_PROBE_TARGET_REPO,
+                "--state",
+                "open",
+                "--limit",
+                "10",
+                "--json",
+            ],
+            &[
+                (
+                    "qgh://github.com/issue/I_FILTER_TARGET",
+                    FILTER_PROBE_TARGET_ISSUE,
+                ),
+                (
+                    "qgh://github.com/issue/I_FILTER_WRONG_LABEL",
+                    FILTER_PROBE_TARGET_ISSUE + 1,
+                ),
+                (
+                    "qgh://github.com/issue/I_FILTER_WRONG_AUTHOR",
+                    FILTER_PROBE_TARGET_ISSUE + 3,
+                ),
+                (
+                    "qgh://github.com/issue/I_FILTER_OTHER_ISSUE",
+                    FILTER_PROBE_TARGET_ISSUE + 4,
+                ),
+            ],
+            query_vectors_json,
+            expected_ranking,
+        ),
+        assert_hard_filter_results(
+            fixture,
+            &[
+                "query",
+                FILTER_PROBE_SENTINEL,
+                "--repo",
+                FILTER_PROBE_TARGET_REPO,
+                "--author",
+                "target-author",
+                "--limit",
+                "10",
+                "--json",
+            ],
+            &[
+                (
+                    "qgh://github.com/issue/I_FILTER_TARGET",
+                    FILTER_PROBE_TARGET_ISSUE,
+                ),
+                (
+                    "qgh://github.com/issue/I_FILTER_WRONG_LABEL",
+                    FILTER_PROBE_TARGET_ISSUE + 1,
+                ),
+                (
+                    "qgh://github.com/issue/I_FILTER_WRONG_STATE",
+                    FILTER_PROBE_TARGET_ISSUE + 2,
+                ),
+                (
+                    "qgh://github.com/issue/I_FILTER_OTHER_ISSUE",
+                    FILTER_PROBE_TARGET_ISSUE + 4,
+                ),
+            ],
+            query_vectors_json,
+            expected_ranking,
+        ),
+        assert_hard_filter_results(
+            fixture,
+            &[
+                "query",
+                FILTER_PROBE_SENTINEL,
+                "--repo",
+                FILTER_PROBE_TARGET_REPO,
+                "--limit",
+                "10",
+                "--json",
+            ],
+            &[
+                (
+                    "qgh://github.com/issue/I_FILTER_TARGET",
+                    FILTER_PROBE_TARGET_ISSUE,
+                ),
+                (
+                    "qgh://github.com/issue/I_FILTER_WRONG_LABEL",
+                    FILTER_PROBE_TARGET_ISSUE + 1,
+                ),
+                (
+                    "qgh://github.com/issue/I_FILTER_WRONG_STATE",
+                    FILTER_PROBE_TARGET_ISSUE + 2,
+                ),
+                (
+                    "qgh://github.com/issue/I_FILTER_WRONG_AUTHOR",
+                    FILTER_PROBE_TARGET_ISSUE + 3,
+                ),
+                (
+                    "qgh://github.com/issue/I_FILTER_OTHER_ISSUE",
+                    FILTER_PROBE_TARGET_ISSUE + 4,
+                ),
+            ],
+            query_vectors_json,
+            expected_ranking,
+        ),
+    ] {
+        let result = result?;
+        evidence.query_count += 1;
+        evidence.ranked_results += result.ranked_results;
+        evidence.results_with_both_branches += result.results_with_both_branches;
+    }
+    Ok(evidence)
+}
+
+fn run_exact_issue_filter_queries(
+    fixture: &CliFixture,
+    query_vectors_json: &str,
+) -> Result<usize, DynError> {
+    let expected = [(
+        "qgh://github.com/issue/I_FILTER_TARGET",
+        FILTER_PROBE_TARGET_ISSUE,
+    )];
+    let mut query_count = 0usize;
+    for result in [
+        assert_hard_filter_results(
+            fixture,
+            &[
+                "query",
+                FILTER_PROBE_SENTINEL,
+                "--repo",
+                FILTER_PROBE_TARGET_REPO,
+                "--issue",
+                "900001",
+                "--limit",
+                "10",
+                "--json",
+            ],
+            &expected,
+            Some(query_vectors_json),
+            ExpectedRankingPath::Exact,
+        ),
+        assert_hard_filter_results(
+            fixture,
+            &[
+                "query",
+                FILTER_PROBE_SENTINEL,
+                "--repo",
+                FILTER_PROBE_TARGET_REPO,
+                "--label",
+                "target-label",
+                "--state",
+                "open",
+                "--author",
+                "target-author",
+                "--issue",
+                "900001",
+                "--limit",
+                "10",
+                "--json",
+            ],
+            &expected,
+            Some(query_vectors_json),
+            ExpectedRankingPath::Exact,
+        ),
+    ] {
+        let result = result?;
+        if result.ranked_results != 1 || result.results_with_both_branches != 0 {
+            return Err("issue filter did not stay on the exact locator path".into());
+        }
+        query_count += 1;
+    }
+    Ok(query_count)
 }
 
 fn assert_hard_filter_results(
     fixture: &CliFixture,
     arguments: &[&str],
     expected: &[(&str, u64)],
-    expected_repo: &str,
-) -> Result<(), DynError> {
-    let output = fixture.qgh(arguments)?;
+    query_vectors_json: Option<&str>,
+    expected_ranking: ExpectedRankingPath,
+) -> Result<HardFilterQuerySetEvidence, DynError> {
+    let output = fixture.qgh_with_test_vectors(arguments, query_vectors_json, None)?;
     let envelope: Value = serde_json::from_slice(&output.stdout)?;
     let results = envelope["data"]["results"]
         .as_array()
@@ -772,8 +1048,41 @@ fn assert_hard_filter_results(
         let issue_number = result["issue_number"]
             .as_u64()
             .ok_or("hard-filter result issue_number missing")?;
-        if repo != expected_repo || entity_type != "issue" {
-            return Err("repo/source-type filter admitted a competing source".into());
+        if repo != FILTER_PROBE_TARGET_REPO || entity_type != "issue" {
+            return Err(format!(
+                "repo/source-type filter admitted source={source_id} repo={repo} entity_type={entity_type} arguments={arguments:?}"
+            )
+            .into());
+        }
+        let ranking = &result["ranking"];
+        let ranking_kind = ranking["kind"]
+            .as_str()
+            .ok_or("hard-filter result ranking.kind missing")?;
+        match expected_ranking {
+            ExpectedRankingPath::Bm25 => {
+                if ranking_kind != "bm25" || ranking["lexical_score"].as_f64().is_none() {
+                    return Err(format!(
+                        "BM25 filter probe did not use the lexical candidate path: kind={ranking_kind}"
+                    )
+                    .into());
+                }
+            }
+            ExpectedRankingPath::Hybrid => {
+                if ranking_kind != "hybrid"
+                    || ranking["lexical_score"].as_f64().is_none()
+                    || ranking["vector_distance"].as_f64().is_none()
+                {
+                    return Err("hybrid filter probe did not use both candidate generators".into());
+                }
+            }
+            ExpectedRankingPath::Exact => {
+                if ranking_kind != "exact"
+                    || !ranking["lexical_score"].is_null()
+                    || !ranking["vector_distance"].is_null()
+                {
+                    return Err("issue filter did not use the exact locator path".into());
+                }
+            }
         }
         observed.insert(source_id.to_string(), issue_number);
     }
@@ -787,7 +1096,18 @@ fn assert_hard_filter_results(
         )
         .into());
     }
-    Ok(())
+    Ok(HardFilterQuerySetEvidence {
+        query_count: 1,
+        ranked_results: results.len(),
+        results_with_both_branches: results
+            .iter()
+            .filter(|result| {
+                result["ranking"]["kind"].as_str() == Some("hybrid")
+                    && result["ranking"]["lexical_score"].as_f64().is_some()
+                    && result["ranking"]["vector_distance"].as_f64().is_some()
+            })
+            .count(),
+    })
 }
 
 fn target_root_allowed(cwd: &Path, root: &Path) -> bool {
@@ -2458,11 +2778,28 @@ env = "QGH_PUBLIC_FIXTURE_AUTH"
         Ok(())
     }
 
+    fn init_git_worktree(&self) -> Result<(), DynError> {
+        let output = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&self.root)
+            .output()?;
+        if !output.status.success() {
+            return Err("hard-filter fixture git init failed".into());
+        }
+        Ok(())
+    }
+
     fn write_hard_filter_probe_config(
         &self,
         target_repo: &str,
         competing_repo: &str,
+        embedding_enabled: bool,
     ) -> Result<(), DynError> {
+        let embedding = if embedding_enabled {
+            format!("\n[embedding]\nprovider = \"local\"\nmodel = \"{FILTER_PROBE_PRESET}\"\n")
+        } else {
+            String::new()
+        };
         let config = format!(
             r#"schema_version = "qgh.config.v1"
 
@@ -2475,8 +2812,8 @@ repos = ["{target_repo}", "{competing_repo}"]
 [profiles.work.token_source]
 type = "env"
 env = "QGH_PUBLIC_FIXTURE_AUTH"
-"#,
-            self.api_base_url
+{}"#,
+            self.api_base_url, embedding
         );
         fs::write(self.config_home.join("qgh/config.toml"), config)?;
         let policy = format!(
@@ -2505,12 +2842,55 @@ limit = 10
     }
 
     fn qgh(&self, arguments: &[&str]) -> Result<Output, DynError> {
-        let output = self.base_command().args(arguments).output()?;
+        self.qgh_with_test_vectors(arguments, None, None)
+    }
+
+    fn qgh_with_test_vectors(
+        &self,
+        arguments: &[&str],
+        query_vectors_json: Option<&str>,
+        document_vectors_json: Option<&str>,
+    ) -> Result<Output, DynError> {
+        let mut command = self.base_command();
+        command.args(arguments);
+        if let Some(query_vectors_json) = query_vectors_json {
+            command.env(TEST_EMBEDDING_QUERY_VECTORS_ENV, query_vectors_json);
+        }
+        if let Some(document_vectors_json) = document_vectors_json {
+            command.env(TEST_EMBEDDING_DOCUMENT_VECTORS_ENV, document_vectors_json);
+        }
+        let output = command.output()?;
         record_stderr(&output.stderr);
         if !output.status.success() {
             return Err(command_failure(&output).into());
         }
         Ok(output)
+    }
+
+    fn seed_hard_filter_chunks(&self, sources: &[CorpusRecord]) -> Result<(), DynError> {
+        let connection = Connection::open(self.db_path())?;
+        connection.execute("DELETE FROM chunks", [])?;
+        for source in sources {
+            let source_version_id: i64 = connection.query_row(
+                "SELECT coalesce(im.latest_version_id, cm.latest_version_id)
+                 FROM source_entities se
+                 LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+                 LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+                 WHERE se.source_id = ?1 AND se.lifecycle_state = 'active'",
+                [&source.source_id],
+                |row| row.get(0),
+            )?;
+            connection.execute(
+                "INSERT INTO chunks (source_id, source_version_id, body)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    source.source_id,
+                    source_version_id,
+                    hard_filter_chunk_body(&source.source_id),
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     fn timed_qgh(&self, arguments: &[&str]) -> Result<TimedOutput, DynError> {
