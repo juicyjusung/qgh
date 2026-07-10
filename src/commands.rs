@@ -820,7 +820,7 @@ fn rebuild_bm25_index(
     store: &mut Store,
     progress: &StderrSyncProgress,
 ) -> Result<IndexRebuildOutcome, QghError> {
-    let warnings = refresh_embedding_for_sync_if_enabled(profile, store, progress);
+    let mut warnings = refresh_embedding_for_sync_if_enabled(profile, store, progress);
     let sources = store.active_index_sources()?;
     progress.line(format_args!(
         "qgh sync: rebuilding BM25 index sources={}",
@@ -835,6 +835,20 @@ fn rebuild_bm25_index(
         &generation_path.to_string_lossy(),
         sources.len(),
     )?;
+    let expected_publication_id = store
+        .active_retrieval_publication()?
+        .map(|publication| publication.publication_id);
+    if let Some(sync_run_id) = store.latest_successful_sync_run_id()? {
+        if store
+            .activate_retrieval_publication(&sync_run_id, generation, None, expected_publication_id)
+            .is_err()
+        {
+            warnings.push(embedding_sync_warning(
+                "publication.activation_failed",
+                "Retrieval publication activation failed after BM25 rebuild. The previous publication remains active.",
+            ));
+        }
+    }
     progress.line(format_args!(
         "qgh sync: published BM25 index generation={} sources={}",
         generation,

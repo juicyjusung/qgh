@@ -13,6 +13,7 @@ use crate::paths::{ensure_private_dir, set_private_file};
 use crate::time::{now_rfc3339, now_run_id_suffix};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "vector-search")]
 use std::os::raw::{c_char, c_int};
@@ -21,6 +22,45 @@ use std::path::{Path, PathBuf};
 const CHUNK_EMBEDDING_VECTORS_TABLE: &str = "chunk_embedding_vectors";
 const CHUNK_EMBEDDING_VECTOR_ROWIDS_TABLE: &str = "chunk_embedding_vectors_rowids";
 const CHUNK_EMBEDDING_VECTOR_CHUNKS_TABLE: &str = "chunk_embedding_vectors_vector_chunks00";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingGenerationSpec {
+    pub model_manifest_hash: String,
+    pub chunker_fingerprint: String,
+    pub context_template_version: String,
+    pub output_dimension: usize,
+    pub source_sync_run_id: String,
+    pub source_snapshot_hash: String,
+    pub total_chunks: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingGenerationChunk {
+    pub chunk_id: i64,
+    pub source_version_id: i64,
+    pub source_version_hash: String,
+    pub context_hash: String,
+    pub vector: EmbeddingVector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingGenerationChunkBlob {
+    pub bytes: Vec<u8>,
+    pub dimension: usize,
+    pub checksum: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalPublicationView {
+    pub publication_id: i64,
+    pub source_snapshot_sync_run_id: String,
+    pub tantivy_generation: i64,
+    pub embedding_generation_id: Option<i64>,
+    pub model_manifest_hash: Option<String>,
+    pub chunker_fingerprint: Option<String>,
+    pub context_template_version: Option<String>,
+    pub output_dimension: Option<usize>,
+}
 
 pub struct Store {
     conn: Connection,
@@ -1706,6 +1746,19 @@ impl Store {
         })
     }
 
+    pub fn latest_successful_sync_run_id(&self) -> Result<Option<String>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT id FROM sync_runs
+                 WHERE completed_successfully = 1
+                 ORDER BY completed_at DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(QghError::from)
+    }
+
     pub fn coverage_snapshot(&self) -> Result<CoverageSnapshot, QghError> {
         let snapshot = self
             .conn
@@ -1761,6 +1814,583 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    #[cfg(feature = "vector-search")]
+    pub fn begin_embedding_generation(
+        &mut self,
+        spec: &EmbeddingGenerationSpec,
+    ) -> Result<i64, QghError> {
+        if spec.output_dimension == 0 || spec.total_chunks < 0 {
+            return Err(QghError::validation(
+                "embedding.generation_invalid_spec",
+                "Embedding generation dimension and total chunk count must be positive.",
+            ));
+        }
+        if let Some(id) = self
+            .conn
+            .query_row(
+                "SELECT id FROM embedding_generations
+                 WHERE state = 'building'
+                   AND model_manifest_hash = ?1
+                   AND chunker_fingerprint = ?2
+                   AND context_template_version = ?3
+                   AND output_dimension = ?4
+                   AND source_sync_run_id = ?5
+                   AND source_snapshot_hash = ?6
+                 ORDER BY id DESC LIMIT 1",
+                params![
+                    spec.model_manifest_hash,
+                    spec.chunker_fingerprint,
+                    spec.context_template_version,
+                    spec.output_dimension as i64,
+                    spec.source_sync_run_id,
+                    spec.source_snapshot_hash
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+        {
+            return Ok(id);
+        }
+        let now = now_rfc3339();
+        self.conn.execute(
+            "INSERT INTO embedding_generations
+                (state, model_manifest_hash, chunker_fingerprint,
+                 context_template_version, output_dimension, source_sync_run_id,
+                 source_snapshot_hash, total_chunks, created_at, updated_at)
+             VALUES ('building', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![
+                spec.model_manifest_hash,
+                spec.chunker_fingerprint,
+                spec.context_template_version,
+                spec.output_dimension as i64,
+                spec.source_sync_run_id,
+                spec.source_snapshot_hash,
+                spec.total_chunks,
+                now
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    #[cfg(feature = "vector-search")]
+    pub fn stage_embedding_generation_batch(
+        &mut self,
+        generation_id: i64,
+        chunks: &[EmbeddingGenerationChunk],
+    ) -> Result<usize, QghError> {
+        let (dimension, state): (usize, String) = self.conn.query_row(
+            "SELECT output_dimension, state FROM embedding_generations WHERE id = ?1",
+            params![generation_id],
+            |row| Ok((row.get::<_, i64>(0)? as usize, row.get(1)?)),
+        )?;
+        if state != "building" {
+            return Err(QghError::validation(
+                "embedding.generation_not_building",
+                "Only a building embedding generation can accept staged batches.",
+            ));
+        }
+        if chunks.iter().any(|chunk| chunk.vector.len() != dimension) {
+            return Err(QghError::validation(
+                "embedding.generation_dimension_mismatch",
+                "A staged vector dimension does not match the generation dimension.",
+            ));
+        }
+        let vector_table = generation_vector_table_name(dimension);
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            self.conn.execute(
+                &format!(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS {vector_table}
+                     USING vec0(embedding float[{dimension}])"
+                ),
+                [],
+            )?;
+            for chunk in chunks {
+                let bytes = encode_embedding_blob(&chunk.vector);
+                let checksum = embedding_blob_checksum(&bytes);
+                if let Some((old_table, old_rowid)) = self
+                    .conn
+                    .query_row(
+                        "SELECT vector_table, vector_rowid
+                         FROM embedding_generation_vector_rows
+                         WHERE generation_id = ?1 AND chunk_id = ?2",
+                        params![generation_id, chunk.chunk_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?
+                {
+                    self.conn.execute(
+                        &format!("DELETE FROM {old_table} WHERE rowid = ?1"),
+                        params![old_rowid],
+                    )?;
+                }
+                self.conn.execute(
+                    "DELETE FROM embedding_generation_vector_rows
+                     WHERE generation_id = ?1 AND chunk_id = ?2",
+                    params![generation_id, chunk.chunk_id],
+                )?;
+                self.conn.execute(
+                    "INSERT INTO embedding_generation_chunks
+                        (generation_id, chunk_id, source_version_id, source_version_hash,
+                         context_hash, vector_blob, vector_checksum, vector_dimension, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(generation_id, chunk_id) DO UPDATE SET
+                        source_version_id = excluded.source_version_id,
+                        source_version_hash = excluded.source_version_hash,
+                        context_hash = excluded.context_hash,
+                        vector_blob = excluded.vector_blob,
+                        vector_checksum = excluded.vector_checksum,
+                        vector_dimension = excluded.vector_dimension,
+                        created_at = excluded.created_at",
+                    params![
+                        generation_id,
+                        chunk.chunk_id,
+                        chunk.source_version_id,
+                        chunk.source_version_hash,
+                        chunk.context_hash,
+                        bytes,
+                        checksum,
+                        dimension as i64,
+                        now_rfc3339()
+                    ],
+                )?;
+                let mapping_id = {
+                    self.conn.execute(
+                        "INSERT INTO embedding_generation_vector_rows
+                            (generation_id, chunk_id, dimension, vector_table, vector_rowid)
+                         VALUES (?1, ?2, ?3, ?4, 0)",
+                        params![
+                            generation_id,
+                            chunk.chunk_id,
+                            dimension as i64,
+                            vector_table
+                        ],
+                    )?;
+                    self.conn.last_insert_rowid()
+                };
+                self.conn.execute(
+                    &format!("INSERT INTO {vector_table}(rowid, embedding) VALUES (?1, ?2)"),
+                    params![mapping_id, encode_embedding_blob(&chunk.vector)],
+                )?;
+                self.conn.execute(
+                    "UPDATE embedding_generation_vector_rows
+                     SET vector_rowid = ?1 WHERE id = ?1",
+                    params![mapping_id],
+                )?;
+            }
+            let now = now_rfc3339();
+            self.conn.execute(
+                "UPDATE embedding_generations
+                 SET completed_chunks = (SELECT count(*) FROM embedding_generation_chunks WHERE generation_id = ?1),
+                     checkpoint_chunk_id = (SELECT max(chunk_id) FROM embedding_generation_chunks WHERE generation_id = ?1),
+                     updated_at = ?2
+                 WHERE id = ?1",
+                params![generation_id, now],
+            )?;
+            Ok::<usize, rusqlite::Error>(chunks.len())
+        })();
+        match result {
+            Ok(count) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(count)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(QghError::from(error))
+            }
+        }
+    }
+
+    #[cfg(feature = "vector-search")]
+    pub fn embedding_generation_chunk_blob(
+        &self,
+        generation_id: i64,
+        chunk_id: i64,
+    ) -> Result<EmbeddingGenerationChunkBlob, QghError> {
+        self.conn
+            .query_row(
+                "SELECT vector_blob, vector_checksum, vector_dimension
+                 FROM embedding_generation_chunks
+                 WHERE generation_id = ?1 AND chunk_id = ?2",
+                params![generation_id, chunk_id],
+                |row| {
+                    Ok(EmbeddingGenerationChunkBlob {
+                        bytes: row.get(0)?,
+                        checksum: row.get(1)?,
+                        dimension: row.get::<_, i64>(2)? as usize,
+                    })
+                },
+            )
+            .map_err(QghError::from)
+    }
+
+    #[cfg(feature = "vector-search")]
+    pub fn validate_embedding_generation(&mut self, generation_id: i64) -> Result<(), QghError> {
+        let (state, dimension, total_chunks, completed_chunks): (String, usize, i64, i64) =
+            self.conn.query_row(
+                "SELECT state, output_dimension, total_chunks, completed_chunks
+                 FROM embedding_generations WHERE id = ?1",
+                params![generation_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, i64>(1)? as usize,
+                        row.get(2)?,
+                        row.get(3)?,
+                    ))
+                },
+            )?;
+        if state != "building" || completed_chunks != total_chunks {
+            return self.fail_embedding_generation(
+                generation_id,
+                "embedding.generation_incomplete",
+                "Embedding generation is incomplete and cannot be activated.",
+            );
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT gc.vector_blob, gc.vector_checksum, gc.vector_dimension,
+                    gc.source_version_id, gc.source_version_hash, gc.context_hash,
+                    sv.body_hash, coalesce(im.latest_version_id, cm.latest_version_id)
+             FROM embedding_generation_chunks gc
+             JOIN source_versions sv ON sv.id = gc.source_version_id
+             LEFT JOIN issue_metadata im ON im.source_id = sv.source_id
+             LEFT JOIN comment_metadata cm ON cm.source_id = sv.source_id
+             WHERE gc.generation_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![generation_id], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as usize,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+            ))
+        })?;
+        let mut invalid = false;
+        for row in rows {
+            let (
+                bytes,
+                checksum,
+                stored_dimension,
+                source_version_id,
+                source_hash,
+                context_hash,
+                body_hash,
+                latest_version_id,
+            ) = row?;
+            if stored_dimension != dimension
+                || decode_embedding_blob(&bytes, dimension).is_err()
+                || embedding_blob_checksum(&bytes) != checksum
+                || source_hash != body_hash
+                || latest_version_id != Some(source_version_id)
+                || context_hash.is_empty()
+            {
+                invalid = true;
+                break;
+            }
+        }
+        drop(stmt);
+        if invalid {
+            return self.fail_embedding_generation(
+                generation_id,
+                "embedding.generation_validation_failed",
+                "Embedding generation validation failed.",
+            );
+        }
+        self.conn.execute(
+            "UPDATE embedding_generations SET state = 'ready', updated_at = ?2, failure_code = NULL WHERE id = ?1",
+            params![generation_id, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "vector-search")]
+    pub fn embedding_generation_state(&self, generation_id: i64) -> Result<String, QghError> {
+        self.conn
+            .query_row(
+                "SELECT state FROM embedding_generations WHERE id = ?1",
+                params![generation_id],
+                |row| row.get(0),
+            )
+            .map_err(QghError::from)
+    }
+
+    pub fn activate_retrieval_publication(
+        &mut self,
+        source_snapshot_sync_run_id: &str,
+        tantivy_generation: i64,
+        embedding_generation_id: Option<i64>,
+        expected_publication_id: Option<i64>,
+    ) -> Result<i64, QghError> {
+        let embedding_metadata = if let Some(generation_id) = embedding_generation_id {
+            Some(self.conn.query_row(
+                "SELECT state, model_manifest_hash, chunker_fingerprint,
+                        context_template_version, output_dimension, total_chunks,
+                        completed_chunks
+                 FROM embedding_generations WHERE id = ?1",
+                params![generation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)? as usize,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )?)
+        } else {
+            None
+        };
+        if let Some((state, _, _, _, _, total_chunks, completed_chunks)) = &embedding_metadata {
+            if state != "ready" || total_chunks != completed_chunks {
+                return Err(QghError::validation(
+                    "publication.embedding_not_ready",
+                    "Only a complete ready embedding generation can be published.",
+                ));
+            }
+        }
+
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let current = self
+                .conn
+                .query_row(
+                    "SELECT publication_id FROM retrieval_publication_pointer WHERE id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if expected_publication_id.is_some() && current != expected_publication_id {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    "publication.cas_conflict".to_string(),
+                ));
+            }
+            let now = now_rfc3339();
+            let (manifest, chunker, context, dimension) = embedding_metadata
+                .as_ref()
+                .map(|(_, manifest, chunker, context, dimension, _, _)| {
+                    (
+                        Some(manifest.as_str()),
+                        Some(chunker.as_str()),
+                        Some(context.as_str()),
+                        Some(*dimension as i64),
+                    )
+                })
+                .unwrap_or((None, None, None, None));
+            self.conn.execute(
+                "INSERT INTO retrieval_publications
+                    (source_snapshot_sync_run_id, tantivy_generation,
+                     embedding_generation_id, model_manifest_hash,
+                     chunker_fingerprint, context_template_version,
+                     output_dimension, active, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8)",
+                params![
+                    source_snapshot_sync_run_id,
+                    tantivy_generation,
+                    embedding_generation_id,
+                    manifest,
+                    chunker,
+                    context,
+                    dimension,
+                    now
+                ],
+            )?;
+            let publication_id = self.conn.last_insert_rowid();
+            self.conn.execute(
+                "UPDATE retrieval_publications SET active = 0 WHERE publication_id != ?1",
+                params![publication_id],
+            )?;
+            self.conn.execute(
+                "INSERT INTO retrieval_publication_pointer(id, publication_id)
+                 VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET publication_id = excluded.publication_id",
+                params![publication_id],
+            )?;
+            if let Some(generation_id) = embedding_generation_id {
+                self.conn.execute(
+                    "UPDATE embedding_generations SET state = 'active', updated_at = ?2 WHERE id = ?1",
+                    params![generation_id, now_rfc3339()],
+                )?;
+            }
+            if let Some(previous) = current {
+                if let Some(previous_generation) = self
+                    .conn
+                    .query_row(
+                        "SELECT embedding_generation_id FROM retrieval_publications WHERE publication_id = ?1",
+                        params![previous],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )?
+                {
+                    self.conn.execute(
+                        "UPDATE embedding_generations SET state = 'ready', updated_at = ?2
+                         WHERE id = ?1 AND state = 'active'",
+                        params![previous_generation, now_rfc3339()],
+                    )?;
+                }
+            }
+            Ok::<i64, rusqlite::Error>(publication_id)
+        })();
+        match result {
+            Ok(publication_id) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(publication_id)
+            }
+            Err(rusqlite::Error::InvalidParameterName(code))
+                if code == "publication.cas_conflict" =>
+            {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(QghError::validation(
+                    "publication.cas_conflict",
+                    "Retrieval publication changed before activation.",
+                ))
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(QghError::from(error))
+            }
+        }
+    }
+
+    pub fn active_retrieval_publication(
+        &self,
+    ) -> Result<Option<RetrievalPublicationView>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT rp.publication_id, rp.source_snapshot_sync_run_id,
+                        rp.tantivy_generation, rp.embedding_generation_id,
+                        rp.model_manifest_hash, rp.chunker_fingerprint,
+                        rp.context_template_version, rp.output_dimension
+                 FROM retrieval_publication_pointer p
+                 JOIN retrieval_publications rp ON rp.publication_id = p.publication_id
+                 WHERE p.id = 1",
+                [],
+                |row| {
+                    Ok(RetrievalPublicationView {
+                        publication_id: row.get(0)?,
+                        source_snapshot_sync_run_id: row.get(1)?,
+                        tantivy_generation: row.get(2)?,
+                        embedding_generation_id: row.get(3)?,
+                        model_manifest_hash: row.get(4)?,
+                        chunker_fingerprint: row.get(5)?,
+                        context_template_version: row.get(6)?,
+                        output_dimension: row.get::<_, Option<i64>>(7)?.map(|value| value as usize),
+                    })
+                },
+            )
+            .optional()
+            .map_err(QghError::from)
+    }
+
+    #[cfg(feature = "vector-search")]
+    pub fn cleanup_embedding_generations(
+        &mut self,
+        stale_building_before: &str,
+        previous_ready_before: &str,
+    ) -> Result<usize, QghError> {
+        let active_generation = self
+            .conn
+            .query_row(
+                "SELECT embedding_generation_id FROM retrieval_publications WHERE active = 1",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        let previous_generation = self
+            .conn
+            .query_row(
+                "SELECT embedding_generation_id FROM retrieval_publications
+                 WHERE active = 0 AND embedding_generation_id IS NOT NULL
+                 ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let mut keep = BTreeSet::new();
+        if let Some(id) = active_generation {
+            keep.insert(id);
+        }
+        if let Some(id) = previous_generation {
+            let created_at = self.conn.query_row(
+                "SELECT created_at FROM embedding_generations WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )?;
+            let recent = created_at.as_str() >= previous_ready_before;
+            if recent {
+                keep.insert(id);
+            }
+        }
+        let mut candidates = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM embedding_generations
+             WHERE (state = 'building' AND updated_at < ?1)
+                OR (state IN ('failed', 'ready') AND id NOT IN (SELECT value FROM json_each(?2)))",
+        )?;
+        let keep_json = serde_json::to_string(&keep.iter().copied().collect::<Vec<_>>()).unwrap();
+        let rows = stmt.query_map(params![stale_building_before, keep_json], |row| row.get(0))?;
+        for row in rows {
+            candidates.push(row?);
+        }
+        drop(stmt);
+        let mut removed = 0;
+        for generation_id in candidates {
+            if keep.contains(&generation_id) {
+                continue;
+            }
+            let mappings = self
+                .conn
+                .prepare(
+                    "SELECT vector_table, vector_rowid FROM embedding_generation_vector_rows
+                     WHERE generation_id = ?1",
+                )?
+                .query_map(params![generation_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (table, rowid) in mappings {
+                self.conn.execute(
+                    &format!("DELETE FROM {table} WHERE rowid = ?1"),
+                    params![rowid],
+                )?;
+            }
+            self.conn.execute(
+                "DELETE FROM embedding_generation_vector_rows WHERE generation_id = ?1",
+                params![generation_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM embedding_generation_chunks WHERE generation_id = ?1",
+                params![generation_id],
+            )?;
+            removed += self.conn.execute(
+                "DELETE FROM embedding_generations WHERE id = ?1",
+                params![generation_id],
+            )?;
+        }
+        Ok(removed)
+    }
+
+    #[cfg(feature = "vector-search")]
+    fn fail_embedding_generation(
+        &mut self,
+        generation_id: i64,
+        code: &str,
+        message: &str,
+    ) -> Result<(), QghError> {
+        self.conn.execute(
+            "UPDATE embedding_generations
+             SET state = 'failed', failure_code = ?2, updated_at = ?3 WHERE id = ?1",
+            params![generation_id, code, now_rfc3339()],
+        )?;
+        Err(QghError::validation(code, message))
     }
 
     fn ensure_vector_storage(&mut self, dimension: usize) -> Result<(), QghError> {
@@ -1869,6 +2499,66 @@ impl Store {
                 vector_json TEXT NOT NULL,
                 embedded_at TEXT NOT NULL,
                 PRIMARY KEY (chunk_id, fingerprint_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS embedding_generations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                state TEXT NOT NULL,
+                model_manifest_hash TEXT NOT NULL,
+                chunker_fingerprint TEXT NOT NULL,
+                context_template_version TEXT NOT NULL,
+                output_dimension INTEGER NOT NULL,
+                source_sync_run_id TEXT NOT NULL,
+                source_snapshot_hash TEXT NOT NULL,
+                total_chunks INTEGER NOT NULL,
+                completed_chunks INTEGER NOT NULL DEFAULT 0,
+                checkpoint_chunk_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                failure_code TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS embedding_generation_chunks (
+                generation_id INTEGER NOT NULL,
+                chunk_id INTEGER NOT NULL,
+                source_version_id INTEGER NOT NULL,
+                source_version_hash TEXT NOT NULL,
+                context_hash TEXT NOT NULL,
+                vector_blob BLOB NOT NULL,
+                vector_checksum TEXT NOT NULL,
+                vector_dimension INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (generation_id, chunk_id),
+                FOREIGN KEY (generation_id) REFERENCES embedding_generations(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS embedding_generation_vector_rows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                generation_id INTEGER NOT NULL,
+                chunk_id INTEGER NOT NULL,
+                dimension INTEGER NOT NULL,
+                vector_table TEXT NOT NULL,
+                vector_rowid INTEGER NOT NULL,
+                UNIQUE (generation_id, chunk_id),
+                FOREIGN KEY (generation_id) REFERENCES embedding_generations(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS retrieval_publications (
+                publication_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_snapshot_sync_run_id TEXT NOT NULL,
+                tantivy_generation INTEGER NOT NULL,
+                embedding_generation_id INTEGER,
+                model_manifest_hash TEXT,
+                chunker_fingerprint TEXT,
+                context_template_version TEXT,
+                output_dimension INTEGER,
+                active INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS retrieval_publication_pointer (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                publication_id INTEGER NOT NULL
             );
             "#,
         )?;
@@ -2053,6 +2743,24 @@ impl Store {
                 task_type TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 completed_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS retrieval_publications (
+                publication_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_snapshot_sync_run_id TEXT NOT NULL,
+                tantivy_generation INTEGER NOT NULL,
+                embedding_generation_id INTEGER,
+                model_manifest_hash TEXT,
+                chunker_fingerprint TEXT,
+                context_template_version TEXT,
+                output_dimension INTEGER,
+                active INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS retrieval_publication_pointer (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                publication_id INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -2264,6 +2972,44 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, QghError> {
         )
         .optional()?
         .is_some())
+}
+
+#[cfg(feature = "vector-search")]
+fn generation_vector_table_name(dimension: usize) -> String {
+    format!("embedding_generation_vectors_d{dimension}")
+}
+
+#[cfg(feature = "vector-search")]
+fn encode_embedding_blob(vector: &[f32]) -> Vec<u8> {
+    vector
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+#[cfg(feature = "vector-search")]
+fn decode_embedding_blob(bytes: &[u8], dimension: usize) -> Result<Vec<f32>, QghError> {
+    if bytes.len() != dimension.saturating_mul(std::mem::size_of::<f32>()) {
+        return Err(QghError::validation(
+            "embedding.generation_blob_dimension_mismatch",
+            "Embedding generation BLOB length does not match its dimension.",
+        ));
+    }
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| {
+            let bytes: [u8; 4] = chunk.try_into().expect("chunks_exact guarantees width");
+            Ok(f32::from_le_bytes(bytes))
+        })
+        .collect()
+}
+
+#[cfg(feature = "vector-search")]
+fn embedding_blob_checksum(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn vector_table_dimension(conn: &Connection) -> Result<Option<usize>, QghError> {
@@ -2954,6 +3700,223 @@ mod tests {
             row.get(0)
         })
         .unwrap()
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn embedding_generation_stages_resumes_and_validates_little_endian_vectors() {
+        let paths = temp_profile_paths("generation-stage");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        store.ensure_vector_storage(2).unwrap();
+        let chunk_id = insert_test_issue_chunk(
+            &mut store,
+            "qgh://github.com/issue/I_GENERATION",
+            "generation-sync",
+        );
+        let source_version_id = store
+            .latest_source_version_id("qgh://github.com/issue/I_GENERATION")
+            .unwrap()
+            .unwrap();
+        let spec = EmbeddingGenerationSpec {
+            model_manifest_hash: "manifest-a".to_string(),
+            chunker_fingerprint: "chunker-a".to_string(),
+            context_template_version: "context-v1".to_string(),
+            output_dimension: 2,
+            source_sync_run_id: "generation-sync".to_string(),
+            source_snapshot_hash: "snapshot-a".to_string(),
+            total_chunks: 1,
+        };
+        let generation_id = store.begin_embedding_generation(&spec).unwrap();
+        store
+            .stage_embedding_generation_batch(
+                generation_id,
+                &[EmbeddingGenerationChunk {
+                    chunk_id,
+                    source_version_id,
+                    source_version_hash: "body-hash-generation-sync".to_string(),
+                    context_hash: "context-hash-a".to_string(),
+                    vector: vec![1.0, 2.0],
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            store.begin_embedding_generation(&spec).unwrap(),
+            generation_id
+        );
+        let staged = store
+            .embedding_generation_chunk_blob(generation_id, chunk_id)
+            .unwrap();
+        assert_eq!(staged.dimension, 2);
+        assert_eq!(staged.bytes, vec![0, 0, 128, 63, 0, 0, 0, 64]);
+        store.validate_embedding_generation(generation_id).unwrap();
+        assert_eq!(
+            store.embedding_generation_state(generation_id).unwrap(),
+            "ready"
+        );
+        assert!(table_names(&store.conn)
+            .iter()
+            .any(|name| name == "chunk_embedding_vectors"));
+        let second_spec = EmbeddingGenerationSpec {
+            output_dimension: 3,
+            model_manifest_hash: "manifest-b".to_string(),
+            ..spec.clone()
+        };
+        let second_generation = store.begin_embedding_generation(&second_spec).unwrap();
+        store
+            .stage_embedding_generation_batch(
+                second_generation,
+                &[EmbeddingGenerationChunk {
+                    chunk_id,
+                    source_version_id,
+                    source_version_hash: "body-hash-generation-sync".to_string(),
+                    context_hash: "context-hash-b".to_string(),
+                    vector: vec![1.0, 2.0, 3.0],
+                }],
+            )
+            .unwrap();
+        assert!(table_names(&store.conn)
+            .iter()
+            .any(|name| name == "embedding_generation_vectors_d2"));
+        assert!(table_names(&store.conn)
+            .iter()
+            .any(|name| name == "embedding_generation_vectors_d3"));
+        store
+            .validate_embedding_generation(second_generation)
+            .unwrap();
+        let publication = store
+            .activate_retrieval_publication("generation-sync", 1, Some(second_generation), None)
+            .unwrap();
+        let publication_view = store.active_retrieval_publication().unwrap().unwrap();
+        assert_eq!(publication_view.publication_id, publication);
+        assert_eq!(
+            publication_view.embedding_generation_id,
+            Some(second_generation)
+        );
+        assert_eq!(publication_view.output_dimension, Some(3));
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn retrieval_publication_cas_keeps_bm25_embedding_null_and_rolls_back_conflicts() {
+        let paths = temp_profile_paths("publication-cas");
+        let mut store = Store::open(&paths).unwrap();
+        let first = store
+            .activate_retrieval_publication("sync-one", 1, None, None)
+            .unwrap();
+        let active = store.active_retrieval_publication().unwrap().unwrap();
+        assert_eq!(active.publication_id, first);
+        assert_eq!(active.embedding_generation_id, None);
+        assert_eq!(active.tantivy_generation, 1);
+        let second = store
+            .activate_retrieval_publication("sync-two", 2, None, Some(first))
+            .unwrap();
+        assert_ne!(first, second);
+        let conflict = store.activate_retrieval_publication("sync-three", 3, None, Some(first));
+        assert_eq!(conflict.unwrap_err().code, "publication.cas_conflict");
+        assert_eq!(
+            store
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            second
+        );
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn invalid_generation_checksum_fails_without_touching_legacy_storage() {
+        let paths = temp_profile_paths("generation-invalid-checksum");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        store.ensure_vector_storage(2).unwrap();
+        let chunk_id = insert_test_issue_chunk(
+            &mut store,
+            "qgh://github.com/issue/I_GENERATION_BAD",
+            "generation-bad-sync",
+        );
+        let source_version_id = store
+            .latest_source_version_id("qgh://github.com/issue/I_GENERATION_BAD")
+            .unwrap()
+            .unwrap();
+        let generation_id = store
+            .begin_embedding_generation(&EmbeddingGenerationSpec {
+                model_manifest_hash: "manifest-bad".to_string(),
+                chunker_fingerprint: "chunker-bad".to_string(),
+                context_template_version: "context-v1".to_string(),
+                output_dimension: 2,
+                source_sync_run_id: "generation-bad-sync".to_string(),
+                source_snapshot_hash: "snapshot-bad".to_string(),
+                total_chunks: 1,
+            })
+            .unwrap();
+        store
+            .stage_embedding_generation_batch(
+                generation_id,
+                &[EmbeddingGenerationChunk {
+                    chunk_id,
+                    source_version_id,
+                    source_version_hash: "body-hash-generation-bad".to_string(),
+                    context_hash: "context-hash".to_string(),
+                    vector: vec![1.0, 2.0],
+                }],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_generation_chunks SET vector_checksum = 'bad' WHERE generation_id = ?1",
+                params![generation_id],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .validate_embedding_generation(generation_id)
+                .unwrap_err()
+                .code,
+            "embedding.generation_validation_failed"
+        );
+        assert_eq!(
+            store.embedding_generation_state(generation_id).unwrap(),
+            "failed"
+        );
+        assert!(table_names(&store.conn)
+            .iter()
+            .any(|name| name == "chunk_embedding_vectors"));
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn stale_building_generation_is_removed_only_by_explicit_cleanup() {
+        let paths = temp_profile_paths("generation-retention");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let generation_id = store
+            .begin_embedding_generation(&EmbeddingGenerationSpec {
+                model_manifest_hash: "manifest-retention".to_string(),
+                chunker_fingerprint: "chunker-retention".to_string(),
+                context_template_version: "context-v1".to_string(),
+                output_dimension: 2,
+                source_sync_run_id: "sync-retention".to_string(),
+                source_snapshot_hash: "snapshot-retention".to_string(),
+                total_chunks: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            store.embedding_generation_state(generation_id).unwrap(),
+            "building"
+        );
+        assert_eq!(
+            store
+                .cleanup_embedding_generations("9999-01-01T00:00:00Z", "9999-01-01T00:00:00Z")
+                .unwrap(),
+            1
+        );
+        assert!(store.embedding_generation_state(generation_id).is_err());
+        let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
     #[cfg(feature = "vector-search")]
