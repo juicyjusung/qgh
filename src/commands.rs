@@ -1,4 +1,6 @@
-use crate::chunking::{chunk_markdown, CHUNKER_FINGERPRINT};
+use crate::chunking::{
+    chunk_markdown_with_fingerprint, chunker_fingerprint_for_tokenizer_identity,
+};
 use crate::cli::{EmbedArgs, InitArgs, InitRepoArgs, InitTokenSourceArg, QueryArgs, ReconcileMode};
 use crate::config::{
     bootstrap_profile_repo, current_git_worktree_root, discover_repo_policy,
@@ -16,8 +18,8 @@ use crate::embedding::{
 };
 #[cfg(feature = "fastembed-provider")]
 use crate::embedding::{
-    validate_batch_comparability, FastembedEngine, FastembedTokenizer, LocalEmbeddingProvider,
-    PreparedModelSnapshot,
+    tokenizer_contract_identity_from_manifest, validate_batch_comparability, FastembedEngine,
+    FastembedTokenizer, LocalEmbeddingProvider, PreparedEmbeddingTokenizer, PreparedModelSnapshot,
 };
 #[cfg(debug_assertions)]
 use crate::embedding::{PoolingKind, TokenSpan, DEFAULT_QUERY_PREFIX};
@@ -1754,7 +1756,14 @@ fn prepare_embedding_chunks_for_sync_if_enabled(
             return (warnings, false);
         }
     };
-    if refresh_embedding_chunks(store, tokenizer.as_ref(), progress).is_err() {
+    if refresh_embedding_chunks(
+        store,
+        tokenizer.tokenizer.as_ref(),
+        &tokenizer.chunker_fingerprint,
+        progress,
+    )
+    .is_err()
+    {
         warnings.push(embedding_sync_warning(
             "embedding.sync_chunking_failed",
             "Embedding chunk refresh failed during sync. BM25 index refresh remains available.",
@@ -1767,6 +1776,7 @@ fn prepare_embedding_chunks_for_sync_if_enabled(
 fn refresh_embedding_chunks(
     store: &mut Store,
     tokenizer: &dyn EmbeddingTokenizer,
+    expected_fingerprint: &str,
     progress: &StderrSyncProgress,
 ) -> Result<ChunkRefreshStats, QghError> {
     let mut stats = ChunkRefreshStats::default();
@@ -1779,16 +1789,17 @@ fn refresh_embedding_chunks(
                     source.source_id
                 ))
             })?;
-        if store.source_version_chunks_match_fingerprint(source_version_id, CHUNKER_FINGERPRINT)? {
+        if store.source_version_chunks_match_fingerprint(source_version_id, expected_fingerprint)? {
             stats.skipped_sources += 1;
             continue;
         }
-        let chunks = chunk_markdown(&source.body, tokenizer).map_err(|error| {
-            QghError::storage(format!(
-                "Failed to chunk source `{}` with embedding tokenizer: {error}",
-                source.source_id
-            ))
-        })?;
+        let chunks = chunk_markdown_with_fingerprint(&source.body, tokenizer, expected_fingerprint)
+            .map_err(|error| {
+                QghError::storage(format!(
+                    "Failed to chunk source `{}` with embedding tokenizer: {error}",
+                    source.source_id
+                ))
+            })?;
         stats.refreshed_chunks += store
             .replace_chunks_for_source_version(&source.source_id, source_version_id, &chunks)?
             .len();
@@ -1829,6 +1840,7 @@ fn refresh_incremental_chunk_embeddings_for_snapshot(
         runtime.provider.as_ref(),
         runtime.model_manifest_hash.clone(),
         runtime.fingerprint_seed.clone(),
+        runtime.chunker_fingerprint.clone(),
         &expectation,
         snapshot,
     )
@@ -1839,6 +1851,7 @@ fn refresh_incremental_chunk_embeddings_with_provider(
     provider: &dyn EmbeddingProvider,
     model_manifest_hash: String,
     fingerprint_seed: EmbeddingFingerprintSeed,
+    expected_chunker_fingerprint: String,
     expectation: &EmbeddingFingerprintExpectation,
 ) -> Result<usize, QghError> {
     let Some(snapshot) = store.capture_retrieval_build_snapshot()? else {
@@ -1850,6 +1863,7 @@ fn refresh_incremental_chunk_embeddings_with_provider(
             provider,
             model_manifest_hash,
             fingerprint_seed,
+            expected_chunker_fingerprint,
             expectation,
             &snapshot,
         )?
@@ -1862,12 +1876,22 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
     provider: &dyn EmbeddingProvider,
     model_manifest_hash: String,
     fingerprint_seed: EmbeddingFingerprintSeed,
+    expected_chunker_fingerprint: String,
     _expectation: &EmbeddingFingerprintExpectation,
     snapshot: &RetrievalBuildSnapshot,
 ) -> Result<(usize, Option<i64>), QghError> {
     let chunks = snapshot.embedding_chunks();
     if chunks.is_empty() {
         return Ok((0, None));
+    }
+    if chunks
+        .iter()
+        .any(|chunk| chunk.chunk.chunker_fingerprint != expected_chunker_fingerprint)
+    {
+        return Err(QghError::validation(
+            "embedding.generation_invalid_spec",
+            "Stored chunks do not match the prepared tokenizer contract.",
+        ));
     }
 
     let texts = chunks
@@ -1892,10 +1916,7 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
     let spec = crate::store::EmbeddingGenerationSpec {
         model_manifest_hash: model_manifest_hash.clone(),
         runtime_fingerprint_hash,
-        chunker_fingerprint: chunks
-            .first()
-            .map(|chunk| chunk.chunk.chunker_fingerprint.clone())
-            .unwrap_or_else(|| "none".to_string()),
+        chunker_fingerprint: expected_chunker_fingerprint.clone(),
         context_template_version: context_template_version.clone(),
         output_dimension: dimension,
     };
@@ -1913,7 +1934,7 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
                         .ok_or_else(|| QghError::storage("Missing source version hash."))?,
                     context_hash: chunk
                         .prepared_input
-                        .context_hash(&model_manifest_hash, &chunk.chunk.chunker_fingerprint),
+                        .context_hash(&model_manifest_hash, &expected_chunker_fingerprint),
                     vector: (*vector).clone(),
                 })
             })
@@ -1944,26 +1965,32 @@ fn cleanup_old_embedding_generations(store: &mut Store) -> Result<usize, QghErro
     Ok(removed_generations + removed_chunks)
 }
 
+struct EmbeddingChunkingRuntime {
+    tokenizer: Box<dyn EmbeddingTokenizer>,
+    chunker_fingerprint: String,
+}
+
 #[cfg(feature = "fastembed-provider")]
-fn embedding_tokenizer(
-    embedding: &EmbeddingConfig,
-) -> Result<Box<dyn EmbeddingTokenizer>, QghError> {
+fn embedding_tokenizer(embedding: &EmbeddingConfig) -> Result<EmbeddingChunkingRuntime, QghError> {
     match embedding.provider {
         EmbeddingProviderKind::Local => {
             let options = embedding.fastembed_options();
             let prepared_store = default_prepared_model_store().map_err(embedding_error)?;
-            prepared_store
-                .acquire_tokenizer(&options)
-                .map(|tokenizer| Box::new(tokenizer) as Box<dyn EmbeddingTokenizer>)
-                .map_err(embedding_error)
+            let tokenizer: PreparedEmbeddingTokenizer = prepared_store
+                .acquire_tokenizer_with_identity(&options)
+                .map_err(embedding_error)?;
+            let chunker_fingerprint =
+                chunker_fingerprint_for_tokenizer_identity(tokenizer.contract_identity());
+            Ok(EmbeddingChunkingRuntime {
+                tokenizer: Box::new(tokenizer),
+                chunker_fingerprint,
+            })
         }
     }
 }
 
 #[cfg(not(feature = "fastembed-provider"))]
-fn embedding_tokenizer(
-    embedding: &EmbeddingConfig,
-) -> Result<Box<dyn EmbeddingTokenizer>, QghError> {
+fn embedding_tokenizer(embedding: &EmbeddingConfig) -> Result<EmbeddingChunkingRuntime, QghError> {
     match embedding.provider {
         EmbeddingProviderKind::Local => Err(QghError::validation(
             "embedding.provider_unavailable",
@@ -2096,7 +2123,12 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
     store.enable_vector()?;
     let runtime = embedding_runtime_for_acquisition(embedding)?;
     let progress = StderrSyncProgress::new(false);
-    let chunk_stats = refresh_embedding_chunks(&mut store, runtime.tokenizer.as_ref(), &progress)?;
+    let chunk_stats = refresh_embedding_chunks(
+        &mut store,
+        runtime.tokenizer.as_ref(),
+        &runtime.chunker_fingerprint,
+        &progress,
+    )?;
     let source_snapshot_sync_run_id = if store.successor_repair_required()? {
         store
             .record_purge_successor_snapshot()?
@@ -2119,6 +2151,7 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
         runtime.provider.as_ref(),
         runtime.model_manifest_hash.clone(),
         runtime.fingerprint_seed.clone(),
+        &runtime.chunker_fingerprint,
         &snapshot,
     )?;
     let mut warnings = Vec::new();
@@ -2153,6 +2186,7 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
 
 struct EmbeddingRuntime {
     tokenizer: Box<dyn EmbeddingTokenizer>,
+    chunker_fingerprint: String,
     provider: Box<dyn EmbeddingProvider>,
     model_manifest_hash: String,
     fingerprint_seed: EmbeddingFingerprintSeed,
@@ -2255,6 +2289,9 @@ fn test_embedding_runtime(
     let configured = configured_embedding_snapshot(embedding);
     Ok(Some(EmbeddingRuntime {
         tokenizer: Box::new(TestEmbeddingTokenizer),
+        // Explicit debug-provider fixture identity. Production prepared-model
+        // runtimes always derive this from their tokenizer contract.
+        chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
         provider: Box::new(TestEmbeddingProvider {
             document_vectors,
             query_vectors,
@@ -2414,6 +2451,9 @@ fn build_embedding_runtime(
     embedding: &EmbeddingConfig,
     snapshot: &PreparedModelSnapshot,
 ) -> Result<Arc<EmbeddingRuntime>, QghError> {
+    let tokenizer_identity =
+        tokenizer_contract_identity_from_manifest(&snapshot.manifest).map_err(embedding_error)?;
+    let chunker_fingerprint = chunker_fingerprint_for_tokenizer_identity(&tokenizer_identity);
     let tokenizer = FastembedTokenizer::from_prepared_snapshot(snapshot)
         .map(|tokenizer| Box::new(tokenizer) as Box<dyn EmbeddingTokenizer>)
         .map_err(embedding_error)?;
@@ -2424,6 +2464,7 @@ fn build_embedding_runtime(
     validate_batch_comparability(&provider, "qgh prepared model smoke").map_err(embedding_error)?;
     Ok(Arc::new(EmbeddingRuntime {
         tokenizer,
+        chunker_fingerprint,
         provider: Box::new(provider),
         model_manifest_hash: snapshot.manifest.hash(),
         fingerprint_seed: embedding_fingerprint_seed(embedding, snapshot),
@@ -2493,6 +2534,7 @@ fn refresh_chunk_embeddings(
     provider: &dyn EmbeddingProvider,
     model_manifest_hash: String,
     fingerprint_seed: EmbeddingFingerprintSeed,
+    expected_chunker_fingerprint: &str,
     snapshot: &RetrievalBuildSnapshot,
 ) -> Result<Value, QghError> {
     let chunks = snapshot.embedding_chunks();
@@ -2502,6 +2544,15 @@ fn refresh_chunk_embeddings(
             "No active chunks are available to embed.",
         )
         .with_hint("Run `qgh sync` with [embedding] configured before `qgh embed --force`."));
+    }
+    if chunks
+        .iter()
+        .any(|chunk| chunk.chunk.chunker_fingerprint != expected_chunker_fingerprint)
+    {
+        return Err(QghError::validation(
+            "embedding.generation_invalid_spec",
+            "Stored chunks do not match the prepared tokenizer contract.",
+        ));
     }
 
     let texts = chunks
@@ -2528,10 +2579,7 @@ fn refresh_chunk_embeddings(
     let spec = crate::store::EmbeddingGenerationSpec {
         model_manifest_hash: model_manifest_hash.clone(),
         runtime_fingerprint_hash,
-        chunker_fingerprint: chunks
-            .first()
-            .map(|chunk| chunk.chunk.chunker_fingerprint.clone())
-            .unwrap_or_else(|| "none".to_string()),
+        chunker_fingerprint: expected_chunker_fingerprint.to_string(),
         context_template_version: context_template_version.clone(),
         output_dimension: dimension,
     };
@@ -2548,7 +2596,7 @@ fn refresh_chunk_embeddings(
                         .ok_or_else(|| QghError::storage("Missing source version hash."))?,
                     context_hash: chunk
                         .prepared_input
-                        .context_hash(&model_manifest_hash, &chunk.chunk.chunker_fingerprint),
+                        .context_hash(&model_manifest_hash, expected_chunker_fingerprint),
                     vector: vector.clone(),
                 })
             })
@@ -3782,6 +3830,7 @@ fn encode_hybrid_query(
         .hash();
     if publication.model_manifest_hash.as_deref() != Some(runtime.model_manifest_hash.as_str())
         || publication.runtime_fingerprint_hash.as_deref() != Some(expected_runtime_hash.as_str())
+        || publication.chunker_fingerprint.as_deref() != Some(runtime.chunker_fingerprint.as_str())
     {
         return Err(HybridQueryEncodingError::FingerprintMismatch);
     }
@@ -6142,18 +6191,21 @@ mod tests {
 
     #[cfg(feature = "vector-search")]
     #[test]
-    fn runtime_fingerprint_mismatch_blocks_query_encoding_before_bm25_fallback() {
+    fn chunker_fingerprint_mismatch_blocks_query_encoding_before_bm25_fallback() {
+        let fingerprint_seed = EmbeddingFingerprintSeed {
+            provider: "local".to_string(),
+            model_id: "fixture/model".to_string(),
+            model_revision: "fixture-sha".to_string(),
+            pooling: PoolingKind::Cls,
+            query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
+        };
+        let runtime_fingerprint_hash = fingerprint_seed.clone().with_dimension(3).hash();
         let runtime = EmbeddingRuntime {
             tokenizer: Box::new(TestEmbeddingTokenizer),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
             provider: Box::new(PanicQueryEmbeddingProvider),
             model_manifest_hash: "manifest-query-runtime-check".to_string(),
-            fingerprint_seed: EmbeddingFingerprintSeed {
-                provider: "local".to_string(),
-                model_id: "fixture/model".to_string(),
-                model_revision: "fixture-sha".to_string(),
-                pooling: PoolingKind::Cls,
-                query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
-            },
+            fingerprint_seed,
         };
         let publication = RetrievalPublicationView {
             publication_id: 1,
@@ -6162,8 +6214,8 @@ mod tests {
             tantivy_generation: 1,
             embedding_generation_id: Some(1),
             model_manifest_hash: Some("manifest-query-runtime-check".to_string()),
-            runtime_fingerprint_hash: Some("wrong-runtime-fingerprint".to_string()),
-            chunker_fingerprint: Some(crate::chunking::CHUNKER_FINGERPRINT.to_string()),
+            runtime_fingerprint_hash: Some(runtime_fingerprint_hash),
+            chunker_fingerprint: Some("wrong-chunker-fingerprint".to_string()),
             context_template_version: Some(
                 crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
             ),
@@ -6207,6 +6259,7 @@ mod tests {
         assert_ne!(model_manifest_hash, runtime_fingerprint_hash);
         let runtime = EmbeddingRuntime {
             tokenizer: Box::new(TestEmbeddingTokenizer),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
             provider: Box::new(RecordingEmbeddingProvider::default()),
             model_manifest_hash: model_manifest_hash.to_string(),
             fingerprint_seed,
@@ -6274,6 +6327,7 @@ mod tests {
             &provider,
             "manifest-context-sync".to_string(),
             seed,
+            crate::chunking::CHUNKER_FINGERPRINT.to_string(),
             &expectation,
         )
         .unwrap();
@@ -6358,6 +6412,7 @@ mod tests {
             &provider,
             model_manifest_hash.to_string(),
             seed,
+            crate::chunking::CHUNKER_FINGERPRINT,
             &snapshot,
         )
         .unwrap();
@@ -6638,6 +6693,7 @@ mod tests {
             &MockEmbeddingProvider,
             "manifest-command-embed".to_string(),
             seed,
+            crate::chunking::CHUNKER_FINGERPRINT,
             &force_snapshot,
         )
         .unwrap();
@@ -6699,7 +6755,16 @@ mod tests {
             )
             .unwrap();
         let progress = StderrSyncProgress::new(false);
-        refresh_embedding_chunks(&mut store, &TestEmbeddingTokenizer, &progress).unwrap();
+        let arctic_fingerprint =
+            chunker_fingerprint_for_tokenizer_identity("arctic-tokenizer-contract");
+        let gte_fingerprint = chunker_fingerprint_for_tokenizer_identity("gte-tokenizer-contract");
+        refresh_embedding_chunks(
+            &mut store,
+            &TestEmbeddingTokenizer,
+            &arctic_fingerprint,
+            &progress,
+        )
+        .unwrap();
         let source_version_id = store.latest_source_version_id(source_id).unwrap().unwrap();
         rusqlite::Connection::open(&paths.db_path)
             .unwrap()
@@ -6711,15 +6776,20 @@ mod tests {
             .unwrap();
         let raw_body_before = store.get_issue(source_id).unwrap().unwrap().body;
 
-        let refreshed =
-            refresh_embedding_chunks(&mut store, &TestEmbeddingTokenizer, &progress).unwrap();
+        let refreshed = refresh_embedding_chunks(
+            &mut store,
+            &TestEmbeddingTokenizer,
+            &arctic_fingerprint,
+            &progress,
+        )
+        .unwrap();
 
         assert_eq!(refreshed.skipped_sources, 0);
         assert!(refreshed.refreshed_chunks > 0);
         let refreshed_chunks = store.chunks_for_source_version(source_version_id).unwrap();
         assert!(refreshed_chunks
             .iter()
-            .all(|chunk| { chunk.chunker_fingerprint == crate::chunking::CHUNKER_FINGERPRINT }));
+            .all(|chunk| chunk.chunker_fingerprint == arctic_fingerprint));
         assert_eq!(
             store.get_issue(source_id).unwrap().unwrap().body,
             raw_body_before
@@ -6729,8 +6799,13 @@ mod tests {
             .map(|chunk| chunk.chunk_id)
             .collect::<Vec<_>>();
 
-        let second =
-            refresh_embedding_chunks(&mut store, &TestEmbeddingTokenizer, &progress).unwrap();
+        let second = refresh_embedding_chunks(
+            &mut store,
+            &TestEmbeddingTokenizer,
+            &arctic_fingerprint,
+            &progress,
+        )
+        .unwrap();
 
         assert_eq!(second.refreshed_chunks, 0);
         assert_eq!(second.skipped_sources, 1);
@@ -6742,6 +6817,53 @@ mod tests {
                 .map(|chunk| chunk.chunk_id)
                 .collect::<Vec<_>>(),
             refreshed_ids
+        );
+        store
+            .mark_sync_run_completed("sync-stale-chunk-fingerprint")
+            .unwrap();
+        assert!(store.capture_retrieval_build_snapshot().unwrap().is_some());
+
+        let epoch_before_switch: i64 = rusqlite::Connection::open(&paths.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM profile_meta
+                 WHERE key = 'source_snapshot_epoch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let switched = refresh_embedding_chunks(
+            &mut store,
+            &TestEmbeddingTokenizer,
+            &gte_fingerprint,
+            &progress,
+        )
+        .unwrap();
+        assert!(switched.refreshed_chunks > 0);
+        let switched_chunks = store.chunks_for_source_version(source_version_id).unwrap();
+        assert!(switched_chunks
+            .iter()
+            .all(|chunk| chunk.chunker_fingerprint == gte_fingerprint));
+        assert_ne!(
+            switched_chunks
+                .iter()
+                .map(|chunk| chunk.chunk_id)
+                .collect::<Vec<_>>(),
+            refreshed_ids
+        );
+        let epoch_after_switch: i64 = rusqlite::Connection::open(&paths.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM profile_meta
+                 WHERE key = 'source_snapshot_epoch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(epoch_after_switch > epoch_before_switch);
+        assert_eq!(
+            store.capture_retrieval_build_snapshot().unwrap_err().code,
+            "publication.source_snapshot_incomplete"
         );
 
         rusqlite::Connection::open(&paths.db_path)
@@ -6758,14 +6880,19 @@ mod tests {
                 rusqlite::params![source_version_id],
             )
             .unwrap();
-        let mixed =
-            refresh_embedding_chunks(&mut store, &TestEmbeddingTokenizer, &progress).unwrap();
+        let mixed = refresh_embedding_chunks(
+            &mut store,
+            &TestEmbeddingTokenizer,
+            &gte_fingerprint,
+            &progress,
+        )
+        .unwrap();
         assert!(mixed.refreshed_chunks > 0);
         assert!(store
             .chunks_for_source_version(source_version_id)
             .unwrap()
             .iter()
-            .all(|chunk| chunk.chunker_fingerprint == CHUNKER_FINGERPRINT));
+            .all(|chunk| chunk.chunker_fingerprint == gte_fingerprint));
 
         let conn = rusqlite::Connection::open(&paths.db_path).unwrap();
         conn.execute_batch(
@@ -6797,14 +6924,19 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let null_fingerprint =
-            refresh_embedding_chunks(&mut store, &TestEmbeddingTokenizer, &progress).unwrap();
+        let null_fingerprint = refresh_embedding_chunks(
+            &mut store,
+            &TestEmbeddingTokenizer,
+            &gte_fingerprint,
+            &progress,
+        )
+        .unwrap();
         assert!(null_fingerprint.refreshed_chunks > 0);
         assert!(store
             .chunks_for_source_version(source_version_id)
             .unwrap()
             .iter()
-            .all(|chunk| chunk.chunker_fingerprint == CHUNKER_FINGERPRINT));
+            .all(|chunk| chunk.chunker_fingerprint == gte_fingerprint));
         assert_eq!(
             store.get_issue(source_id).unwrap().unwrap().body,
             raw_body_before
@@ -6898,11 +7030,23 @@ mod tests {
             query_prefix: Some(crate::embedding::DEFAULT_QUERY_PREFIX.to_string()),
         };
 
+        let error = refresh_incremental_chunk_embeddings_with_provider(
+            &mut store,
+            &MockEmbeddingProvider,
+            "manifest-sync-embed".to_string(),
+            seed.clone(),
+            chunker_fingerprint_for_tokenizer_identity("different-tokenizer-contract"),
+            &expectation,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "embedding.generation_invalid_spec");
+
         let embedded = refresh_incremental_chunk_embeddings_with_provider(
             &mut store,
             &MockEmbeddingProvider,
             "manifest-sync-embed".to_string(),
             seed.clone(),
+            crate::chunking::CHUNKER_FINGERPRINT.to_string(),
             &expectation,
         )
         .unwrap();
@@ -6920,6 +7064,7 @@ mod tests {
             &MockEmbeddingProvider,
             "manifest-sync-embed".to_string(),
             seed,
+            crate::chunking::CHUNKER_FINGERPRINT.to_string(),
             &expectation,
         )
         .unwrap();

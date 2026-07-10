@@ -1104,6 +1104,14 @@ impl PreparedModelStore {
         &self,
         options: &FastembedProviderOptions,
     ) -> Result<FastembedTokenizer, EmbeddingProviderError> {
+        Ok(self.acquire_tokenizer_with_identity(options)?.tokenizer)
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    pub fn acquire_tokenizer_with_identity(
+        &self,
+        options: &FastembedProviderOptions,
+    ) -> Result<PreparedEmbeddingTokenizer, EmbeddingProviderError> {
         let alias_inspection = match fs::symlink_metadata(self.alias_path(options)) {
             Ok(_) => Some(self.inspect_with_roles(options, Some(&TOKENIZER_ARTIFACT_ROLES))?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1478,7 +1486,8 @@ impl PreparedModelStore {
     fn verify_tokenizer(
         &self,
         inspection: PreparedModelInspection,
-    ) -> Result<FastembedTokenizer, EmbeddingProviderError> {
+    ) -> Result<PreparedEmbeddingTokenizer, EmbeddingProviderError> {
+        let contract_identity = tokenizer_contract_identity_from_manifest(&inspection.manifest)?;
         validate_tokenizer_artifact_sizes(
             inspection
                 .artifacts
@@ -1512,13 +1521,18 @@ impl PreparedModelStore {
                 record_tokenizer_only_artifact_bytes(artifact.role, artifact.expected_byte_size);
             }
         }
-        FastembedTokenizer::from_verified_bytes(tokenizer_bytes.ok_or_else(|| {
-            EmbeddingProviderError::structured(
-                "embedding.model_file_missing",
-                "Prepared tokenizer snapshot is missing its tokenizer artifact.",
-            )
-            .with_details(json!({ "role": ArtifactRole::Tokenizer }))
-        })?)
+        let tokenizer =
+            FastembedTokenizer::from_verified_bytes(tokenizer_bytes.ok_or_else(|| {
+                EmbeddingProviderError::structured(
+                    "embedding.model_file_missing",
+                    "Prepared tokenizer snapshot is missing its tokenizer artifact.",
+                )
+                .with_details(json!({ "role": ArtifactRole::Tokenizer }))
+            })?)?;
+        Ok(PreparedEmbeddingTokenizer {
+            tokenizer,
+            contract_identity,
+        })
     }
 
     fn alias_path(&self, options: &FastembedProviderOptions) -> PathBuf {
@@ -2238,7 +2252,7 @@ impl PreparedModelStore {
     fn acquire_hf_tokenizer(
         &self,
         options: &FastembedProviderOptions,
-    ) -> Result<FastembedTokenizer, EmbeddingProviderError> {
+    ) -> Result<PreparedEmbeddingTokenizer, EmbeddingProviderError> {
         let configured_model = options.model.as_deref();
         let explicit_preset = configured_model.and_then(builtin_preset);
         if explicit_preset.is_some()
@@ -2292,7 +2306,16 @@ impl PreparedModelStore {
         let artifacts = tokenizer_artifact_paths(|file| repo.get(file))?;
         let acquired = load_unmanifested_tokenizer_with_evidence(&cache_dir, artifacts)?;
         self.finalize_acquisition_pin(options, &reference, &pinned, &acquired.artifacts)?;
-        Ok(acquired.tokenizer)
+        let source = ModelSourceV1::Hf {
+            model_id: pinned.model_id,
+            resolved_revision: pinned.revision,
+        };
+        let contract_identity =
+            tokenizer_contract_identity_from_evidence(&source, &acquired.artifacts)?;
+        Ok(PreparedEmbeddingTokenizer {
+            tokenizer: acquired.tokenizer,
+            contract_identity,
+        })
     }
 
     #[cfg(feature = "fastembed-provider")]
@@ -2468,7 +2491,7 @@ impl PreparedModelStore {
 #[cfg(feature = "fastembed-provider")]
 fn acquire_local_tokenizer(
     options: &FastembedProviderOptions,
-) -> Result<FastembedTokenizer, EmbeddingProviderError> {
+) -> Result<PreparedEmbeddingTokenizer, EmbeddingProviderError> {
     let model_path = options
         .model_path
         .as_deref()
@@ -2483,7 +2506,16 @@ fn acquire_local_tokenizer(
         model_path.to_path_buf()
     };
     let artifacts = tokenizer_artifact_paths(|file| Ok(root.join(file)))?;
-    load_unmanifested_tokenizer(&root, artifacts)
+    let acquired = load_unmanifested_tokenizer_with_evidence(&root, artifacts)?;
+    let source = ModelSourceV1::Local {
+        declared_id: model_path.to_string_lossy().into_owned(),
+    };
+    let contract_identity =
+        tokenizer_contract_identity_from_evidence(&source, &acquired.artifacts)?;
+    Ok(PreparedEmbeddingTokenizer {
+        tokenizer: acquired.tokenizer,
+        contract_identity,
+    })
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -2495,14 +2527,6 @@ fn tokenizer_artifact_paths(
         .zip(TOKENIZER_FILES)
         .map(|(role, file)| resolve(file).map(|path| (role, file.to_string(), path)))
         .collect()
-}
-
-#[cfg(feature = "fastembed-provider")]
-fn load_unmanifested_tokenizer(
-    root: &Path,
-    artifacts: Vec<(ArtifactRole, String, PathBuf)>,
-) -> Result<FastembedTokenizer, EmbeddingProviderError> {
-    Ok(load_unmanifested_tokenizer_with_evidence(root, artifacts)?.tokenizer)
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -2744,6 +2768,110 @@ fn tokenizer_pin_artifacts_from_materialized(
     }
     validate_tokenizer_pin_artifacts(&selected).map_err(|_| acquisition_artifact_mismatch())?;
     Ok(selected)
+}
+
+pub fn tokenizer_contract_identity_from_manifest(
+    manifest: &ModelManifestV1,
+) -> Result<String, EmbeddingProviderError> {
+    manifest.validate_contract()?;
+    let mut selected = Vec::with_capacity(TOKENIZER_ARTIFACT_ROLES.len());
+    for (expected_role, expected_path) in TOKENIZER_ARTIFACT_ROLES.into_iter().zip(TOKENIZER_FILES)
+    {
+        let mut matching = manifest
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.role == expected_role);
+        let artifact = matching.next().ok_or_else(manifest_artifacts_invalid)?;
+        if matching.next().is_some()
+            || artifact.relative_path != expected_path
+            || artifact.external_initializer_name.is_some()
+        {
+            return Err(manifest_artifacts_invalid());
+        }
+        selected.push(artifact);
+    }
+    Ok(hash_tokenizer_contract_fields(
+        &manifest.model_source,
+        selected.iter().map(|artifact| {
+            (
+                artifact.role,
+                artifact.relative_path.as_str(),
+                artifact.sha256.as_str(),
+                artifact.byte_size,
+            )
+        }),
+    ))
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn tokenizer_contract_identity_from_evidence(
+    source: &ModelSourceV1,
+    artifacts: &[PreparedTokenizerArtifactV2],
+) -> Result<String, EmbeddingProviderError> {
+    validate_tokenizer_pin_artifacts(artifacts)?;
+    Ok(hash_tokenizer_contract_fields(
+        source,
+        artifacts.iter().map(|artifact| {
+            (
+                artifact.role,
+                artifact.relative_path.as_str(),
+                artifact.sha256.as_str(),
+                artifact.byte_size,
+            )
+        }),
+    ))
+}
+
+fn hash_tokenizer_contract_fields<'a>(
+    source: &ModelSourceV1,
+    artifacts: impl IntoIterator<Item = (ArtifactRole, &'a str, &'a str, u64)>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hash_identity_field(&mut hasher, "qgh.tokenizer_contract.v1");
+    // Bind model families so preset switches invalidate chunks even if two
+    // repositories publish identical tokenizer files. Mutable revisions and
+    // local paths are intentionally excluded: exact artifact hashes below
+    // already capture every tokenizer behavior change without graph-only
+    // rechunking.
+    match source {
+        ModelSourceV1::Hf { model_id, .. } => {
+            hash_identity_field(&mut hasher, "hf");
+            hash_identity_field(&mut hasher, model_id);
+        }
+        ModelSourceV1::Local { .. } => {
+            hash_identity_field(&mut hasher, "local");
+        }
+    }
+    for (role, relative_path, sha256, byte_size) in artifacts {
+        hash_identity_field(&mut hasher, artifact_role_identity_name(role));
+        hash_identity_field(&mut hasher, relative_path);
+        hash_identity_field(&mut hasher, sha256);
+        hasher.update(byte_size.to_le_bytes());
+    }
+    hex_digest(&hasher.finalize())
+}
+
+fn hash_identity_field(hasher: &mut Sha256, field: &str) {
+    hasher.update((field.len() as u64).to_le_bytes());
+    hasher.update(field.as_bytes());
+}
+
+fn artifact_role_identity_name(role: ArtifactRole) -> &'static str {
+    match role {
+        ArtifactRole::OnnxModel => "onnx_model",
+        ArtifactRole::OnnxExternalData => "onnx_external_data",
+        ArtifactRole::Tokenizer => "tokenizer",
+        ArtifactRole::Config => "config",
+        ArtifactRole::SpecialTokensMap => "special_tokens_map",
+        ArtifactRole::TokenizerConfig => "tokenizer_config",
+    }
+}
+
+fn manifest_artifacts_invalid() -> EmbeddingProviderError {
+    EmbeddingProviderError::structured(
+        "embedding.manifest_artifacts_invalid",
+        "Embedding manifest tokenizer artifacts are incomplete or ambiguous.",
+    )
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -3983,6 +4111,30 @@ pub struct FastembedTokenizer {
 }
 
 #[cfg(feature = "fastembed-provider")]
+pub struct PreparedEmbeddingTokenizer {
+    tokenizer: FastembedTokenizer,
+    contract_identity: String,
+}
+
+#[cfg(feature = "fastembed-provider")]
+impl PreparedEmbeddingTokenizer {
+    pub fn contract_identity(&self) -> &str {
+        &self.contract_identity
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
+impl EmbeddingTokenizer for PreparedEmbeddingTokenizer {
+    fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError> {
+        self.tokenizer.tokenize(text)
+    }
+
+    fn tokenize_canonical(&self, text: &str) -> Result<TokenizedText, EmbeddingProviderError> {
+        self.tokenizer.tokenize_canonical(text)
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
 fn fastembed_user_defined_model(
     snapshot: &PreparedModelSnapshot,
 ) -> Result<fastembed::UserDefinedEmbeddingModel, EmbeddingProviderError> {
@@ -4928,6 +5080,60 @@ mod tests {
     }
 
     #[test]
+    fn tokenizer_contract_identity_tracks_source_and_exact_tokenizer_artifacts() {
+        let mut manifest = fixture_manifest(
+            [
+                (ArtifactRole::OnnxModel, "model.onnx"),
+                (ArtifactRole::Tokenizer, "tokenizer.json"),
+                (ArtifactRole::Config, "config.json"),
+                (ArtifactRole::SpecialTokensMap, "special_tokens_map.json"),
+                (ArtifactRole::TokenizerConfig, "tokenizer_config.json"),
+            ]
+            .into_iter()
+            .map(|(role, path)| fixture_artifact(role, path, path.as_bytes(), None))
+            .collect(),
+        );
+        let baseline = tokenizer_contract_identity_from_manifest(&manifest).unwrap();
+
+        manifest
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.role == ArtifactRole::Tokenizer)
+            .unwrap()
+            .sha256 = "a".repeat(64);
+        let tokenizer_changed = tokenizer_contract_identity_from_manifest(&manifest).unwrap();
+        assert_ne!(baseline, tokenizer_changed);
+
+        manifest
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.role == ArtifactRole::OnnxModel)
+            .unwrap()
+            .sha256 = "b".repeat(64);
+        assert_eq!(
+            tokenizer_changed,
+            tokenizer_contract_identity_from_manifest(&manifest).unwrap()
+        );
+
+        manifest.model_source = ModelSourceV1::Hf {
+            model_id: "thenlper/gte-modernbert-base".to_string(),
+            resolved_revision: "c".repeat(40),
+        };
+        let gte_identity = tokenizer_contract_identity_from_manifest(&manifest).unwrap();
+        assert_ne!(tokenizer_changed, gte_identity);
+        if let ModelSourceV1::Hf {
+            resolved_revision, ..
+        } = &mut manifest.model_source
+        {
+            *resolved_revision = "d".repeat(40);
+        }
+        assert_eq!(
+            gte_identity,
+            tokenizer_contract_identity_from_manifest(&manifest).unwrap()
+        );
+    }
+
+    #[test]
     fn prepared_store_rejects_escape_symlink_and_artifact_integrity_mismatch() {
         let root = temp_dir("qgh-prepared-store");
         let snapshot_root = root.join("snapshot");
@@ -5368,6 +5574,16 @@ mod tests {
         assert_eq!(
             finalized.tokenizer_artifacts.as_deref(),
             Some(tokenizer.artifacts.as_slice())
+        );
+        let source = ModelSourceV1::Hf {
+            model_id: reference.model_id.clone(),
+            resolved_revision: pinned.revision.clone(),
+        };
+        let mut prepared_manifest = verified.manifest.clone();
+        prepared_manifest.model_source = source.clone();
+        assert_eq!(
+            tokenizer_contract_identity_from_evidence(&source, &tokenizer.artifacts).unwrap(),
+            tokenizer_contract_identity_from_manifest(&prepared_manifest).unwrap()
         );
 
         fs::write(source_root.join("config.json"), b"[]").unwrap();

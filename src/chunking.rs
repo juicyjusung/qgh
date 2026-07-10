@@ -1,4 +1,5 @@
 use crate::embedding::{EmbeddingProviderError, EmbeddingTokenizer, TokenSpan};
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
 
@@ -76,13 +77,63 @@ pub fn chunk_markdown(
     text: &str,
     tokenizer: &(impl EmbeddingTokenizer + ?Sized),
 ) -> Result<Vec<MarkdownChunk>, ChunkingError> {
-    chunk_markdown_with_config(text, tokenizer, ChunkerConfig::default())
+    chunk_markdown_with_config_and_fingerprint(
+        text,
+        tokenizer,
+        ChunkerConfig::default(),
+        CHUNKER_FINGERPRINT,
+    )
+}
+
+pub fn chunk_markdown_with_tokenizer_identity(
+    text: &str,
+    tokenizer: &(impl EmbeddingTokenizer + ?Sized),
+    tokenizer_identity: &str,
+) -> Result<Vec<MarkdownChunk>, ChunkingError> {
+    let fingerprint = chunker_fingerprint_for_tokenizer_identity(tokenizer_identity);
+    chunk_markdown_with_fingerprint(text, tokenizer, &fingerprint)
+}
+
+pub fn chunk_markdown_with_fingerprint(
+    text: &str,
+    tokenizer: &(impl EmbeddingTokenizer + ?Sized),
+    fingerprint: &str,
+) -> Result<Vec<MarkdownChunk>, ChunkingError> {
+    chunk_markdown_with_config_and_fingerprint(
+        text,
+        tokenizer,
+        ChunkerConfig::default(),
+        fingerprint,
+    )
+}
+
+pub fn chunker_fingerprint_for_tokenizer_identity(tokenizer_identity: &str) -> String {
+    let mut hasher = Sha256::new();
+    for field in [
+        "qgh.chunker_contract.v1",
+        CHUNKER_VERSION,
+        CHUNKER_FINGERPRINT,
+        tokenizer_identity,
+    ] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    format!("{CHUNKER_VERSION}:{}", hex_digest(&hasher.finalize()))
 }
 
 pub fn chunk_markdown_with_config(
     text: &str,
     tokenizer: &(impl EmbeddingTokenizer + ?Sized),
     config: ChunkerConfig,
+) -> Result<Vec<MarkdownChunk>, ChunkingError> {
+    chunk_markdown_with_config_and_fingerprint(text, tokenizer, config, CHUNKER_FINGERPRINT)
+}
+
+fn chunk_markdown_with_config_and_fingerprint(
+    text: &str,
+    tokenizer: &(impl EmbeddingTokenizer + ?Sized),
+    config: ChunkerConfig,
+    fingerprint: &str,
 ) -> Result<Vec<MarkdownChunk>, ChunkingError> {
     if config.target_tokens == 0 {
         return Err(ChunkingError::new(
@@ -142,7 +193,7 @@ pub fn chunk_markdown_with_config(
             token_count: token_end - token_start,
             body: original_text[byte_start..byte_end].to_string(),
             chunker_version: CHUNKER_VERSION.to_string(),
-            chunker_fingerprint: CHUNKER_FINGERPRINT.to_string(),
+            chunker_fingerprint: fingerprint.to_string(),
             heading_path: heading_path(text, normalized_byte_start),
         });
 
@@ -160,6 +211,10 @@ pub fn chunk_markdown_with_config(
     }
 
     Ok(chunks)
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn validate_token_spans(text: &str, tokens: &[TokenSpan]) -> Result<(), ChunkingError> {
@@ -538,6 +593,41 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].token_count, 1);
         assert_eq!(chunks[0].body, text);
+    }
+
+    #[test]
+    fn tokenizer_identity_changes_chunk_fingerprint_without_mutating_body() {
+        let source = "raw body must remain byte-for-byte stable";
+        let arctic = chunk_markdown_with_tokenizer_identity(
+            source,
+            &WhitespaceTokenizer,
+            "arctic-tokenizer-contract",
+        )
+        .unwrap();
+        let gte = chunk_markdown_with_tokenizer_identity(
+            source,
+            &WhitespaceTokenizer,
+            "gte-tokenizer-contract",
+        )
+        .unwrap();
+        let arctic_again = chunk_markdown_with_tokenizer_identity(
+            source,
+            &WhitespaceTokenizer,
+            "arctic-tokenizer-contract",
+        )
+        .unwrap();
+
+        assert_eq!(arctic[0].body, source);
+        assert_eq!(gte[0].body, source);
+        assert_ne!(arctic[0].chunker_fingerprint, gte[0].chunker_fingerprint);
+        assert_eq!(
+            arctic[0].chunker_fingerprint,
+            arctic_again[0].chunker_fingerprint
+        );
+        assert_eq!(
+            arctic[0].chunker_fingerprint,
+            chunker_fingerprint_for_tokenizer_identity("arctic-tokenizer-contract")
+        );
     }
 
     #[test]
