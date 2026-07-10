@@ -1498,6 +1498,33 @@ fn metadata_context_templates_are_exact_and_versioned() {
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
+fn parent_issue_title_change_invalidates_comment_context_hash_in_release_contract() {
+    let before = qgh::context::prepare_embedding_input(
+        qgh::context::EmbeddingSourceContext::Comment {
+            repository: "github.com/owner/repo",
+            parent_issue_number: 47,
+            parent_issue_title: "Old title",
+        },
+        "Unchanged authoritative comment chunk.",
+    );
+    let after = qgh::context::prepare_embedding_input(
+        qgh::context::EmbeddingSourceContext::Comment {
+            repository: "github.com/owner/repo",
+            parent_issue_number: 47,
+            parent_issue_title: "New title",
+        },
+        "Unchanged authoritative comment chunk.",
+    );
+
+    assert_ne!(before.as_str(), after.as_str());
+    assert_ne!(
+        before.context_hash("manifest-hash", "chunker-fingerprint"),
+        after.context_hash("manifest-hash", "chunker-fingerprint")
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
 fn context_probe_uses_only_the_embedding_generation_in_the_active_publication() {
     let path = std::env::temp_dir().join(format!(
         "qgh-live-model-context-publication-{}-{}.sqlite3",
@@ -1983,6 +2010,23 @@ fn production_hard_filter_contract_excludes_competing_sources() {
     assert_eq!(evidence.exact_issue_queries, 2);
 }
 
+#[cfg(all(feature = "fastembed-provider", not(debug_assertions)))]
+#[test]
+fn production_release_hard_filter_contract_excludes_competing_sources() {
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_qgh"));
+    let evidence =
+        live_model_eval_runtime::run_release_hard_filter_contract_probe(binary, CORPUS_JSONL)
+            .expect("release hard-filter contract probe passes");
+    assert_eq!(evidence.active_competing_sources, 7);
+    assert_eq!(evidence.bm25_filtered_queries, 4);
+    assert_eq!(evidence.exact_issue_queries, 2);
+    println!(
+        "QGH_CONTRACT_BINARY_WITNESS={}",
+        live_model_eval_runtime::release_binary_witness_for_test(binary)
+            .expect("release binary witness")
+    );
+}
+
 #[test]
 fn candidate_reports_capture_post_embed_schema_fingerprints() {
     assert!(RUNTIME_SUPPORT.contains("candidate_database_schema_fingerprint"));
@@ -2336,13 +2380,13 @@ fn canonical_gate_bundle_is_strict_and_bound_to_git_binary_and_file_hash() {
     assert_eq!(
         commands,
         [
-            "cargo test --all-features --test issue_body_tracer sync_issue_refreshes_target_issue_and_reconciles_comment_diff -- --exact",
-            "cargo test --all-features --test issue_body_tracer full_reconciliation_tombstones_deleted_comments_and_updates_status -- --exact",
-            "cargo test --all-features store::tests::purge_retry_finishes_idempotently_and_clears_pending -- --exact",
-            "cargo test --all-features embedding::tests::parent_issue_title_change_invalidates_comment_context_hash -- --exact",
-            "cargo test --all-features --test issue_body_tracer concurrent_cli_sync_and_mcp_reads_keep_index_queryable -- --exact",
-            "cargo test --all-features --test search_quality_eval",
-            "cargo test --all-features --test live_model_eval production_hard_filter_contract_excludes_competing_sources -- --exact",
+            "cargo test --release --all-features --test issue_body_tracer sync_issue_refreshes_target_issue_and_reconciles_comment_diff -- --exact",
+            "cargo test --release --all-features --test issue_body_tracer full_reconciliation_tombstones_deleted_comments_and_updates_status -- --exact",
+            "cargo test --release --all-features --test issue_body_tracer pending_purge_is_retried_by_next_sync_without_touching_user_backup -- --exact",
+            "cargo test --release --all-features --test live_model_eval parent_issue_title_change_invalidates_comment_context_hash_in_release_contract -- --exact",
+            "cargo test --release --all-features --test issue_body_tracer concurrent_cli_sync_and_mcp_reads_keep_index_queryable -- --exact",
+            "cargo test --release --all-features --test live_model_eval bm25_baseline_applies_hard_filters_and_round_trips -- --exact",
+            "cargo test --release --all-features --test live_model_eval production_release_hard_filter_contract_excludes_competing_sources -- --exact --nocapture",
         ]
     );
     let path = root.join("contract-gate-bundle.json");
@@ -2367,6 +2411,21 @@ fn canonical_gate_bundle_is_strict_and_bound_to_git_binary_and_file_hash() {
             .len(),
         64
     );
+    assert_eq!(empty_result["cargo_profile"], "release");
+    assert_eq!(empty_result["candidate_binary_root"], "repository");
+    assert_eq!(empty_result["candidate_binary_path"], "target/release/qgh");
+    assert_eq!(empty_result["candidate_binary_sha256"], binary_sha);
+    assert_eq!(empty_result["candidate_binary_exercised"], false);
+    assert!(
+        live_model_eval_runtime::release_binary_identity_is_confined_for_test(
+            empty_result["candidate_binary_path"].as_str().unwrap()
+        )
+    );
+    assert!(
+        !live_model_eval_runtime::release_binary_identity_is_confined_for_test(
+            "forged/release/qgh"
+        )
+    );
     empty_result["observed_test_count"] = json!(0);
     let empty_result_bytes = serde_json::to_vec_pretty(&empty_result).unwrap();
     std::fs::write(&first_result_path, &empty_result_bytes).unwrap();
@@ -2386,6 +2445,31 @@ fn canonical_gate_bundle_is_strict_and_bound_to_git_binary_and_file_hash() {
     let bundle =
         live_model_eval_runtime::contract_gate_bundle_json_for_test(&root, &git_sha, &binary_sha)
             .expect("restore non-empty gate result artifacts");
+    std::fs::write(&path, serde_json::to_vec_pretty(&bundle).unwrap()).unwrap();
+
+    let hard_filter_result_path = root.join("contract-gates/hard_filter_exclusion.json");
+    let mut debug_mismatch: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&hard_filter_result_path).unwrap()).unwrap();
+    assert_eq!(debug_mismatch["candidate_binary_exercised"], true);
+    debug_mismatch["cargo_profile"] = json!("debug");
+    let debug_mismatch_bytes = serde_json::to_vec_pretty(&debug_mismatch).unwrap();
+    std::fs::write(&hard_filter_result_path, &debug_mismatch_bytes).unwrap();
+    let mut debug_bundle = bundle.clone();
+    debug_bundle["gates"][6]["result_sha256"] =
+        json!(format!("{:x}", Sha256::digest(&debug_mismatch_bytes)));
+    std::fs::write(&path, serde_json::to_vec_pretty(&debug_bundle).unwrap()).unwrap();
+    assert!(
+        live_model_eval_runtime::verify_contract_gate_bundle_path_for_test(
+            &root,
+            &git_sha,
+            &binary_sha,
+            None,
+        )
+        .is_err()
+    );
+    let bundle =
+        live_model_eval_runtime::contract_gate_bundle_json_for_test(&root, &git_sha, &binary_sha)
+            .expect("restore release-profile gate result artifacts");
     std::fs::write(&path, serde_json::to_vec_pretty(&bundle).unwrap()).unwrap();
 
     let nested_result = root.join("contract-gates/nested/edit_reconciliation.json");

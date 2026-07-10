@@ -67,6 +67,7 @@ const FINAL_REPORT_ARTIFACT: &str = "live-model-eval-report.json";
 struct ContractGateSpec {
     name: &'static str,
     arguments: &'static [&'static str],
+    requires_binary_witness: bool,
 }
 
 const REQUIRED_CONTRACT_GATES: [ContractGateSpec; 7] = [
@@ -74,6 +75,7 @@ const REQUIRED_CONTRACT_GATES: [ContractGateSpec; 7] = [
         name: "edit_reconciliation",
         arguments: &[
             "test",
+            "--release",
             "--all-features",
             "--test",
             "issue_body_tracer",
@@ -81,11 +83,13 @@ const REQUIRED_CONTRACT_GATES: [ContractGateSpec; 7] = [
             "--",
             "--exact",
         ],
+        requires_binary_witness: false,
     },
     ContractGateSpec {
         name: "delete_and_stale_exclusion",
         arguments: &[
             "test",
+            "--release",
             "--all-features",
             "--test",
             "issue_body_tracer",
@@ -93,31 +97,41 @@ const REQUIRED_CONTRACT_GATES: [ContractGateSpec; 7] = [
             "--",
             "--exact",
         ],
+        requires_binary_witness: false,
     },
     ContractGateSpec {
         name: "purge_pending_retry",
         arguments: &[
             "test",
+            "--release",
             "--all-features",
-            "store::tests::purge_retry_finishes_idempotently_and_clears_pending",
+            "--test",
+            "issue_body_tracer",
+            "pending_purge_is_retried_by_next_sync_without_touching_user_backup",
             "--",
             "--exact",
         ],
+        requires_binary_witness: false,
     },
     ContractGateSpec {
         name: "parent_context_invalidation",
         arguments: &[
             "test",
+            "--release",
             "--all-features",
-            "embedding::tests::parent_issue_title_change_invalidates_comment_context_hash",
+            "--test",
+            "live_model_eval",
+            "parent_issue_title_change_invalidates_comment_context_hash_in_release_contract",
             "--",
             "--exact",
         ],
+        requires_binary_witness: false,
     },
     ContractGateSpec {
         name: "concurrent_publication_snapshot",
         arguments: &[
             "test",
+            "--release",
             "--all-features",
             "--test",
             "issue_body_tracer",
@@ -125,22 +139,36 @@ const REQUIRED_CONTRACT_GATES: [ContractGateSpec; 7] = [
             "--",
             "--exact",
         ],
+        requires_binary_witness: false,
     },
     ContractGateSpec {
         name: "bm25_search_quality",
-        arguments: &["test", "--all-features", "--test", "search_quality_eval"],
+        arguments: &[
+            "test",
+            "--release",
+            "--all-features",
+            "--test",
+            "live_model_eval",
+            "bm25_baseline_applies_hard_filters_and_round_trips",
+            "--",
+            "--exact",
+        ],
+        requires_binary_witness: false,
     },
     ContractGateSpec {
         name: "hard_filter_exclusion",
         arguments: &[
             "test",
+            "--release",
             "--all-features",
             "--test",
             "live_model_eval",
-            "production_hard_filter_contract_excludes_competing_sources",
+            "production_release_hard_filter_contract_excludes_competing_sources",
             "--",
             "--exact",
+            "--nocapture",
         ],
+        requires_binary_witness: true,
     },
 ];
 
@@ -354,6 +382,11 @@ struct ContractGateResult {
     name: String,
     git_sha: String,
     binary_sha256: String,
+    cargo_profile: String,
+    candidate_binary_root: String,
+    candidate_binary_path: String,
+    candidate_binary_sha256: String,
+    candidate_binary_exercised: bool,
     command: String,
     exit_status: i32,
     observed_test_count: usize,
@@ -367,6 +400,9 @@ struct ContractGateBundle {
     schema_version: String,
     git_sha: String,
     binary_sha256: String,
+    cargo_profile: String,
+    candidate_binary_root: String,
+    candidate_binary_path: String,
     gates: Vec<ContractGateRecord>,
 }
 
@@ -377,7 +413,61 @@ struct VerifiedContractGateBundle {
     sha256: String,
     git_sha: String,
     binary_sha256: String,
+    cargo_profile: String,
+    candidate_binary_root: String,
+    candidate_binary_path: String,
     gates: Vec<ContractGateRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseBinaryWitness {
+    schema_version: String,
+    cargo_profile: String,
+    candidate_binary_root: String,
+    candidate_binary_path: String,
+    candidate_binary_sha256: String,
+}
+
+fn release_binary_witness(
+    repo_root: &Path,
+    binary: &Path,
+) -> Result<ReleaseBinaryWitness, DynError> {
+    let candidate_binary_path = confined_root_relative_identity(repo_root, binary)?;
+    if !is_confined_release_binary_identity(&candidate_binary_path) {
+        return Err("contract gate candidate must be the Cargo release qgh binary".into());
+    }
+    Ok(ReleaseBinaryWitness {
+        schema_version: "qgh.live_model_eval_binary_witness.v1".to_string(),
+        cargo_profile: "release".to_string(),
+        candidate_binary_root: "repository".to_string(),
+        candidate_binary_path,
+        candidate_binary_sha256: file_sha256(binary)?,
+    })
+}
+
+#[cfg(not(debug_assertions))]
+pub(super) fn release_binary_witness_for_test(binary: &Path) -> Result<Value, DynError> {
+    let repo_root = std::env::current_dir()?.canonicalize()?;
+    Ok(serde_json::to_value(release_binary_witness(
+        &repo_root, binary,
+    )?)?)
+}
+
+fn parse_release_binary_witness(
+    stdout: &[u8],
+    expected: &ReleaseBinaryWitness,
+) -> Result<(), DynError> {
+    const PREFIX: &str = "QGH_CONTRACT_BINARY_WITNESS=";
+    let witnesses = String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix(PREFIX))
+        .map(serde_json::from_str::<ReleaseBinaryWitness>)
+        .collect::<Result<Vec<_>, _>>()?;
+    if witnesses.len() != 1 || witnesses.first() != Some(expected) {
+        return Err("release contract gate binary witness mismatch".into());
+    }
+    Ok(())
 }
 
 fn load_contract_gate_bundle(
@@ -400,9 +490,12 @@ fn load_contract_gate_bundle(
     }
     let bundle: ContractGateBundle = serde_json::from_slice(&bytes)
         .map_err(|_| "canonical live-eval contract gate bundle is invalid")?;
-    if bundle.schema_version != "qgh.live_model_eval_gate_bundle.v1"
+    if bundle.schema_version != "qgh.live_model_eval_gate_bundle.v2"
         || bundle.git_sha != expected_git_sha
         || bundle.binary_sha256 != expected_binary_sha256
+        || bundle.cargo_profile != "release"
+        || bundle.candidate_binary_root != "repository"
+        || !is_confined_release_binary_identity(&bundle.candidate_binary_path)
         || !is_git_object_id(&bundle.git_sha)
         || !is_sha256(&bundle.binary_sha256)
         || bundle.gates.len() != REQUIRED_CONTRACT_GATES.len()
@@ -428,10 +521,15 @@ fn load_contract_gate_bundle(
         }
         let result: ContractGateResult = serde_json::from_slice(&result_bytes)
             .map_err(|_| "canonical live-eval contract gate result is invalid")?;
-        if result.schema_version != "qgh.live_model_eval_gate_result.v1"
+        if result.schema_version != "qgh.live_model_eval_gate_result.v2"
             || result.name != actual.name
             || result.git_sha != bundle.git_sha
             || result.binary_sha256 != bundle.binary_sha256
+            || result.cargo_profile != bundle.cargo_profile
+            || result.candidate_binary_root != bundle.candidate_binary_root
+            || result.candidate_binary_path != bundle.candidate_binary_path
+            || result.candidate_binary_sha256 != bundle.binary_sha256
+            || result.candidate_binary_exercised != expected.requires_binary_witness
             || result.command != actual.command
             || result.exit_status != actual.exit_status
             || result.observed_test_count != 1
@@ -442,11 +540,14 @@ fn load_contract_gate_bundle(
         }
     }
     Ok(VerifiedContractGateBundle {
-        schema_version: "qgh.live_model_eval_verified_gate_bundle.v1",
+        schema_version: "qgh.live_model_eval_verified_gate_bundle.v2",
         artifact: CONTRACT_GATE_BUNDLE_FILE,
         sha256,
         git_sha: bundle.git_sha,
         binary_sha256: bundle.binary_sha256,
+        cargo_profile: bundle.cargo_profile,
+        candidate_binary_root: bundle.candidate_binary_root,
+        candidate_binary_path: bundle.candidate_binary_path,
         gates: bundle.gates,
     })
 }
@@ -481,6 +582,22 @@ fn confined_contract_gate_result_path(root: &Path, relative: &str) -> Result<Pat
 
 fn is_git_object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_confined_release_binary_identity(value: &str) -> bool {
+    let path = Path::new(value);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && path
+            == Path::new("target")
+                .join("release")
+                .join(format!("qgh{}", std::env::consts::EXE_SUFFIX))
+}
+
+pub(super) fn release_binary_identity_is_confined_for_test(value: &str) -> bool {
+    is_confined_release_binary_identity(value)
 }
 
 fn contract_gate_command(spec: &ContractGateSpec) -> String {
@@ -554,6 +671,10 @@ fn run_contract_gate_bundle(
     binary: &Path,
     binary_sha256: &str,
 ) -> Result<(), DynError> {
+    let binary_witness = release_binary_witness(repo_root, binary)?;
+    if binary_witness.candidate_binary_sha256 != binary_sha256 {
+        return Err("contract gate release binary hash mismatch".into());
+    }
     let result_root = root.join("contract-gates");
     if result_root.exists() {
         let metadata = fs::symlink_metadata(&result_root)?;
@@ -576,12 +697,25 @@ fn run_contract_gate_bundle(
         if !output.status.success() || output.status.code() != Some(0) || observed_test_count != 1 {
             return Err(format!("canonical live-eval contract gate failed: {}", spec.name).into());
         }
+        if spec.requires_binary_witness {
+            parse_release_binary_witness(&output.stdout, &binary_witness)?;
+        } else if String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with("QGH_CONTRACT_BINARY_WITNESS="))
+        {
+            return Err("unexpected release contract gate binary witness".into());
+        }
         let result_artifact = format!("contract-gates/{}.json", spec.name);
         let result = ContractGateResult {
-            schema_version: "qgh.live_model_eval_gate_result.v1".to_string(),
+            schema_version: "qgh.live_model_eval_gate_result.v2".to_string(),
             name: spec.name.to_string(),
             git_sha: git_sha.to_string(),
             binary_sha256: binary_sha256.to_string(),
+            cargo_profile: binary_witness.cargo_profile.clone(),
+            candidate_binary_root: binary_witness.candidate_binary_root.clone(),
+            candidate_binary_path: binary_witness.candidate_binary_path.clone(),
+            candidate_binary_sha256: binary_witness.candidate_binary_sha256.clone(),
+            candidate_binary_exercised: spec.requires_binary_witness,
             command: command.clone(),
             exit_status: 0,
             observed_test_count,
@@ -599,13 +733,19 @@ fn run_contract_gate_bundle(
         });
     }
     let (verified_git_sha, worktree_clean) = repository_identity(repo_root)?;
-    if verified_git_sha != git_sha || !worktree_clean || file_sha256(binary)? != binary_sha256 {
+    if verified_git_sha != git_sha
+        || !worktree_clean
+        || release_binary_witness(repo_root, binary)? != binary_witness
+    {
         return Err("contract gate run identity changed during execution".into());
     }
     let bundle = ContractGateBundle {
-        schema_version: "qgh.live_model_eval_gate_bundle.v1".to_string(),
+        schema_version: "qgh.live_model_eval_gate_bundle.v2".to_string(),
         git_sha: git_sha.to_string(),
         binary_sha256: binary_sha256.to_string(),
+        cargo_profile: binary_witness.cargo_profile,
+        candidate_binary_root: binary_witness.candidate_binary_root,
+        candidate_binary_path: binary_witness.candidate_binary_path,
         gates,
     };
     write_atomic(
@@ -623,15 +763,25 @@ pub(super) fn contract_gate_bundle_json_for_test(
     git_sha: &str,
     binary_sha256: &str,
 ) -> Result<Value, DynError> {
+    let candidate_binary_path = Path::new("target")
+        .join("release")
+        .join(format!("qgh{}", std::env::consts::EXE_SUFFIX))
+        .to_string_lossy()
+        .into_owned();
     let mut gates = Vec::new();
     for spec in REQUIRED_CONTRACT_GATES {
         let command = contract_gate_command(&spec);
         let result_artifact = format!("contract-gates/{}.json", spec.name);
         let result = ContractGateResult {
-            schema_version: "qgh.live_model_eval_gate_result.v1".to_string(),
+            schema_version: "qgh.live_model_eval_gate_result.v2".to_string(),
             name: spec.name.to_string(),
             git_sha: git_sha.to_string(),
             binary_sha256: binary_sha256.to_string(),
+            cargo_profile: "release".to_string(),
+            candidate_binary_root: "repository".to_string(),
+            candidate_binary_path: candidate_binary_path.clone(),
+            candidate_binary_sha256: binary_sha256.to_string(),
+            candidate_binary_exercised: spec.requires_binary_witness,
             command: command.clone(),
             exit_status: 0,
             observed_test_count: 1,
@@ -653,9 +803,12 @@ pub(super) fn contract_gate_bundle_json_for_test(
         });
     }
     Ok(serde_json::to_value(ContractGateBundle {
-        schema_version: "qgh.live_model_eval_gate_bundle.v1".to_string(),
+        schema_version: "qgh.live_model_eval_gate_bundle.v2".to_string(),
         git_sha: git_sha.to_string(),
         binary_sha256: binary_sha256.to_string(),
+        cargo_profile: "release".to_string(),
+        candidate_binary_root: "repository".to_string(),
+        candidate_binary_path,
         gates,
     })
     .expect("contract gate test bundle serializes"))
@@ -2022,6 +2175,13 @@ pub(super) struct HardFilterProbeEvidence {
     pub(super) exact_issue_queries: usize,
 }
 
+#[cfg(not(debug_assertions))]
+pub(super) struct ReleaseHardFilterProbeEvidence {
+    pub(super) active_competing_sources: usize,
+    pub(super) bm25_filtered_queries: usize,
+    pub(super) exact_issue_queries: usize,
+}
+
 #[derive(Clone, Copy)]
 enum ExpectedRankingPath {
     Bm25,
@@ -2039,6 +2199,27 @@ struct HardFilterQuerySetEvidence {
 pub(super) fn run_hard_filter_contract_probe(
     binary: &Path,
     corpus_raw: &str,
+) -> Result<HardFilterProbeEvidence, DynError> {
+    run_hard_filter_contract_probe_with_mode(binary, corpus_raw, true)
+}
+
+#[cfg(not(debug_assertions))]
+pub(super) fn run_release_hard_filter_contract_probe(
+    binary: &Path,
+    corpus_raw: &str,
+) -> Result<ReleaseHardFilterProbeEvidence, DynError> {
+    let evidence = run_hard_filter_contract_probe_with_mode(binary, corpus_raw, false)?;
+    Ok(ReleaseHardFilterProbeEvidence {
+        active_competing_sources: evidence.active_competing_sources,
+        bm25_filtered_queries: evidence.bm25_filtered_queries,
+        exact_issue_queries: evidence.exact_issue_queries,
+    })
+}
+
+fn run_hard_filter_contract_probe_with_mode(
+    binary: &Path,
+    corpus_raw: &str,
+    include_debug_hybrid: bool,
 ) -> Result<HardFilterProbeEvidence, DynError> {
     let corpus = parse_jsonl::<CorpusRecord>(corpus_raw);
     let issue_seed = corpus
@@ -2167,6 +2348,18 @@ pub(super) fn run_hard_filter_contract_probe(
     drop(connection);
 
     let bm25 = run_hard_filter_query_set(&fixture, None, ExpectedRankingPath::Bm25)?;
+
+    if !include_debug_hybrid {
+        let exact_issue_queries = run_exact_issue_filter_queries(&fixture, "{}")?;
+        return Ok(HardFilterProbeEvidence {
+            active_competing_sources: source_count,
+            bm25_filtered_queries: bm25.query_count,
+            hybrid_filtered_queries: 0,
+            hybrid_ranked_results: 0,
+            hybrid_results_with_both_branches: 0,
+            exact_issue_queries,
+        });
+    }
 
     fixture.write_hard_filter_probe_config(
         FILTER_PROBE_TARGET_REPO,
