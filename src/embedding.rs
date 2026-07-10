@@ -21,6 +21,8 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static DURABLE_CREATE_SYNC_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    static DURABLE_CREATE_SYNC_PATHS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     static SNAPSHOT_FILE_SYNC_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
 }
@@ -411,6 +413,16 @@ fn fail_snapshot_directory_sync_after(successful_syncs: usize) {
 #[cfg(test)]
 fn fail_durable_create_sync_after(successful_syncs: usize) {
     DURABLE_CREATE_SYNC_FAILURE_AFTER.set(Some(successful_syncs));
+}
+
+#[cfg(test)]
+fn reset_durable_create_sync_paths() {
+    DURABLE_CREATE_SYNC_PATHS.with(|paths| paths.borrow_mut().clear());
+}
+
+#[cfg(test)]
+fn durable_create_sync_paths() -> Vec<PathBuf> {
+    DURABLE_CREATE_SYNC_PATHS.with(|paths| paths.borrow().clone())
 }
 
 #[cfg(test)]
@@ -3478,11 +3490,16 @@ fn create_prepared_store_root_durable(
     code: &str,
     message: &str,
 ) -> Result<(), EmbeddingProviderError> {
-    create_dir_all_durable(root, code, message)?;
-    if let Some(cache_boundary) = root.parent().and_then(Path::parent) {
-        if cache_boundary.parent().is_some() {
-            sync_durable_directory(cache_boundary, code, message)?;
-        }
+    fs::create_dir_all(root).map_err(|_| EmbeddingProviderError::structured(code, message))?;
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|_| EmbeddingProviderError::structured(code, message))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(EmbeddingProviderError::structured(code, message));
+    }
+    let canonical_root =
+        fs::canonicalize(root).map_err(|_| EmbeddingProviderError::structured(code, message))?;
+    for directory in canonical_root.ancestors() {
+        sync_durable_directory(directory, code, message)?;
     }
     Ok(())
 }
@@ -3494,6 +3511,7 @@ fn sync_durable_directory(
 ) -> Result<(), EmbeddingProviderError> {
     #[cfg(test)]
     {
+        DURABLE_CREATE_SYNC_PATHS.with(|paths| paths.borrow_mut().push(path.to_path_buf()));
         let fail = DURABLE_CREATE_SYNC_FAILURE_AFTER.with(|remaining| match remaining.get() {
             Some(0) => {
                 remaining.set(None);
@@ -5899,38 +5917,62 @@ mod tests {
 
     #[test]
     fn durable_directory_retry_reasserts_every_visible_ancestor() {
-        let root = temp_dir("qgh-multilevel-directory-durability");
-        let prepared = root.join("cache/qgh/prepared-models");
+        let root = fs::canonicalize(temp_dir("qgh-multilevel-directory-durability")).unwrap();
 
-        fail_durable_create_sync_after(2);
-        let first = create_prepared_store_root_durable(
-            &prepared,
-            "embedding.acquisition_artifact_invalid",
-            "Prepared directory ancestry sync failed.",
-        )
-        .unwrap_err();
-        assert!(prepared.is_dir());
+        for failed_at in 0.. {
+            let prepared = root.join(format!(
+                "case-{failed_at}/xdg/one/two/three/four/qgh/prepared-models"
+            ));
+            let expected = prepared
+                .ancestors()
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>();
+            if failed_at == expected.len() {
+                break;
+            }
+            assert!(
+                prepared
+                    .ancestors()
+                    .take_while(|path| !path.exists())
+                    .count()
+                    >= 8,
+                "fixture must cover a newly created multi-level cache boundary"
+            );
 
-        fail_durable_create_sync_after(2);
-        let second = create_prepared_store_root_durable(
-            &prepared,
-            "embedding.acquisition_artifact_invalid",
-            "Prepared directory ancestry sync failed.",
-        )
-        .unwrap_err();
+            reset_durable_create_sync_paths();
+            fail_durable_create_sync_after(failed_at);
+            let error = create_prepared_store_root_durable(
+                &prepared,
+                "embedding.acquisition_artifact_invalid",
+                "Prepared directory ancestry sync failed.",
+            )
+            .unwrap_err();
 
-        assert_eq!(first.code(), "embedding.acquisition_artifact_invalid");
-        assert_eq!(second.code(), "embedding.acquisition_artifact_invalid");
-        assert!(!second
-            .details()
-            .to_string()
-            .contains(&root.to_string_lossy()[..]));
-        create_prepared_store_root_durable(
-            &prepared,
-            "embedding.acquisition_artifact_invalid",
-            "Prepared directory ancestry sync failed.",
-        )
-        .expect("retry reaches and syncs the pre-existing external ancestor");
+            assert_eq!(error.code(), "embedding.acquisition_artifact_invalid");
+            assert!(prepared.is_dir());
+            assert_eq!(
+                durable_create_sync_paths(),
+                expected[..=failed_at],
+                "failure case {failed_at} must reach the selected ancestor leaf-first"
+            );
+            assert!(!error
+                .details()
+                .to_string()
+                .contains(&root.to_string_lossy()[..]));
+
+            reset_durable_create_sync_paths();
+            create_prepared_store_root_durable(
+                &prepared,
+                "embedding.acquisition_artifact_invalid",
+                "Prepared directory ancestry sync failed.",
+            )
+            .expect("retry reasserts every visible ancestor through the filesystem root");
+            assert_eq!(
+                durable_create_sync_paths(),
+                expected,
+                "retry case {failed_at} must sync every ancestor leaf-first"
+            );
+        }
     }
 
     #[cfg(all(feature = "fastembed-provider", unix))]
