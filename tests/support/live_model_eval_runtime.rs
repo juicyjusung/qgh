@@ -4,13 +4,17 @@ use super::{
 };
 use percent_encoding::percent_decode_str;
 use qgh::chunking::{
-    chunk_markdown_with_config, ChunkerConfig, CHUNKER_FINGERPRINT, CHUNKER_VERSION,
+    chunk_markdown_with_config, chunker_fingerprint_for_tokenizer_identity, ChunkerConfig,
+    CHUNKER_FINGERPRINT, CHUNKER_VERSION,
 };
 use qgh::context::{
     embedding_context_hash, prepare_embedding_input, EmbeddingSourceContext,
     METADATA_CONTEXT_TEMPLATE_VERSION,
 };
-use qgh::embedding::{EmbeddingTokenizer, FastembedTokenizer, ModelManifestV1, PreparedModelStore};
+use qgh::embedding::{
+    tokenizer_contract_identity_from_manifest, EmbeddingTokenizer, FastembedTokenizer,
+    ModelManifestV1, PreparedModelStore,
+};
 use qgh::search_eval::{
     production_lexical_profile_for_eval, search_with_lexical_profile_for_eval, EvalLexicalProfile,
     SearchFilters,
@@ -63,6 +67,10 @@ const FILTER_PROBE_SENTINEL: &str = "bounded-adversarial-filter-sentinel";
 const FILTER_PROBE_PRESET: &str = "arctic-l-v2-fp32";
 const CONTRACT_GATE_BUNDLE_FILE: &str = "contract-gate-bundle.json";
 const FINAL_REPORT_ARTIFACT: &str = "live-model-eval-report.json";
+// Debug-provider fixtures intentionally exercise the legacy static fingerprint.
+// Real prepared candidates must derive their identity from their strict manifest.
+const DEBUG_TEST_TOKENIZER_CONTRACT_IDENTITY: &str = "qgh.debug-test-tokenizer-static.v1";
+const DEBUG_TEST_CHUNKER_FINGERPRINT: &str = CHUNKER_FINGERPRINT;
 
 struct ContractGateSpec {
     name: &'static str,
@@ -249,6 +257,9 @@ struct OfflineFusionDiagnostic {
 
 #[derive(Debug, Clone, Serialize)]
 struct ResourceEvidence {
+    schema_version: &'static str,
+    tokenizer_contract_identity: String,
+    chunker_fingerprint: String,
     phase: String,
     complete: bool,
     cold_process_samples_ms: Vec<f64>,
@@ -289,7 +300,11 @@ struct Blocker {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct BackfillIntegrityEvidence {
     raw_chunks: usize,
+    chunker_fingerprint: String,
+    distinct_chunker_fingerprints: usize,
+    chunker_fingerprint_mismatch_rows: usize,
     generation_state: String,
+    generation_chunker_fingerprint: String,
     generation_output_dimension: usize,
     generation_total_chunks: usize,
     generation_completed_chunks: usize,
@@ -369,6 +384,8 @@ impl Error for HybridFilterContractFailure {}
 struct CandidateHybridFilterContract {
     schema_version: &'static str,
     candidate: String,
+    tokenizer_contract_identity: String,
+    chunker_fingerprint: String,
     manifest_relative_path: String,
     manifest_hash: String,
     prepared_snapshot_sha256: String,
@@ -893,12 +910,15 @@ impl PathPrivacyGuard {
 
 #[derive(Debug, Serialize)]
 struct CandidateReport {
+    schema_version: &'static str,
     candidate: String,
     model_id: String,
     resolved_revision: String,
     runtime: String,
     status: String,
     manifest_hash: Option<String>,
+    tokenizer_contract_identity: Option<String>,
+    chunker_fingerprint: Option<String>,
     candidate_database_schema_fingerprint: Option<String>,
     candidate_tantivy_schema_fingerprint: Option<String>,
     context_contract: Option<ContextContractEvidence>,
@@ -926,7 +946,7 @@ struct FrozenConfig {
     qrels_dev_sha256: String,
     qrels_test_sha256: String,
     chunker_version: &'static str,
-    chunker_fingerprint: &'static str,
+    chunker_base_fingerprint: &'static str,
     context_profile: &'static str,
     fusion: &'static str,
     rrf_k: usize,
@@ -956,6 +976,8 @@ struct FrozenCandidateState {
     offline_dev_diagnostics_sha256: Option<String>,
     manifest_relative_path: Option<String>,
     manifest_hash: Option<String>,
+    tokenizer_contract_identity: Option<String>,
+    chunker_fingerprint: Option<String>,
     manifest_file_sha256: Option<String>,
     artifact_set_sha256: Option<String>,
     prepared_snapshot_sha256: Option<String>,
@@ -970,6 +992,73 @@ struct PreparedSnapshotDigest {
     sha256: String,
     bytes: u64,
     file_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TokenizerChunkerContract {
+    tokenizer_contract_identity: String,
+    chunker_fingerprint: String,
+}
+
+impl TokenizerChunkerContract {
+    fn from_manifest(manifest: &ModelManifestV1) -> Result<Self, DynError> {
+        let tokenizer_contract_identity = tokenizer_contract_identity_from_manifest(manifest)?;
+        let chunker_fingerprint =
+            chunker_fingerprint_for_tokenizer_identity(&tokenizer_contract_identity);
+        let contract = Self {
+            tokenizer_contract_identity,
+            chunker_fingerprint,
+        };
+        contract.validate()?;
+        Ok(contract)
+    }
+
+    fn validate(&self) -> Result<(), DynError> {
+        let fingerprint_hash = self
+            .chunker_fingerprint
+            .strip_prefix(&format!("{CHUNKER_VERSION}:"))
+            .ok_or("dynamic chunker fingerprint has the wrong version prefix")?;
+        if !is_sha256(&self.tokenizer_contract_identity) || !is_sha256(fingerprint_hash) {
+            return Err("tokenizer/chunker contract identity is malformed".into());
+        }
+        Ok(())
+    }
+
+    fn require_match(&self, expected: &Self) -> Result<(), DynError> {
+        self.validate()?;
+        expected.validate()?;
+        if self != expected {
+            return Err("prepared manifest tokenizer/chunker contract changed".into());
+        }
+        Ok(())
+    }
+}
+
+fn tokenizer_chunker_contract_from_manifest_bytes(
+    manifest_bytes: &[u8],
+) -> Result<TokenizerChunkerContract, DynError> {
+    let manifest = ModelManifestV1::from_json_slice(manifest_bytes)?;
+    TokenizerChunkerContract::from_manifest(&manifest)
+}
+
+pub(super) fn tokenizer_chunker_contract_for_test(
+    manifest_bytes: &[u8],
+    expected_tokenizer_contract_identity: Option<&str>,
+    expected_chunker_fingerprint: Option<&str>,
+) -> Result<Value, DynError> {
+    let contract = tokenizer_chunker_contract_from_manifest_bytes(manifest_bytes)?;
+    if expected_tokenizer_contract_identity.is_some() || expected_chunker_fingerprint.is_some() {
+        let expected = TokenizerChunkerContract {
+            tokenizer_contract_identity: expected_tokenizer_contract_identity
+                .ok_or("expected tokenizer identity is missing")?
+                .to_string(),
+            chunker_fingerprint: expected_chunker_fingerprint
+                .ok_or("expected chunker fingerprint is missing")?
+                .to_string(),
+        };
+        contract.require_match(&expected)?;
+    }
+    Ok(serde_json::to_value(contract)?)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2250,7 +2339,11 @@ pub(super) fn run_hard_filter_contract_probe(
         FILTER_PROBE_SENTINEL,
         vec![1.0_f32, 0.0, 0.0, 0.0],
     )]))?;
-    fixture.seed_hard_filter_chunks(&prepared.sources)?;
+    fixture.seed_hard_filter_chunks(
+        &prepared.sources,
+        DEBUG_TEST_TOKENIZER_CONTRACT_IDENTITY,
+        DEBUG_TEST_CHUNKER_FINGERPRINT,
+    )?;
     let document_vectors_json = hard_filter_document_vectors_json(&prepared.sources)?;
     let embed = fixture.qgh_with_test_vectors(
         &["embed", "--force", "--json"],
@@ -2443,6 +2536,44 @@ fn hard_filter_probe_sources(
     Ok((sources, issue_metadata))
 }
 
+fn verify_active_chunker_contract(
+    db_path: &Path,
+    expected_chunker_fingerprint: &str,
+) -> Result<(), DynError> {
+    let fingerprint_hash = expected_chunker_fingerprint
+        .strip_prefix(&format!("{CHUNKER_VERSION}:"))
+        .ok_or("expected dynamic chunker fingerprint has the wrong version prefix")?;
+    if !is_sha256(fingerprint_hash) {
+        return Err("expected dynamic chunker fingerprint is malformed".into());
+    }
+    let connection = Connection::open(db_path)?;
+    let generation_chunker_fingerprint: String = connection.query_row(
+        "SELECT eg.chunker_fingerprint
+         FROM retrieval_publication_pointer p
+         JOIN retrieval_publications rp ON rp.publication_id = p.publication_id
+         JOIN embedding_generations eg ON eg.id = rp.embedding_generation_id
+         WHERE p.id = 1 AND rp.active = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let (distinct_chunker_fingerprints, mismatch_rows): (usize, usize) = connection.query_row(
+        "SELECT COUNT(DISTINCT chunker_fingerprint),
+                    coalesce(SUM(CASE WHEN chunker_fingerprint != ?1 THEN 1 ELSE 0 END), 0)
+             FROM chunks",
+        [expected_chunker_fingerprint],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if generation_chunker_fingerprint != expected_chunker_fingerprint
+        || distinct_chunker_fingerprints != 1
+        || mismatch_rows != 0
+    {
+        return Err(
+            "active embedding publication does not match the manifest chunker contract".into(),
+        );
+    }
+    Ok(())
+}
+
 fn run_candidate_hybrid_filter_contract(
     root: &Path,
     binary: &Path,
@@ -2454,6 +2585,7 @@ fn run_candidate_hybrid_filter_contract(
     let binary_witness = release_binary_witness(&repo_root, binary)?;
     let manifest_bytes = fs::read(manifest_path)?;
     let manifest = ModelManifestV1::from_json_slice(&manifest_bytes)?;
+    let tokenizer_chunker_contract = TokenizerChunkerContract::from_manifest(&manifest)?;
     let manifest_hash = manifest.hash();
     let manifest_relative_path = confined_root_relative_identity(root, manifest_path)?;
     let snapshot = prepared_snapshot_digest(
@@ -2488,6 +2620,10 @@ fn run_candidate_hybrid_filter_contract(
     if embedded_chunks != sources.len() {
         return Err("candidate hybrid filter did not embed every adversarial source".into());
     }
+    verify_active_chunker_contract(
+        &fixture.db_path(),
+        &tokenizer_chunker_contract.chunker_fingerprint,
+    )?;
     let source_count = Connection::open(fixture.db_path())?.query_row(
         "SELECT COUNT(*) FROM source_entities WHERE lifecycle_state = 'active'",
         [],
@@ -2505,6 +2641,8 @@ fn run_candidate_hybrid_filter_contract(
     }
     let evidence = candidate_hybrid_filter_contract_evidence(
         candidate,
+        tokenizer_chunker_contract.tokenizer_contract_identity,
+        tokenizer_chunker_contract.chunker_fingerprint,
         manifest_relative_path,
         manifest_hash,
         snapshot.sha256,
@@ -2522,6 +2660,8 @@ fn run_candidate_hybrid_filter_contract(
 #[allow(clippy::too_many_arguments)]
 fn candidate_hybrid_filter_contract_evidence(
     candidate: &str,
+    tokenizer_contract_identity: String,
+    chunker_fingerprint: String,
     manifest_relative_path: String,
     manifest_hash: String,
     prepared_snapshot_sha256: String,
@@ -2535,6 +2675,10 @@ fn candidate_hybrid_filter_contract_evidence(
 ) -> Result<CandidateHybridFilterContract, DynError> {
     let manifest_identity = Path::new(&manifest_relative_path);
     if candidate.is_empty()
+        || !is_sha256(&tokenizer_contract_identity)
+        || !chunker_fingerprint
+            .strip_prefix(&format!("{CHUNKER_VERSION}:"))
+            .is_some_and(is_sha256)
         || manifest_identity.is_absolute()
         || manifest_identity.as_os_str().is_empty()
         || manifest_identity
@@ -2553,8 +2697,10 @@ fn candidate_hybrid_filter_contract_evidence(
         return Err("candidate hybrid filter contract evidence is invalid".into());
     }
     Ok(CandidateHybridFilterContract {
-        schema_version: "qgh.candidate_hybrid_filter_contract.v1",
+        schema_version: "qgh.candidate_hybrid_filter_contract.v2",
         candidate: candidate.to_string(),
+        tokenizer_contract_identity,
+        chunker_fingerprint,
         manifest_relative_path,
         manifest_hash,
         prepared_snapshot_sha256,
@@ -2574,6 +2720,8 @@ pub(super) fn candidate_hybrid_filter_contract_for_test(
     Ok(serde_json::to_value(
         candidate_hybrid_filter_contract_evidence(
             "candidate",
+            "d".repeat(64),
+            format!("{CHUNKER_VERSION}:{}", "e".repeat(64)),
             manifest_relative_path.to_string(),
             "a".repeat(64),
             "b".repeat(64),
@@ -3241,6 +3389,7 @@ struct PreparedCandidate {
     model_id: String,
     revision: String,
     manifest_hash: String,
+    tokenizer_chunker_contract: TokenizerChunkerContract,
     candidate_database_schema_fingerprint: String,
     candidate_tantivy_schema_fingerprint: String,
     context_contract: ContextContractEvidence,
@@ -3274,6 +3423,8 @@ fn frozen_prepared_candidate_state(
 ) -> Result<FrozenCandidateState, DynError> {
     let manifest_bytes = fs::read(&prepared.manifest_path)?;
     let manifest = ModelManifestV1::from_json_slice(&manifest_bytes)?;
+    let tokenizer_chunker_contract = TokenizerChunkerContract::from_manifest(&manifest)?;
+    tokenizer_chunker_contract.require_match(&prepared.tokenizer_chunker_contract)?;
     let snapshot_root = prepared
         .manifest_path
         .parent()
@@ -3296,6 +3447,8 @@ fn frozen_prepared_candidate_state(
         )),
         manifest_relative_path: Some(relative),
         manifest_hash: Some(manifest.hash()),
+        tokenizer_contract_identity: Some(tokenizer_chunker_contract.tokenizer_contract_identity),
+        chunker_fingerprint: Some(tokenizer_chunker_contract.chunker_fingerprint),
         manifest_file_sha256: Some(format!("{:x}", Sha256::digest(&manifest_bytes))),
         artifact_set_sha256: Some(format!(
             "{:x}",
@@ -3334,6 +3487,8 @@ fn frozen_blocked_candidate_state(
         offline_dev_diagnostics_sha256: Some(offline_dev_diagnostics_sha256),
         manifest_relative_path: None,
         manifest_hash: report.manifest_hash.clone(),
+        tokenizer_contract_identity: report.tokenizer_contract_identity.clone(),
+        chunker_fingerprint: report.chunker_fingerprint.clone(),
         manifest_file_sha256: None,
         artifact_set_sha256: None,
         prepared_snapshot_sha256: None,
@@ -3349,6 +3504,7 @@ fn frozen_blocked_candidate_state(
     if manifest_path.is_file() {
         let manifest_bytes = fs::read(&manifest_path)?;
         let manifest = ModelManifestV1::from_json_slice(&manifest_bytes)?;
+        let tokenizer_chunker_contract = TokenizerChunkerContract::from_manifest(&manifest)?;
         let snapshot = prepared_snapshot_digest(
             manifest_path
                 .parent()
@@ -3357,6 +3513,12 @@ fn frozen_blocked_candidate_state(
         frozen.manifest_relative_path =
             Some(confined_root_relative_identity(root, &manifest_path)?);
         frozen.manifest_hash = Some(manifest.hash());
+        frozen.tokenizer_contract_identity = Some(
+            tokenizer_chunker_contract
+                .tokenizer_contract_identity
+                .clone(),
+        );
+        frozen.chunker_fingerprint = Some(tokenizer_chunker_contract.chunker_fingerprint.clone());
         frozen.manifest_file_sha256 = Some(format!("{:x}", Sha256::digest(&manifest_bytes)));
         frozen.artifact_set_sha256 = Some(format!(
             "{:x}",
@@ -3584,6 +3746,7 @@ impl FrozenRunGuard {
             let manifest_path = resolve_confined_root_relative_identity(root, relative)?;
             let manifest_bytes = fs::read(&manifest_path)?;
             let manifest = ModelManifestV1::from_json_slice(&manifest_bytes)?;
+            let tokenizer_chunker_contract = TokenizerChunkerContract::from_manifest(&manifest)?;
             let snapshot = prepared_snapshot_digest(
                 manifest_path
                     .parent()
@@ -3600,6 +3763,14 @@ impl FrozenRunGuard {
                     != Some(actual_manifest_file_sha256.as_str())
                 || frozen.artifact_set_sha256.as_deref()
                     != Some(actual_artifact_set_sha256.as_str())
+                || frozen.tokenizer_contract_identity.as_deref()
+                    != Some(
+                        tokenizer_chunker_contract
+                            .tokenizer_contract_identity
+                            .as_str(),
+                    )
+                || frozen.chunker_fingerprint.as_deref()
+                    != Some(tokenizer_chunker_contract.chunker_fingerprint.as_str())
                 || frozen.prepared_snapshot_sha256.as_deref() != Some(snapshot.sha256.as_str())
                 || frozen.prepared_snapshot_bytes != Some(snapshot.bytes)
                 || frozen.prepared_snapshot_file_count != Some(snapshot.file_count)
@@ -3611,8 +3782,12 @@ impl FrozenRunGuard {
                     .hybrid_filter_contract
                     .as_ref()
                     .ok_or("prepared candidate hybrid filter evidence is missing")?;
-                if evidence.schema_version != "qgh.candidate_hybrid_filter_contract.v1"
+                if evidence.schema_version != "qgh.candidate_hybrid_filter_contract.v2"
                     || evidence.candidate != frozen.candidate
+                    || evidence.tokenizer_contract_identity
+                        != tokenizer_chunker_contract.tokenizer_contract_identity
+                    || evidence.chunker_fingerprint
+                        != tokenizer_chunker_contract.chunker_fingerprint
                     || evidence.manifest_relative_path != relative
                     || evidence.manifest_hash != actual_manifest_hash
                     || evidence.prepared_snapshot_sha256 != snapshot.sha256
@@ -4016,7 +4191,7 @@ pub(super) fn run(
     // deployable frozen values are the actual source constants: k=60 and
     // TOP_K(20) * overfetch(4) = 80.  The k/window grid above is diagnostic.
     let frozen = FrozenConfig {
-        schema_version: "qgh.live_model_eval_config.v4",
+        schema_version: "qgh.live_model_eval_config.v5",
         integrated_git_head: integrated_git_head.clone(),
         worktree_clean,
         release_binary_sha256: host.binary_sha256.clone(),
@@ -4027,7 +4202,7 @@ pub(super) fn run(
         qrels_dev_sha256: qrels_dev_sha256.clone(),
         qrels_test_sha256,
         chunker_version: CHUNKER_VERSION,
-        chunker_fingerprint: CHUNKER_FINGERPRINT,
+        chunker_base_fingerprint: CHUNKER_FINGERPRINT,
         context_profile: "qgh.context.v1",
         fusion: "production_equal_rrf",
         rrf_k: RRF_K,
@@ -4187,7 +4362,7 @@ pub(super) fn run(
     );
     frozen_guard.revalidate_before_final_report(root, &binary)?;
     let mut report = FullReport {
-        schema_version: "qgh.live_model_eval_report.v3",
+        schema_version: "qgh.live_model_eval_report.v4",
         run_finished_at: command_output("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
         corpus_snapshot_at: provenance.snapshot_at,
         host,
@@ -4409,6 +4584,16 @@ fn prepare_candidate_dev(
             };
             eprintln!("live-eval candidate={candidate} status=blocked code={code}");
             let mut report = blocked_candidate(candidate, model_id, revision, code, phase);
+            if let Ok(manifest_bytes) = fs::read(manifest_path) {
+                if let Ok(manifest) = ModelManifestV1::from_json_slice(&manifest_bytes) {
+                    report.manifest_hash = Some(manifest.hash());
+                    if let Ok(contract) = TokenizerChunkerContract::from_manifest(&manifest) {
+                        report.tokenizer_contract_identity =
+                            Some(contract.tokenizer_contract_identity);
+                        report.chunker_fingerprint = Some(contract.chunker_fingerprint);
+                    }
+                }
+            }
             if let Some(failure) = context_failure {
                 report.manifest_hash = Some(failure.manifest_hash.clone());
                 report.candidate_database_schema_fingerprint =
@@ -4447,6 +4632,7 @@ fn try_prepare_candidate_dev(
     fixture.write_config(Some(manifest_path))?;
     let manifest_bytes = fs::read(manifest_path)?;
     let manifest = ModelManifestV1::from_json_slice(&manifest_bytes)?;
+    let tokenizer_chunker_contract = TokenizerChunkerContract::from_manifest(&manifest)?;
     let manifest_hash = manifest.hash();
     let snapshot_bytes = directory_bytes(manifest_path.parent().ok_or("manifest parent missing")?)?;
     let download_transfer_bytes = Some(prepared_model_download_bytes(
@@ -4467,6 +4653,10 @@ fn try_prepare_candidate_dev(
     if chunk_count == 0 {
         return Err("embedding completed without any chunks".into());
     }
+    verify_active_chunker_contract(
+        &fixture.db_path(),
+        &tokenizer_chunker_contract.chunker_fingerprint,
+    )?;
     let db_growth = fixture.db_bytes()?.saturating_sub(db_bytes_before);
     let (candidate_database_schema_fingerprint, candidate_tantivy_schema_fingerprint) =
         fixture.schema_fingerprints()?;
@@ -4502,11 +4692,23 @@ fn try_prepare_candidate_dev(
     let hybrid_filter_contract =
         run_candidate_hybrid_filter_contract(root, binary, candidate, manifest_path, corpus)
             .map_err(|_| -> DynError { Box::new(HybridFilterContractFailure) })?;
+    if hybrid_filter_contract.tokenizer_contract_identity
+        != tokenizer_chunker_contract.tokenizer_contract_identity
+        || hybrid_filter_contract.chunker_fingerprint
+            != tokenizer_chunker_contract.chunker_fingerprint
+    {
+        return Err(Box::new(HybridFilterContractFailure));
+    }
+    verify_active_chunker_contract(
+        &fixture.db_path(),
+        &tokenizer_chunker_contract.chunker_fingerprint,
+    )?;
     Ok(PreparedCandidate {
         candidate: candidate.to_string(),
         model_id: model_id.to_string(),
         revision: revision.to_string(),
         manifest_hash,
+        tokenizer_chunker_contract,
         candidate_database_schema_fingerprint,
         candidate_tantivy_schema_fingerprint,
         context_contract,
@@ -4539,6 +4741,25 @@ fn finish_candidate(
         "live-eval candidate={} phase=heldout-warm-mcp status=running",
         prepared.candidate
     );
+    if verify_active_chunker_contract(
+        &prepared.fixture.db_path(),
+        &prepared.tokenizer_chunker_contract.chunker_fingerprint,
+    )
+    .is_err()
+    {
+        return prepared_candidate_report(
+            prepared,
+            "blocked_after_dev",
+            None,
+            None,
+            vec!["chunker_contract_mismatch".to_string()],
+            vec!["chunker_contract_mismatch".to_string()],
+            Some(Blocker {
+                code: "eval.chunker_contract_mismatch".to_string(),
+                phase: "heldout_preflight".to_string(),
+            }),
+        );
+    }
     let warm = match run_heldout_mcp(&prepared.fixture, held_out) {
         Ok(warm) => warm,
         Err(_) => {
@@ -4579,6 +4800,25 @@ fn finish_candidate(
             );
         }
     };
+    if verify_active_chunker_contract(
+        &prepared.fixture.db_path(),
+        &prepared.tokenizer_chunker_contract.chunker_fingerprint,
+    )
+    .is_err()
+    {
+        return prepared_candidate_report(
+            prepared,
+            "blocked_after_heldout",
+            Some(held_out_metrics),
+            None,
+            vec!["chunker_contract_mismatch".to_string()],
+            vec!["chunker_contract_mismatch".to_string()],
+            Some(Blocker {
+                code: "eval.chunker_contract_mismatch".to_string(),
+                phase: "heldout_postflight".to_string(),
+            }),
+        );
+    }
     eprintln!(
         "live-eval candidate={} phase=50k-effective-runtime status=running",
         prepared.candidate
@@ -4610,6 +4850,7 @@ fn finish_candidate(
         binary,
         &prepared.candidate,
         &prepared.manifest_path,
+        &prepared.tokenizer_chunker_contract,
         corpus,
         &prepared.fixture.cache_home,
     ) {
@@ -4705,6 +4946,15 @@ fn resource_evidence(
     backfill: &PartialBackfillEvidence,
 ) -> ResourceEvidence {
     ResourceEvidence {
+        schema_version: "qgh.live_model_eval_resource.v2",
+        tokenizer_contract_identity: prepared
+            .tokenizer_chunker_contract
+            .tokenizer_contract_identity
+            .clone(),
+        chunker_fingerprint: prepared
+            .tokenizer_chunker_contract
+            .chunker_fingerprint
+            .clone(),
         phase: phase.to_string(),
         complete,
         cold_start_p95_ms: percentile(&prepared.cold_samples_ms, 0.95),
@@ -4744,6 +4994,9 @@ fn resource_evidence(
 
 pub(super) fn resource_failure_contract_for_test() -> Value {
     let resources = ResourceEvidence {
+        schema_version: "qgh.live_model_eval_resource.v2",
+        tokenizer_contract_identity: "d".repeat(64),
+        chunker_fingerprint: format!("{CHUNKER_VERSION}:{}", "e".repeat(64)),
         phase: "50k_embed".to_string(),
         complete: false,
         cold_process_samples_ms: vec![1.0],
@@ -4796,12 +5049,19 @@ fn prepared_candidate_report(
 ) -> CandidateReport {
     let report_path = prepared.fixture.root.join("report.json");
     let report = CandidateReport {
+        schema_version: "qgh.live_model_eval_candidate.v2",
         candidate: prepared.candidate,
         model_id: prepared.model_id,
         resolved_revision: prepared.revision,
         runtime: "qgh release binary / fastembed UserDefinedEmbeddingModel".to_string(),
         status: status.to_string(),
         manifest_hash: Some(prepared.manifest_hash),
+        tokenizer_contract_identity: Some(
+            prepared
+                .tokenizer_chunker_contract
+                .tokenizer_contract_identity,
+        ),
+        chunker_fingerprint: Some(prepared.tokenizer_chunker_contract.chunker_fingerprint),
         candidate_database_schema_fingerprint: Some(prepared.candidate_database_schema_fingerprint),
         candidate_tantivy_schema_fingerprint: Some(prepared.candidate_tantivy_schema_fingerprint),
         context_contract: Some(prepared.context_contract),
@@ -4827,12 +5087,15 @@ fn blocked_candidate(
     phase: &str,
 ) -> CandidateReport {
     CandidateReport {
+        schema_version: "qgh.live_model_eval_candidate.v2",
         candidate: candidate.to_string(),
         model_id: model_id.to_string(),
         resolved_revision: revision.to_string(),
         runtime: "qgh release binary / fastembed UserDefinedEmbeddingModel".to_string(),
         status: "blocked".to_string(),
         manifest_hash: None,
+        tokenizer_contract_identity: None,
+        chunker_fingerprint: None,
         candidate_database_schema_fingerprint: None,
         candidate_tantivy_schema_fingerprint: None,
         context_contract: None,
@@ -4880,12 +5143,15 @@ fn dragonkue_blocker(root: &Path) -> Result<CandidateReport, DynError> {
         blocker.code
     );
     Ok(CandidateReport {
+        schema_version: "qgh.live_model_eval_candidate.v2",
         candidate: "dragonkue-ko".to_string(),
         model_id: DRAGONKUE_MODEL_ID.to_string(),
         resolved_revision: DRAGONKUE_REVISION.to_string(),
         runtime: "qgh fastembed UserDefinedEmbeddingModel".to_string(),
         status: "blocked".to_string(),
         manifest_hash: None,
+        tokenizer_contract_identity: None,
+        chunker_fingerprint: None,
         candidate_database_schema_fingerprint: None,
         candidate_tantivy_schema_fingerprint: None,
         context_contract: None,
@@ -4912,10 +5178,20 @@ fn measure_50k_backfill(
     binary: &Path,
     candidate: &str,
     manifest_path: &Path,
+    expected_tokenizer_chunker_contract: &TokenizerChunkerContract,
     corpus: &[CorpusRecord],
     shared_cache: &Path,
 ) -> Result<BackfillEvidence, Box<ResourceRunFailure>> {
     let mut partial = PartialBackfillEvidence::default();
+    let manifest_bytes =
+        fs::read(manifest_path).map_err(|_| resource_run_failure("50k_setup", &partial))?;
+    let manifest = ModelManifestV1::from_json_slice(&manifest_bytes)
+        .map_err(|_| resource_run_failure("50k_setup", &partial))?;
+    let tokenizer_chunker_contract = TokenizerChunkerContract::from_manifest(&manifest)
+        .map_err(|_| resource_run_failure("50k_setup", &partial))?;
+    tokenizer_chunker_contract
+        .require_match(expected_tokenizer_chunker_contract)
+        .map_err(|_| resource_run_failure("50k_setup", &partial))?;
     let fixture = CliFixture::new_with_cache(
         root.join(format!("{candidate}-resource-live")),
         binary.to_path_buf(),
@@ -4933,10 +5209,18 @@ fn measure_50k_backfill(
         .map_err(|_| resource_run_failure("50k_tokenize", &partial))?;
     partial.raw_chunk_tokens = Some(chunk.raw_token_count);
     partial.contextual_chunk_tokens = Some(chunk.contextual_token_count);
-    seed_50k_chunks(&fixture.db_path(), &chunk.body, chunk.raw_token_count)
-        .map_err(|_| resource_run_failure("50k_seed", &partial))?;
-    let seed_preflight = resource_seed_preflight(&fixture.db_path())
-        .map_err(|_| resource_run_failure("50k_seed", &partial))?;
+    seed_50k_chunks(
+        &fixture.db_path(),
+        &chunk.body,
+        chunk.raw_token_count,
+        &tokenizer_chunker_contract.chunker_fingerprint,
+    )
+    .map_err(|_| resource_run_failure("50k_seed", &partial))?;
+    let seed_preflight = resource_seed_preflight(
+        &fixture.db_path(),
+        &tokenizer_chunker_contract.chunker_fingerprint,
+    )
+    .map_err(|_| resource_run_failure("50k_seed", &partial))?;
     let seeded_chunk_count = seed_preflight.seeded_chunks;
     partial.chunk_count = Some(seeded_chunk_count);
     let bytes_before = checkpoint_and_storage_bytes(&fixture.db_path())
@@ -4981,8 +5265,12 @@ fn measure_50k_backfill(
         .map_err(|_| resource_run_failure("50k_verify", &partial))?;
     let db_growth = bytes_after.saturating_sub(bytes_before);
     partial.db_growth_bytes_per_chunk = Some(db_growth as f64 / embedded as f64);
-    let integrity = verify_backfill_integrity(&fixture.db_path(), 50_000)
-        .map_err(|_| resource_run_failure("50k_verify", &partial))?;
+    let integrity = verify_backfill_integrity(
+        &fixture.db_path(),
+        50_000,
+        &tokenizer_chunker_contract.chunker_fingerprint,
+    )
+    .map_err(|_| resource_run_failure("50k_verify", &partial))?;
     partial.integrity = Some(integrity.clone());
     Ok(BackfillEvidence {
         chunk_count: embedded,
@@ -5051,7 +5339,15 @@ fn public_900_token_chunk(
     })
 }
 
-fn seed_50k_chunks(db_path: &Path, body: &str, token_count: usize) -> Result<(), DynError> {
+fn seed_50k_chunks(
+    db_path: &Path,
+    body: &str,
+    token_count: usize,
+    chunker_fingerprint: &str,
+) -> Result<(), DynError> {
+    if chunker_fingerprint.is_empty() {
+        return Err("50k resource seed requires an explicit chunker fingerprint".into());
+    }
     let mut connection = Connection::open(db_path)?;
     let active_versions = {
         let mut statement = connection.prepare(
@@ -5098,7 +5394,7 @@ fn seed_50k_chunks(db_path: &Path, body: &str, token_count: usize) -> Result<(),
                     token_count as i64,
                     body.len() as i64,
                     CHUNKER_VERSION,
-                    CHUNKER_FINGERPRINT,
+                    chunker_fingerprint,
                 ])?;
             }
         }
@@ -5107,7 +5403,10 @@ fn seed_50k_chunks(db_path: &Path, body: &str, token_count: usize) -> Result<(),
     Ok(())
 }
 
-fn resource_seed_preflight(db_path: &Path) -> Result<ResourceSeedPreflight, DynError> {
+fn resource_seed_preflight(
+    db_path: &Path,
+    expected_chunker_fingerprint: &str,
+) -> Result<ResourceSeedPreflight, DynError> {
     let connection = Connection::open(db_path)?;
     let seeded_chunks =
         connection.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
@@ -5177,18 +5476,29 @@ fn resource_seed_preflight(db_path: &Path) -> Result<ResourceSeedPreflight, DynE
         [],
         |row| row.get(0),
     )?;
+    let (distinct_chunker_fingerprints, chunker_fingerprint_mismatch_rows) = connection.query_row(
+        "SELECT COUNT(DISTINCT chunker_fingerprint),
+                    coalesce(SUM(CASE WHEN chunker_fingerprint != ?1 THEN 1 ELSE 0 END), 0)
+             FROM chunks",
+        [expected_chunker_fingerprint],
+        |row| Ok((row.get::<_, usize>(0)?, row.get::<_, usize>(1)?)),
+    )?;
     let evidence = ResourceSeedPreflight {
         seeded_chunks,
         active_latest_versions,
         active_latest_versions_without_chunks,
         minimum_chunks_per_active_version,
         invalid_source_local_chunk_indices,
+        distinct_chunker_fingerprints,
+        chunker_fingerprint_mismatch_rows,
     };
     if evidence.seeded_chunks != 50_000
         || evidence.active_latest_versions == 0
         || evidence.active_latest_versions_without_chunks != 0
         || evidence.minimum_chunks_per_active_version == 0
         || evidence.invalid_source_local_chunk_indices != 0
+        || evidence.distinct_chunker_fingerprints != 1
+        || evidence.chunker_fingerprint_mismatch_rows != 0
     {
         return Err("50k resource seed preflight failed".into());
     }
@@ -5265,8 +5575,9 @@ pub(super) fn resource_seed_embed_contract_for_test(
             return Err("resource writer setup returned an unexpected error".into());
         }
         let body = "public deterministic resource measurement chunk";
-        seed_50k_chunks(&fixture.db_path(), body, 1)?;
-        let preflight = resource_seed_preflight(&fixture.db_path())?;
+        seed_50k_chunks(&fixture.db_path(), body, 1, DEBUG_TEST_CHUNKER_FINGERPRINT)?;
+        let preflight =
+            resource_seed_preflight(&fixture.db_path(), DEBUG_TEST_CHUNKER_FINGERPRINT)?;
         let document_vectors = resource_document_vectors_json(&sources, body)?;
         let output = fixture.qgh_with_test_vectors(
             &["embed", "--force", "--json"],
@@ -5274,13 +5585,18 @@ pub(super) fn resource_seed_embed_contract_for_test(
             Some(&document_vectors),
         )?;
         let envelope: Value = serde_json::from_slice(&output.stdout)?;
-        let post_embed = resource_seed_preflight(&fixture.db_path())?;
+        let post_embed =
+            resource_seed_preflight(&fixture.db_path(), DEBUG_TEST_CHUNKER_FINGERPRINT)?;
         Ok(json!({
+            "tokenizer_contract_identity": DEBUG_TEST_TOKENIZER_CONTRACT_IDENTITY,
+            "chunker_fingerprint": DEBUG_TEST_CHUNKER_FINGERPRINT,
             "seeded_chunks": preflight.seeded_chunks,
             "active_latest_versions": preflight.active_latest_versions,
             "active_latest_versions_without_chunks": preflight.active_latest_versions_without_chunks,
             "minimum_chunks_per_active_version": preflight.minimum_chunks_per_active_version,
             "invalid_source_local_chunk_indices": preflight.invalid_source_local_chunk_indices,
+            "distinct_chunker_fingerprints": preflight.distinct_chunker_fingerprints,
+            "chunker_fingerprint_mismatch_rows": preflight.chunker_fingerprint_mismatch_rows,
             "refreshed_chunks": envelope["data"]["chunks"]["refreshed"],
             "embedded_chunks": envelope["data"]["chunks"]["embedded"],
             "post_embed_chunks": post_embed.seeded_chunks,
@@ -5293,20 +5609,30 @@ pub(super) fn resource_seed_embed_contract_for_test(
 fn verify_backfill_integrity(
     db_path: &Path,
     expected_chunks: usize,
+    expected_chunker_fingerprint: &str,
 ) -> Result<BackfillIntegrityEvidence, DynError> {
     let connection = Connection::open(db_path)?;
     register_eval_sqlite_vec(&connection)?;
     let raw_chunks: usize =
         connection.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
+    let (distinct_chunker_fingerprints, chunker_fingerprint_mismatch_rows): (usize, usize) =
+        connection.query_row(
+            "SELECT COUNT(DISTINCT chunker_fingerprint),
+                    coalesce(SUM(CASE WHEN chunker_fingerprint != ?1 THEN 1 ELSE 0 END), 0)
+             FROM chunks",
+            [expected_chunker_fingerprint],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
     let (
         publication_embedding_generation_id,
         publication_active,
         generation_state,
+        generation_chunker_fingerprint,
         generation_output_dimension,
         generation_total_chunks,
         generation_completed_chunks,
-    ): (i64, bool, String, usize, usize, usize) = connection.query_row(
-        "SELECT eg.id, rp.active, eg.state, eg.output_dimension,
+    ): (i64, bool, String, String, usize, usize, usize) = connection.query_row(
+        "SELECT eg.id, rp.active, eg.state, eg.chunker_fingerprint, eg.output_dimension,
                 eg.total_chunks, eg.completed_chunks
          FROM retrieval_publication_pointer p
          JOIN retrieval_publications rp ON rp.publication_id = p.publication_id
@@ -5321,6 +5647,7 @@ fn verify_backfill_integrity(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
             ))
         },
     )?;
@@ -5365,7 +5692,11 @@ fn verify_backfill_integrity(
     )?;
     let evidence = BackfillIntegrityEvidence {
         raw_chunks,
+        chunker_fingerprint: expected_chunker_fingerprint.to_string(),
+        distinct_chunker_fingerprints,
+        chunker_fingerprint_mismatch_rows,
         generation_state,
+        generation_chunker_fingerprint,
         generation_output_dimension,
         generation_total_chunks,
         generation_completed_chunks,
@@ -5378,6 +5709,9 @@ fn verify_backfill_integrity(
         publication_active,
     };
     if evidence.raw_chunks != expected_chunks
+        || evidence.distinct_chunker_fingerprints != 1
+        || evidence.chunker_fingerprint_mismatch_rows != 0
+        || evidence.generation_chunker_fingerprint != evidence.chunker_fingerprint
         || evidence.generation_state != "active"
         || evidence.generation_total_chunks != expected_chunks
         || evidence.generation_completed_chunks != expected_chunks
@@ -5413,10 +5747,12 @@ fn register_eval_sqlite_vec(connection: &Connection) -> Result<(), DynError> {
 pub(super) fn backfill_integrity_for_test(
     db_path: &Path,
     expected_chunks: usize,
+    expected_chunker_fingerprint: &str,
 ) -> Result<Value, DynError> {
     Ok(serde_json::to_value(verify_backfill_integrity(
         db_path,
         expected_chunks,
+        expected_chunker_fingerprint,
     )?)?)
 }
 
@@ -6216,6 +6552,13 @@ fn weighted_mrr(per_class: &BTreeMap<QueryClass, ClassMetrics>) -> f64 {
 
 fn live_resource_failures(resources: &ResourceEvidence, light: bool) -> Vec<String> {
     let mut failures = resources.protocol_unverified.clone();
+    let fingerprint_valid = resources
+        .chunker_fingerprint
+        .strip_prefix(&format!("{CHUNKER_VERSION}:"))
+        .is_some_and(is_sha256);
+    if !is_sha256(&resources.tokenizer_contract_identity) || !fingerprint_valid {
+        failures.push("tokenizer_chunker_contract".to_string());
+    }
     if !resources.complete {
         failures.push("resource_evidence_incomplete".to_string());
     }
@@ -6231,8 +6574,13 @@ fn live_resource_failures(resources: &ResourceEvidence, light: bool) -> Vec<Stri
     {
         failures.push("measured_contextual_chunk_tokens".to_string());
     }
-    if resources.backfill_integrity.is_none() {
-        failures.push("backfill_integrity".to_string());
+    match resources.backfill_integrity.as_ref() {
+        Some(integrity)
+            if integrity.chunker_fingerprint == resources.chunker_fingerprint
+                && integrity.generation_chunker_fingerprint == resources.chunker_fingerprint
+                && integrity.distinct_chunker_fingerprints == 1
+                && integrity.chunker_fingerprint_mismatch_rows == 0 => {}
+        _ => failures.push("backfill_integrity".to_string()),
     }
     let gib = 1024_u64 * 1024 * 1024;
     if resources.warm_query_p95_ms > 1_500.0 {
@@ -6451,6 +6799,8 @@ struct ResourceSeedPreflight {
     active_latest_versions_without_chunks: usize,
     minimum_chunks_per_active_version: usize,
     invalid_source_local_chunk_indices: usize,
+    distinct_chunker_fingerprints: usize,
+    chunker_fingerprint_mismatch_rows: usize,
 }
 
 struct CliFixture {
@@ -6656,7 +7006,17 @@ limit = 10
         Ok(output)
     }
 
-    fn seed_hard_filter_chunks(&self, sources: &[CorpusRecord]) -> Result<(), DynError> {
+    fn seed_hard_filter_chunks(
+        &self,
+        sources: &[CorpusRecord],
+        test_tokenizer_contract_identity: &str,
+        test_chunker_fingerprint: &str,
+    ) -> Result<(), DynError> {
+        if test_tokenizer_contract_identity != DEBUG_TEST_TOKENIZER_CONTRACT_IDENTITY
+            || test_chunker_fingerprint != DEBUG_TEST_CHUNKER_FINGERPRINT
+        {
+            return Err("debug hard-filter seed requires its explicit static test identity".into());
+        }
         let connection = Connection::open(self.db_path())?;
         connection.execute("DELETE FROM chunks", [])?;
         for source in sources {
@@ -6685,7 +7045,7 @@ limit = 10
                     token_count,
                     byte_end,
                     CHUNKER_VERSION,
-                    CHUNKER_FINGERPRINT,
+                    test_chunker_fingerprint,
                 ],
             )?;
         }

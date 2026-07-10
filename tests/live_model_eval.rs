@@ -444,6 +444,90 @@ fn prepared_manifests_target_context_v1() {
     assert!(!MODEL_PREP_SCRIPT.contains("qgh.context.none.v1"));
 }
 
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn real_manifest_tokenizer_contract_drives_frozen_and_resource_chunker_identity() {
+    let artifact = |role: &str, relative_path: &str, marker: u8| {
+        json!({
+            "role": role,
+            "relative_path": relative_path,
+            "sha256": format!("{marker:02x}").repeat(32),
+            "byte_size": u64::from(marker) + 1,
+        })
+    };
+    let manifest = json!({
+        "schema_version": "qgh.model_manifest.v1",
+        "preset_id": null,
+        "provider": "fastembed",
+        "model_source": {"type": "local", "declared_id": "public-fixture"},
+        "artifacts": [
+            artifact("onnx_model", "onnx/model.onnx", 1),
+            artifact("tokenizer", "tokenizer.json", 2),
+            artifact("config", "config.json", 3),
+            artifact("special_tokens_map", "special_tokens_map.json", 4),
+            artifact("tokenizer_config", "tokenizer_config.json", 5),
+        ],
+        "tokenizer": "hf_tokenizer_json",
+        "query_prefix": "",
+        "document_prefix": "",
+        "pooling": "cls",
+        "normalization": "l2",
+        "native_dimension": 4,
+        "output_dimension": 4,
+        "max_length": 32,
+        "quantization": "none",
+        "context_template_version": "qgh.context.v1",
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let contract =
+        live_model_eval_runtime::tokenizer_chunker_contract_for_test(&manifest_bytes, None, None)
+            .expect("valid real manifest derives its exact tokenizer/chunker contract");
+    let tokenizer_identity = contract["tokenizer_contract_identity"].as_str().unwrap();
+    let chunker_fingerprint = contract["chunker_fingerprint"].as_str().unwrap();
+    assert_eq!(tokenizer_identity.len(), 64);
+    assert!(chunker_fingerprint.starts_with("markdown-token-v2:"));
+    assert_eq!(chunker_fingerprint.len(), "markdown-token-v2:".len() + 64);
+    assert_eq!(
+        contract.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["chunker_fingerprint", "tokenizer_contract_identity"]
+    );
+
+    let mut tokenizer_tamper = manifest.clone();
+    tokenizer_tamper["artifacts"][1]["sha256"] = json!("ff".repeat(32));
+    assert!(
+        live_model_eval_runtime::tokenizer_chunker_contract_for_test(
+            &serde_json::to_vec(&tokenizer_tamper).unwrap(),
+            Some(tokenizer_identity),
+            Some(chunker_fingerprint),
+        )
+        .is_err()
+    );
+
+    let mut model_only_tamper = manifest;
+    model_only_tamper["artifacts"][0]["sha256"] = json!("ee".repeat(32));
+    live_model_eval_runtime::tokenizer_chunker_contract_for_test(
+        &serde_json::to_vec(&model_only_tamper).unwrap(),
+        Some(tokenizer_identity),
+        Some(chunker_fingerprint),
+    )
+    .expect("non-tokenizer artifact does not change the tokenizer contract");
+
+    for required in [
+        "tokenizer_contract_identity_from_manifest",
+        "chunker_fingerprint_for_tokenizer_identity",
+        "tokenizer_contract_identity",
+        "qgh.live_model_eval_config.v5",
+        "qgh.live_model_eval_report.v4",
+        "qgh.live_model_eval_candidate.v2",
+        "qgh.live_model_eval_resource.v2",
+    ] {
+        assert!(RUNTIME_SUPPORT.contains(required), "missing {required}");
+    }
+    assert!(RUNTIME_SUPPORT.contains(
+        "seed_50k_chunks(\n        &fixture.db_path(),\n        &chunk.body,\n        chunk.raw_token_count,\n        &tokenizer_chunker_contract.chunker_fingerprint,"
+    ));
+}
+
 #[test]
 fn model_preparation_records_download_and_cache_source_bytes() {
     let root = std::env::temp_dir().join(format!(
@@ -557,6 +641,10 @@ fn model_preparation_records_download_and_cache_source_bytes() {
         let blocker = live_model_eval_runtime::dragonkue_blocker_for_test(&root)
             .expect("immutable unavailability evidence produces an offline blocker");
         assert_eq!(blocker["candidate"], "dragonkue-ko");
+        assert_eq!(
+            blocker["schema_version"],
+            "qgh.live_model_eval_candidate.v2"
+        );
         assert_eq!(blocker["status"], "blocked");
         assert_eq!(
             blocker["blocker"],
@@ -1349,6 +1437,10 @@ fn resource_failure_preserves_heldout_quality_and_numeric_partial_evidence() {
     let report = live_model_eval_runtime::resource_failure_contract_for_test();
     assert!(report["held_out_metrics"].is_object());
     assert_eq!(report["resources"]["complete"], false);
+    assert_eq!(
+        report["resources"]["schema_version"],
+        "qgh.live_model_eval_resource.v2"
+    );
     assert_eq!(report["resources"]["phase"], "50k_embed");
     assert_eq!(
         report["resources"]["warm_path_includes_manifest_artifact_rehash"],
@@ -1396,6 +1488,16 @@ fn resource_seed_covers_every_active_latest_source_and_production_embed_is_exact
     assert_eq!(evidence["refreshed_chunks"], 0);
     assert_eq!(evidence["embedded_chunks"], 50_000);
     assert_eq!(evidence["post_embed_chunks"], 50_000);
+    assert_eq!(
+        evidence["tokenizer_contract_identity"],
+        "qgh.debug-test-tokenizer-static.v1"
+    );
+    assert_eq!(
+        evidence["chunker_fingerprint"],
+        qgh::chunking::CHUNKER_FINGERPRINT
+    );
+    assert_eq!(evidence["distinct_chunker_fingerprints"], 1);
+    assert_eq!(evidence["chunker_fingerprint_mismatch_rows"], 0);
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -1410,12 +1512,13 @@ fn backfill_success_requires_complete_generation_mapping_vec0_and_publication_co
             .as_nanos()
     ));
     let connection = rusqlite::Connection::open(&path).unwrap();
+    let chunker_fingerprint = format!("markdown-token-v2:{}", "a".repeat(64));
     connection
-        .execute_batch(
-            "CREATE TABLE chunks(id INTEGER PRIMARY KEY);
+        .execute_batch(&format!(
+            "CREATE TABLE chunks(id INTEGER PRIMARY KEY, chunker_fingerprint TEXT NOT NULL);
              CREATE TABLE embedding_generations(
                id INTEGER PRIMARY KEY, state TEXT, output_dimension INTEGER,
-               total_chunks INTEGER, completed_chunks INTEGER
+               total_chunks INTEGER, completed_chunks INTEGER, chunker_fingerprint TEXT NOT NULL
              );
              CREATE TABLE embedding_generation_chunks(generation_id INTEGER, chunk_id INTEGER);
              CREATE TABLE embedding_generation_vector_rows(
@@ -1426,26 +1529,52 @@ fn backfill_success_requires_complete_generation_mapping_vec0_and_publication_co
                publication_id INTEGER PRIMARY KEY, embedding_generation_id INTEGER, active INTEGER
              );
              CREATE TABLE retrieval_publication_pointer(id INTEGER PRIMARY KEY, publication_id INTEGER);
-             INSERT INTO chunks VALUES (1), (2);
-             INSERT INTO embedding_generations VALUES (7, 'active', 4, 2, 2);
+             INSERT INTO chunks VALUES (1, '{chunker_fingerprint}'), (2, '{chunker_fingerprint}');
+             INSERT INTO embedding_generations
+               VALUES (7, 'active', 4, 2, 2, '{chunker_fingerprint}');
              INSERT INTO embedding_generation_chunks VALUES (7, 1), (7, 2);
              INSERT INTO embedding_generation_vector_rows
                VALUES (7, 'embedding_generation_vectors_d4', 1),
                       (7, 'embedding_generation_vectors_d4', 2);
              INSERT INTO embedding_generation_vectors_d4 VALUES (1), (2);
              INSERT INTO retrieval_publications VALUES (9, 7, 1);
-             INSERT INTO retrieval_publication_pointer VALUES (1, 9);",
-        )
+             INSERT INTO retrieval_publication_pointer VALUES (1, 9);"
+        ))
         .unwrap();
     drop(connection);
-    let evidence = live_model_eval_runtime::backfill_integrity_for_test(&path, 2)
-        .expect("complete publication");
+    let evidence =
+        live_model_eval_runtime::backfill_integrity_for_test(&path, 2, &chunker_fingerprint)
+            .expect("complete publication");
     assert_eq!(evidence["generation_total_chunks"], 2);
     assert_eq!(evidence["generation_output_dimension"], 4);
     assert_eq!(evidence["vector_table"], "embedding_generation_vectors_d4");
     assert_eq!(evidence["vector_mapping_rows"], 2);
     assert_eq!(evidence["vec0_rows"], 2);
+    assert_eq!(evidence["chunker_fingerprint"], chunker_fingerprint);
+    assert_eq!(
+        evidence["generation_chunker_fingerprint"],
+        chunker_fingerprint
+    );
+    assert_eq!(evidence["chunker_fingerprint_mismatch_rows"], 0);
     let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE chunks SET chunker_fingerprint = 'legacy-mismatch' WHERE id = 2",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(
+        live_model_eval_runtime::backfill_integrity_for_test(&path, 2, &chunker_fingerprint)
+            .is_err()
+    );
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE chunks SET chunker_fingerprint = ?1 WHERE id = 2",
+            [&chunker_fingerprint],
+        )
+        .unwrap();
     connection
         .execute(
             "DELETE FROM embedding_generation_vectors_d4 WHERE rowid = 2",
@@ -1453,7 +1582,10 @@ fn backfill_success_requires_complete_generation_mapping_vec0_and_publication_co
         )
         .unwrap();
     drop(connection);
-    assert!(live_model_eval_runtime::backfill_integrity_for_test(&path, 2).is_err());
+    assert!(
+        live_model_eval_runtime::backfill_integrity_for_test(&path, 2, &chunker_fingerprint)
+            .is_err()
+    );
     let connection = rusqlite::Connection::open(&path).unwrap();
     connection
         .execute_batch(
@@ -1465,7 +1597,10 @@ fn backfill_success_requires_complete_generation_mapping_vec0_and_publication_co
         )
         .unwrap();
     drop(connection);
-    assert!(live_model_eval_runtime::backfill_integrity_for_test(&path, 2).is_err());
+    assert!(
+        live_model_eval_runtime::backfill_integrity_for_test(&path, 2, &chunker_fingerprint)
+            .is_err()
+    );
     std::fs::remove_file(path).unwrap();
 }
 
@@ -2080,8 +2215,19 @@ fn candidate_hybrid_filter_evidence_is_complete_and_root_relative() {
     .expect("complete root-relative evidence");
     assert_eq!(
         evidence["schema_version"],
-        "qgh.candidate_hybrid_filter_contract.v1"
+        "qgh.candidate_hybrid_filter_contract.v2"
     );
+    assert_eq!(
+        evidence["tokenizer_contract_identity"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(evidence["chunker_fingerprint"]
+        .as_str()
+        .unwrap()
+        .starts_with("markdown-token-v2:"));
     assert_eq!(evidence["active_competing_sources"], 7);
     assert_eq!(evidence["embedded_chunks"], 7);
     assert_eq!(evidence["hybrid_filtered_queries"], 4);
