@@ -3303,17 +3303,32 @@ fn contains_path_marker(bytes: &[u8], markers: &BTreeSet<String>) -> bool {
 }
 
 fn collect_redaction_artifacts(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), DynError> {
-    if !root.exists() {
+    collect_redaction_artifacts_from(root, root, files)
+}
+
+fn collect_redaction_artifacts_from(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), DynError> {
+    if !directory.exists() {
         return Ok(());
     }
-    for entry in fs::read_dir(root)? {
+    for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
         if entry.file_type()?.is_dir() {
-            collect_redaction_artifacts(&path, files)?;
+            collect_redaction_artifacts_from(root, &path, files)?;
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
+        let is_model_input = is_prepared_model_payload(root, &path, &name);
+        if is_model_input {
+            // Prepared model payloads are immutable evaluation inputs. Their
+            // tokenizer vocabularies can legitimately contain a qrel string,
+            // so only qgh-authored model manifests/provenance are audit output.
+            continue;
+        }
         let extension = path.extension().and_then(|extension| extension.to_str());
         if matches!(extension, Some("json" | "jsonl" | "partial" | "fragment"))
             || name.contains("events")
@@ -3324,6 +3339,28 @@ fn collect_redaction_artifacts(root: &Path, files: &mut Vec<PathBuf>) -> Result<
         }
     }
     Ok(())
+}
+
+fn is_prepared_model_payload(root: &Path, path: &Path, name: &str) -> bool {
+    if matches!(name, "manifest.json" | "preparation-provenance.json") {
+        return false;
+    }
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let components = relative
+        .components()
+        .map(|component| component.as_os_str())
+        .collect::<Vec<_>>();
+    components
+        .first()
+        .is_some_and(|component| *component == "models")
+        || components
+            .windows(2)
+            .any(|pair| pair[0] == "hf" && pair[1].to_string_lossy().starts_with("models--"))
+        || components.windows(3).any(|parts| {
+            parts[0] == "qgh" && parts[1] == "prepared-models" && parts[2] == "snapshots"
+        })
 }
 
 pub(super) fn redaction_file_scan_for_test(

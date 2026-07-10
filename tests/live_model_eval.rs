@@ -2783,6 +2783,52 @@ fn redaction_audit_scans_canonical_gate_artifacts_and_partial_canary_fragments()
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
+fn redaction_audit_excludes_model_payloads_but_scans_model_evidence() {
+    let root = std::env::temp_dir().join(format!(
+        "qgh-live-model-redaction-inputs-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let model_root = root.join("models/candidate");
+    std::fs::create_dir_all(&model_root).unwrap();
+    let canary = "private-canary-fragment";
+    std::fs::write(model_root.join("tokenizer.json"), canary).unwrap();
+    std::fs::write(model_root.join("config.json"), canary).unwrap();
+    std::fs::write(model_root.join("manifest.json"), canary).unwrap();
+    std::fs::write(root.join("models/preparation-provenance.json"), "{}\n").unwrap();
+    let cached_model_root =
+        root.join("hard-filter-contract-debug/cache/qgh/hf/models--candidate/snapshots/revision");
+    std::fs::create_dir_all(&cached_model_root).unwrap();
+    std::fs::write(cached_model_root.join("tokenizer.json"), canary).unwrap();
+    let prepared_model_root =
+        root.join("hard-filter-contract-debug/cache/qgh/prepared-models/snapshots/digest");
+    std::fs::create_dir_all(&prepared_model_root).unwrap();
+    std::fs::write(prepared_model_root.join("tokenizer.json"), canary).unwrap();
+    std::fs::write(
+        root.join("hard-filter-contract-debug/candidate-events.jsonl"),
+        canary,
+    )
+    .unwrap();
+
+    let evidence = live_model_eval_runtime::redaction_file_scan_for_test(&root, canary)
+        .expect("redaction scan completes");
+    assert_eq!(evidence["artifact_files_checked"], 3);
+    assert_eq!(
+        evidence["violation_artifacts"],
+        json!([
+            "hard-filter-contract-debug/candidate-events.jsonl",
+            "models/candidate/manifest.json"
+        ])
+    );
+    assert_eq!(evidence["passed"], false);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
 fn redaction_audit_detects_json_escaped_sensitive_values() {
     let root = std::env::temp_dir().join(format!(
         "qgh-live-model-redaction-escaped-{}-{}",
