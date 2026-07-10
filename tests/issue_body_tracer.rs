@@ -3643,12 +3643,56 @@ fn force_embed_uses_local_snapshot_without_advancing_remote_freshness() {
         "Repository: github.com/owner/repo\nComment on issue #42: Cache sync bug\n\nThe answer lives in this comment-only mitigation note.": [0.3, 0.2, 0.1]
     });
 
-    for _ in 0..2 {
-        let embed =
-            fixture.qgh_with_document_vectors(["embed", "--force", "--json"], &document_vectors);
-        assert_success(&embed);
-        assert_eq!(stdout_json(&embed)["data"]["embedding_state"], "refreshed");
-    }
+    let first_embed =
+        fixture.qgh_with_document_vectors(["embed", "--force", "--json"], &document_vectors);
+    assert_success(&first_embed);
+    assert_eq!(
+        stdout_json(&first_embed)["data"]["embedding_state"],
+        "refreshed"
+    );
+    let issue_source_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    let raw_body_before = stdout_json(&fixture.qgh(["get", issue_source_id, "--json"]))["data"]
+        ["source"]["body"]
+        .clone();
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE chunks SET chunker_fingerprint = 'legacy-force-embed-fingerprint'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let repaired_embed =
+        fixture.qgh_with_document_vectors(["embed", "--force", "--json"], &document_vectors);
+    assert_success(&repaired_embed);
+    assert_eq!(
+        stdout_json(&repaired_embed)["data"]["embedding_state"],
+        "refreshed"
+    );
+    let repaired_chunk_ids = fixture.sqlite_chunk_ids_for_source(issue_source_id);
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let stale_fingerprint_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM chunks
+             WHERE chunker_fingerprint IS NOT ?1",
+            [qgh::chunking::CHUNKER_FINGERPRINT],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale_fingerprint_count, 0);
+    drop(conn);
+    assert_eq!(
+        stdout_json(&fixture.qgh(["get", issue_source_id, "--json"]))["data"]["source"]["body"],
+        raw_body_before
+    );
+
+    let idempotent_embed =
+        fixture.qgh_with_document_vectors(["embed", "--force", "--json"], &document_vectors);
+    assert_success(&idempotent_embed);
+    assert_eq!(
+        fixture.sqlite_chunk_ids_for_source(issue_source_id),
+        repaired_chunk_ids
+    );
 
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let remote_completed_at: String = conn
@@ -3677,7 +3721,7 @@ fn force_embed_uses_local_snapshot_without_advancing_remote_freshness() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(local_snapshot_count, 2);
+    assert_eq!(local_snapshot_count, 3);
     drop(conn);
     let status = stdout_json(&fixture.qgh(["status", "--json"]));
     assert_eq!(status["data"]["sync"]["last_sync_at"], backdated);

@@ -2737,6 +2737,29 @@ impl Store {
         Ok(count > 0)
     }
 
+    pub fn source_version_chunks_match_fingerprint(
+        &self,
+        source_version_id: i64,
+        expected_fingerprint: &str,
+    ) -> Result<bool, QghError> {
+        if !embedding_schema_exists(&self.conn)? {
+            return Ok(false);
+        }
+        let (count, mismatched): (i64, i64) = self.conn.query_row(
+            "SELECT count(*),
+                    coalesce(sum(
+                        CASE
+                            WHEN chunker_fingerprint IS ?2 THEN 0
+                            ELSE 1
+                        END
+                    ), 0)
+             FROM chunks WHERE source_version_id = ?1",
+            params![source_version_id, expected_fingerprint],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(count > 0 && mismatched == 0)
+    }
+
     pub fn cleanup_inactive_embedding_artifacts(&mut self) -> Result<usize, QghError> {
         let expected_epoch = self.content_write_epoch;
         let tx = self
@@ -8827,7 +8850,7 @@ fn stored_chunks_match(
     let mut stmt = conn.prepare(
         "SELECT id, source_id, source_version_id, body, chunk_index, token_start,
                 token_end, byte_start, byte_end, chunker_version,
-                chunker_fingerprint, heading_path_json
+                coalesce(chunker_fingerprint, ''), heading_path_json
          FROM chunks WHERE source_version_id = ?1 ORDER BY chunk_index, id",
     )?;
     let stored = stmt
@@ -16649,6 +16672,75 @@ mod tests {
                 .unwrap();
             assert_eq!(version_count, 1);
         }
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(not(feature = "vector-search"))]
+    #[test]
+    fn bm25_store_treats_null_and_mixed_chunk_fingerprints_as_stale() {
+        let paths = temp_profile_paths("bm25-stale-chunk-fingerprints");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_BM25_STALE_CHUNK_FINGERPRINT";
+        store
+            .upsert_sources_for_run(
+                "sync-bm25-stale-chunk-fingerprint",
+                &[test_issue(source_id, "owner/repo", "bm25-stale-chunk")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let source_version_id = store.latest_source_version_id(source_id).unwrap().unwrap();
+        store
+            .conn
+            .execute_batch(&format!(
+                "CREATE TABLE chunks (
+                    id INTEGER PRIMARY KEY, source_version_id INTEGER NOT NULL,
+                    chunker_fingerprint TEXT
+                 );
+                 CREATE TABLE embedding_fingerprints (id INTEGER PRIMARY KEY);
+                 CREATE TABLE chunk_embeddings (chunk_id INTEGER PRIMARY KEY);
+                 INSERT INTO chunks VALUES (1, {source_version_id}, NULL);
+                 INSERT INTO chunks VALUES (
+                    2, {source_version_id}, '{}'
+                 );",
+                crate::chunking::CHUNKER_FINGERPRINT
+            ))
+            .unwrap();
+
+        assert!(!store
+            .source_version_chunks_match_fingerprint(
+                source_version_id,
+                crate::chunking::CHUNKER_FINGERPRINT
+            )
+            .unwrap());
+        store
+            .conn
+            .execute(
+                "UPDATE chunks SET chunker_fingerprint = ?1",
+                params![crate::chunking::CHUNKER_FINGERPRINT],
+            )
+            .unwrap();
+        assert!(store
+            .source_version_chunks_match_fingerprint(
+                source_version_id,
+                crate::chunking::CHUNKER_FINGERPRINT
+            )
+            .unwrap());
+        store
+            .conn
+            .execute(
+                "UPDATE chunks SET chunker_fingerprint = 'legacy-mixed' WHERE id = 2",
+                [],
+            )
+            .unwrap();
+        assert!(!store
+            .source_version_chunks_match_fingerprint(
+                source_version_id,
+                crate::chunking::CHUNKER_FINGERPRINT
+            )
+            .unwrap());
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }

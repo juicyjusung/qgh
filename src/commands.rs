@@ -1,4 +1,4 @@
-use crate::chunking::chunk_markdown;
+use crate::chunking::{chunk_markdown, CHUNKER_FINGERPRINT};
 use crate::cli::{EmbedArgs, InitArgs, InitRepoArgs, InitTokenSourceArg, QueryArgs, ReconcileMode};
 use crate::config::{
     bootstrap_profile_repo, current_git_worktree_root, discover_repo_policy,
@@ -1779,7 +1779,7 @@ fn refresh_embedding_chunks(
                     source.source_id
                 ))
             })?;
-        if store.source_version_has_chunks(source_version_id)? {
+        if store.source_version_chunks_match_fingerprint(source_version_id, CHUNKER_FINGERPRINT)? {
             stats.skipped_sources += 1;
             continue;
         }
@@ -6445,6 +6445,158 @@ mod tests {
             .unwrap()
             .embedding_generation_id
             .is_some());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn chunk_refresh_replaces_stale_fingerprint_and_is_idempotent() {
+        let paths = temp_profile_paths("command-refresh-stale-chunk-fingerprint");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let source_id = "qgh://github.com/issue/I_STALE_CHUNK_FINGERPRINT";
+        let issue = IssueRecord {
+            source_id: source_id.to_string(),
+            host: "github.com".to_string(),
+            repo: "owner/repo".to_string(),
+            node_id: "I_STALE_CHUNK_FINGERPRINT".to_string(),
+            github_id: 906,
+            number: 906,
+            title: "Stale chunk fingerprint".to_string(),
+            body: "raw body must remain byte-for-byte stable".to_string(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone: None,
+            assignees: Vec::new(),
+            author: Some("alice".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            closed_at: None,
+            canonical_url: "https://github.com/owner/repo/issues/906".to_string(),
+            body_hash: "body-hash-stale-chunk-fingerprint".to_string(),
+            indexed_at: "2026-01-02T00:00:01Z".to_string(),
+        };
+        store
+            .upsert_sources_for_run(
+                "sync-stale-chunk-fingerprint",
+                std::slice::from_ref(&issue),
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let progress = StderrSyncProgress::new(false);
+        refresh_embedding_chunks(&mut store, &TestEmbeddingTokenizer, &progress).unwrap();
+        let source_version_id = store.latest_source_version_id(source_id).unwrap().unwrap();
+        rusqlite::Connection::open(&paths.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE chunks SET chunker_fingerprint = 'legacy-stale-fingerprint'
+                 WHERE source_version_id = ?1",
+                rusqlite::params![source_version_id],
+            )
+            .unwrap();
+        let raw_body_before = store.get_issue(source_id).unwrap().unwrap().body;
+
+        let refreshed =
+            refresh_embedding_chunks(&mut store, &TestEmbeddingTokenizer, &progress).unwrap();
+
+        assert_eq!(refreshed.skipped_sources, 0);
+        assert!(refreshed.refreshed_chunks > 0);
+        let refreshed_chunks = store.chunks_for_source_version(source_version_id).unwrap();
+        assert!(refreshed_chunks
+            .iter()
+            .all(|chunk| { chunk.chunker_fingerprint == crate::chunking::CHUNKER_FINGERPRINT }));
+        assert_eq!(
+            store.get_issue(source_id).unwrap().unwrap().body,
+            raw_body_before
+        );
+        let refreshed_ids = refreshed_chunks
+            .iter()
+            .map(|chunk| chunk.chunk_id)
+            .collect::<Vec<_>>();
+
+        let second =
+            refresh_embedding_chunks(&mut store, &TestEmbeddingTokenizer, &progress).unwrap();
+
+        assert_eq!(second.refreshed_chunks, 0);
+        assert_eq!(second.skipped_sources, 1);
+        assert_eq!(
+            store
+                .chunks_for_source_version(source_version_id)
+                .unwrap()
+                .iter()
+                .map(|chunk| chunk.chunk_id)
+                .collect::<Vec<_>>(),
+            refreshed_ids
+        );
+
+        rusqlite::Connection::open(&paths.db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO chunks
+                    (source_id, source_version_id, body, chunk_index, token_start,
+                     token_end, byte_start, byte_end, chunker_version,
+                     chunker_fingerprint, heading_path_json)
+                 SELECT source_id, source_version_id, body, chunk_index + 1, token_start,
+                        token_end, byte_start, byte_end, chunker_version,
+                        'legacy-mixed-fingerprint', heading_path_json
+                 FROM chunks WHERE source_version_id = ?1 LIMIT 1",
+                rusqlite::params![source_version_id],
+            )
+            .unwrap();
+        let mixed =
+            refresh_embedding_chunks(&mut store, &TestEmbeddingTokenizer, &progress).unwrap();
+        assert!(mixed.refreshed_chunks > 0);
+        assert!(store
+            .chunks_for_source_version(source_version_id)
+            .unwrap()
+            .iter()
+            .all(|chunk| chunk.chunker_fingerprint == CHUNKER_FINGERPRINT));
+
+        let conn = rusqlite::Connection::open(&paths.db_path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE chunks RENAME TO chunks_with_strict_fingerprint;
+             CREATE TABLE chunks (
+                id INTEGER PRIMARY KEY,
+                source_id TEXT NOT NULL,
+                source_version_id INTEGER NOT NULL,
+                body TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL DEFAULT 0,
+                token_start INTEGER NOT NULL DEFAULT 0,
+                token_end INTEGER NOT NULL DEFAULT 0,
+                byte_start INTEGER NOT NULL DEFAULT 0,
+                byte_end INTEGER NOT NULL DEFAULT 0,
+                chunker_version TEXT NOT NULL DEFAULT 'markdown-token-v1',
+                chunker_fingerprint TEXT,
+                heading_path_json TEXT NOT NULL DEFAULT '[]'
+             );
+             INSERT INTO chunks
+                (id, source_id, source_version_id, body, chunk_index, token_start,
+                 token_end, byte_start, byte_end, chunker_version,
+                 chunker_fingerprint, heading_path_json)
+             SELECT id, source_id, source_version_id, body, chunk_index, token_start,
+                    token_end, byte_start, byte_end, chunker_version,
+                    NULL, heading_path_json
+             FROM chunks_with_strict_fingerprint;
+             DROP TABLE chunks_with_strict_fingerprint;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let null_fingerprint =
+            refresh_embedding_chunks(&mut store, &TestEmbeddingTokenizer, &progress).unwrap();
+        assert!(null_fingerprint.refreshed_chunks > 0);
+        assert!(store
+            .chunks_for_source_version(source_version_id)
+            .unwrap()
+            .iter()
+            .all(|chunk| chunk.chunker_fingerprint == CHUNKER_FINGERPRINT));
+        assert_eq!(
+            store.get_issue(source_id).unwrap().unwrap().body,
+            raw_body_before
+        );
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
