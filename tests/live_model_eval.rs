@@ -548,6 +548,20 @@ fn resource_failure_preserves_heldout_quality_and_numeric_partial_evidence() {
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
+fn failing_resource_child_preserves_sanitized_numeric_evidence() {
+    let evidence = live_model_eval_runtime::timed_failure_evidence_for_test()
+        .expect("failing child returns typed numeric evidence");
+    assert_eq!(evidence["embedded_chunks"], 12_500);
+    assert!(evidence["elapsed_ms"].as_f64().unwrap() > 0.0);
+    assert!(evidence["peak_rss_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(
+        evidence.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["elapsed_ms", "embedded_chunks", "peak_rss_bytes"]
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
 fn backfill_success_requires_complete_generation_mapping_vec0_and_publication_counts() {
     let path = std::env::temp_dir().join(format!(
         "qgh-live-model-backfill-contract-{}-{}.sqlite3",
@@ -595,6 +609,19 @@ fn backfill_success_requires_complete_generation_mapping_vec0_and_publication_co
         .execute(
             "DELETE FROM embedding_generation_vectors_d4 WHERE rowid = 2",
             [],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(live_model_eval_runtime::backfill_integrity_for_test(&path, 2).is_err());
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO embedding_generation_vectors_d4 VALUES (2);
+             CREATE TABLE embedding_generation_vectors_d8(rowid INTEGER PRIMARY KEY);
+             INSERT INTO embedding_generation_vectors_d8 VALUES (2);
+             UPDATE embedding_generation_vector_rows
+             SET vector_table = 'embedding_generation_vectors_d8'
+             WHERE vector_rowid = 2;",
         )
         .unwrap();
     drop(connection);
@@ -672,6 +699,33 @@ fn target_root_rejects_lookalikes_and_parent_traversal() {
         &cwd,
         std::path::Path::new("target/qgh-eval/../escape")
     ));
+}
+
+#[cfg(all(feature = "fastembed-provider", unix))]
+#[test]
+fn canonical_eval_root_rejects_an_existing_symlink() {
+    let base = std::env::temp_dir().join(format!(
+        "qgh-live-model-root-symlink-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cwd = base.join("repo");
+    let outside = base.join("outside");
+    std::fs::create_dir_all(cwd.join("target")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, cwd.join("target/qgh-eval")).unwrap();
+    assert!(
+        live_model_eval_runtime::ensure_target_root_from_cwd_for_test(
+            &cwd,
+            std::path::Path::new("target/qgh-eval/run"),
+        )
+        .is_err()
+    );
+    std::fs::remove_file(cwd.join("target/qgh-eval")).unwrap();
+    std::fs::remove_dir_all(base).unwrap();
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -784,6 +838,17 @@ fn frozen_run_identity_covers_complete_snapshots_and_is_revalidated_at_phase_bou
         .unwrap();
     let backfill = RUNTIME_SUPPORT.find("measure_50k_backfill(").unwrap();
     assert!(resource_revalidation < backfill);
+    let post_resource_revalidation = RUNTIME_SUPPORT
+        .find("frozen_guard.revalidate_after_50k")
+        .unwrap();
+    let resource_eligibility = RUNTIME_SUPPORT.find("live_resource_failures(").unwrap();
+    assert!(backfill < post_resource_revalidation);
+    assert!(post_resource_revalidation < resource_eligibility);
+    let final_revalidation = RUNTIME_SUPPORT
+        .find("frozen_guard.revalidate_before_final_report")
+        .unwrap();
+    let final_report = RUNTIME_SUPPORT.find("let mut report = FullReport").unwrap();
+    assert!(final_revalidation < final_report);
 }
 
 #[test]
@@ -791,6 +856,33 @@ fn runtime_records_schema_fingerprints_and_derives_redaction_state() {
     assert!(RUNTIME_SUPPORT.contains("database_schema_fingerprint"));
     assert!(RUNTIME_SUPPORT.contains("tantivy_schema_fingerprint"));
     assert!(!RUNTIME_SUPPORT.contains("raw_query_or_body_logged: false"));
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn contract_gate_test_count_is_derived_from_cargo_output() {
+    let stdout = br#"
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out
+
+running 1 test
+test store::tests::purge_retry_finishes_idempotently_and_clears_pending ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 206 filtered out
+"#;
+    let stderr = b"test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+    assert_eq!(
+        live_model_eval_runtime::observed_contract_test_count_for_test(stdout, stderr),
+        1
+    );
+    assert_eq!(
+        live_model_eval_runtime::observed_contract_test_count_for_test(
+            b"test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out\n",
+            b"",
+        ),
+        0
+    );
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -838,6 +930,60 @@ fn canonical_gate_bundle_is_strict_and_bound_to_git_binary_and_file_hash() {
     )
     .expect("valid canonical gate bundle");
     assert_eq!(frozen_hash.len(), 64);
+
+    let first_result_path = root.join("contract-gates/edit_reconciliation.json");
+    let mut empty_result: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&first_result_path).unwrap()).unwrap();
+    assert_eq!(empty_result["observed_test_count"], 1);
+    assert_eq!(
+        empty_result["command_output_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    empty_result["observed_test_count"] = json!(0);
+    let empty_result_bytes = serde_json::to_vec_pretty(&empty_result).unwrap();
+    std::fs::write(&first_result_path, &empty_result_bytes).unwrap();
+    let mut empty_bundle = bundle.clone();
+    empty_bundle["gates"][0]["result_sha256"] =
+        json!(format!("{:x}", Sha256::digest(&empty_result_bytes)));
+    std::fs::write(&path, serde_json::to_vec_pretty(&empty_bundle).unwrap()).unwrap();
+    assert!(
+        live_model_eval_runtime::verify_contract_gate_bundle_path_for_test(
+            &root,
+            &git_sha,
+            &binary_sha,
+            None,
+        )
+        .is_err()
+    );
+    let bundle =
+        live_model_eval_runtime::contract_gate_bundle_json_for_test(&root, &git_sha, &binary_sha)
+            .expect("restore non-empty gate result artifacts");
+    std::fs::write(&path, serde_json::to_vec_pretty(&bundle).unwrap()).unwrap();
+
+    let nested_result = root.join("contract-gates/nested/edit_reconciliation.json");
+    std::fs::create_dir_all(nested_result.parent().unwrap()).unwrap();
+    std::fs::copy(
+        root.join("contract-gates/edit_reconciliation.json"),
+        &nested_result,
+    )
+    .unwrap();
+    let mut nested_bundle = bundle.clone();
+    nested_bundle["gates"][0]["result_artifact"] =
+        json!("contract-gates/nested/edit_reconciliation.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&nested_bundle).unwrap()).unwrap();
+    assert!(
+        live_model_eval_runtime::verify_contract_gate_bundle_path_for_test(
+            &root,
+            &git_sha,
+            &binary_sha,
+            None,
+        )
+        .is_err()
+    );
+    std::fs::write(&path, serde_json::to_vec_pretty(&bundle).unwrap()).unwrap();
 
     std::fs::write(root.join("contract-gates/edit_reconciliation.json"), b"{}").unwrap();
     assert!(

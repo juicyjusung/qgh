@@ -27,7 +27,7 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const TOP_K: usize = 20;
 const WARMUP_RUNS: usize = 1;
@@ -218,6 +218,8 @@ struct BackfillIntegrityEvidence {
     generation_completed_chunks: usize,
     generation_chunk_rows: usize,
     vector_mapping_rows: usize,
+    vector_table: String,
+    vector_table_count: usize,
     vec0_rows: usize,
     publication_embedding_generation_id: i64,
     publication_active: bool,
@@ -291,6 +293,8 @@ struct ContractGateResult {
     binary_sha256: String,
     command: String,
     exit_status: i32,
+    observed_test_count: usize,
+    command_output_sha256: String,
     result: String,
 }
 
@@ -345,9 +349,11 @@ fn load_contract_gate_bundle(
     for (actual, (expected_name, expected_command)) in
         bundle.gates.iter().zip(REQUIRED_CONTRACT_GATES)
     {
+        let expected_result_artifact = format!("contract-gates/{expected_name}.json");
         if actual.name != expected_name
             || actual.command != expected_command
             || actual.exit_status != 0
+            || actual.result_artifact != expected_result_artifact
             || !is_sha256(&actual.result_sha256)
         {
             return Err("canonical live-eval contract gate record failed verification".into());
@@ -366,6 +372,8 @@ fn load_contract_gate_bundle(
             || result.binary_sha256 != bundle.binary_sha256
             || result.command != actual.command
             || result.exit_status != actual.exit_status
+            || result.observed_test_count != 1
+            || !is_sha256(&result.command_output_sha256)
             || result.result != "passed"
         {
             return Err("canonical live-eval contract gate result identity mismatch".into());
@@ -413,6 +421,195 @@ fn is_git_object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn contract_gate_arguments(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        "edit_reconciliation" => Some(&[
+            "test",
+            "--all-features",
+            "--test",
+            "issue_body_tracer",
+            "sync_issue_refreshes_target_issue_and_reconciles_comment_diff",
+            "--",
+            "--exact",
+        ]),
+        "delete_and_stale_exclusion" => Some(&[
+            "test",
+            "--all-features",
+            "--test",
+            "issue_body_tracer",
+            "full_reconciliation_tombstones_deleted_comments_and_updates_status",
+            "--",
+            "--exact",
+        ]),
+        "purge_pending_retry" => Some(&[
+            "test",
+            "--all-features",
+            "store::tests::purge_retry_finishes_idempotently_and_clears_pending",
+            "--",
+            "--exact",
+        ]),
+        "parent_context_invalidation" => Some(&[
+            "test",
+            "--all-features",
+            "embedding::tests::parent_issue_title_change_invalidates_comment_context_hash",
+            "--",
+            "--exact",
+        ]),
+        "concurrent_publication_snapshot" => Some(&[
+            "test",
+            "--all-features",
+            "--test",
+            "issue_body_tracer",
+            "concurrent_cli_sync_and_mcp_reads_keep_index_queryable",
+            "--",
+            "--exact",
+        ]),
+        "bm25_search_quality" => Some(&["test", "--all-features", "--test", "search_quality_eval"]),
+        "hard_filter_exclusion" => Some(&[
+            "test",
+            "--all-features",
+            "--test",
+            "live_model_eval",
+            "production_hard_filter_contract_excludes_competing_sources",
+            "--",
+            "--exact",
+        ]),
+        _ => None,
+    }
+}
+
+fn observed_contract_test_count(stdout: &[u8], stderr: &[u8]) -> usize {
+    [stdout, stderr]
+        .into_iter()
+        .map(|stream| {
+            let output = String::from_utf8_lossy(stream);
+            output
+                .lines()
+                .filter_map(|line| {
+                    let summary = line.split_once("test result:")?.1;
+                    let passed = summary.split_once(" passed;")?.0;
+                    passed.split_whitespace().last()?.parse::<usize>().ok()
+                })
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+fn command_output_sha256(output: &Output) -> String {
+    let mut digest = Sha256::new();
+    digest.update(&output.stdout);
+    digest.update([0]);
+    digest.update(&output.stderr);
+    format!("{:x}", digest.finalize())
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), DynError> {
+    let parent = path
+        .parent()
+        .ok_or("atomic artifact parent is unavailable")?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err("atomic artifact parent must be a regular directory".into());
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("atomic artifact name is invalid")?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "atomic artifact clock is unavailable")?
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{file_name}.{}.{nonce}.partial",
+        std::process::id()
+    ));
+    let mut options = fs::OpenOptions::new();
+    let mut file = options.write(true).create_new(true).open(&temporary)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn run_contract_gate_bundle(
+    root: &Path,
+    repo_root: &Path,
+    git_sha: &str,
+    binary: &Path,
+    binary_sha256: &str,
+) -> Result<(), DynError> {
+    let result_root = root.join("contract-gates");
+    if result_root.exists() {
+        let metadata = fs::symlink_metadata(&result_root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("contract gate artifact directory must be a regular directory".into());
+        }
+    } else {
+        fs::create_dir(&result_root)?;
+    }
+
+    let mut gates = Vec::with_capacity(REQUIRED_CONTRACT_GATES.len());
+    for (name, command) in REQUIRED_CONTRACT_GATES {
+        let arguments = contract_gate_arguments(name)
+            .ok_or("canonical live-eval contract gate command is unavailable")?;
+        let output = Command::new("cargo")
+            .args(arguments)
+            .current_dir(repo_root)
+            .output()
+            .map_err(|_| "canonical live-eval contract gate could not be executed")?;
+        let observed_test_count = observed_contract_test_count(&output.stdout, &output.stderr);
+        if !output.status.success() || output.status.code() != Some(0) || observed_test_count != 1 {
+            return Err(format!("canonical live-eval contract gate failed: {name}").into());
+        }
+        let result_artifact = format!("contract-gates/{name}.json");
+        let result = ContractGateResult {
+            schema_version: "qgh.live_model_eval_gate_result.v1".to_string(),
+            name: name.to_string(),
+            git_sha: git_sha.to_string(),
+            binary_sha256: binary_sha256.to_string(),
+            command: command.to_string(),
+            exit_status: 0,
+            observed_test_count,
+            command_output_sha256: command_output_sha256(&output),
+            result: "passed".to_string(),
+        };
+        let result_bytes = with_newline(serde_json::to_vec_pretty(&result)?);
+        write_atomic(&root.join(&result_artifact), &result_bytes)?;
+        gates.push(ContractGateRecord {
+            name: name.to_string(),
+            command: command.to_string(),
+            exit_status: 0,
+            result_artifact,
+            result_sha256: format!("{:x}", Sha256::digest(&result_bytes)),
+        });
+    }
+    let (verified_git_sha, worktree_clean) = repository_identity(repo_root)?;
+    if verified_git_sha != git_sha || !worktree_clean || file_sha256(binary)? != binary_sha256 {
+        return Err("contract gate run identity changed during execution".into());
+    }
+    let bundle = ContractGateBundle {
+        schema_version: "qgh.live_model_eval_gate_bundle.v1".to_string(),
+        git_sha: git_sha.to_string(),
+        binary_sha256: binary_sha256.to_string(),
+        gates,
+    };
+    write_atomic(
+        &root.join(CONTRACT_GATE_BUNDLE_FILE),
+        &with_newline(serde_json::to_vec_pretty(&bundle)?),
+    )
+}
+
+pub(super) fn observed_contract_test_count_for_test(stdout: &[u8], stderr: &[u8]) -> usize {
+    observed_contract_test_count(stdout, stderr)
+}
+
 pub(super) fn contract_gate_bundle_json_for_test(
     root: &Path,
     git_sha: &str,
@@ -428,6 +625,8 @@ pub(super) fn contract_gate_bundle_json_for_test(
             binary_sha256: binary_sha256.to_string(),
             command: command.to_string(),
             exit_status: 0,
+            observed_test_count: 1,
+            command_output_sha256: "e".repeat(64),
             result: "passed".to_string(),
         };
         let result_bytes = with_newline(serde_json::to_vec_pretty(&result)?);
@@ -1916,6 +2115,14 @@ impl FrozenRunGuard {
         self.revalidate(root, binary, "50k")
     }
 
+    fn revalidate_after_50k(&self, root: &Path, binary: &Path) -> Result<(), DynError> {
+        self.revalidate(root, binary, "post_50k")
+    }
+
+    fn revalidate_before_final_report(&self, root: &Path, binary: &Path) -> Result<(), DynError> {
+        self.revalidate(root, binary, "final_report")
+    }
+
     fn revalidate(&self, root: &Path, binary: &Path, _phase: &str) -> Result<(), DynError> {
         let frozen_bytes = fs::read(root.join("frozen-config.json"))?;
         if format!("{:x}", Sha256::digest(&frozen_bytes)) != self.frozen_config_sha256 {
@@ -2022,6 +2229,13 @@ pub(super) fn run(
         return Err("live evaluation requires the integrated clean git HEAD".into());
     }
     let host_protocol_failures = host_protocol_failures(&host);
+    run_contract_gate_bundle(
+        root,
+        &repo_root,
+        &host.git_sha,
+        &binary,
+        &host.binary_sha256,
+    )?;
     let contract_gate_bundle =
         load_contract_gate_bundle(root, &host.git_sha, &host.binary_sha256, None)?;
     let model_preparation_provenance_sha256 =
@@ -2205,6 +2419,7 @@ pub(super) fn run(
         "completed_not_eligible"
     }
     .to_string();
+    frozen_guard.revalidate_before_final_report(root, &binary)?;
     let mut report = FullReport {
         schema_version: "qgh.live_model_eval_report.v1",
         run_finished_at: command_output("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
@@ -2610,7 +2825,19 @@ fn finish_candidate(
         Err(error) => {
             prepared.isolated_peak_rss =
                 prepared.isolated_peak_rss.max(error.partial.peak_rss_bytes);
-            let resources = resource_evidence(&prepared, &warm, error.phase, false, &error.partial);
+            let identity_changed = frozen_guard.revalidate_after_50k(root, binary).is_err();
+            let failure_phase = if identity_changed {
+                "frozen_revalidation_after_50k"
+            } else {
+                error.phase
+            };
+            let failure_code = if identity_changed {
+                "eval.frozen_identity_changed"
+            } else {
+                error.code
+            };
+            let resources =
+                resource_evidence(&prepared, &warm, failure_phase, false, &error.partial);
             return prepared_candidate_report(
                 prepared,
                 "blocked_after_heldout",
@@ -2619,8 +2846,8 @@ fn finish_candidate(
                 vec!["resource_evidence_incomplete".to_string()],
                 vec!["resource_evidence_incomplete".to_string()],
                 Some(Blocker {
-                    code: error.code.to_string(),
-                    phase: error.phase.to_string(),
+                    code: failure_code.to_string(),
+                    phase: failure_phase.to_string(),
                 }),
             );
         }
@@ -2636,6 +2863,27 @@ fn finish_candidate(
         peak_rss_bytes: backfill.peak_rss_bytes,
         integrity: Some(backfill.integrity),
     };
+    if frozen_guard.revalidate_after_50k(root, binary).is_err() {
+        let resources = resource_evidence(
+            &prepared,
+            &warm,
+            "frozen_revalidation_after_50k",
+            false,
+            &partial,
+        );
+        return prepared_candidate_report(
+            prepared,
+            "blocked_after_heldout",
+            Some(held_out_metrics),
+            Some(resources),
+            vec!["resource_evidence_incomplete".to_string()],
+            vec!["resource_evidence_incomplete".to_string()],
+            Some(Blocker {
+                code: "eval.frozen_identity_changed".to_string(),
+                phase: "frozen_revalidation_after_50k".to_string(),
+            }),
+        );
+    }
     let resources = resource_evidence(&prepared, &warm, "complete", true, &partial);
     let light_gate_failures = live_resource_failures(&resources, true);
     let quality_resource_gate_failures = live_resource_failures(&resources, false);
@@ -2912,9 +3160,20 @@ fn measure_50k_backfill(
     eprintln!(
         "live-eval candidate={candidate} phase=50k-production-embed status=running chunks={seeded_chunk_count} started_at={started_at}"
     );
-    let embed = fixture
-        .timed_qgh_with_start(&["embed", "--force", "--json"], candidate)
-        .map_err(|_| resource_run_failure("50k_embed", &partial))?;
+    let embed = match fixture.timed_qgh_with_start(&["embed", "--force", "--json"], candidate) {
+        Ok(embed) => embed,
+        Err(failure) => {
+            partial.peak_rss_bytes = failure.peak_rss_bytes;
+            partial.seconds = Some(failure.elapsed_ms / 1_000.0);
+            partial.chunk_count = failure.embedded_chunks;
+            if let (Some(chunks), Some(seconds)) = (partial.chunk_count, partial.seconds) {
+                if seconds > 0.0 {
+                    partial.chunks_per_second = Some(chunks as f64 / seconds);
+                }
+            }
+            return Err(resource_run_failure("50k_embed", &partial));
+        }
+    };
     partial.peak_rss_bytes = embed.peak_rss_bytes;
     let seconds = embed.elapsed_ms / 1_000.0;
     partial.seconds = Some(seconds);
@@ -3089,6 +3348,15 @@ fn verify_backfill_integrity(
         [publication_embedding_generation_id],
         |row| row.get(0),
     )?;
+    let vector_table_count: usize = connection.query_row(
+        "SELECT COUNT(DISTINCT vector_table)
+         FROM embedding_generation_vector_rows WHERE generation_id = ?1",
+        [publication_embedding_generation_id],
+        |row| row.get(0),
+    )?;
+    if vector_table_count != 1 {
+        return Err("50k backfill must use exactly one dimension-specific vector table".into());
+    }
     let vector_table: String = connection.query_row(
         "SELECT vector_table FROM embedding_generation_vector_rows
          WHERE generation_id = ?1 ORDER BY vector_table LIMIT 1",
@@ -3107,9 +3375,9 @@ fn verify_backfill_integrity(
         &format!(
             "SELECT COUNT(*) FROM {vector_table} v
              JOIN embedding_generation_vector_rows m ON m.vector_rowid = v.rowid
-             WHERE m.generation_id = ?1"
+             WHERE m.generation_id = ?1 AND m.vector_table = ?2"
         ),
-        [publication_embedding_generation_id],
+        params![publication_embedding_generation_id, vector_table],
         |row| row.get(0),
     )?;
     let evidence = BackfillIntegrityEvidence {
@@ -3119,6 +3387,8 @@ fn verify_backfill_integrity(
         generation_completed_chunks,
         generation_chunk_rows,
         vector_mapping_rows,
+        vector_table,
+        vector_table_count,
         vec0_rows,
         publication_embedding_generation_id,
         publication_active,
@@ -3129,6 +3399,7 @@ fn verify_backfill_integrity(
         || evidence.generation_completed_chunks != expected_chunks
         || evidence.generation_chunk_rows != expected_chunks
         || evidence.vector_mapping_rows != expected_chunks
+        || evidence.vector_table_count != 1
         || evidence.vec0_rows != expected_chunks
         || !evidence.publication_active
     {
@@ -3771,10 +4042,73 @@ struct TimedQuery {
     peak_rss_bytes: u64,
 }
 
+#[derive(Debug)]
 struct TimedOutput {
     output: Output,
     elapsed_ms: f64,
     peak_rss_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TimedCommandFailure {
+    elapsed_ms: f64,
+    peak_rss_bytes: u64,
+    embedded_chunks: Option<usize>,
+}
+
+fn run_timed_command(
+    mut command: Command,
+    candidate: &str,
+) -> Result<TimedOutput, TimedCommandFailure> {
+    let started = Instant::now();
+    let child = command.spawn().map_err(|_| TimedCommandFailure {
+        elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+        peak_rss_bytes: 0,
+        embedded_chunks: None,
+    })?;
+    eprintln!(
+        "live-eval candidate={candidate} phase=50k-production-embed time_wrapper_pid={}",
+        child.id()
+    );
+    let output = child.wait_with_output().map_err(|_| TimedCommandFailure {
+        elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+        peak_rss_bytes: 0,
+        embedded_chunks: None,
+    })?;
+    record_stderr(&output.stderr);
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let peak_rss_bytes = parse_peak_rss(&String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        return Err(TimedCommandFailure {
+            elapsed_ms,
+            peak_rss_bytes,
+            embedded_chunks: serde_json::from_slice::<Value>(&output.stdout)
+                .ok()
+                .and_then(|value| value["data"]["chunks"]["embedded"].as_u64())
+                .map(|count| count as usize),
+        });
+    }
+    Ok(TimedOutput {
+        output,
+        elapsed_ms,
+        peak_rss_bytes,
+    })
+}
+
+pub(super) fn timed_failure_evidence_for_test() -> Result<Value, DynError> {
+    let mut command = Command::new("/usr/bin/time");
+    command
+        .arg("-l")
+        .args([
+            "/bin/sh",
+            "-c",
+            "printf '{\"data\":{\"chunks\":{\"embedded\":12500}}}'; exit 7",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let failure =
+        run_timed_command(command, "typed-failure-test").expect_err("test child must exit nonzero");
+    Ok(serde_json::to_value(failure)?)
 }
 
 struct BackfillEvidence {
@@ -4003,7 +4337,7 @@ limit = 10
         &self,
         arguments: &[&str],
         candidate: &str,
-    ) -> Result<TimedOutput, DynError> {
+    ) -> Result<TimedOutput, TimedCommandFailure> {
         let mut command = Command::new("/usr/bin/time");
         command
             .arg("-l")
@@ -4014,24 +4348,7 @@ limit = 10
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         self.apply_env(&mut command);
-        let started = Instant::now();
-        let child = command.spawn()?;
-        eprintln!(
-            "live-eval candidate={candidate} phase=50k-production-embed time_wrapper_pid={}",
-            child.id()
-        );
-        let output = child.wait_with_output()?;
-        record_stderr(&output.stderr);
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-        if !output.status.success() {
-            return Err(command_failure(&output).into());
-        }
-        let peak_rss_bytes = parse_peak_rss(&String::from_utf8_lossy(&output.stderr));
-        Ok(TimedOutput {
-            output,
-            elapsed_ms,
-            peak_rss_bytes,
-        })
+        run_timed_command(command, candidate)
     }
 
     fn timed_query(&self, qrel: &QrelRecord) -> Result<TimedQuery, DynError> {
@@ -4719,12 +5036,33 @@ fn command_output(command: &str, arguments: &[&str]) -> String {
 
 fn ensure_target_root(root: &Path) -> Result<(), DynError> {
     let cwd = std::env::current_dir()?.canonicalize()?;
+    ensure_target_root_from_cwd(&cwd, root)
+}
+
+fn ensure_target_root_from_cwd(cwd: &Path, root: &Path) -> Result<(), DynError> {
+    let cwd = cwd.canonicalize()?;
     if !target_root_allowed(&cwd, root) {
         return Err("live eval artifacts must stay under target/qgh-eval".into());
     }
+    let target = cwd.join("target");
+    if target.exists() {
+        let metadata = fs::symlink_metadata(&target)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("live eval target directory must not be a symlink".into());
+        }
+    }
     let allowed = cwd.join("target/qgh-eval");
+    if allowed.exists() {
+        let metadata = fs::symlink_metadata(&allowed)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("live eval canonical artifact root must not be a symlink".into());
+        }
+    }
     fs::create_dir_all(&allowed)?;
     let allowed = allowed.canonicalize()?;
+    if !allowed.starts_with(&cwd) {
+        return Err("live eval canonical artifact root escapes the repository".into());
+    }
     let candidate = if root.is_absolute() {
         root.to_path_buf()
     } else {
@@ -4737,11 +5075,21 @@ fn ensure_target_root(root: &Path) -> Result<(), DynError> {
             return Err("live eval root contains a non-normal path component".into());
         };
         cursor.push(component);
-        if cursor.exists() && !cursor.canonicalize()?.starts_with(&allowed) {
-            return Err("live eval root escapes target/qgh-eval through a symlink".into());
+        if cursor.exists() {
+            let metadata = fs::symlink_metadata(&cursor)?;
+            if metadata.file_type().is_symlink() || !cursor.canonicalize()?.starts_with(&allowed) {
+                return Err("live eval root escapes target/qgh-eval through a symlink".into());
+            }
         }
     }
     Ok(())
+}
+
+pub(super) fn ensure_target_root_from_cwd_for_test(
+    cwd: &Path,
+    root: &Path,
+) -> Result<(), DynError> {
+    ensure_target_root_from_cwd(cwd, root)
 }
 
 fn absolute_path(path: PathBuf) -> Result<PathBuf, DynError> {
