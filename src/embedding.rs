@@ -73,6 +73,7 @@ const TOKENIZER_ARTIFACT_ROLES: [ArtifactRole; 4] = [
     ArtifactRole::TokenizerConfig,
 ];
 const MAX_TOKENIZER_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_TOKENIZER_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenSpan {
@@ -394,6 +395,37 @@ fn record_tokenizer_only_artifact_bytes(role: ArtifactRole, bytes: u64) {
     TOKENIZER_ONLY_ARTIFACT_BYTES.with(|recorded| {
         *recorded.borrow_mut().entry(role).or_default() += bytes;
     });
+}
+
+fn validate_tokenizer_artifact_sizes(
+    artifacts: impl IntoIterator<Item = (ArtifactRole, u64)>,
+) -> Result<(), EmbeddingProviderError> {
+    let mut total = 0_u64;
+    for (role, byte_size) in artifacts {
+        if !TOKENIZER_ARTIFACT_ROLES.contains(&role) {
+            continue;
+        }
+        if byte_size > MAX_TOKENIZER_ARTIFACT_BYTES {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.tokenizer_artifact_too_large",
+                "Tokenizer artifact exceeds the supported size.",
+            )
+            .with_details(json!({ "role": role })));
+        }
+        total = total.checked_add(byte_size).ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.tokenizer_artifact_too_large",
+                "Tokenizer artifact sizes exceed the supported range.",
+            )
+        })?;
+        if total > MAX_TOKENIZER_SNAPSHOT_BYTES {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.tokenizer_artifact_too_large",
+                "Tokenizer snapshot exceeds the supported cumulative size.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1116,8 +1148,8 @@ impl PreparedModelStore {
         if let Some(alias) = alias_inspection {
             return self.verify_tokenizer(alias);
         }
-        if let Some(model_path) = &options.model_path {
-            return acquire_local_tokenizer(model_path);
+        if options.model_path.is_some() {
+            return acquire_local_tokenizer(options);
         }
         self.acquire_hf_tokenizer(options)
     }
@@ -1137,25 +1169,18 @@ impl PreparedModelStore {
         self.inspect_with_roles(options, None)
     }
 
-    fn inspect_with_roles(
+    pub fn inspect_prepared_alias_contract(
         &self,
         options: &FastembedProviderOptions,
-        selected_roles: Option<&[ArtifactRole]>,
-    ) -> Result<PreparedModelInspection, EmbeddingProviderError> {
+    ) -> Result<PreparedManifestInspection, EmbeddingProviderError> {
         let alias_path = self.alias_path(options);
-        let alias_metadata = match fs::symlink_metadata(&alias_path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                if let Some(manifest_path) = &options.manifest_path {
-                    self.inspect_manifest_with_roles(manifest_path, selected_roles)?;
-                }
-                return Err(EmbeddingProviderError::structured(
-                    "embedding.prepared_snapshot_missing",
-                    "No prepared local model snapshot is available.",
-                )
-                .with_details(json!({ "error": error.to_string() })));
-            }
-        };
+        let alias_metadata = fs::symlink_metadata(&alias_path).map_err(|error| {
+            EmbeddingProviderError::structured(
+                "embedding.prepared_snapshot_missing",
+                "No prepared local model snapshot is available.",
+            )
+            .with_details(json!({ "error": error.to_string() }))
+        })?;
         if alias_metadata.file_type().is_symlink() || !alias_metadata.is_file() {
             return Err(EmbeddingProviderError::structured(
                 "embedding.prepared_alias_invalid",
@@ -1228,7 +1253,7 @@ impl PreparedModelStore {
                 "Prepared model alias must reference a regular snapshot directory.",
             ));
         }
-        let inspection = self.inspect_manifest_with_roles(&manifest_path, selected_roles)?;
+        let inspection = read_manifest_contract(&manifest_path)?;
         if inspection.manifest_hash != alias.manifest_hash {
             return Err(EmbeddingProviderError::structured(
                 "embedding.prepared_alias_mismatch",
@@ -1242,6 +1267,24 @@ impl PreparedModelStore {
             ));
         }
         Ok(inspection)
+    }
+
+    fn inspect_with_roles(
+        &self,
+        options: &FastembedProviderOptions,
+        selected_roles: Option<&[ArtifactRole]>,
+    ) -> Result<PreparedModelInspection, EmbeddingProviderError> {
+        let contract = match self.inspect_prepared_alias_contract(options) {
+            Ok(contract) => contract,
+            Err(error) if error.code() == "embedding.prepared_snapshot_missing" => {
+                if let Some(manifest_path) = &options.manifest_path {
+                    self.inspect_manifest_with_roles(manifest_path, selected_roles)?;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.inspect_manifest_with_roles(&contract.root.join("manifest.json"), selected_roles)
     }
 
     pub fn load_manifest(
@@ -1282,6 +1325,15 @@ impl PreparedModelStore {
         let manifest = contract.manifest;
         let manifest_hash = contract.manifest_hash;
         let canonical_root = contract.root;
+        validate_tokenizer_artifact_sizes(
+            manifest
+                .artifacts
+                .iter()
+                .filter(|artifact| {
+                    selected_roles.is_none_or(|roles| roles.contains(&artifact.role))
+                })
+                .map(|artifact| (artifact.role, artifact.byte_size)),
+        )?;
         let mut artifacts = Vec::with_capacity(manifest.artifacts.len());
         for artifact in &manifest.artifacts {
             if selected_roles.is_some_and(|roles| !roles.contains(&artifact.role)) {
@@ -1393,6 +1445,34 @@ fn read_manifest_contract(
     })
 }
 
+fn verify_streamed_prepared_artifact(
+    file: &mut File,
+    artifact: &PreparedArtifactInspection,
+) -> Result<ArtifactFileIdentity, EmbeddingProviderError> {
+    let opened_identity = artifact_file_identity(&file.metadata()?);
+    if opened_identity != artifact.identity {
+        return Err(artifact_changed_error());
+    }
+    let (sha256, byte_size) = stream_sha256(file)?;
+    let final_identity = artifact_file_identity(&file.metadata()?);
+    if final_identity != opened_identity {
+        return Err(artifact_changed_error());
+    }
+    if byte_size != artifact.expected_byte_size {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.artifact_size_mismatch",
+            "Prepared model artifact size does not match the manifest.",
+        ));
+    }
+    if sha256 != artifact.expected_sha256 {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.artifact_checksum_mismatch",
+            "Prepared model artifact checksum does not match the manifest.",
+        ));
+    }
+    Ok(opened_identity)
+}
+
 impl PreparedModelStore {
     pub fn verify(
         &self,
@@ -1403,27 +1483,7 @@ impl PreparedModelStore {
         let mut runtime_artifacts = Vec::with_capacity(inspection.artifacts.len());
         for artifact in &inspection.artifacts {
             let mut file = File::open(&artifact.canonical_path)?;
-            let opened_identity = artifact_file_identity(&file.metadata()?);
-            if opened_identity != artifact.identity {
-                return Err(artifact_changed_error());
-            }
-            let (sha256, byte_size) = stream_sha256(&mut file)?;
-            let final_identity = artifact_file_identity(&file.metadata()?);
-            if final_identity != opened_identity {
-                return Err(artifact_changed_error());
-            }
-            if byte_size != artifact.expected_byte_size {
-                return Err(EmbeddingProviderError::structured(
-                    "embedding.artifact_size_mismatch",
-                    "Prepared model artifact size does not match the manifest.",
-                ));
-            }
-            if sha256 != artifact.expected_sha256 {
-                return Err(EmbeddingProviderError::structured(
-                    "embedding.artifact_checksum_mismatch",
-                    "Prepared model artifact checksum does not match the manifest.",
-                ));
-            }
+            let opened_identity = verify_streamed_prepared_artifact(&mut file, artifact)?;
             paths
                 .entry(artifact.role)
                 .or_default()
@@ -1457,26 +1517,37 @@ impl PreparedModelStore {
         &self,
         inspection: PreparedModelInspection,
     ) -> Result<FastembedTokenizer, EmbeddingProviderError> {
+        validate_tokenizer_artifact_sizes(
+            inspection
+                .artifacts
+                .iter()
+                .map(|artifact| (artifact.role, artifact.expected_byte_size)),
+        )?;
         let mut tokenizer_bytes = None;
         for artifact in inspection.artifacts {
-            let file = File::open(&artifact.canonical_path)?;
-            let opened_identity = artifact_file_identity(&file.metadata()?);
-            if opened_identity != artifact.identity {
-                return Err(artifact_changed_error());
-            }
-            let mut runtime_artifact = VerifiedRuntimeArtifact {
-                role: artifact.role,
-                relative_path: artifact.relative_path,
-                expected_sha256: artifact.expected_sha256,
-                expected_byte_size: artifact.expected_byte_size,
-                identity: opened_identity,
-                file,
-            };
-            let bytes = read_verified_runtime_artifact(&mut runtime_artifact)?;
-            #[cfg(test)]
-            record_tokenizer_only_artifact_bytes(artifact.role, bytes.len() as u64);
             if artifact.role == ArtifactRole::Tokenizer {
+                let file = File::open(&artifact.canonical_path)?;
+                let opened_identity = artifact_file_identity(&file.metadata()?);
+                if opened_identity != artifact.identity {
+                    return Err(artifact_changed_error());
+                }
+                let mut runtime_artifact = VerifiedRuntimeArtifact {
+                    role: artifact.role,
+                    relative_path: artifact.relative_path,
+                    expected_sha256: artifact.expected_sha256,
+                    expected_byte_size: artifact.expected_byte_size,
+                    identity: opened_identity,
+                    file,
+                };
+                let bytes = read_verified_runtime_artifact(&mut runtime_artifact)?;
+                #[cfg(test)]
+                record_tokenizer_only_artifact_bytes(artifact.role, bytes.len() as u64);
                 tokenizer_bytes = Some(bytes);
+            } else {
+                let mut file = File::open(&artifact.canonical_path)?;
+                verify_streamed_prepared_artifact(&mut file, &artifact)?;
+                #[cfg(test)]
+                record_tokenizer_only_artifact_bytes(artifact.role, artifact.expected_byte_size);
             }
         }
         FastembedTokenizer::from_verified_bytes(tokenizer_bytes.ok_or_else(|| {
@@ -1815,29 +1886,20 @@ impl PreparedModelStore {
 
 #[cfg(feature = "fastembed-provider")]
 fn acquire_local_tokenizer(
-    model_path: &Path,
+    options: &FastembedProviderOptions,
 ) -> Result<FastembedTokenizer, EmbeddingProviderError> {
-    let metadata = fs::symlink_metadata(model_path).map_err(|_| {
-        EmbeddingProviderError::structured(
-            "embedding.model_path_not_found",
-            "Embedding model_path does not exist.",
-        )
-    })?;
-    if metadata.file_type().is_symlink() {
-        return Err(EmbeddingProviderError::structured(
-            "embedding.acquisition_artifact_invalid",
-            "Model acquisition source must not be a symbolic link.",
-        ));
-    }
-    let root = if metadata.is_file() {
+    let model_path = options
+        .model_path
+        .as_deref()
+        .expect("local tokenizer acquisition requires model_path");
+    let root = if options.file.is_none()
+        && model_path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("onnx"))
+    {
         model_root_for_file(model_path)?
-    } else if metadata.is_dir() {
-        model_path.to_path_buf()
     } else {
-        return Err(EmbeddingProviderError::structured(
-            "embedding.model_path_not_found",
-            "Embedding model_path must be a regular file or directory.",
-        ));
+        model_path.to_path_buf()
     };
     let artifacts = tokenizer_artifact_paths(|file| Ok(root.join(file)))?;
     load_unmanifested_tokenizer(&root, artifacts)
@@ -1860,7 +1922,7 @@ fn load_unmanifested_tokenizer(
     artifacts: Vec<(ArtifactRole, PathBuf)>,
 ) -> Result<FastembedTokenizer, EmbeddingProviderError> {
     let canonical_root = fs::canonicalize(root)?;
-    let mut tokenizer_bytes = None;
+    let mut inspected = Vec::with_capacity(artifacts.len());
     for (role, path) in artifacts {
         let metadata = fs::symlink_metadata(&path).map_err(|_| {
             EmbeddingProviderError::structured(
@@ -1876,13 +1938,6 @@ fn load_unmanifested_tokenizer(
             )
             .with_details(json!({ "role": role })));
         }
-        if metadata.len() > MAX_TOKENIZER_ARTIFACT_BYTES {
-            return Err(EmbeddingProviderError::structured(
-                "embedding.artifact_size_mismatch",
-                "Tokenizer artifact exceeds the supported size.",
-            )
-            .with_details(json!({ "role": role })));
-        }
         let canonical_path = fs::canonicalize(&path)?;
         if !canonical_path.starts_with(&canonical_root) {
             return Err(EmbeddingProviderError::structured(
@@ -1891,18 +1946,47 @@ fn load_unmanifested_tokenizer(
             )
             .with_details(json!({ "role": role })));
         }
-        let bytes = read_bounded_file(
-            &canonical_path,
-            &artifact_file_identity(&metadata),
-            MAX_TOKENIZER_ARTIFACT_BYTES,
-            "embedding.artifact_changed",
-            "Tokenizer artifact changed while it was being verified.",
-        )?;
-        let _sha256 = hex_digest(&Sha256::digest(&bytes));
-        #[cfg(test)]
-        record_tokenizer_only_artifact_bytes(role, bytes.len() as u64);
+        inspected.push((
+            role,
+            canonical_path,
+            artifact_file_identity(&metadata),
+            metadata.len(),
+        ));
+    }
+    validate_tokenizer_artifact_sizes(
+        inspected
+            .iter()
+            .map(|(role, _, _, byte_size)| (*role, *byte_size)),
+    )?;
+
+    let mut tokenizer_bytes = None;
+    for (role, canonical_path, identity, byte_size) in inspected {
         if role == ArtifactRole::Tokenizer {
+            let bytes = read_bounded_file(
+                &canonical_path,
+                &identity,
+                MAX_TOKENIZER_ARTIFACT_BYTES,
+                "embedding.artifact_changed",
+                "Tokenizer artifact changed while it was being verified.",
+            )?;
+            let _sha256 = hex_digest(&Sha256::digest(&bytes));
+            #[cfg(test)]
+            record_tokenizer_only_artifact_bytes(role, bytes.len() as u64);
             tokenizer_bytes = Some(bytes);
+        } else {
+            let mut file = File::open(&canonical_path)?;
+            let opened_identity = artifact_file_identity(&file.metadata()?);
+            if opened_identity != identity {
+                return Err(artifact_changed_error());
+            }
+            let (_sha256, actual_size) = stream_sha256(&mut file)?;
+            if actual_size != byte_size
+                || artifact_file_identity(&file.metadata()?) != opened_identity
+            {
+                return Err(artifact_changed_error());
+            }
+            #[cfg(test)]
+            record_tokenizer_only_artifact_bytes(role, actual_size);
         }
     }
     FastembedTokenizer::from_verified_bytes(tokenizer_bytes.ok_or_else(|| {
@@ -4082,6 +4166,77 @@ mod tests {
                 .unwrap_or(0),
             0
         );
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn tokenizer_only_direct_model_file_does_not_require_graph_metadata() {
+        let root = temp_dir("qgh-tokenizer-only-direct-model-file");
+        let manifest_path = write_runtime_payload_fixture(&root);
+        fs::remove_file(&manifest_path).unwrap();
+        fs::remove_file(root.join("model.onnx")).unwrap();
+        fs::remove_file(root.join("weights.bin")).unwrap();
+        fs::create_dir_all(root.join("onnx")).unwrap();
+        let options = FastembedProviderOptions {
+            model_path: Some(root.join("onnx/missing-model.onnx")),
+            quantization: Some(QuantizationKind::None),
+            ..FastembedProviderOptions::default()
+        };
+        let store = PreparedModelStore::new(root.join("store"));
+
+        reset_tokenizer_only_artifact_bytes();
+        store.acquire_tokenizer(&options).unwrap();
+        let bytes = tokenizer_only_artifact_bytes();
+
+        assert!(bytes
+            .get(&ArtifactRole::Tokenizer)
+            .is_some_and(|bytes| *bytes > 0));
+        assert_eq!(bytes.get(&ArtifactRole::OnnxModel).copied().unwrap_or(0), 0);
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn tokenizer_only_rejects_oversized_declared_artifact_before_opening_it() {
+        let root = temp_dir("qgh-tokenizer-only-size-limit");
+        let manifest_path = write_runtime_payload_fixture(&root);
+        let mut manifest = ModelManifestV1::from_json_slice(&fs::read(&manifest_path).unwrap())
+            .expect("fixture manifest");
+        let tokenizer = manifest
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.role == ArtifactRole::Tokenizer)
+            .expect("tokenizer declaration");
+        tokenizer.byte_size = MAX_TOKENIZER_ARTIFACT_BYTES + 1;
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(root.join("tokenizer.json")).unwrap();
+        let options = FastembedProviderOptions {
+            manifest_path: Some(manifest_path),
+            ..FastembedProviderOptions::default()
+        };
+        let store = PreparedModelStore::new(root.join("store"));
+
+        let error = match store.acquire_tokenizer(&options) {
+            Ok(_) => panic!("oversized tokenizer artifact must fail before opening"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), "embedding.tokenizer_artifact_too_large");
+    }
+
+    #[test]
+    fn tokenizer_size_validation_rejects_cumulative_overflow() {
+        let error = validate_tokenizer_artifact_sizes([
+            (ArtifactRole::Tokenizer, MAX_TOKENIZER_ARTIFACT_BYTES),
+            (ArtifactRole::Config, MAX_TOKENIZER_ARTIFACT_BYTES),
+            (ArtifactRole::TokenizerConfig, 1),
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.code(), "embedding.tokenizer_artifact_too_large");
     }
 
     #[cfg(feature = "fastembed-provider")]

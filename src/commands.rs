@@ -4410,7 +4410,7 @@ fn embedding_fingerprint_status_json(
 fn embedding_fingerprint_expectation(
     embedding: &EmbeddingConfig,
 ) -> EmbeddingFingerprintExpectation {
-    let configured = configured_embedding_snapshot(embedding);
+    let configured = configured_embedding_contract_snapshot(embedding);
     embedding_fingerprint_expectation_from_snapshot(embedding, &configured)
 }
 
@@ -4428,41 +4428,47 @@ fn embedding_fingerprint_expectation_from_snapshot(
 }
 
 fn configured_embedding_snapshot(embedding: &EmbeddingConfig) -> ConfiguredEmbeddingSnapshot {
-    let prepared_runtime = {
-        let mut prepared_runtime = PreparedRuntimeAvailability::Missing;
-        if let Ok(store) = default_prepared_model_store() {
-            let options = embedding.fastembed_options();
-            match store.inspect(&options) {
-                Ok(inspection) => {
-                    return configured_snapshot_from_inspection(
-                        &inspection,
-                        configured_available_runtime(),
-                    );
-                }
-                Err(error) => {
-                    let availability = configured_runtime_error_availability(error.code());
-                    prepared_runtime = availability;
-                    if let Some(manifest_path) = options.manifest_path.as_deref() {
-                        if let Ok(inspection) = PreparedModelStore::new(PathBuf::new())
-                            .inspect_manifest_contract(manifest_path)
-                        {
-                            return configured_snapshot_from_contract(&inspection, availability);
-                        }
-                    }
-                }
-            }
-        }
-        prepared_runtime
+    let mut configured = configured_embedding_contract_snapshot(embedding);
+    configured.prepared_runtime = match default_prepared_model_store() {
+        Ok(store) => store
+            .inspect(&embedding.fastembed_options())
+            .map(|_| configured_available_runtime())
+            .unwrap_or_else(|error| configured_runtime_error_availability(error.code())),
+        Err(_) => PreparedRuntimeAvailability::Missing,
     };
 
     #[cfg(debug_assertions)]
-    let prepared_runtime = if std::env::var_os(TEST_EMBEDDING_QUERY_VECTORS_ENV).is_some()
+    if std::env::var_os(TEST_EMBEDDING_QUERY_VECTORS_ENV).is_some()
         || std::env::var_os(TEST_EMBEDDING_DOCUMENT_VECTORS_ENV).is_some()
     {
-        PreparedRuntimeAvailability::Available
-    } else {
-        prepared_runtime
-    };
+        configured.prepared_runtime = PreparedRuntimeAvailability::Available;
+    }
+
+    configured
+}
+
+fn configured_embedding_contract_snapshot(
+    embedding: &EmbeddingConfig,
+) -> ConfiguredEmbeddingSnapshot {
+    let options = embedding.fastembed_options();
+    if let Ok(store) = default_prepared_model_store() {
+        if let Ok(inspection) = store.inspect_prepared_alias_contract(&options) {
+            return configured_snapshot_from_contract(
+                &inspection,
+                PreparedRuntimeAvailability::Missing,
+            );
+        }
+    }
+    if let Some(manifest_path) = options.manifest_path.as_deref() {
+        if let Ok(inspection) =
+            PreparedModelStore::new(PathBuf::new()).inspect_manifest_contract(manifest_path)
+        {
+            return configured_snapshot_from_contract(
+                &inspection,
+                PreparedRuntimeAvailability::Missing,
+            );
+        }
+    }
 
     ConfiguredEmbeddingSnapshot {
         model_id: if embedding.model_path.is_some() {
@@ -4476,19 +4482,8 @@ fn configured_embedding_snapshot(embedding: &EmbeddingConfig) -> ConfiguredEmbed
         model_revision: configured_embedding_model_revision_without_snapshot(embedding),
         pooling: embedding.pooling,
         query_prefix: embedding.query_prefix.clone(),
-        prepared_runtime,
+        prepared_runtime: PreparedRuntimeAvailability::Missing,
     }
-}
-
-fn configured_snapshot_from_inspection(
-    inspection: &PreparedModelInspection,
-    prepared_runtime: PreparedRuntimeAvailability,
-) -> ConfiguredEmbeddingSnapshot {
-    configured_snapshot_from_manifest(
-        inspection.manifest(),
-        inspection.manifest_hash(),
-        prepared_runtime,
-    )
 }
 
 fn configured_snapshot_from_contract(

@@ -1118,7 +1118,8 @@ fn parse_embedding_config(raw: &RawEmbeddingConfig) -> Result<(), QghError> {
             token_source_env: None,
             cache_dir: None,
         };
-        let prepared = default_prepared_model_store().and_then(|store| store.inspect(&options));
+        let prepared = default_prepared_model_store()
+            .and_then(|store| store.inspect_prepared_alias_contract(&options));
         let source_store = PreparedModelStore::new(PathBuf::new());
         match fs::symlink_metadata(manifest_path) {
             Ok(_) => {

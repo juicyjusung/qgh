@@ -144,6 +144,35 @@ fn existing_explicit_manifest_must_match_its_prepared_alias() {
         "{}",
         String::from_utf8_lossy(&offline_alias.stdout)
     );
+
+    let snapshots = fixture.cache_home.join("qgh/prepared-models/snapshots");
+    let snapshot_root = fs::read_dir(&snapshots)
+        .unwrap()
+        .next()
+        .expect("prepared snapshot")
+        .unwrap()
+        .path();
+    fs::remove_file(snapshot_root.join("model.onnx")).unwrap();
+    let artifact_missing = fixture.status(true);
+    assert!(
+        artifact_missing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&artifact_missing.stdout)
+    );
+    let artifact_missing_json: serde_json::Value =
+        serde_json::from_slice(&artifact_missing.stdout).unwrap();
+    assert_eq!(
+        artifact_missing_json["data"]["embedding"]["configured_model"]["model_id"],
+        "local:fixture"
+    );
+    assert_eq!(
+        artifact_missing_json["data"]["embedding"]["state"],
+        "missing"
+    );
+    let get = fixture.get_missing_source();
+    assert_eq!(get.status.code(), Some(4));
+    let get_json: serde_json::Value = serde_json::from_slice(&get.stdout).unwrap();
+    assert_eq!(get_json["error"]["code"], "source.not_found");
 }
 
 #[cfg(feature = "fastembed-provider")]
