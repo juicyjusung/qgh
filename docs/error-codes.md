@@ -25,6 +25,42 @@ Common codes include `config.no_matching_profile`, `config.ambiguous_profile`,
 `source.outside_effective_scope`, `purge.failed`, `purge.retry_failed`,
 `purge.read_fenced`, and `purge.write_fenced`.
 
+Local model acquisition and prepared-snapshot publication fail closed with
+stable, content-free errors:
+
+- `embedding.acquisition_artifact_mismatch`: materialized model artifacts do
+  not match the pinned acquisition or declared manifest.
+- `embedding.acquisition_pin_busy`: another pin mutation is active, or its
+  bounded lock could not yet be safely reclaimed.
+- `embedding.acquisition_pin_invalid`: the persisted acquisition request does
+  not satisfy its contract or local-store confinement rules.
+- `embedding.acquisition_pin_lock_failed`: qgh could not create the local lock
+  required to serialize pin mutation.
+- `embedding.acquisition_pin_mismatch`: the acquisition pin changed or went
+  missing before publication or retirement completed.
+- `embedding.acquisition_pin_retire_failed`: a completed acquisition pin could
+  not be removed durably.
+- `embedding.acquisition_pin_unlock_failed`: the acquisition mutation lock
+  could not be released durably.
+- `embedding.acquisition_staging_cleanup_failed`: a failed acquisition's
+  staging state could not be safely removed.
+- `embedding.atomic_replace_cleanup_failed`: cleanup after a failed atomic
+  local-state replacement did not complete.
+- `embedding.hf_cache_invalid`: a downloaded Hugging Face artifact could not be
+  resolved as a confined local-cache file.
+- `embedding.hf_revision_mismatch`: resolved artifacts do not match the pinned
+  Hugging Face revision.
+- `embedding.prepared_alias_publish_failed`: the verified prepared-snapshot
+  alias could not be published durably.
+- `embedding.tokenizer_artifact_too_large`: one tokenizer artifact or the
+  cumulative tokenizer snapshot exceeds qgh's bounded local resource limit.
+
+These descriptions intentionally omit local paths, tokens, model bytes,
+queries, and source content. Resolve the local acquisition state and retry
+preparation; qgh does not accept a mismatched artifact as validated. Separately,
+`embedding.vector_integrity_failed` is a content-free warning, not an error
+envelope code: hybrid vector use is skipped and BM25 results are returned.
+
 Typed GitHub lifecycle adapters may return `github.invalid_issue_json` or
 `github.invalid_comment_json` when a successful response cannot be decoded.
 `sync.commit_page_failed` and `validation.lifecycle_failed` are content-free

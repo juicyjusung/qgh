@@ -24,6 +24,10 @@ fn released_error_schema_covers_all_stable_externally_emitted_error_codes() {
         .filter(|code| has_stable_error_prefix(code))
         .cloned()
         .collect::<BTreeSet<_>>();
+    assert!(
+        !published.contains("embedding.vector_integrity_failed"),
+        "content-free BM25 fallback warnings must not be published as error envelope codes"
+    );
     let mut expected_contract = stable_external_error_codes_from_source(&root);
     // Reserved as the stable fail-safe identity for an unexpected envelope
     // boundary failure even though no ordinary command path emits it today.
@@ -2756,6 +2760,7 @@ fn stable_external_error_codes_from_source(root: &std::path::Path) -> BTreeSet<S
         "embedding.sync_vector_init_failed",
         "embedding.tombstone_cleanup_failed",
         "embedding.vector_init_failed",
+        "embedding.vector_integrity_failed",
         "embedding.vector_search_failed",
         "config.duplicate_repo_allowlist",
         "config.profile_not_checked",
