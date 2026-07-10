@@ -30,7 +30,7 @@ use crate::model::{
 };
 use crate::paths::ProfilePaths;
 use crate::resolution::ResolvedRepoScope;
-use crate::store::{PurgeOutcome, PurgeTarget, PurgeTrigger, RetrievalPublicationView, Store};
+use crate::store::{PendingPurgeView, PurgeTarget, PurgeTrigger, RetrievalPublicationView, Store};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -124,9 +124,7 @@ pub async fn sync(
     };
     let fetch_profile = profile_scoped_to_repo(&profile, repo_scope)?;
     let mut store = Store::open(&profile.paths)?;
-    if run_sync_purge_preflight(&profile, &mut store)? {
-        rebuild_bm25_successor_after_purge(&profile, &mut store)?;
-    }
+    run_sync_purge_preflight(&profile, &mut store)?;
     let token = resolve_token(&profile)?;
 
     // `--if-stale`: skip the network sync entirely when the local snapshot is
@@ -406,8 +404,7 @@ pub async fn sync(
             let result =
                 github::reconcile_sources(&fetch_profile, &token, &candidates, Some(&progress))
                     .await?;
-            let mut tombstoned_sources = 0;
-            let mut purge_changed = false;
+            let mut purge_requests = Vec::new();
             for unavailable in result.unavailable_sources {
                 let candidate = candidates_by_source_id
                     .get(&unavailable.source_id)
@@ -418,13 +415,13 @@ pub async fn sync(
                             6,
                         )
                     })?;
-                let outcome = purge_candidate(&mut store, candidate, &unavailable.reason)?;
-                tombstoned_sources += outcome.purged_sources;
-                purge_changed |= outcome.sensitive_wal_truncated;
+                purge_requests.push((
+                    purge_target_for_candidate(candidate, &unavailable.reason),
+                    purge_trigger_for_lifecycle_reason(&unavailable.reason),
+                ));
             }
-            if purge_changed {
-                rebuild_bm25_successor_after_purge(&profile, &mut store)?;
-            }
+            let purge = queue_and_finish_purges(&mut store, &purge_requests)?;
+            let tombstoned_sources = purge.purged_sources;
             store.record_reconciliation_run(
                 mode_str,
                 result.checked_sources,
@@ -441,8 +438,9 @@ pub async fn sync(
         None => json!({ "mode": "none" }),
     };
     store.clear_backoff_state()?;
-    let index = rebuild_bm25_index(&profile, &mut store, &progress)?;
     store.mark_sync_run_completed(&summary.sync_run_id)?;
+    let repair = repair_lexical_successor_if_required(&profile, &mut store)?;
+    let index = rebuild_after_successor_repair(&profile, &mut store, &progress, repair)?;
     let comment_listing = match repo_comment_stats {
         Some((skipped_pr_comments, deferred_comments)) => json!({
             "mode": "repo_listing",
@@ -566,7 +564,7 @@ async fn backfill_sync(
             backoff.retry_after_seconds,
             backoff.reset_at.as_deref(),
         )?;
-        let index = rebuild_bm25_index(profile, store, progress)?;
+        let warnings = rebuild_bm25_index(profile, store, progress)?.warnings;
         let status = store.status()?;
         return Ok(local_read_outcome(
             json!({
@@ -587,15 +585,16 @@ async fn backfill_sync(
                     "tombstone_count": status.tombstone_count
                 }
             }),
-            index.warnings,
+            warnings,
         ));
     }
 
     store.clear_backoff_state()?;
-    let index = rebuild_bm25_index(profile, store, progress)?;
     if let Some(summary) = &summary {
         store.mark_sync_run_completed(&summary.sync_run_id)?;
     }
+    let repair = repair_lexical_successor_if_required(profile, store)?;
+    let index = rebuild_after_successor_repair(profile, store, progress, repair)?;
     Ok(local_read_outcome(
         json!({
             "profile_id": profile.id,
@@ -654,9 +653,7 @@ pub async fn sync_issue(
     let profile = load_profile(profile_id)?;
     let repo = target_issue_repo(&profile, repo_scope)?;
     let mut store = Store::open(&profile.paths)?;
-    if run_sync_purge_preflight(&profile, &mut store)? {
-        rebuild_bm25_successor_after_purge(&profile, &mut store)?;
-    }
+    run_sync_purge_preflight(&profile, &mut store)?;
     let token = resolve_token(&profile)?;
     progress.line(format_args!(
         "qgh sync issue: fetching repo={} issue_number={issue_number}",
@@ -741,28 +738,27 @@ pub async fn sync_issue(
             } else {
                 0
             };
-            let mut purge_changed = false;
-            for source_id in &deleted_comment_ids {
-                purge_changed |= store
-                    .purge(
+            let mut purge_requests = deleted_comment_ids
+                .iter()
+                .map(|source_id| {
+                    (
                         PurgeTarget::Source {
                             source_id: source_id.clone(),
                         },
                         PurgeTrigger::ConfirmedDelete,
-                    )?
-                    .sensitive_wal_truncated;
-            }
+                    )
+                })
+                .collect::<Vec<_>>();
             if transferred {
-                purge_changed |= store
-                    .purge(
-                        PurgeTarget::Issue {
-                            repo: repo.full_name(),
-                            issue_number,
-                        },
-                        PurgeTrigger::ConfirmedTombstone,
-                    )?
-                    .sensitive_wal_truncated;
+                purge_requests.push((
+                    PurgeTarget::Issue {
+                        repo: repo.full_name(),
+                        issue_number,
+                    },
+                    PurgeTrigger::ConfirmedTombstone,
+                ));
             }
+            queue_and_finish_purges(&mut store, &purge_requests)?;
             let mut summary =
                 store.upsert_target_issue_refresh(&fetched.issue, &fetched.comments)?;
             summary.deleted_comments += deleted_comment_ids.len();
@@ -772,15 +768,13 @@ pub async fn sync_issue(
                 summary.tombstoned_comments += transferred_comment_count;
                 summary.deleted_comments += transferred_comment_count;
             }
-            if purge_changed {
-                rebuild_bm25_successor_after_purge(&profile, &mut store)?;
-            }
+            let repair = repair_lexical_successor_if_required(&profile, &mut store)?;
             progress.line(format_args!(
                 "qgh sync issue: stored comments added={} updated={} deleted={}",
                 summary.added_comments, summary.updated_comments, summary.deleted_comments
             ));
             store.clear_backoff_state()?;
-            let index = rebuild_bm25_index(&profile, &mut store, &progress)?;
+            let index = rebuild_after_successor_repair(&profile, &mut store, &progress, repair)?;
             progress.line(format_args!(
                 "qgh sync issue: complete sync_run_id={}",
                 summary.sync_run_id
@@ -822,15 +816,28 @@ pub async fn sync_issue(
                     issue_number,
                 }
             };
-            let outcome = store.purge(target, purge_trigger_for_lifecycle_reason(reason))?;
-            let sync_run_id = Store::new_sync_run_id();
-            if reason != "permission_loss" {
-                store.upsert_sources_for_run(&sync_run_id, &[], &[], 0, &[])?;
-                store.mark_sync_run_completed(&sync_run_id)?;
-            }
-            if outcome.sensitive_wal_truncated {
-                rebuild_bm25_successor_after_purge(&profile, &mut store)?;
-            }
+            queue_and_finish_purges(
+                &mut store,
+                &[(target, purge_trigger_for_lifecycle_reason(reason))],
+            )?;
+            let successor = repair_lexical_successor_if_required(&profile, &mut store)?;
+            let sync_run_id = match &successor {
+                SuccessorRepairOutcome::Repaired {
+                    source_snapshot_sync_run_id,
+                    ..
+                } => source_snapshot_sync_run_id.clone(),
+                SuccessorRepairOutcome::NotRequired => store
+                    .active_retrieval_publication()?
+                    .map(|publication| publication.source_snapshot_sync_run_id)
+                    .or(store.latest_successful_sync_run_id()?)
+                    .ok_or_else(|| {
+                        QghError::new(
+                            "purge.successor_repair_state_invalid",
+                            "Completed lifecycle cleanup has no published source snapshot.",
+                            6,
+                        )
+                    })?,
+            };
             let summary = TargetedSyncSummary {
                 sync_run_id,
                 fetched_issues: 0,
@@ -844,7 +851,7 @@ pub async fn sync_issue(
                 tombstoned_comments,
             };
             store.clear_backoff_state()?;
-            let index = rebuild_bm25_index(&profile, &mut store, &progress)?;
+            let index = rebuild_after_successor_repair(&profile, &mut store, &progress, successor)?;
             progress.line(format_args!(
                 "qgh sync issue: complete sync_run_id={}",
                 summary.sync_run_id
@@ -995,10 +1002,19 @@ fn rebuild_bm25_index(
 /// Publishes a source-safe lexical successor after destructive lifecycle
 /// cleanup. This path never initializes embedding/model/vector capability and
 /// supports an empty authoritative corpus.
-fn rebuild_bm25_successor_after_purge(
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SuccessorRepairOutcome {
+    NotRequired,
+    Repaired {
+        generation: i64,
+        source_snapshot_sync_run_id: String,
+    },
+}
+
+fn repair_lexical_successor_if_required(
     profile: &Profile,
     store: &mut Store,
-) -> Result<IndexRebuildOutcome, QghError> {
+) -> Result<SuccessorRepairOutcome, QghError> {
     if !store.pending_purges()?.is_empty() {
         return Err(QghError::new(
             "purge.successor_blocked",
@@ -1006,13 +1022,17 @@ fn rebuild_bm25_successor_after_purge(
             6,
         ));
     }
-    let source_snapshot_sync_run_id = store.latest_successful_sync_run_id()?.ok_or_else(|| {
-        QghError::new(
-            "purge.successor_snapshot_missing",
-            "A lexical successor requires a successful source snapshot.",
-            6,
-        )
-    })?;
+    if !store.successor_repair_required()? {
+        return Ok(SuccessorRepairOutcome::NotRequired);
+    }
+    let source_snapshot_sync_run_id =
+        store.record_purge_successor_snapshot()?.ok_or_else(|| {
+            QghError::new(
+                "purge.successor_repair_state_invalid",
+                "Purge successor repair state changed before snapshot creation.",
+                6,
+            )
+        })?;
     let sources = store.active_index_sources()?;
     let (generation, reserved_generation_path) =
         store.reserve_index_generation(&profile.paths.index_root, sources.len())?;
@@ -1027,23 +1047,16 @@ fn rebuild_bm25_successor_after_purge(
         None,
         expected_publication_id,
     )?;
-    let status = store.status()?;
-    Ok(IndexRebuildOutcome {
+    Ok(SuccessorRepairOutcome::Repaired {
         generation,
-        dirty_task_count: status.dirty_task_count,
-        warnings: Vec::new(),
+        source_snapshot_sync_run_id,
     })
 }
 
-fn run_sync_purge_preflight(profile: &Profile, store: &mut Store) -> Result<bool, QghError> {
-    let mut changed = false;
+fn run_sync_purge_preflight(profile: &Profile, store: &mut Store) -> Result<(), QghError> {
     let mut failed = false;
     match store.retry_pending_purges() {
-        Ok(outcomes) => {
-            changed |= outcomes
-                .iter()
-                .any(|outcome| outcome.sensitive_wal_truncated);
-        }
+        Ok(_) => {}
         Err(_) => failed = true,
     }
 
@@ -1065,57 +1078,101 @@ fn run_sync_purge_preflight(profile: &Profile, store: &mut Store) -> Result<bool
         .into_iter()
         .filter(|repo| !configured.contains(repo))
         .filter(|repo| !remaining_before_reconciliation.contains(repo))
+        .map(|repo| {
+            (
+                PurgeTarget::Repository { repo },
+                PurgeTrigger::AllowlistRemoval,
+            )
+        })
         .collect::<Vec<_>>();
-    for repo in removed_repositories {
-        match store.purge(
-            PurgeTarget::Repository { repo },
-            PurgeTrigger::AllowlistRemoval,
-        ) {
-            Ok(outcome) => changed |= outcome.sensitive_wal_truncated,
-            Err(_) => failed = true,
-        }
+    if store.queue_purges(&removed_repositories).is_err() {
+        failed = true;
+    } else if !failed && store.retry_pending_purges().is_err() {
+        failed = true;
     }
 
     let remaining = store.pending_purges()?;
     if failed || !remaining.is_empty() {
-        let target_kinds = remaining
-            .iter()
-            .map(|pending| pending.target.kind())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let triggers = remaining
-            .iter()
-            .map(|pending| pending.trigger.as_str())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let current_stages = remaining
-            .iter()
-            .map(|pending| pending.current_stage.as_str())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let failure_stages = remaining
-            .iter()
-            .filter_map(|pending| pending.failure_stage.map(|stage| stage.as_str()))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        return Err(QghError::new(
-            "purge.retry_failed",
-            "One or more lifecycle purges remain pending after all targets were attempted.",
-            6,
-        )
-        .with_details(json!({
-            "pending_count": remaining.len(),
-            "target_kinds": target_kinds,
-            "triggers": triggers,
-            "current_stages": current_stages,
-            "failure_stages": failure_stages
-        })));
+        return Err(purge_retry_error(&remaining));
     }
-    Ok(changed)
+    repair_lexical_successor_if_required(profile, store)?;
+    Ok(())
+}
+
+fn rebuild_after_successor_repair(
+    profile: &Profile,
+    store: &mut Store,
+    progress: &StderrSyncProgress,
+    repair: SuccessorRepairOutcome,
+) -> Result<IndexRebuildOutcome, QghError> {
+    if profile.embedding.is_none() {
+        if let SuccessorRepairOutcome::Repaired { generation, .. } = repair {
+            let status = store.status()?;
+            return Ok(IndexRebuildOutcome {
+                generation,
+                dirty_task_count: status.dirty_task_count,
+                warnings: Vec::new(),
+            });
+        }
+    }
+    rebuild_bm25_index(profile, store, progress)
+}
+
+#[derive(Default)]
+struct PurgeBatchOutcome {
+    purged_sources: usize,
+}
+
+fn queue_and_finish_purges(
+    store: &mut Store,
+    requests: &[(PurgeTarget, PurgeTrigger)],
+) -> Result<PurgeBatchOutcome, QghError> {
+    store.queue_purges(requests)?;
+    let outcomes = match store.retry_pending_purges() {
+        Ok(outcomes) => outcomes,
+        Err(_) => {
+            let remaining = store.pending_purges()?;
+            return Err(purge_retry_error(&remaining));
+        }
+    };
+    let remaining = store.pending_purges()?;
+    if !remaining.is_empty() {
+        return Err(purge_retry_error(&remaining));
+    }
+    Ok(PurgeBatchOutcome {
+        purged_sources: outcomes.iter().map(|outcome| outcome.purged_sources).sum(),
+    })
+}
+
+fn purge_retry_error(remaining: &[PendingPurgeView]) -> QghError {
+    let target_kinds = remaining
+        .iter()
+        .map(|pending| pending.target.kind())
+        .collect::<BTreeSet<_>>();
+    let triggers = remaining
+        .iter()
+        .map(|pending| pending.trigger.as_str())
+        .collect::<BTreeSet<_>>();
+    let current_stages = remaining
+        .iter()
+        .map(|pending| pending.current_stage.as_str())
+        .collect::<BTreeSet<_>>();
+    let failure_stages = remaining
+        .iter()
+        .filter_map(|pending| pending.failure_stage.map(|stage| stage.as_str()))
+        .collect::<BTreeSet<_>>();
+    QghError::new(
+        "purge.retry_failed",
+        "One or more lifecycle purges remain pending after all targets were attempted.",
+        6,
+    )
+    .with_details(json!({
+        "pending_count": remaining.len(),
+        "target_kinds": target_kinds,
+        "triggers": triggers,
+        "current_stages": current_stages,
+        "failure_stages": failure_stages
+    }))
 }
 
 fn purge_trigger_for_lifecycle_reason(reason: &str) -> PurgeTrigger {
@@ -1142,17 +1199,6 @@ fn purge_target_for_candidate(candidate: &ReconciliationCandidate, reason: &str)
             source_id: candidate.source_id.clone(),
         }
     }
-}
-
-fn purge_candidate(
-    store: &mut Store,
-    candidate: &ReconciliationCandidate,
-    reason: &str,
-) -> Result<PurgeOutcome, QghError> {
-    store.purge(
-        purge_target_for_candidate(candidate, reason),
-        purge_trigger_for_lifecycle_reason(reason),
-    )
 }
 
 struct IndexRebuildOutcome {
@@ -1876,7 +1922,7 @@ fn prepared_model_id(snapshot: &PreparedModelSnapshot) -> String {
 
 fn refresh_chunk_embeddings(
     store: &mut Store,
-    _profile_id: &str,
+    profile_id: &str,
     provider: &dyn EmbeddingProvider,
     fingerprint_seed: EmbeddingFingerprintSeed,
 ) -> Result<Value, QghError> {
@@ -1908,8 +1954,21 @@ fn refresh_chunk_embeddings(
     let fingerprint = fingerprint_seed.with_dimension(dimension);
     let embeddings = chunks.iter().zip(vectors).collect::<Vec<_>>();
     let source_sync_run_id = store
-        .latest_successful_sync_run_id()?
-        .unwrap_or_else(|| "embedding-embed".to_string());
+        .active_retrieval_publication()?
+        .map(|publication| publication.source_snapshot_sync_run_id)
+        .or(store.latest_successful_sync_run_id()?)
+        .ok_or_else(|| {
+            QghError::new(
+                "embedding.source_snapshot_missing",
+                "Embedding refresh requires a completed source snapshot.",
+                6,
+            )
+            .with_details(json!({
+                "profile_id": profile_id,
+                "successful_snapshot_available": false
+            }))
+            .with_hint("Run qgh sync successfully before qgh embed --force.")
+        })?;
     let model_manifest_hash = fingerprint.hash();
     let context_template_version = "qgh.context.v1".to_string();
     let spec = crate::store::EmbeddingGenerationSpec {
@@ -1921,7 +1980,7 @@ fn refresh_chunk_embeddings(
         context_template_version: context_template_version.clone(),
         output_dimension: dimension,
         source_sync_run_id: source_sync_run_id.clone(),
-        source_snapshot_hash: source_sync_run_id,
+        source_snapshot_hash: source_sync_run_id.clone(),
         total_chunks: chunks.len() as i64,
     };
     let generation_id = store.begin_embedding_generation(&spec)?;
@@ -1956,11 +2015,8 @@ fn refresh_chunk_embeddings(
             Some(publication.publication_id),
         )?;
     } else if let Some(tantivy_generation) = store.active_index_generation()? {
-        let sync_run_id = store
-            .latest_successful_sync_run_id()?
-            .unwrap_or_else(|| "embedding-embed".to_string());
         store.activate_retrieval_publication(
-            &sync_run_id,
+            &source_sync_run_id,
             tantivy_generation,
             Some(generation_id),
             None,
@@ -2634,6 +2690,7 @@ pub fn query(
     let outcome = (|| -> Result<LocalReadOutcome, QghError> {
         let overrides = freshness_overrides(args.max_age.as_deref(), args.require_fresh)?;
         let publication = store.active_retrieval_publication()?;
+        ensure_query_publication_is_safe(&store, publication.as_ref())?;
         if let Some(results) = exact_results(&store, &args.query, &filters, &profile.id)? {
             let last_successful_sync_at =
                 query_freshness_sync_time(&store, &profile, &filters, &results)?;
@@ -4096,10 +4153,14 @@ async fn lifecycle_check_for_get(
                         "remote_checked": true
                     }),
                     Ok(github::LifecycleCheck::Unavailable { reason }) => {
-                        let outcome = purge_candidate(store, &candidate, &reason)?;
-                        if outcome.sensitive_wal_truncated {
-                            rebuild_bm25_successor_after_purge(profile, store)?;
-                        }
+                        queue_and_finish_purges(
+                            store,
+                            &[(
+                                purge_target_for_candidate(&candidate, &reason),
+                                purge_trigger_for_lifecycle_reason(&reason),
+                            )],
+                        )?;
+                        repair_lexical_successor_if_required(profile, store)?;
                         let tombstone = store.get_tombstone(source_id)?.ok_or_else(|| {
                             QghError::new(
                                 "purge.tombstone_missing",
@@ -4276,7 +4337,8 @@ pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
     let store = Store::open(&profile.paths)?;
     let status = store.status()?;
     let purge = purge_report(&store)?;
-    let purge_ok = purge["pending_count"].as_u64() == Some(0);
+    let purge_ok = purge["pending_count"].as_u64() == Some(0)
+        && purge["retrieval_blocked"].as_bool() == Some(false);
     let permissions_ok = private_paths_ok(&profile.paths);
     let sqlite_ok = status.active_generation >= 0;
     let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
@@ -4321,6 +4383,7 @@ pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
         ],
         "purge": {
             "pending_count": purge["pending_count"],
+            "successor_repair_required": purge["successor_repair_required"],
             "retrieval_blocked": purge["retrieval_blocked"],
             "target_kinds": purge["target_kinds"],
             "triggers": purge["triggers"],
@@ -4337,6 +4400,8 @@ pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
 
 fn purge_report(store: &Store) -> Result<Value, QghError> {
     let pending = store.pending_purges()?;
+    let successor_repair_required = store.successor_repair_required()?;
+    let retrieval_blocked = !pending.is_empty() || successor_repair_required;
     let target_kinds = pending
         .iter()
         .map(|request| request.target.kind())
@@ -4355,7 +4420,8 @@ fn purge_report(store: &Store) -> Result<Value, QghError> {
         .collect::<BTreeSet<_>>();
     Ok(json!({
         "pending_count": pending.len(),
-        "retrieval_blocked": !pending.is_empty(),
+        "successor_repair_required": successor_repair_required,
+        "retrieval_blocked": retrieval_blocked,
         "target_kinds": target_kinds,
         "triggers": triggers,
         "current_stages": current_stages,
@@ -4387,6 +4453,27 @@ fn publication_index_path(
             }),
         None => active_index_path(store, fallback),
     }
+}
+
+fn ensure_query_publication_is_safe(
+    store: &Store,
+    _publication: Option<&RetrievalPublicationView>,
+) -> Result<(), QghError> {
+    if store.successor_repair_required()? {
+        return Err(successor_repair_required_error());
+    }
+    Ok(())
+}
+
+fn successor_repair_required_error() -> QghError {
+    QghError::new(
+        "purge.successor_repair_required",
+        "Retrieval is blocked until a clean lexical successor is published.",
+        6,
+    )
+    .with_details(json!({
+        "successor_repair_required": true
+    }))
 }
 
 fn freshness_overrides(
@@ -4965,11 +5052,24 @@ mod tests {
             query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
         };
 
-        store
+        let missing_snapshot =
+            refresh_chunk_embeddings(&mut store, "work", &MockEmbeddingProvider, seed.clone())
+                .unwrap_err();
+        assert_eq!(missing_snapshot.code, "embedding.source_snapshot_missing");
+        store.mark_sync_run_completed("sync-command-embed").unwrap();
+
+        let (generation, reserved_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
+        let generation_path = index::rebuild(
+            &paths.index_root,
+            generation,
+            &store.active_index_sources().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(generation_path, reserved_path);
         store
-            .activate_retrieval_publication("embed-sync", 1, None, None)
+            .activate_retrieval_publication("sync-command-embed", generation, None, None)
             .unwrap();
 
         let outcome =

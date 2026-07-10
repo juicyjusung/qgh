@@ -537,8 +537,9 @@ fn render_status(data: &Value) -> String {
     line(
         &mut out,
         format_args!(
-            "purge: pending {}, retrieval blocked {}, stages {}",
+            "purge: pending {}, successor repair required {}, retrieval blocked {}, stages {}",
             display_at(data, &["purge", "pending_count"]),
+            display_at(data, &["purge", "successor_repair_required"]),
             display_at(data, &["purge", "retrieval_blocked"]),
             join_array(data.pointer("/purge/current_stages"))
         ),
@@ -605,6 +606,13 @@ fn render_doctor(data: &Value) -> String {
         format_args!(
             "doctor exposed to MCP: {}",
             display_at(data, &["mcp", "doctor_exposed"])
+        ),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "purge successor repair required: {}",
+            display_at(data, &["purge", "successor_repair_required"])
         ),
     );
     line(

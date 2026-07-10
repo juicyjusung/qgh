@@ -9,8 +9,10 @@ Stable error families:
 - `freshness.*`: local snapshot freshness failures.
 - `auth.*`: token source failures.
 - `github.*`: GitHub request failures outside structured backoff state.
+- `embedding.*`: local embedding preparation and source-snapshot failures.
 - `source.*`: missing or tombstoned source lookups.
 - `purge.*`: fail-closed purge, retry, publication, and read/write-fence failures.
+- `publication.*`: retrieval snapshot CAS, provenance, and artifact-readiness failures.
 - `storage.*`: SQLite or local filesystem storage failures.
 - `index.*`: Tantivy index failures.
 - `internal.*`: unexpected internal failures.
@@ -30,6 +32,18 @@ request. A retry that remains incomplete returns `purge.retry_failed` with only
 aggregate target/trigger kinds and coarse stage names; it does not include
 source bodies, queries, tokens, or raw transport errors. `purge.successor_*`
 codes mean qgh could not publish the required clean lexical successor snapshot.
+`purge.successor_repair_required` blocks query fallback from opening an old
+index after purge invalidated the publication pointer; the next valid `sync`
+repairs that pointer before token resolution or a GitHub request.
+Post-purge activation additionally requires the current durable
+`purge_successor` snapshot and a real validated Tantivy artifact; reserved-only,
+missing, stale-epoch, or corrupt generations remain unpublished and leave
+successor repair pending.
+
+`embed --force` returns `embedding.source_snapshot_missing` instead of creating
+a synthetic provenance id when no completed remote or purge-successor source
+snapshot exists. Run a successful `sync` first; the failed embed attempt does
+not publish vectors or a retrieval generation.
 
 `query`/`search` and `status` may return `freshness.stale` when the local
 snapshot violates a fail-mode freshness policy or `--require-fresh` is passed.

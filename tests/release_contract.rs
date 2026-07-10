@@ -540,12 +540,16 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "validation.backfill_conflicts",
         "validation.requires_backfill",
         "validation.repo_required",
+        "embedding.source_snapshot_missing",
         "purge.failed",
         "purge.retry_failed",
         "purge.read_fenced",
         "purge.write_fenced",
         "purge.successor_blocked",
-        "purge.successor_snapshot_missing",
+        "purge.successor_repair_required",
+        "purge.successor_snapshot_pending",
+        "publication.successor_snapshot_required",
+        "publication.tantivy_artifact_not_ready",
     ] {
         assert!(
             error_codes.contains(&json!(code)),
@@ -920,6 +924,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         status_purge["required"],
         json!([
             "pending_count",
+            "successor_repair_required",
             "retrieval_blocked",
             "target_kinds",
             "triggers",

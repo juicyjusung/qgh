@@ -918,6 +918,37 @@ fn sync_purges_repo_removed_from_profile_allowlist_and_preserves_other_repo() {
 }
 
 #[test]
+fn purge_successor_snapshot_does_not_advance_remote_sync_freshness() {
+    let fixture = TestFixture::new("purge-successor-keeps-remote-freshness");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let before = stdout_json(&fixture.qgh(["status", "--json"]));
+    let remote_last_sync = before["data"]["sync"]["last_sync_at"].clone();
+    assert!(remote_last_sync.as_str().is_some());
+
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo"]);
+    server.clear_requests();
+    let purge = fixture.qgh(["sync", "--if-stale", "--json"]);
+    assert_success(&purge);
+    assert_eq!(stdout_json(&purge)["data"]["sync_state"], "skipped_fresh");
+    assert!(
+        server.requests().is_empty(),
+        "purge successor repair must not force or impersonate a remote sync"
+    );
+
+    let after = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(after["data"]["sync"]["last_sync_at"], remote_last_sync);
+    assert_eq!(after["data"]["purge"]["successor_repair_required"], false);
+    let removed = fixture.qgh(["get", "qgh://github.com/issue/I_POLICY_OTHER", "--json"]);
+    assert_eq!(removed.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&removed)["error"]["details"]["reason"],
+        "allowlist_removal"
+    );
+}
+
+#[test]
 fn purge_successor_remains_queryable_when_configured_embedding_refresh_fails() {
     let fixture = TestFixture::new("purge-successor-embedding-fallback");
     let server = MultiRepoFakeGitHub::start();
@@ -957,6 +988,79 @@ quantization = "none"
 
 #[cfg(unix)]
 #[test]
+fn missing_successor_publication_stays_blocked_until_preflight_repair_succeeds() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("purge-successor-repair-retry");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.clear_retrieval_publication();
+    fixture.mark_successor_repair_required();
+
+    let index_root = fixture.data_home.join("qgh/profiles/work/tantivy");
+    let saved_index_root = fixture
+        .data_home
+        .join("qgh/profiles/work/tantivy-before-repair");
+    fs::rename(&index_root, &saved_index_root).unwrap();
+    let invalid_index_root = fixture.root.join("invalid-repair-index-root");
+    fs::create_dir_all(&invalid_index_root).unwrap();
+    symlink(&invalid_index_root, &index_root).unwrap();
+    server.clear_requests();
+    let failed = fixture.qgh(["sync", "--json"]);
+
+    fs::remove_file(&index_root).unwrap();
+    fs::rename(&saved_index_root, &index_root).unwrap();
+
+    assert_eq!(failed.status.code(), Some(6));
+    assert!(server.requests().is_empty(), "repair must precede network");
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["pending_count"], 0);
+    assert_eq!(status["data"]["purge"]["successor_repair_required"], true);
+    assert_eq!(status["data"]["purge"]["retrieval_blocked"], true);
+    let doctor = stdout_json(&fixture.qgh(["doctor", "--json"]));
+    let purge_check = doctor["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "purge")
+        .unwrap();
+    assert_eq!(purge_check["ok"], false);
+
+    let query = fixture.qgh(["query", "shared repo policy tracer", "--json"]);
+    assert_eq!(query.status.code(), Some(6));
+    assert_eq!(
+        stdout_json(&query)["error"]["code"],
+        "purge.successor_repair_required"
+    );
+
+    fixture.write_config_with_repos("http://127.0.0.1:1", &["owner/repo"]);
+    let repaired_before_network_failure = fixture.qgh(["sync", "--json"]);
+    assert_eq!(repaired_before_network_failure.status.code(), Some(3));
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["successor_repair_required"], false);
+    assert_eq!(status["data"]["purge"]["retrieval_blocked"], false);
+    assert_success(&fixture.qgh(["query", "shared repo policy tracer", "--json"]));
+}
+
+#[test]
+fn never_synced_empty_store_does_not_require_synthetic_successor_snapshot() {
+    let fixture = TestFixture::new("purge-successor-empty-never-synced");
+    fixture.write_config_with_repos("http://127.0.0.1:1", &["owner/repo"]);
+
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["successor_repair_required"], false);
+    assert_eq!(status["data"]["purge"]["retrieval_blocked"], false);
+    let query = fixture.qgh(["query", "nothing indexed yet", "--json"]);
+    assert_success(&query);
+    assert!(stdout_json(&query)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(unix)]
+#[test]
 fn pending_purge_is_retried_by_next_sync_without_touching_user_backup() {
     use std::os::unix::fs::symlink;
 
@@ -989,6 +1093,10 @@ fn pending_purge_is_retried_by_next_sync_without_touching_user_backup() {
     assert_success(&status);
     let status_json = stdout_json(&status);
     assert_eq!(status_json["data"]["purge"]["pending_count"], 1);
+    assert_eq!(
+        status_json["data"]["purge"]["successor_repair_required"],
+        true
+    );
     assert_eq!(status_json["data"]["purge"]["retrieval_blocked"], true);
     assert_eq!(
         status_json["data"]["purge"]["current_stages"],
@@ -1021,6 +1129,10 @@ fn pending_purge_is_retried_by_next_sync_without_touching_user_backup() {
     let status = fixture.qgh(["status", "--json"]);
     assert_success(&status);
     assert_eq!(stdout_json(&status)["data"]["purge"]["pending_count"], 0);
+    assert_eq!(
+        stdout_json(&status)["data"]["purge"]["successor_repair_required"],
+        false
+    );
     assert_success(&fixture.qgh(["query", "shared repo policy tracer", "--json"]));
 }
 
@@ -5682,6 +5794,63 @@ fn sync_issue_refreshes_target_issue_and_reconciles_comment_diff() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn sync_issue_marks_every_confirmed_missing_comment_pending_before_batch_failure() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("targeted-refresh-purge-batch-failure");
+    let server = TargetedRefreshFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let profile_dir = fixture.data_home.join("qgh/profiles/work");
+    let index_root = profile_dir.join("tantivy");
+    let saved_index_root = profile_dir.join("tantivy-before-batch-failure");
+    fs::rename(&index_root, &saved_index_root).unwrap();
+    let user_backup = fixture.root.join("user-created-batch-failure-backup");
+    fs::create_dir_all(user_backup.join("generation-999")).unwrap();
+    symlink(&user_backup, &index_root).unwrap();
+
+    server.set_mode(TARGET_REFRESH_EMPTY_COMMENTS);
+    let failed = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_eq!(failed.status.code(), Some(6));
+    let failed_stdout = stdout_text(&failed);
+    assert!(failed_stdout.contains("purge.retry_failed"));
+    for private_marker in [
+        "IC_TARGET_1",
+        "IC_TARGET_3",
+        "targeted refresh original comment",
+        "deleteonlysentinel",
+    ] {
+        assert!(
+            !failed_stdout.contains(private_marker),
+            "purge error exposed private marker `{private_marker}`"
+        );
+    }
+
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["pending_count"], 2);
+    assert_eq!(status["data"]["purge"]["target_kinds"], json!(["source"]));
+    for source_id in [
+        "qgh://github.com/issue-comment/IC_TARGET_1",
+        "qgh://github.com/issue-comment/IC_TARGET_3",
+    ] {
+        let get = fixture.qgh(["get", source_id, "--json"]);
+        assert_eq!(get.status.code(), Some(6));
+        assert_eq!(stdout_json(&get)["error"]["code"], "purge.read_fenced");
+    }
+
+    fs::remove_file(&index_root).unwrap();
+    fs::rename(&saved_index_root, &index_root).unwrap();
+    let retry = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_success(&retry);
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["pending_count"], 0);
+    fixture.assert_tombstone_reason("qgh://github.com/issue-comment/IC_TARGET_1", "deleted");
+    fixture.assert_tombstone_reason("qgh://github.com/issue-comment/IC_TARGET_3", "deleted");
+}
+
 #[test]
 fn sync_issue_human_output_reports_comment_diff_on_stdout_and_stderr() {
     let fixture = TestFixture::new("targeted-refresh-human-output");
@@ -5749,6 +5918,12 @@ fn sync_issue_marks_permission_loss_with_distinct_reason() {
     );
     assert_eq!(refresh_json["data"]["lifecycle"]["http_status"], 403);
     assert_eq!(refresh_json["data"]["issues"]["tombstoned"], 1);
+    fixture.assert_successful_sync_run(
+        refresh_json["data"]["sync_run_id"]
+            .as_str()
+            .expect("permission-loss sync_run_id"),
+        "purge_successor",
+    );
 
     let issue_get = fixture.qgh(["get", "qgh://github.com/issue/I_kwDOISSUE1", "--json"]);
     assert_eq!(issue_get.status.code(), Some(4));
@@ -7103,6 +7278,55 @@ limit = 10
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    fn clear_retrieval_publication(&self) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute("DELETE FROM retrieval_publication_pointer", [])
+            .unwrap();
+        conn.execute("UPDATE retrieval_publications SET active = 0", [])
+            .unwrap();
+        conn.execute("UPDATE index_generations SET active = 0", [])
+            .unwrap();
+    }
+
+    fn mark_successor_repair_required(&self) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let epoch: String = conn
+            .query_row(
+                "SELECT value FROM profile_meta WHERE key = 'content_write_epoch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for (key, value) in [
+            ("successor_repair_required", "1"),
+            ("successor_repair_requested_epoch", epoch.as_str()),
+            ("successor_repair_reason", "purge"),
+        ] {
+            conn.execute(
+                "INSERT INTO profile_meta(key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            .unwrap();
+        }
+    }
+
+    fn assert_successful_sync_run(&self, sync_run_id: &str, expected_snapshot_kind: &str) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let (completed, snapshot_kind): (i64, String) = conn
+            .query_row(
+                "SELECT completed_successfully, snapshot_kind FROM sync_runs WHERE id = ?1",
+                [sync_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(completed, 1);
+        assert_eq!(snapshot_kind, expected_snapshot_kind);
     }
 
     fn set_last_sync_age_seconds(&self, age_seconds: i64) {
@@ -8602,6 +8826,7 @@ const TARGET_REFRESH_TRANSFER: usize = 5;
 const TARGET_REFRESH_TRANSFER_CYCLE: usize = 6;
 const TARGET_REFRESH_AUTH_FAILED: usize = 7;
 const TARGET_REFRESH_SECONDARY_RATE_LIMIT_NO_RETRY_AFTER: usize = 8;
+const TARGET_REFRESH_EMPTY_COMMENTS: usize = 9;
 
 struct TargetedRefreshFakeGitHub {
     base_url: String,
@@ -8684,6 +8909,8 @@ fn handle_targeted_refresh_connection(
     {
         if mode == TARGET_REFRESH_DIFF {
             ("200 OK", targeted_refreshed_comments_payload(), None)
+        } else if mode == TARGET_REFRESH_EMPTY_COMMENTS {
+            ("200 OK", "[]", None)
         } else {
             ("200 OK", targeted_initial_comments_payload(), None)
         }

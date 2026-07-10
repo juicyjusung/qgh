@@ -96,8 +96,10 @@ metadata when resolution has run:
 
 `status` also includes `data.resolution` with the same resolved profile and
 repo-scope fields. Its read-only `data.purge` block reports only aggregate,
-content-free pending-purge state: count, whether affected retrieval is fenced,
-target/trigger kinds, and coarse current/failure stages. CLI-only `doctor`
+content-free purge state: pending count, whether lexical-successor repair is
+required, whether retrieval is fenced, target/trigger kinds, and coarse
+current/failure stages.
+CLI-only `doctor`
 includes the same diagnostics and is the explicit command that may run probes.
 Its purge block also states that user-created filesystem backups and snapshots
 outside qgh-managed generation paths are not deleted by qgh. Neither `status`

@@ -89,6 +89,7 @@
       "type": "object",
       "required": [
         "pending_count",
+        "successor_repair_required",
         "retrieval_blocked",
         "target_kinds",
         "triggers",
@@ -100,6 +101,9 @@
         "pending_count": {
           "type": "integer",
           "minimum": 0
+        },
+        "successor_repair_required": {
+          "type": "boolean"
         },
         "retrieval_blocked": {
           "type": "boolean"
