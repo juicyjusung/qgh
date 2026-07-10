@@ -124,6 +124,10 @@ struct IndexBuildDeletion {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TantivyPurgeFailurePoint {
+    PayloadDirectorySync,
+    ManifestDirectorySync,
+    MarkerDirectorySync,
+    MarkerOnlyDirectorySync,
     AfterMarkerUnlink,
     AfterRootRemove,
 }
@@ -643,6 +647,11 @@ impl Store {
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
+            // Marker-less generation directories were emitted before qgh
+            // persisted build leases. Only a missing lease (or the durable
+            // repair it created before sealing) may relax the legacy marker
+            // check; normal leased generations must always prove ownership.
+            let allow_missing_owner_marker = owner_pid.is_none() || repair_token.is_some();
             let owner_token = lease_token
                 .or(repair_token)
                 .unwrap_or_else(|| format!("index-adoption-{generation}-{}", now_run_id_suffix()));
@@ -698,6 +707,7 @@ impl Store {
                     &expected_path,
                     generation,
                     &owner_token,
+                    allow_missing_owner_marker,
                 )?;
                 Ok(())
             })();
@@ -1758,6 +1768,18 @@ impl Store {
         false
     }
 
+    fn sync_anchored_quarantine_directory(
+        &mut self,
+        directory: &fs::File,
+        #[cfg(test)] failure_point: TantivyPurgeFailurePoint,
+    ) -> Result<(), QghError> {
+        #[cfg(test)]
+        if self.should_fail_tantivy_purge_filesystem_point(failure_point) {
+            return Err(purge_error());
+        }
+        directory.sync_all().map_err(|_| purge_error())
+    }
+
     #[cfg(test)]
     fn inject_build_cleanup_quarantine_swap_after_open(
         &mut self,
@@ -2654,6 +2676,11 @@ impl Store {
             }) {
                 return Err(purge_error());
             }
+            self.sync_anchored_quarantine_directory(
+                &directory,
+                #[cfg(test)]
+                TantivyPurgeFailurePoint::PayloadDirectorySync,
+            )?;
             self.advance_tantivy_purge_phase(
                 generation,
                 &deletion,
@@ -2676,6 +2703,11 @@ impl Store {
                     &manifest.fingerprint(),
                 )?;
             }
+            self.sync_anchored_quarantine_directory(
+                &directory,
+                #[cfg(test)]
+                TantivyPurgeFailurePoint::ManifestDirectorySync,
+            )?;
             self.advance_tantivy_purge_phase(
                 generation,
                 &deletion,
@@ -2704,6 +2736,11 @@ impl Store {
                     return Err(purge_error());
                 }
             }
+            self.sync_anchored_quarantine_directory(
+                &directory,
+                #[cfg(test)]
+                TantivyPurgeFailurePoint::MarkerDirectorySync,
+            )?;
             self.advance_tantivy_purge_phase(
                 generation,
                 &deletion,
@@ -3216,6 +3253,11 @@ impl Store {
                     &marker,
                 )?;
             }
+            self.sync_anchored_quarantine_directory(
+                &directory,
+                #[cfg(test)]
+                TantivyPurgeFailurePoint::MarkerOnlyDirectorySync,
+            )?;
             let changed = self.conn.execute(
                 "UPDATE index_build_deletions SET phase = 'marker_deleted', updated_at = ?1
                  WHERE generation = ?2 AND owner_token = ?3
@@ -13982,6 +14024,137 @@ mod tests {
     }
 
     #[test]
+    fn payload_directory_sync_failure_keeps_verified_phase_and_retry_succeeds() {
+        let source_id = "qgh://github.com/issue/I_PURGE_PAYLOAD_DIRECTORY_SYNC";
+        let (paths, mut store, generation, quarantine_path) =
+            tantivy_purge_sync_fixture("payload-directory-sync", source_id);
+        store
+            .fail_tantivy_purge_at_filesystem_point(TantivyPurgeFailurePoint::PayloadDirectorySync);
+
+        store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        let phase: String = store
+            .conn
+            .query_row(
+                "SELECT phase FROM tantivy_purge_deletions WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "verified");
+        assert!(quarantine_path.exists());
+        assert!(quarantine_path.join(TANTIVY_OWNER_MARKER_FILE).exists());
+        assert!(quarantine_path.join(TANTIVY_MANAGED_MANIFEST_FILE).exists());
+
+        let outcome = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+        assert_eq!(outcome.discarded_tantivy_generations, 1);
+        assert!(!quarantine_path.exists());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn manifest_directory_sync_failure_keeps_payload_phase_and_retry_succeeds() {
+        let source_id = "qgh://github.com/issue/I_PURGE_MANIFEST_DIRECTORY_SYNC";
+        let (paths, mut store, generation, quarantine_path) =
+            tantivy_purge_sync_fixture("manifest-directory-sync", source_id);
+        store.fail_tantivy_purge_at_filesystem_point(
+            TantivyPurgeFailurePoint::ManifestDirectorySync,
+        );
+
+        store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        let phase: String = store
+            .conn
+            .query_row(
+                "SELECT phase FROM tantivy_purge_deletions WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "payload_deleted");
+        assert!(quarantine_path.exists());
+        assert!(!quarantine_path.join(TANTIVY_MANAGED_MANIFEST_FILE).exists());
+        assert!(quarantine_path.join(TANTIVY_OWNER_MARKER_FILE).exists());
+
+        let outcome = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+        assert_eq!(outcome.discarded_tantivy_generations, 1);
+        assert!(!quarantine_path.exists());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn marker_directory_sync_failure_keeps_manifest_phase_and_retry_succeeds() {
+        let source_id = "qgh://github.com/issue/I_PURGE_MARKER_DIRECTORY_SYNC";
+        let (paths, mut store, generation, quarantine_path) =
+            tantivy_purge_sync_fixture("marker-directory-sync", source_id);
+        store.fail_tantivy_purge_at_filesystem_point(TantivyPurgeFailurePoint::MarkerDirectorySync);
+
+        store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        let phase: String = store
+            .conn
+            .query_row(
+                "SELECT phase FROM tantivy_purge_deletions WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "manifest_deleted");
+        assert!(quarantine_path.exists());
+        assert!(!quarantine_path.join(TANTIVY_OWNER_MARKER_FILE).exists());
+
+        let outcome = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+        assert_eq!(outcome.discarded_tantivy_generations, 1);
+        assert!(!quarantine_path.exists());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
     fn purge_resumes_when_crash_happens_after_quarantine_root_removal() {
         let paths = temp_profile_paths("purge-tantivy-root-remove-resume");
         let mut store = Store::open(&paths).unwrap();
@@ -14141,7 +14314,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_active_and_previous_generations_are_adopted_then_purged() {
+    fn markerless_legacy_active_and_previous_generations_are_adopted_then_purged() {
         let paths = temp_profile_paths("legacy-tantivy-ownership-adoption");
         let mut store = Store::open(&paths).unwrap();
         let source_id = "qgh://github.com/issue/I_LEGACY_OWNERSHIP_ADOPTION";
@@ -14185,17 +14358,7 @@ mod tests {
             .unwrap();
         for path in [&first_path, &second_path] {
             let marker_path = path.join(".qgh-build-owner-v1");
-            let sealed = fs::read_to_string(&marker_path).unwrap();
-            let owner_digest = sealed
-                .strip_prefix("qgh.index-generation-owner.v1:")
-                .and_then(|value| value.split_once(':'))
-                .map(|(owner_digest, _)| owner_digest)
-                .unwrap();
-            fs::write(
-                marker_path,
-                format!("qgh.index-build-owner.v1:{owner_digest}"),
-            )
-            .unwrap();
+            fs::remove_file(marker_path).unwrap();
         }
         store
             .conn
@@ -14245,7 +14408,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_generation_with_unknown_entry_requires_retirement_without_deleting_it() {
+    fn markerless_legacy_generation_with_unknown_entry_requires_retirement_without_deleting_it() {
         let paths = temp_profile_paths("legacy-tantivy-ownership-repair");
         let mut store = Store::open(&paths).unwrap();
         let source_id = "qgh://github.com/issue/I_LEGACY_OWNERSHIP_REPAIR";
@@ -14271,17 +14434,7 @@ mod tests {
             .activate_retrieval_publication("sync-legacy-ownership-repair", generation, None, None)
             .unwrap();
         let marker_path = generation_path.join(".qgh-build-owner-v1");
-        let sealed = fs::read_to_string(&marker_path).unwrap();
-        let owner_digest = sealed
-            .strip_prefix("qgh.index-generation-owner.v1:")
-            .and_then(|value| value.split_once(':'))
-            .map(|(owner_digest, _)| owner_digest)
-            .unwrap();
-        fs::write(
-            marker_path,
-            format!("qgh.index-build-owner.v1:{owner_digest}"),
-        )
-        .unwrap();
+        fs::remove_file(marker_path).unwrap();
         let foreign_entry = generation_path.join("foreign-backup-marker");
         fs::write(&foreign_entry, b"preserve").unwrap();
         store
@@ -14326,6 +14479,207 @@ mod tests {
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn markerless_legacy_generation_with_symlink_requires_retirement_without_deleting_it() {
+        use std::os::unix::fs::symlink;
+
+        let paths = temp_profile_paths("legacy-tantivy-markerless-symlink");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_LEGACY_MARKERLESS_SYMLINK";
+        store
+            .upsert_sources_for_run(
+                "sync-legacy-markerless-symlink",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "legacy-markerless-symlink-private-marker",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication(
+                "sync-legacy-markerless-symlink",
+                generation,
+                None,
+                None,
+            )
+            .unwrap();
+        fs::remove_file(generation_path.join(TANTIVY_OWNER_MARKER_FILE)).unwrap();
+        let foreign_target = paths.profile_dir.join("foreign-symlink-target");
+        fs::write(&foreign_target, b"preserve").unwrap();
+        let foreign_link = generation_path.join("foreign-symlink");
+        symlink(&foreign_target, &foreign_link).unwrap();
+        store
+            .conn
+            .execute("DELETE FROM index_build_leases", [])
+            .unwrap();
+        drop(store);
+
+        let repaired = Store::open(&paths).unwrap();
+        let state: String = repaired
+            .conn
+            .query_row(
+                "SELECT state FROM tantivy_ownership_repairs WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "retirement_required");
+        assert!(fs::symlink_metadata(&foreign_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&foreign_target).unwrap(), b"preserve");
+        assert!(generation_path.exists());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn markerless_legacy_generation_with_inventory_mismatch_requires_retirement_and_is_preserved() {
+        let paths = temp_profile_paths("legacy-tantivy-markerless-inventory-mismatch");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_LEGACY_MARKERLESS_INVENTORY_MISMATCH";
+        store
+            .upsert_sources_for_run(
+                "sync-legacy-markerless-inventory-mismatch",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "legacy-markerless-inventory-private-marker",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication(
+                "sync-legacy-markerless-inventory-mismatch",
+                generation,
+                None,
+                None,
+            )
+            .unwrap();
+        fs::remove_file(generation_path.join(TANTIVY_OWNER_MARKER_FILE)).unwrap();
+        store
+            .conn
+            .execute("DELETE FROM index_build_leases", [])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE index_generations SET source_inventory_hash = ?1 WHERE generation = ?2",
+                params!["f".repeat(64), generation],
+            )
+            .unwrap();
+        drop(store);
+
+        let repaired = Store::open(&paths).unwrap();
+        let state: String = repaired
+            .conn
+            .query_row(
+                "SELECT state FROM tantivy_ownership_repairs WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "retirement_required");
+        assert!(generation_path.exists());
+        assert!(!generation_path.join(TANTIVY_OWNER_MARKER_FILE).exists());
+        let ownership_rows: i64 = repaired
+            .conn
+            .query_row(
+                "SELECT count(*) FROM index_build_leases WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ownership_rows, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn markerless_generation_with_existing_lease_is_not_treated_as_prelease_legacy() {
+        let paths = temp_profile_paths("markerless-generation-existing-lease");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_MARKERLESS_EXISTING_LEASE";
+        store
+            .upsert_sources_for_run(
+                "sync-markerless-existing-lease",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "markerless-existing-lease-private-marker",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication(
+                "sync-markerless-existing-lease",
+                generation,
+                None,
+                None,
+            )
+            .unwrap();
+        fs::remove_file(generation_path.join(TANTIVY_OWNER_MARKER_FILE)).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE index_build_leases SET owner_pid = ?1 WHERE generation = ?2",
+                params![TANTIVY_ADOPTION_OWNER_PID, generation],
+            )
+            .unwrap();
+        drop(store);
+
+        let repaired = Store::open(&paths).unwrap();
+        let state: String = repaired
+            .conn
+            .query_row(
+                "SELECT state FROM tantivy_ownership_repairs WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "retirement_required");
+        assert!(generation_path.exists());
+        assert!(!generation_path.join(TANTIVY_OWNER_MARKER_FILE).exists());
+        let ownership_rows: i64 = repaired
+            .conn
+            .query_row(
+                "SELECT count(*) FROM index_build_leases WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ownership_rows, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
     #[test]
     fn legacy_generation_adoption_resumes_after_seal_temp_was_synced() {
         let paths = temp_profile_paths("legacy-tantivy-ownership-adoption-resume");
@@ -14359,13 +14713,7 @@ mod tests {
             .unwrap();
         let owner_token = format!("test-adoption-resume-{generation}");
         let marker_path = generation_path.join(".qgh-build-owner-v1");
-        let sealed = fs::read_to_string(&marker_path).unwrap();
-        let owner_digest = sealed
-            .strip_prefix("qgh.index-generation-owner.v1:")
-            .and_then(|value| value.split_once(':'))
-            .map(|(owner_digest, _)| owner_digest)
-            .unwrap();
-        let legacy_marker = format!("qgh.index-build-owner.v1:{owner_digest}");
+        fs::remove_file(&marker_path).unwrap();
         store
             .conn
             .execute("DELETE FROM index_build_leases", [])
@@ -14396,17 +14744,22 @@ mod tests {
                 ],
             )
             .unwrap();
-        // Start the fresh adoption from the pre-ownership marker.
-        fs::write(&marker_path, &legacy_marker).unwrap();
-        crate::index::adopt_legacy_generation_directory(&generation_path, generation, &owner_token)
-            .unwrap();
+        // Start the fresh adoption from the marker-less legacy artifact, then
+        // model a crash after the new seal was synced but before its rename.
+        crate::index::adopt_legacy_generation_directory(
+            &generation_path,
+            generation,
+            &owner_token,
+            true,
+        )
+        .unwrap();
         let adoption_seal = fs::read_to_string(&marker_path).unwrap();
         fs::write(
             generation_path.join(".qgh-build-owner-v1.sealing"),
             &adoption_seal,
         )
         .unwrap();
-        fs::write(&marker_path, legacy_marker).unwrap();
+        fs::remove_file(&marker_path).unwrap();
         drop(store);
 
         let resumed = Store::open(&paths).unwrap();
@@ -16326,6 +16679,58 @@ mod tests {
 
         builder.cleanup_owned_index_generation(generation).unwrap();
 
+        assert!(!quarantine_path.exists());
+        let rows: i64 = builder
+            .conn
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM index_generations) +
+                    (SELECT count(*) FROM index_build_leases) +
+                    (SELECT count(*) FROM index_build_deletions)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn marker_only_directory_sync_failure_keeps_verified_phase_and_retry_succeeds() {
+        let paths = temp_profile_paths("index-marker-only-directory-sync");
+        let mut builder = Store::open(&paths).unwrap();
+        let (generation, _) = builder
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        let owner_token = builder
+            .index_build_tokens
+            .get(&generation)
+            .cloned()
+            .unwrap();
+        let quarantine_path =
+            index_build_cleanup_quarantine_path(&paths.index_root, generation, &owner_token);
+        builder.fail_tantivy_purge_at_filesystem_point(
+            TantivyPurgeFailurePoint::MarkerOnlyDirectorySync,
+        );
+
+        builder
+            .cleanup_owned_index_generation(generation)
+            .unwrap_err();
+
+        let phase: String = builder
+            .conn
+            .query_row(
+                "SELECT phase FROM index_build_deletions WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "verified");
+        assert!(quarantine_path.exists());
+        assert!(!quarantine_path.join(TANTIVY_OWNER_MARKER_FILE).exists());
+
+        builder.cleanup_owned_index_generation(generation).unwrap();
         assert!(!quarantine_path.exists());
         let rows: i64 = builder
             .conn
@@ -20405,6 +20810,43 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    fn tantivy_purge_sync_fixture(
+        name: &str,
+        source_id: &str,
+    ) -> (ProfilePaths, Store, i64, PathBuf) {
+        let paths = temp_profile_paths(&format!("purge-tantivy-{name}"));
+        let mut store = Store::open(&paths).unwrap();
+        let sync_run_id = format!("sync-purge-{name}");
+        store
+            .upsert_sources_for_run(
+                &sync_run_id,
+                &[test_issue(source_id, "owner/repo", "private-sync-failure")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication(&sync_run_id, generation, None, None)
+            .unwrap();
+        let owner_token: String = store
+            .conn
+            .query_row(
+                "SELECT owner_token FROM index_build_leases WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let quarantine_path =
+            tantivy_purge_quarantine_path(&paths.index_root, generation, &owner_token);
+        (paths, store, generation, quarantine_path)
     }
 
     fn rebuild_reserved_generation(

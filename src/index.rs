@@ -214,11 +214,12 @@ pub(crate) fn adopt_legacy_generation_directory(
     path: &Path,
     generation: i64,
     owner_token: &str,
+    allow_missing_owner_marker: bool,
 ) -> Result<(), QghError> {
     if validate_owned_generation_directory(path, generation, owner_token).is_ok() {
         return Ok(());
     }
-    validate_legacy_build_directory(path)?;
+    validate_legacy_build_directory(path, allow_missing_owner_marker)?;
     validate_legacy_tantivy_file_inventory(path)?;
     write_owned_generation_seal(path, generation, owner_token)?;
     validate_owned_generation_directory(path, generation, owner_token)
@@ -263,14 +264,24 @@ fn write_owned_generation_seal(
     Ok(())
 }
 
-fn validate_legacy_build_directory(path: &Path) -> Result<(), QghError> {
+fn validate_legacy_build_directory(
+    path: &Path,
+    allow_missing_owner_marker: bool,
+) -> Result<(), QghError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| index_build_collision_error())?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(index_build_collision_error());
     }
     let marker_path = path.join(INDEX_BUILD_MARKER_FILE);
-    let marker_metadata =
-        fs::symlink_metadata(&marker_path).map_err(|_| index_build_collision_error())?;
+    let marker_metadata = match fs::symlink_metadata(&marker_path) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && allow_missing_owner_marker =>
+        {
+            return Ok(());
+        }
+        Err(_) => return Err(index_build_collision_error()),
+    };
     if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
         return Err(index_build_collision_error());
     }
