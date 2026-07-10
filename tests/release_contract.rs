@@ -1,3 +1,4 @@
+use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs;
@@ -6,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 #[test]
-fn released_error_schema_covers_stable_embedding_error_codes() {
+fn released_error_schema_covers_all_stable_externally_emitted_error_codes() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let error_schema: Value = serde_json::from_str(
         &fs::read_to_string(root.join("docs/schemas/error.schema.json")).unwrap(),
@@ -18,17 +19,39 @@ fn released_error_schema_covers_stable_embedding_error_codes() {
         .iter()
         .map(|code| code.as_str().unwrap().to_string())
         .collect::<BTreeSet<_>>();
-    let published_embedding = published
+    let published_stable = published
         .iter()
-        .filter(|code| code.starts_with("embedding."))
+        .filter(|code| has_stable_error_prefix(code))
         .cloned()
         .collect::<BTreeSet<_>>();
-    let emitted = stable_embedding_error_codes_from_source(&root);
+    let mut expected_contract = stable_external_error_codes_from_source(&root);
+    // Reserved as the stable fail-safe identity for an unexpected envelope
+    // boundary failure even though no ordinary command path emits it today.
+    expected_contract.insert("internal.failure".to_string());
     assert_eq!(
-        published_embedding, emitted,
-        "released error schema embedding codes must exactly match stable externally emitted source codes"
+        published_stable, expected_contract,
+        "released error schema codes must exactly match stable externally emitted and reserved codes"
     );
     assert_eq!(error_schema["additionalProperties"], false);
+}
+
+#[test]
+fn error_code_docs_describe_publication_snapshot_failures() {
+    let docs =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/error-codes.md"))
+            .unwrap();
+    for code in [
+        "publication.source_snapshot_incomplete",
+        "publication.source_snapshot_changed",
+        "publication.source_inventory_mismatch",
+        "publication.embedding_snapshot_mismatch",
+    ] {
+        assert!(docs.contains(code), "error code docs must describe {code}");
+    }
+    assert!(
+        !docs.contains("embedding.source_snapshot_missing"),
+        "error code docs must not advertise the removed embedding.source_snapshot_missing code"
+    );
 }
 
 #[cfg(not(feature = "vector-search"))]
@@ -98,6 +121,119 @@ env = "QGH_RELEASE_CONTRACT_TOKEN"
         .as_array()
         .unwrap()
         .contains(&envelope["error"]["code"]));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cli_publication_error_envelope_matches_released_schema() {
+    let root = std::env::temp_dir().join(format!(
+        "qgh-release-contract-publication-error-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_home = root.join("config");
+    let data_home = root.join("data");
+    fs::create_dir_all(config_home.join("qgh")).unwrap();
+    fs::create_dir_all(&data_home).unwrap();
+    fs::write(
+        config_home.join("qgh/config.toml"),
+        r#"schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["juicyjusung/qgh"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_RELEASE_CONTRACT_TOKEN"
+"#,
+    )
+    .unwrap();
+
+    let initialized = Command::new(binary())
+        .args(["--profile", "work", "status", "--json"])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_DATA_HOME", &data_home)
+        .env("QGH_RELEASE_CONTRACT_TOKEN", "not-a-real-token")
+        .output()
+        .unwrap();
+    assert_success(&initialized);
+    let connection = Connection::open(data_home.join("qgh/profiles/work/qgh.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO repositories (repo, host, owner, name)
+            VALUES ('juicyjusung/qgh', 'github.com', 'juicyjusung', 'qgh');
+
+            INSERT INTO source_entities
+                (source_id, entity_type, host, repo, node_id, github_id,
+                 lifecycle_state, created_at, updated_at, last_seen_at)
+            VALUES ('github:issue:release-contract', 'issue', 'github.com',
+                    'juicyjusung/qgh', 'I_release_contract_fixture', 47,
+                    'active', '2026-07-11T00:00:00Z',
+                    '2026-07-11T00:00:00Z', '2026-07-11T00:00:00Z');
+
+            INSERT INTO source_versions
+                (source_id, body_hash, github_updated_at, indexed_at, sync_run_id, lifecycle_state)
+            VALUES ('github:issue:release-contract',
+                    '0000000000000000000000000000000000000000000000000000000000000047',
+                    '2026-07-11T00:00:00Z', '2026-07-11T00:00:00Z',
+                    'incomplete-release-contract-snapshot', 'active');
+
+            INSERT INTO issue_metadata
+                (source_id, repo, issue_number, title, body, state, labels_json,
+                 milestone, assignees_json, author, created_at, updated_at,
+                 closed_at, canonical_url, latest_version_id)
+            VALUES ('github:issue:release-contract', 'juicyjusung/qgh', 47,
+                    'Release contract fixture',
+                    'Fixture body for publication error envelope validation.',
+                    'open', '[]', NULL, '[]', 'fixture',
+                    '2026-07-11T00:00:00Z', '2026-07-11T00:00:00Z', NULL,
+                    'https://github.com/juicyjusung/qgh/issues/47',
+                    (SELECT id FROM source_versions
+                     WHERE source_id = 'github:issue:release-contract'));
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let output = Command::new(binary())
+        .args(["--profile", "work", "query", "release contract", "--json"])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_DATA_HOME", &data_home)
+        .env("QGH_RELEASE_CONTRACT_TOKEN", "not-a-real-token")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(6));
+    assert!(stderr_text(&output).is_empty());
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["schema_version"], "qgh.v1");
+    assert_eq!(envelope["ok"], false);
+    assert!(envelope.get("data").is_none());
+    assert_eq!(
+        envelope["error"]["code"],
+        "publication.source_snapshot_incomplete"
+    );
+    let error_schema: Value = serde_json::from_str(
+        &fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/schemas/error.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let envelope_schema: Value = serde_json::from_str(
+        &fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/schemas/envelope.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_error_envelope_matches_released_schemas(&envelope, &envelope_schema, &error_schema);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2536,7 +2672,69 @@ fn format_schema_location(schema_path: &str, json_path: &[String]) -> String {
     }
 }
 
-fn stable_embedding_error_codes_from_source(root: &std::path::Path) -> BTreeSet<String> {
+fn assert_error_envelope_matches_released_schemas(
+    envelope: &Value,
+    envelope_schema: &Value,
+    error_schema: &Value,
+) {
+    assert_eq!(envelope_schema["type"], "object");
+    assert_eq!(envelope_schema["additionalProperties"], false);
+    let object = envelope
+        .as_object()
+        .expect("CLI error envelope must be an object");
+    let actual_fields = object.keys().cloned().collect::<BTreeSet<_>>();
+    let mut required_fields = envelope_schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
+    required_fields.insert("error".to_string());
+    assert_eq!(
+        actual_fields, required_fields,
+        "CLI error envelope must have exactly the released strict schema fields"
+    );
+    assert_eq!(
+        envelope["schema_version"],
+        envelope_schema["properties"]["schema_version"]["const"]
+    );
+    assert_eq!(envelope["ok"], false);
+    assert!(envelope["warnings"].is_array());
+    assert!(envelope["meta"].is_object());
+    assert_error_matches_released_schema(&envelope["error"], error_schema);
+}
+
+fn assert_error_matches_released_schema(error: &Value, schema: &Value) {
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["additionalProperties"], false);
+    let object = error.as_object().expect("CLI error must be an object");
+    let actual_fields = object.keys().cloned().collect::<BTreeSet<_>>();
+    let required_fields = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual_fields, required_fields,
+        "CLI error object must have exactly the released strict schema fields"
+    );
+    assert!(error["message"].is_string());
+    assert!(error["details"].is_object());
+    assert!(error["hint"].is_null() || error["hint"].is_string());
+    assert!(error["retryable"].is_boolean());
+    assert!(error["exit_code"].is_i64());
+    assert!(schema["$defs"]["error_code"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&error["code"]));
+    assert!(schema["properties"]["exit_code"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&error["exit_code"]));
+}
+
+fn stable_external_error_codes_from_source(root: &std::path::Path) -> BTreeSet<String> {
     const WARNING_CODES: &[&str] = &[
         "embedding.artifact_corrupt",
         "embedding.coverage_missing",
@@ -2553,10 +2751,22 @@ fn stable_embedding_error_codes_from_source(root: &std::path::Path) -> BTreeSet<
         "embedding.tombstone_cleanup_failed",
         "embedding.vector_init_failed",
         "embedding.vector_search_failed",
+        "config.duplicate_repo_allowlist",
+        "config.profile_not_checked",
+        "freshness.active_issue_snapshot_stale",
+        "freshness.never_synced",
+        "freshness.query_snapshot_stale",
+        "publication.activation_failed",
+        "publication.incomplete_snapshot_deferred",
     ];
-    const TEST_ONLY_CODES: &[&str] = &["embedding.generation_cleanup_injected_failure"];
+    const DEBUG_OR_TEST_ONLY_CODES: &[&str] = &["embedding.generation_cleanup_injected_failure"];
+    const NON_ERROR_LITERALS: &[&str] = &["config.json", "config.toml", "github.com"];
     let warning_codes = WARNING_CODES.iter().copied().collect::<BTreeSet<_>>();
-    let test_only_codes = TEST_ONLY_CODES.iter().copied().collect::<BTreeSet<_>>();
+    let debug_or_test_only_codes = DEBUG_OR_TEST_ONLY_CODES
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let non_error_literals = NON_ERROR_LITERALS.iter().copied().collect::<BTreeSet<_>>();
     let mut codes = BTreeSet::new();
     for entry in fs::read_dir(root.join("src")).unwrap() {
         let path = entry.unwrap().path();
@@ -2564,22 +2774,64 @@ fn stable_embedding_error_codes_from_source(root: &std::path::Path) -> BTreeSet<
             continue;
         }
         let source = fs::read_to_string(path).unwrap();
+        // Ignore only the top-level test module, never inline `#[cfg(test)]`
+        // fields or blocks. In particular, store.rs contains production error
+        // constructors thousands of lines after its first inline test cfg.
         let production = production_source_before_top_level_test_module(&source);
-        let mut rest = production;
-        while let Some(offset) = rest.find("\"embedding.") {
-            rest = &rest[offset + 1..];
-            let end = rest.find('"').expect("embedding code literal is closed");
-            let code = &rest[..end];
-            if !code.starts_with("embedding.test_")
-                && !warning_codes.contains(code)
-                && !test_only_codes.contains(code)
-            {
-                codes.insert(code.to_string());
+        for prefix in stable_error_prefixes() {
+            let needle = format!("\"{prefix}");
+            let mut rest = production;
+            while let Some(offset) = rest.find(&needle) {
+                rest = &rest[offset + 1..];
+                let end = rest.find('"').expect("stable error code literal is closed");
+                let code = &rest[..end];
+                if is_error_code_literal(code)
+                    && !code.contains(".test_")
+                    && !warning_codes.contains(code)
+                    && !debug_or_test_only_codes.contains(code)
+                    && !non_error_literals.contains(code)
+                {
+                    codes.insert(code.to_string());
+                }
+                rest = &rest[end + 1..];
             }
-            rest = &rest[end + 1..];
         }
     }
     codes
+}
+
+fn is_error_code_literal(code: &str) -> bool {
+    let Some((_, name)) = code.split_once('.') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn has_stable_error_prefix(code: &str) -> bool {
+    stable_error_prefixes()
+        .iter()
+        .any(|prefix| code.starts_with(prefix))
+}
+
+fn stable_error_prefixes() -> &'static [&'static str] {
+    &[
+        "auth.",
+        "config.",
+        "embedding.",
+        "freshness.",
+        "github.",
+        "index.",
+        "internal.",
+        "publication.",
+        "purge.",
+        "source.",
+        "storage.",
+        "sync.",
+        "validation.",
+    ]
 }
 
 fn production_source_before_top_level_test_module(source: &str) -> &str {
@@ -2589,7 +2841,7 @@ fn production_source_before_top_level_test_module(source: &str) -> &str {
         if line.trim_end() == "#[cfg(test)]"
             && lines
                 .get(index + 1)
-                .is_some_and(|next| next.trim_start().starts_with("mod tests"))
+                .is_some_and(|next| next.trim_start().starts_with("mod "))
         {
             return &source[..offset];
         }

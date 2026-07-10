@@ -43,6 +43,9 @@ request. A retry that remains incomplete returns `purge.retry_failed` with only
 aggregate target/trigger kinds and coarse stage names; it does not include
 source bodies, queries, tokens, or raw transport errors. `purge.successor_*`
 codes mean qgh could not publish the required clean lexical successor snapshot.
+`purge.allowlist_reconciliation_required` means stored repository state no
+longer matches the configured allowlist and must be reconciled by `sync` before
+reads resume.
 `purge.successor_repair_required` blocks query fallback from opening an old
 index after purge invalidated the publication pointer; the next valid `sync`
 repairs that pointer before token resolution or a GitHub request.
@@ -51,10 +54,21 @@ Post-purge activation additionally requires the current durable
 missing, stale-epoch, or corrupt generations remain unpublished and leave
 successor repair pending.
 
-`embed --force` returns `embedding.source_snapshot_missing` instead of creating
-a synthetic provenance id when no completed remote or purge-successor source
-snapshot exists. Run a successful `sync` first; the failed embed attempt does
-not publish vectors or a retrieval generation.
+Retrieval publication is fail closed when its durable provenance cannot be
+validated:
+
+- `publication.source_snapshot_incomplete`: active source state has no complete
+  snapshot identity at the current source epoch.
+- `publication.source_snapshot_changed`: the source epoch or snapshot identity
+  changed before activation or retrieval.
+- `publication.source_inventory_mismatch`: the stored lexical generation count
+  or inventory digest does not match the captured source snapshot.
+- `publication.embedding_snapshot_mismatch`: lexical and embedding generations
+  do not share the same fully validated source snapshot and identity fields.
+
+These failures do not activate or query an unvalidated generation. Run a
+successful `sync` to publish a coherent successor; when purge successor repair
+is pending, the next otherwise-valid `sync` performs that repair first.
 
 `query`/`search` and `status` may return `freshness.stale` when the local
 snapshot violates a fail-mode freshness policy or `--require-fresh` is passed.
@@ -66,6 +80,9 @@ query arguments are invalid, such as `--limit 0`.
 `query`/`search --issue` and `sync issue` may return
 `validation.invalid_issue_number` when the requested issue number is less than
 one.
+Label-filtered retrieval may return `validation.stale_index_label_filter` when
+the local lexical index predates label-filter support; run `qgh sync` to rebuild
+the index before retrying that filter.
 
 `init` may additionally return:
 
