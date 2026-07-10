@@ -780,6 +780,67 @@ impl FrozenLexicalProfileName {
             _ => Err("unknown frozen lexical profile".into()),
         }
     }
+
+    fn alternate(self) -> Self {
+        match self {
+            Self::ProductionV1 => Self::MetadataBoostV1,
+            Self::MetadataBoostV1 => Self::ProductionV1,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ProductionV1 => "production_v1",
+            Self::MetadataBoostV1 => "metadata_boost_v1",
+        }
+    }
+
+    fn selected_production_blocker(self) -> &'static str {
+        match self {
+            Self::ProductionV1 => "dev_selection_is_production_v1",
+            Self::MetadataBoostV1 => "dev_selection_is_metadata_boost_v1",
+        }
+    }
+
+    fn fresh_production_model_blocker(self) -> &'static str {
+        match self {
+            Self::ProductionV1 => "fresh_production_v1_model_evaluation_required",
+            Self::MetadataBoostV1 => "fresh_metadata_boost_v1_model_evaluation_required",
+        }
+    }
+
+    fn fresh_production_model_state(self) -> &'static str {
+        match self {
+            Self::ProductionV1 => "blocked_fresh_production_v1_model_evaluation_required",
+            Self::MetadataBoostV1 => "blocked_fresh_metadata_boost_v1_model_evaluation_required",
+        }
+    }
+
+    fn dev_events_relative_path(self) -> &'static str {
+        match self {
+            Self::ProductionV1 => "bm25-live/lexical-production-v1-dev-events.jsonl",
+            Self::MetadataBoostV1 => "bm25-live/lexical-metadata-boost-v1-dev-events.jsonl",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LexicalProfileComparisonPlan {
+    production_profile: FrozenLexicalProfileName,
+    comparison_candidate: FrozenLexicalProfileName,
+}
+
+impl LexicalProfileComparisonPlan {
+    fn for_production(production_profile: FrozenLexicalProfileName) -> Self {
+        Self {
+            production_profile,
+            comparison_candidate: production_profile.alternate(),
+        }
+    }
+
+    fn for_current_production() -> Self {
+        Self::for_production(production_frozen_lexical_profile())
+    }
 }
 
 fn production_frozen_lexical_profile() -> FrozenLexicalProfileName {
@@ -787,6 +848,19 @@ fn production_frozen_lexical_profile() -> FrozenLexicalProfileName {
         EvalLexicalProfile::ProductionV1 => FrozenLexicalProfileName::ProductionV1,
         EvalLexicalProfile::MetadataBoostV1 => FrozenLexicalProfileName::MetadataBoostV1,
     }
+}
+
+pub(super) fn lexical_profile_comparison_plan_for_test(production_profile: &str) -> Value {
+    let plan = LexicalProfileComparisonPlan::for_production(
+        FrozenLexicalProfileName::parse(production_profile)
+            .expect("test production profile name is valid"),
+    );
+    json!({
+        "production_profile": plan.production_profile,
+        "baseline_profile": plan.production_profile,
+        "comparison_candidate": plan.comparison_candidate,
+        "heldout_fallback_profile": plan.production_profile,
+    })
 }
 
 fn model_candidate_requires_lexical_promotion(profile: FrozenLexicalProfileName) -> bool {
@@ -819,8 +893,8 @@ pub(super) fn model_candidate_lexical_gate_for_test(profile: &str) -> Value {
 
 #[derive(Debug, Clone, Serialize)]
 struct FrozenLexicalProfile {
-    production_profile: &'static str,
-    comparison_candidate: &'static str,
+    production_profile: FrozenLexicalProfileName,
+    comparison_candidate: FrozenLexicalProfileName,
     selected_profile: FrozenLexicalProfileName,
     selection_reasons: Vec<String>,
     dev_report_sha256: String,
@@ -862,19 +936,23 @@ struct LexicalProfileHeldoutConfirmation {
     schema_version: &'static str,
     frozen_config_sha256: String,
     dev_report_sha256: String,
+    production_profile: FrozenLexicalProfileName,
     frozen_dev_selection: FrozenLexicalProfileName,
     effective_profile: FrozenLexicalProfileName,
     promotion_eligible: bool,
     blockers: Vec<String>,
-    production_v1: RetrievalMetrics,
+    production_baseline: RetrievalMetrics,
     frozen_selected_profile: RetrievalMetrics,
 }
 
+const LEXICAL_PROFILE_HELDOUT_SCHEMA_VERSION: &str = "qgh.lexical_profile_heldout_confirmation.v2";
+
 pub(super) fn lexical_profile_freeze_for_test() -> Value {
+    let plan = LexicalProfileComparisonPlan::for_current_production();
     serde_json::to_value(FrozenLexicalProfile {
-        production_profile: "production_v1",
-        comparison_candidate: "metadata_boost_v1",
-        selected_profile: FrozenLexicalProfileName::ProductionV1,
+        production_profile: plan.production_profile,
+        comparison_candidate: plan.comparison_candidate,
+        selected_profile: plan.production_profile,
         selection_reasons: vec!["weighted_ndcg_not_strictly_improved".to_string()],
         dev_report_sha256: "report-sha256".to_string(),
         corpus_sha256: "corpus-sha256".to_string(),
@@ -889,7 +967,7 @@ pub(super) fn lexical_profile_freeze_for_test() -> Value {
             sha256: "meta-sha256".to_string(),
         }],
         heldout_confirmation_required: false,
-        heldout_fallback_profile: FrozenLexicalProfileName::ProductionV1,
+        heldout_fallback_profile: plan.production_profile,
     })
     .expect("frozen lexical profile serializes")
 }
@@ -1041,10 +1119,30 @@ pub(super) fn lexical_profile_heldout_confirmation_for_test(
     baseline: Value,
     candidate: Value,
 ) -> Value {
+    lexical_profile_heldout_confirmation_for_production_for_test(
+        production_frozen_lexical_profile().as_str(),
+        frozen_config_sha256,
+        dev_report_sha256,
+        frozen_dev_selection,
+        baseline,
+        candidate,
+    )
+}
+
+pub(super) fn lexical_profile_heldout_confirmation_for_production_for_test(
+    production_profile: &str,
+    frozen_config_sha256: &str,
+    dev_report_sha256: &str,
+    frozen_dev_selection: &str,
+    baseline: Value,
+    candidate: Value,
+) -> Value {
+    let production_profile = FrozenLexicalProfileName::parse(production_profile)
+        .expect("test production profile name is valid");
     let frozen_dev_selection =
         FrozenLexicalProfileName::parse(frozen_dev_selection).expect("test profile name is valid");
-    let blockers = if frozen_dev_selection == FrozenLexicalProfileName::ProductionV1 {
-        vec!["dev_selection_is_production_v1".to_string()]
+    let blockers = if frozen_dev_selection == production_profile {
+        vec![production_profile.selected_production_blocker().to_string()]
     } else {
         lexical_heldout_blockers(
             &lexical_selection_signals(&baseline),
@@ -1059,28 +1157,81 @@ pub(super) fn lexical_profile_heldout_confirmation_for_test(
         "effective_profile": if promotion_eligible {
             frozen_dev_selection
         } else {
-            FrozenLexicalProfileName::ProductionV1
+            production_profile
         },
         "promotion_eligible": promotion_eligible,
         "blockers": blockers,
     })
 }
 
+pub(super) fn lexical_profile_heldout_artifact_contract_for_test(
+    production_profile: &str,
+) -> Value {
+    let production_profile = FrozenLexicalProfileName::parse(production_profile)
+        .expect("test production profile name is valid");
+    let metrics = RetrievalMetrics {
+        query_count: 0,
+        per_class: BTreeMap::new(),
+        weighted_ndcg_at_10: 0.0,
+        weighted_mrr_at_10: 0.0,
+        exact_top_1: 0.0,
+        hard_filter_violations: 0,
+        get_round_trip: 0.0,
+        stale_leakage_live_fixture: Some(0),
+        duplicate_crowding_queries: 0,
+        hybrid_expected_queries: 0,
+        hybrid_path_queries: 0,
+        quality_gate_failures: Vec::new(),
+    };
+    let artifact = serde_json::to_value(LexicalProfileHeldoutConfirmation {
+        schema_version: LEXICAL_PROFILE_HELDOUT_SCHEMA_VERSION,
+        frozen_config_sha256: "frozen".to_string(),
+        dev_report_sha256: "dev".to_string(),
+        production_profile,
+        frozen_dev_selection: production_profile,
+        effective_profile: production_profile,
+        promotion_eligible: false,
+        blockers: vec![production_profile.selected_production_blocker().to_string()],
+        production_baseline: metrics.clone(),
+        frozen_selected_profile: metrics,
+    })
+    .expect("held-out confirmation serializes");
+    json!({
+        "schema_version": artifact["schema_version"],
+        "production_profile": artifact["production_profile"],
+        "has_production_baseline": artifact.get("production_baseline").is_some(),
+        "has_legacy_production_v1_key": artifact.get("production_v1").is_some(),
+    })
+}
+
 pub(super) fn lexical_profile_selection_for_test(baseline: Value, candidate: Value) -> Value {
+    lexical_profile_selection_for_production_for_test("production_v1", baseline, candidate)
+}
+
+pub(super) fn lexical_profile_selection_for_production_for_test(
+    production_profile: &str,
+    baseline: Value,
+    candidate: Value,
+) -> Value {
+    let plan = LexicalProfileComparisonPlan::for_production(
+        FrozenLexicalProfileName::parse(production_profile)
+            .expect("test production profile name is valid"),
+    );
     let baseline = lexical_selection_signals(&baseline);
     let candidate = lexical_selection_signals(&candidate);
     let reasons = lexical_selection_reasons(&baseline, &candidate);
     json!({
         "selected_profile": if reasons.is_empty() {
-            "metadata_boost_v1"
+            plan.comparison_candidate
         } else {
-            "production_v1"
+            plan.production_profile
         },
         "reasons": reasons,
     })
 }
 
 fn select_lexical_profile(
+    plan: LexicalProfileComparisonPlan,
     baseline: &RetrievalMetrics,
     candidate: &RetrievalMetrics,
 ) -> LexicalProfileSelection {
@@ -1106,9 +1257,9 @@ fn select_lexical_profile(
     let reasons = lexical_selection_reasons(&signals(baseline), &signals(candidate));
     LexicalProfileSelection {
         selected_profile: if reasons.is_empty() {
-            FrozenLexicalProfileName::MetadataBoostV1
+            plan.comparison_candidate
         } else {
-            FrozenLexicalProfileName::ProductionV1
+            plan.production_profile
         },
         reasons,
     }
@@ -1117,12 +1268,13 @@ fn select_lexical_profile(
 fn confirm_lexical_profile_heldout(
     frozen_config_sha256: &str,
     dev_report_sha256: &str,
+    production_profile: FrozenLexicalProfileName,
     frozen_dev_selection: FrozenLexicalProfileName,
-    production_v1: RetrievalMetrics,
+    production_baseline: RetrievalMetrics,
     frozen_selected_profile: RetrievalMetrics,
 ) -> LexicalProfileHeldoutConfirmation {
-    let blockers = if frozen_dev_selection == FrozenLexicalProfileName::ProductionV1 {
-        vec!["dev_selection_is_production_v1".to_string()]
+    let blockers = if frozen_dev_selection == production_profile {
+        vec![production_profile.selected_production_blocker().to_string()]
     } else {
         let signals = |metrics: &RetrievalMetrics| LexicalSelectionSignals {
             weighted_ndcg_at_10: metrics.weighted_ndcg_at_10,
@@ -1143,22 +1295,26 @@ fn confirm_lexical_profile_heldout(
             ),
             quality_gate_failures: metrics.quality_gate_failures.clone(),
         };
-        lexical_heldout_blockers(&signals(&production_v1), &signals(&frozen_selected_profile))
+        lexical_heldout_blockers(
+            &signals(&production_baseline),
+            &signals(&frozen_selected_profile),
+        )
     };
     let promotion_eligible = blockers.is_empty();
     LexicalProfileHeldoutConfirmation {
-        schema_version: "qgh.lexical_profile_heldout_confirmation.v1",
+        schema_version: LEXICAL_PROFILE_HELDOUT_SCHEMA_VERSION,
         frozen_config_sha256: frozen_config_sha256.to_string(),
         dev_report_sha256: dev_report_sha256.to_string(),
+        production_profile,
         frozen_dev_selection,
         effective_profile: if promotion_eligible {
             frozen_dev_selection
         } else {
-            FrozenLexicalProfileName::ProductionV1
+            production_profile
         },
         promotion_eligible,
         blockers,
-        production_v1,
+        production_baseline,
         frozen_selected_profile,
     }
 }
@@ -1254,17 +1410,35 @@ struct LexicalGlobalSignal<'a> {
 
 fn finalize_global_evaluation(
     candidate_promotion_eligible: bool,
-    mut promotion_blockers: Vec<String>,
+    promotion_blockers: Vec<String>,
     lexical: LexicalGlobalSignal<'_>,
 ) -> GlobalEvaluationDecision {
     let production_profile = production_frozen_lexical_profile();
+    finalize_global_evaluation_for_production(
+        candidate_promotion_eligible,
+        promotion_blockers,
+        production_profile,
+        lexical,
+    )
+}
+
+fn finalize_global_evaluation_for_production(
+    candidate_promotion_eligible: bool,
+    mut promotion_blockers: Vec<String>,
+    production_profile: FrozenLexicalProfileName,
+    lexical: LexicalGlobalSignal<'_>,
+) -> GlobalEvaluationDecision {
     if lexical.frozen_dev_selection != production_profile {
         if lexical.promotion_eligible && lexical.effective_profile != production_profile {
             promotion_blockers.push("lexical_profile_promotion_required".to_string());
         } else if !lexical.promotion_eligible && lexical.effective_profile == production_profile {
             promotion_blockers.push("lexical_profile_heldout_rejected".to_string());
             promotion_blockers.extend(lexical.blockers.iter().cloned());
-            promotion_blockers.push("fresh_production_v1_model_evaluation_required".to_string());
+            promotion_blockers.push(
+                production_profile
+                    .fresh_production_model_blocker()
+                    .to_string(),
+            );
         }
     }
     let promotion_eligible = candidate_promotion_eligible && promotion_blockers.is_empty();
@@ -1275,9 +1449,9 @@ fn finalize_global_evaluation(
         "promotion_eligible"
     } else if promotion_blockers
         .iter()
-        .any(|blocker| blocker == "fresh_production_v1_model_evaluation_required")
+        .any(|blocker| blocker == production_profile.fresh_production_model_blocker())
     {
-        "blocked_fresh_production_v1_model_evaluation_required"
+        production_profile.fresh_production_model_state()
     } else if promotion_blockers
         .iter()
         .any(|blocker| blocker == "lexical_profile_promotion_required")
@@ -1309,6 +1483,36 @@ pub(super) fn global_evaluation_for_test(
     serde_json::to_value(finalize_global_evaluation(
         candidate_promotion_eligible,
         Vec::new(),
+        LexicalGlobalSignal {
+            frozen_dev_selection: FrozenLexicalProfileName::parse(frozen_dev_selection)
+                .expect("test frozen profile is valid"),
+            effective_profile: FrozenLexicalProfileName::parse(effective_profile)
+                .expect("test effective profile is valid"),
+            promotion_eligible: lexical_promotion_eligible,
+            blockers: &lexical_blockers,
+        },
+    ))
+    .expect("global evaluation decision serializes")
+}
+
+pub(super) fn global_evaluation_for_production_for_test(
+    candidate_promotion_eligible: bool,
+    production_profile: &str,
+    frozen_dev_selection: &str,
+    effective_profile: &str,
+    lexical_promotion_eligible: bool,
+    lexical_blockers: &[&str],
+) -> Value {
+    let production_profile = FrozenLexicalProfileName::parse(production_profile)
+        .expect("test production profile is valid");
+    let lexical_blockers = lexical_blockers
+        .iter()
+        .map(|blocker| (*blocker).to_string())
+        .collect::<Vec<_>>();
+    serde_json::to_value(finalize_global_evaluation_for_production(
+        candidate_promotion_eligible,
+        Vec::new(),
+        production_profile,
         LexicalGlobalSignal {
             frozen_dev_selection: FrozenLexicalProfileName::parse(frozen_dev_selection)
                 .expect("test frozen profile is valid"),
@@ -2999,10 +3203,10 @@ pub(super) fn run(
         TOP_K,
         true,
     )?;
-    if frozen_lexical_profile.selected_profile == FrozenLexicalProfileName::ProductionV1
+    if frozen_lexical_profile.selected_profile == frozen_lexical_profile.production_profile
         && lexical_heldout_evidence.rankings != bm25_evidence.rankings
     {
-        return Err("eval lexical V1 seam diverged from the held-out production protocol".into());
+        return Err("eval lexical baseline diverged from the held-out production protocol".into());
     }
     let frozen_selected_profile = evaluate_rankings(
         &corpus,
@@ -3013,6 +3217,7 @@ pub(super) fn run(
     let lexical_profile_heldout = confirm_lexical_profile_heldout(
         &frozen_config_hash,
         &frozen_lexical_profile.dev_report_sha256,
+        frozen_lexical_profile.production_profile,
         frozen_lexical_profile.selected_profile,
         bm25.clone(),
         frozen_selected_profile,
@@ -4348,28 +4553,29 @@ fn run_lexical_profile_dev_ab(
     tantivy_schema_fingerprint: &str,
 ) -> Result<(LexicalProfileAbReport, FrozenLexicalProfile), DynError> {
     eprintln!("live-eval phase=lexical-profile-dev-ab status=running");
-    let (production_snapshot, production_v1_evidence) = run_lexical_profile_pass(
+    let plan = LexicalProfileComparisonPlan::for_current_production();
+    let (production_snapshot, production_profile_evidence) = run_lexical_profile_pass(
         fixture,
         dev,
         production_evidence,
-        FrozenLexicalProfileName::ProductionV1,
+        plan.production_profile,
         TOP_K,
         true,
     )?;
-    if production_v1_evidence.rankings != production_evidence.rankings {
-        return Err("eval lexical V1 seam diverged from the production query protocol".into());
+    if production_profile_evidence.rankings != production_evidence.rankings {
+        return Err("eval lexical baseline diverged from the production query protocol".into());
     }
-    let production_v1 = evaluate_rankings(
+    let production_profile_metrics = evaluate_rankings(
         corpus,
         dev,
-        &production_v1_evidence,
-        &root.join("bm25-live/lexical-production-v1-dev-events.jsonl"),
+        &production_profile_evidence,
+        &root.join(plan.production_profile.dev_events_relative_path()),
     )?;
-    let (candidate_snapshot, metadata_evidence) = run_lexical_profile_pass(
+    let (candidate_snapshot, comparison_candidate_evidence) = run_lexical_profile_pass(
         fixture,
         dev,
         production_evidence,
-        FrozenLexicalProfileName::MetadataBoostV1,
+        plan.comparison_candidate,
         TOP_K,
         true,
     )?;
@@ -4379,13 +4585,25 @@ fn run_lexical_profile_dev_ab(
     if production_snapshot.tantivy_schema_fingerprint != tantivy_schema_fingerprint {
         return Err("lexical A/B snapshot schema diverged from the frozen BM25 schema".into());
     }
-    let metadata_boost_v1 = evaluate_rankings(
+    let comparison_candidate_metrics = evaluate_rankings(
         corpus,
         dev,
-        &metadata_evidence,
-        &root.join("bm25-live/lexical-metadata-boost-v1-dev-events.jsonl"),
+        &comparison_candidate_evidence,
+        &root.join(plan.comparison_candidate.dev_events_relative_path()),
     )?;
-    let selection = select_lexical_profile(&production_v1, &metadata_boost_v1);
+    let selection = select_lexical_profile(
+        plan,
+        &production_profile_metrics,
+        &comparison_candidate_metrics,
+    );
+    let (production_v1, metadata_boost_v1) = match plan.production_profile {
+        FrozenLexicalProfileName::ProductionV1 => {
+            (production_profile_metrics, comparison_candidate_metrics)
+        }
+        FrozenLexicalProfileName::MetadataBoostV1 => {
+            (comparison_candidate_metrics, production_profile_metrics)
+        }
+    };
     let dev_refs = dev.iter().collect::<Vec<_>>();
     let redaction = verify_redaction(root, corpus, &dev_refs)?;
     let mut report = LexicalProfileAbReport {
@@ -4413,8 +4631,8 @@ fn run_lexical_profile_dev_ab(
     let report_sha256 = format!("{:x}", Sha256::digest(&report_bytes));
     write_atomic(&root.join("lexical-profile-ab-report.json"), &report_bytes)?;
     let frozen = FrozenLexicalProfile {
-        production_profile: "production_v1",
-        comparison_candidate: "metadata_boost_v1",
+        production_profile: plan.production_profile,
+        comparison_candidate: plan.comparison_candidate,
         selected_profile: report.selection.selected_profile,
         selection_reasons: report.selection.reasons.clone(),
         dev_report_sha256: report_sha256,
@@ -4425,9 +4643,8 @@ fn run_lexical_profile_dev_ab(
         tantivy_schema_fingerprint: production_snapshot.tantivy_schema_fingerprint.clone(),
         tantivy_generation_files_sha256: production_snapshot.generation_files_sha256.clone(),
         tantivy_generation_files: production_snapshot.generation_files.clone(),
-        heldout_confirmation_required: report.selection.selected_profile
-            == FrozenLexicalProfileName::MetadataBoostV1,
-        heldout_fallback_profile: FrozenLexicalProfileName::ProductionV1,
+        heldout_confirmation_required: report.selection.selected_profile != plan.production_profile,
+        heldout_fallback_profile: plan.production_profile,
     };
     Ok((report, frozen))
 }

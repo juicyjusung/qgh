@@ -588,6 +588,22 @@ fn lexical_profile_freeze_contains_a_selected_profile_and_dev_report_binding() {
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
+fn promoted_metadata_profile_becomes_the_eval_baseline_and_heldout_fallback() {
+    assert!(RUNTIME_SUPPORT
+        .contains("let plan = LexicalProfileComparisonPlan::for_current_production()"));
+    assert_eq!(
+        live_model_eval_runtime::lexical_profile_comparison_plan_for_test("metadata_boost_v1"),
+        json!({
+            "production_profile": "metadata_boost_v1",
+            "baseline_profile": "metadata_boost_v1",
+            "comparison_candidate": "production_v1",
+            "heldout_fallback_profile": "metadata_boost_v1",
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
 fn lexical_profile_selects_metadata_only_on_strict_clean_dev_improvement() {
     let baseline = json!({
         "weighted_ndcg_at_10": 0.50,
@@ -631,6 +647,31 @@ fn lexical_profile_keeps_v1_without_strict_weighted_dev_improvement() {
         live_model_eval_runtime::lexical_profile_selection_for_test(metrics.clone(), metrics),
         json!({
             "selected_profile": "production_v1",
+            "reasons": ["weighted_ndcg_not_strictly_improved"],
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn post_promotion_selection_keeps_metadata_when_v1_is_not_strictly_better() {
+    let metrics = json!({
+        "weighted_ndcg_at_10": 0.50,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.50, 0.50, 0.50, 0.50],
+    });
+
+    assert_eq!(
+        live_model_eval_runtime::lexical_profile_selection_for_production_for_test(
+            "metadata_boost_v1",
+            metrics.clone(),
+            metrics,
+        ),
+        json!({
+            "selected_profile": "metadata_boost_v1",
             "reasons": ["weighted_ndcg_not_strictly_improved"],
         })
     );
@@ -833,6 +874,55 @@ fn heldout_confirmation_never_reselects_metadata_after_dev_kept_v1() {
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
+fn post_promotion_heldout_recognizes_metadata_as_the_current_production_profile() {
+    let metrics = json!({
+        "weighted_ndcg_at_10": 0.60,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.60, 0.60, 0.60, 0.60],
+        "quality_gate_failures": [],
+    });
+
+    assert_eq!(
+        live_model_eval_runtime::lexical_profile_heldout_confirmation_for_production_for_test(
+            "metadata_boost_v1",
+            "frozen-config-sha256",
+            "dev-report-sha256",
+            "metadata_boost_v1",
+            metrics.clone(),
+            metrics,
+        ),
+        json!({
+            "frozen_config_sha256": "frozen-config-sha256",
+            "dev_report_sha256": "dev-report-sha256",
+            "frozen_dev_selection": "metadata_boost_v1",
+            "effective_profile": "metadata_boost_v1",
+            "promotion_eligible": false,
+            "blockers": ["dev_selection_is_metadata_boost_v1"],
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn post_promotion_heldout_artifact_names_the_production_baseline_truthfully() {
+    assert_eq!(
+        live_model_eval_runtime::lexical_profile_heldout_artifact_contract_for_test(
+            "metadata_boost_v1",
+        ),
+        json!({
+            "schema_version": "qgh.lexical_profile_heldout_confirmation.v2",
+            "production_profile": "metadata_boost_v1",
+            "has_production_baseline": true,
+            "has_legacy_production_v1_key": false,
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
 fn heldout_confirmation_allows_the_frozen_metadata_selection_only_when_clean() {
     let production_v1 = json!({
         "weighted_ndcg_at_10": 0.50,
@@ -923,6 +1013,30 @@ fn global_state_uses_heldout_v1_fallback_instead_of_the_rejected_dev_selection()
                 "lexical_profile_heldout_rejected",
                 "heldout_weighted_ndcg_not_strictly_improved",
                 "fresh_production_v1_model_evaluation_required",
+            ],
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn post_promotion_rejected_v1_candidate_requests_fresh_metadata_production_evidence() {
+    assert_eq!(
+        live_model_eval_runtime::global_evaluation_for_production_for_test(
+            false,
+            "metadata_boost_v1",
+            "production_v1",
+            "metadata_boost_v1",
+            false,
+            &["heldout_weighted_ndcg_not_strictly_improved"],
+        ),
+        json!({
+            "promotion_eligible": false,
+            "evaluation_state": "blocked_fresh_metadata_boost_v1_model_evaluation_required",
+            "promotion_blockers": [
+                "lexical_profile_heldout_rejected",
+                "heldout_weighted_ndcg_not_strictly_improved",
+                "fresh_metadata_boost_v1_model_evaluation_required",
             ],
         })
     );
@@ -1570,7 +1684,7 @@ fn lexical_profile_is_selected_and_report_bound_before_heldout_then_never_resele
     assert!(dev_ab < freeze && freeze < heldout_parse);
     assert_eq!(
         RUNTIME_SUPPORT
-            .matches("select_lexical_profile(&production_v1, &metadata_boost_v1)")
+            .matches("let selection = select_lexical_profile(\n        plan,")
             .count(),
         1
     );
