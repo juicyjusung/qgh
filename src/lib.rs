@@ -22,7 +22,10 @@ mod time;
 /// Internal release/live-qrels adapters. Not a CLI, MCP, or config surface.
 #[doc(hidden)]
 pub mod search_eval {
-    pub use crate::index::{search_with_metadata_boost_v1_for_eval, SearchFilters, SearchHit};
+    pub use crate::index::{
+        search_with_lexical_profile_for_eval, search_with_metadata_boost_v1_for_eval,
+        EvalLexicalProfile, SearchFilters, SearchHit,
+    };
 }
 
 pub async fn run() -> i32 {

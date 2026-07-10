@@ -14,6 +14,7 @@ use qgh::embedding::{
     EmbeddingTokenizer, FastembedProviderOptions, FastembedTokenizer, ModelManifestV1, PoolingKind,
     PreparedModelStore, QuantizationKind,
 };
+use qgh::search_eval::{search_with_lexical_profile_for_eval, EvalLexicalProfile, SearchFilters};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -195,7 +196,7 @@ struct ClassMetrics {
     negative_top_result_rate: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct RetrievalMetrics {
     query_count: usize,
     per_class: BTreeMap<QueryClass, ClassMetrics>,
@@ -754,34 +755,185 @@ struct PreparedSnapshotDigest {
     file_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-struct FrozenLexicalProfile {
-    production_profile: &'static str,
-    comparison_candidate: &'static str,
-    state: LexicalProfileEvaluationState,
-    may_select: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum LexicalProfileEvaluationState {
-    PendingIntegratedLaneDAb,
+enum FrozenLexicalProfileName {
+    ProductionV1,
+    MetadataBoostV1,
 }
 
-impl FrozenLexicalProfile {
-    const fn pending_integrated_ab() -> Self {
-        Self {
-            production_profile: "production_v1",
-            comparison_candidate: "metadata_boost_v1",
-            state: LexicalProfileEvaluationState::PendingIntegratedLaneDAb,
-            may_select: false,
+impl FrozenLexicalProfileName {
+    fn eval_profile(self) -> EvalLexicalProfile {
+        match self {
+            Self::ProductionV1 => EvalLexicalProfile::ProductionV1,
+            Self::MetadataBoostV1 => EvalLexicalProfile::MetadataBoostV1,
         }
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct FrozenLexicalProfile {
+    production_profile: &'static str,
+    comparison_candidate: &'static str,
+    selected_profile: FrozenLexicalProfileName,
+    selection_reasons: Vec<String>,
+    dev_report_sha256: String,
+    corpus_sha256: String,
+    qrels_dev_sha256: String,
+    active_tantivy_generation: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LexicalProfileSelection {
+    selected_profile: FrozenLexicalProfileName,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LexicalProfileAbReport {
+    schema_version: &'static str,
+    integrated_git_head: String,
+    corpus_sha256: String,
+    qrels_dev_sha256: String,
+    active_tantivy_generation: i64,
+    tantivy_schema_fingerprint: String,
+    production_v1: RetrievalMetrics,
+    metadata_boost_v1: RetrievalMetrics,
+    selection: LexicalProfileSelection,
+    redaction_passed: bool,
+}
+
 pub(super) fn lexical_profile_freeze_for_test() -> Value {
-    serde_json::to_value(FrozenLexicalProfile::pending_integrated_ab())
-        .expect("frozen lexical profile serializes")
+    serde_json::to_value(FrozenLexicalProfile {
+        production_profile: "production_v1",
+        comparison_candidate: "metadata_boost_v1",
+        selected_profile: FrozenLexicalProfileName::ProductionV1,
+        selection_reasons: vec!["weighted_ndcg_not_strictly_improved".to_string()],
+        dev_report_sha256: "report-sha256".to_string(),
+        corpus_sha256: "corpus-sha256".to_string(),
+        qrels_dev_sha256: "dev-sha256".to_string(),
+        active_tantivy_generation: 7,
+    })
+    .expect("frozen lexical profile serializes")
+}
+
+#[derive(Debug, Clone)]
+struct LexicalSelectionSignals {
+    weighted_ndcg_at_10: f64,
+    exact_top_1: f64,
+    hard_filter_violations: usize,
+    get_round_trip: f64,
+    stale_leakage: usize,
+    comment_only: [f64; 4],
+}
+
+fn lexical_selection_signals(value: &Value) -> LexicalSelectionSignals {
+    let comment_only = value["comment_only"]
+        .as_array()
+        .expect("comment-only metrics are an array")
+        .iter()
+        .map(|metric| metric.as_f64().expect("comment-only metric is numeric"))
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("comment-only metrics contain four values");
+    LexicalSelectionSignals {
+        weighted_ndcg_at_10: value["weighted_ndcg_at_10"]
+            .as_f64()
+            .expect("weighted nDCG is numeric"),
+        exact_top_1: value["exact_top_1"]
+            .as_f64()
+            .expect("exact top-1 is numeric"),
+        hard_filter_violations: value["hard_filter_violations"]
+            .as_u64()
+            .expect("hard-filter violations are numeric") as usize,
+        get_round_trip: value["get_round_trip"]
+            .as_f64()
+            .expect("round-trip rate is numeric"),
+        stale_leakage: value["stale_leakage"]
+            .as_u64()
+            .expect("stale leakage is numeric") as usize,
+        comment_only,
+    }
+}
+
+fn lexical_selection_reasons(
+    baseline: &LexicalSelectionSignals,
+    candidate: &LexicalSelectionSignals,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if candidate.weighted_ndcg_at_10 <= baseline.weighted_ndcg_at_10 {
+        reasons.push("weighted_ndcg_not_strictly_improved".to_string());
+    }
+    if candidate.exact_top_1 < baseline.exact_top_1 || candidate.exact_top_1 < 0.95 {
+        reasons.push("exact_identifier_regression".to_string());
+    }
+    if candidate.hard_filter_violations > baseline.hard_filter_violations
+        || candidate.hard_filter_violations != 0
+    {
+        reasons.push("hard_filter_regression".to_string());
+    }
+    if candidate.get_round_trip < baseline.get_round_trip || candidate.get_round_trip < 1.0 {
+        reasons.push("query_get_round_trip_regression".to_string());
+    }
+    if candidate.stale_leakage > baseline.stale_leakage || candidate.stale_leakage != 0 {
+        reasons.push("stale_leakage_regression".to_string());
+    }
+    if candidate
+        .comment_only
+        .iter()
+        .zip(baseline.comment_only)
+        .any(|(candidate, baseline)| *candidate < baseline)
+    {
+        reasons.push("comment_only_regression".to_string());
+    }
+    reasons
+}
+
+pub(super) fn lexical_profile_selection_for_test(baseline: Value, candidate: Value) -> Value {
+    let baseline = lexical_selection_signals(&baseline);
+    let candidate = lexical_selection_signals(&candidate);
+    let reasons = lexical_selection_reasons(&baseline, &candidate);
+    json!({
+        "selected_profile": if reasons.is_empty() {
+            "metadata_boost_v1"
+        } else {
+            "production_v1"
+        },
+        "reasons": reasons,
+    })
+}
+
+fn select_lexical_profile(
+    baseline: &RetrievalMetrics,
+    candidate: &RetrievalMetrics,
+) -> LexicalProfileSelection {
+    let signals = |metrics: &RetrievalMetrics| LexicalSelectionSignals {
+        weighted_ndcg_at_10: metrics.weighted_ndcg_at_10,
+        exact_top_1: metrics.exact_top_1,
+        hard_filter_violations: metrics.hard_filter_violations,
+        get_round_trip: metrics.get_round_trip,
+        stale_leakage: metrics.stale_leakage_live_fixture.unwrap_or_default(),
+        comment_only: metrics
+            .per_class
+            .get(&QueryClass::CommentOnly)
+            .map_or([0.0; 4], |class| {
+                [
+                    class.ndcg_at_10,
+                    class.mrr_at_10,
+                    class.recall_at_5,
+                    class.recall_at_10,
+                ]
+            }),
+    };
+    let reasons = lexical_selection_reasons(&signals(baseline), &signals(candidate));
+    LexicalProfileSelection {
+        selected_profile: if reasons.is_empty() {
+            FrozenLexicalProfileName::MetadataBoostV1
+        } else {
+            FrozenLexicalProfileName::ProductionV1
+        },
+        reasons,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -799,6 +951,7 @@ struct FrozenRunGuard {
     contract_gate_bundle_sha256: String,
     model_preparation_provenance_sha256: String,
     candidate_states: Vec<FrozenCandidateState>,
+    lexical_profile_report_sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -842,6 +995,8 @@ struct FullReport {
     frozen_config_hash: String,
     bm25_dev: RetrievalMetrics,
     bm25: RetrievalMetrics,
+    lexical_profile_dev: LexicalProfileAbReport,
+    lexical_profile_heldout: RetrievalMetrics,
     candidates: Vec<CandidateReport>,
     selected_light_candidate: Option<String>,
     selected_quality_candidate: Option<String>,
@@ -892,6 +1047,7 @@ struct ClassAccumulator {
     nonempty: usize,
 }
 
+#[derive(Clone)]
 struct QueryEvidence {
     rankings: BTreeMap<String, Vec<String>>,
     branch_observations: BTreeMap<String, Vec<BranchObservation>>,
@@ -1067,10 +1223,15 @@ fn probe_context_contract(
     let connection = Connection::open(db_path)?;
     let (generation_id, model_manifest_hash, generation_template_version): (i64, String, String) =
         connection.query_row(
-            "SELECT id, model_manifest_hash, context_template_version
-         FROM embedding_generations
-         WHERE state IN ('ready', 'active')
-         ORDER BY id DESC LIMIT 1",
+            "SELECT eg.id, eg.model_manifest_hash, eg.context_template_version
+         FROM retrieval_publication_pointer pointer
+         JOIN retrieval_publications publication
+           ON publication.publication_id = pointer.publication_id
+         JOIN embedding_generations eg
+           ON eg.id = publication.embedding_generation_id
+         WHERE pointer.id = 1
+           AND publication.active = 1
+           AND eg.state IN ('ready', 'active')",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
@@ -1152,6 +1313,16 @@ pub(super) fn context_input_for_test(
     chunk: &str,
 ) -> String {
     context_input(entity_type, host, repo, issue_number, title, chunk)
+}
+
+pub(super) fn context_contract_for_test(
+    db_path: &Path,
+    manifest_template_version: &str,
+) -> Result<Value, DynError> {
+    Ok(serde_json::to_value(probe_context_contract(
+        db_path,
+        manifest_template_version,
+    )?)?)
 }
 
 pub(super) fn select_tier_for_test(
@@ -1900,6 +2071,7 @@ pub(super) fn redaction_file_scan_for_test(
 
 struct WarmEvidence {
     held_out: QueryEvidence,
+    diagnostic: QueryEvidence,
     latencies_ms: Vec<f64>,
     peak_rss_bytes: u64,
 }
@@ -2185,6 +2357,11 @@ impl FrozenRunGuard {
         if format!("{:x}", Sha256::digest(&frozen_bytes)) != self.frozen_config_sha256 {
             return Err("frozen live-eval configuration changed after dev".into());
         }
+        if file_sha256(&root.join("lexical-profile-ab-report.json"))?
+            != self.lexical_profile_report_sha256
+        {
+            return Err("frozen lexical profile A/B report changed after dev".into());
+        }
         let (git_head, worktree_clean) = repository_identity(&self.repo_root)?;
         if git_head != self.integrated_git_head || !worktree_clean {
             return Err(
@@ -2277,6 +2454,8 @@ pub(super) fn run(
     }
     let corpus = parse_jsonl::<CorpusRecord>(corpus_raw);
     let dev = parse_jsonl::<QrelRecord>(dev_raw);
+    let corpus_sha256 = digest_hex(corpus_raw);
+    let qrels_dev_sha256 = digest_hex(dev_raw);
     let provenance: FixtureProvenance = serde_json::from_str(provenance_raw)?;
     let repo_root = std::env::current_dir()?.canonicalize()?;
     let binary = eval_binary()?;
@@ -2317,6 +2496,17 @@ pub(super) fn run(
         &bm25_dev_evidence,
         &root.join("bm25-live/dev-events.jsonl"),
     )?;
+    let (lexical_profile_dev, frozen_lexical_profile) = run_lexical_profile_dev_ab(
+        root,
+        &bm25_fixture,
+        &corpus,
+        &dev,
+        &bm25_dev_evidence,
+        &integrated_git_head,
+        &corpus_sha256,
+        &qrels_dev_sha256,
+        &tantivy_schema_fingerprint,
+    )?;
 
     let mut candidate_states = Vec::new();
     for (candidate, model_id, revision, manifest) in [
@@ -2334,7 +2524,16 @@ pub(super) fn run(
         ),
     ] {
         candidate_states.push(prepare_candidate_dev(
-            root, &server, &binary, candidate, model_id, revision, &manifest, &corpus, &dev,
+            root,
+            &server,
+            &binary,
+            candidate,
+            model_id,
+            revision,
+            &manifest,
+            &corpus,
+            &dev,
+            frozen_lexical_profile.selected_profile,
         ));
     }
     let dragonkue = dragonkue_blocker(root);
@@ -2355,8 +2554,8 @@ pub(super) fn run(
         contract_gate_bundle_sha256: contract_gate_bundle.sha256.clone(),
         model_preparation_provenance_sha256: model_preparation_provenance_sha256.clone(),
         candidate_states: frozen_candidate_states.clone(),
-        corpus_sha256: digest_hex(corpus_raw),
-        qrels_dev_sha256: digest_hex(dev_raw),
+        corpus_sha256: corpus_sha256.clone(),
+        qrels_dev_sha256: qrels_dev_sha256.clone(),
         qrels_test_sha256: digest_hex(test_raw),
         chunker_version: CHUNKER_VERSION,
         chunker_fingerprint: CHUNKER_FINGERPRINT,
@@ -2364,7 +2563,7 @@ pub(super) fn run(
         fusion: "production_equal_rrf",
         rrf_k: RRF_K,
         candidate_window: CANDIDATE_WINDOW,
-        lexical_profile: FrozenLexicalProfile::pending_integrated_ab(),
+        lexical_profile: frozen_lexical_profile.clone(),
         warmup_runs: WARMUP_RUNS,
         measured_runs: MEASURED_RUNS,
         cold_process_runs: COLD_PROCESS_RUNS,
@@ -2388,6 +2587,7 @@ pub(super) fn run(
         contract_gate_bundle_sha256: contract_gate_bundle.sha256.clone(),
         model_preparation_provenance_sha256,
         candidate_states: frozen_candidate_states,
+        lexical_profile_report_sha256: frozen_lexical_profile.dev_report_sha256.clone(),
     };
 
     frozen_guard.revalidate_before_heldout(root, &binary)?;
@@ -2399,6 +2599,20 @@ pub(super) fn run(
         &held_out,
         &bm25_evidence,
         &root.join("bm25-live/heldout-events.jsonl"),
+    )?;
+    let (_, lexical_heldout_evidence) = run_lexical_profile_pass(
+        &bm25_fixture,
+        &held_out,
+        &bm25_evidence,
+        frozen_lexical_profile.selected_profile,
+        TOP_K,
+        true,
+    )?;
+    let lexical_profile_heldout = evaluate_rankings(
+        &corpus,
+        &held_out,
+        &lexical_heldout_evidence,
+        &root.join("bm25-live/lexical-selected-heldout-events.jsonl"),
     )?;
     write_pretty(root.join("bm25-live/dev-report.json"), &bm25_dev)?;
     write_pretty(root.join("bm25-live/heldout-report.json"), &bm25)?;
@@ -2414,6 +2628,7 @@ pub(super) fn run(
                 prepared,
                 &corpus,
                 &held_out,
+                frozen_lexical_profile.selected_profile,
             ),
             Err(report) => *report,
         });
@@ -2485,6 +2700,8 @@ pub(super) fn run(
         frozen_config_hash,
         bm25_dev,
         bm25,
+        lexical_profile_dev,
+        lexical_profile_heldout,
         candidates,
         selected_light_candidate,
         selected_quality_candidate,
@@ -2646,6 +2863,7 @@ fn prepare_candidate_dev(
     manifest_path: &Path,
     corpus: &[CorpusRecord],
     dev: &[QrelRecord],
+    lexical_profile: FrozenLexicalProfileName,
 ) -> Result<PreparedCandidate, Box<CandidateReport>> {
     match try_prepare_candidate_dev(
         root,
@@ -2657,6 +2875,7 @@ fn prepare_candidate_dev(
         manifest_path,
         corpus,
         dev,
+        lexical_profile,
     ) {
         Ok(prepared) => Ok(prepared),
         Err(error) => {
@@ -2703,6 +2922,7 @@ fn try_prepare_candidate_dev(
     manifest_path: &Path,
     corpus: &[CorpusRecord],
     dev: &[QrelRecord],
+    lexical_profile: FrozenLexicalProfileName,
 ) -> Result<PreparedCandidate, DynError> {
     eprintln!("live-eval candidate={candidate} phase=sync status=running");
     let fixture = CliFixture::new(
@@ -2762,10 +2982,17 @@ fn try_prepare_candidate_dev(
     eprintln!("live-eval candidate={candidate} phase=dev-mcp status=running");
     let dev_run = run_dev_mcp(&fixture, dev)?;
     isolated_peak_rss = isolated_peak_rss.max(dev_run.peak_rss_bytes);
+    let selected_dev_evidence = selected_hybrid_evidence(
+        &fixture,
+        dev,
+        &dev_run.primary,
+        &dev_run.diagnostic,
+        lexical_profile,
+    )?;
     let dev_metrics = evaluate_rankings(
         corpus,
         dev,
-        &dev_run.primary,
+        &selected_dev_evidence,
         &fixture.root.join("dev-events.jsonl"),
     )?;
     let offline_dev_diagnostics = offline_fusion_diagnostics(dev, &dev_run.diagnostic)?;
@@ -2791,6 +3018,7 @@ fn try_prepare_candidate_dev(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_candidate(
     root: &Path,
     server: &PublicSnapshotServer,
@@ -2799,6 +3027,7 @@ fn finish_candidate(
     mut prepared: PreparedCandidate,
     corpus: &[CorpusRecord],
     held_out: &[QrelRecord],
+    lexical_profile: FrozenLexicalProfileName,
 ) -> CandidateReport {
     eprintln!(
         "live-eval candidate={} phase=heldout-warm-mcp status=running",
@@ -2822,10 +3051,33 @@ fn finish_candidate(
         }
     };
     prepared.isolated_peak_rss = prepared.isolated_peak_rss.max(warm.peak_rss_bytes);
+    let selected_heldout = match selected_hybrid_evidence(
+        &prepared.fixture,
+        held_out,
+        &warm.held_out,
+        &warm.diagnostic,
+        lexical_profile,
+    ) {
+        Ok(evidence) => evidence,
+        Err(_) => {
+            return prepared_candidate_report(
+                prepared,
+                "blocked_after_dev",
+                None,
+                None,
+                vec!["runtime_unavailable".to_string()],
+                vec!["runtime_unavailable".to_string()],
+                Some(Blocker {
+                    code: "eval.runtime_failed".to_string(),
+                    phase: "heldout_selected_lexical_profile".to_string(),
+                }),
+            );
+        }
+    };
     let held_out_metrics = match evaluate_rankings(
         corpus,
         held_out,
-        &warm.held_out,
+        &selected_heldout,
         &prepared.fixture.root.join("heldout-events.jsonl"),
     ) {
         Ok(metrics) => metrics,
@@ -3515,6 +3767,293 @@ fn run_single_pass(fixture: &CliFixture, qrels: &[QrelRecord]) -> Result<QueryEv
     Ok(evidence)
 }
 
+#[derive(Debug, Clone)]
+struct ActiveTantivySnapshot {
+    generation: i64,
+    path: PathBuf,
+}
+
+fn verify_rankings_with_get(
+    fixture: &CliFixture,
+    rankings: &BTreeMap<String, Vec<String>>,
+) -> Result<(usize, usize, usize), DynError> {
+    let mut client = McpClient::start(fixture)?;
+    let mut total = 0usize;
+    let mut success = 0usize;
+    let mut stale = 0usize;
+    for source_id in rankings.values().flat_map(|ranked| ranked.iter()) {
+        total += 1;
+        let response = client.call_tool("get", json!({ "source_id": source_id }))?;
+        match structured_content(&response) {
+            Ok(get) if get["data"]["source"]["source_id"].as_str() == Some(source_id) => {
+                success += 1;
+            }
+            Ok(get) => {
+                stale += usize::from(get["error"]["code"].as_str() == Some("source.tombstoned"));
+            }
+            Err(_) => {}
+        }
+    }
+    let _ = client.finish()?;
+    Ok((total, success, stale))
+}
+
+fn run_lexical_profile_pass(
+    fixture: &CliFixture,
+    qrels: &[QrelRecord],
+    production_exact_evidence: &QueryEvidence,
+    profile: FrozenLexicalProfileName,
+    limit: usize,
+    verify_get: bool,
+) -> Result<(ActiveTantivySnapshot, QueryEvidence), DynError> {
+    let snapshot = fixture.active_tantivy_snapshot()?;
+    let mut rankings = BTreeMap::new();
+    let mut branch_observations = BTreeMap::new();
+    for qrel in qrels {
+        if qrel.query_class == QueryClass::ExactIdentifier {
+            let ranked = production_exact_evidence
+                .rankings
+                .get(&qrel.query_id)
+                .cloned()
+                .ok_or("production exact ranking missing")?;
+            rankings.insert(qrel.query_id.clone(), ranked);
+            branch_observations.insert(qrel.query_id.clone(), Vec::new());
+            continue;
+        }
+        let filters = SearchFilters {
+            repo: Some(qrel.filters.repo.clone()),
+            issue: qrel
+                .filters
+                .issue_number
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| "qrel issue number does not fit i64")?,
+            source_types: qrel.filters.source_type.as_ref().map_or_else(
+                || vec!["issue".to_string(), "issue_comment".to_string()],
+                |source_type| vec![source_type.clone()],
+            ),
+            ..SearchFilters::default()
+        };
+        let hits = search_with_lexical_profile_for_eval(
+            &snapshot.path,
+            &qrel.query,
+            &filters,
+            profile.eval_profile(),
+            limit,
+        )
+        .map_err(|_| "lexical profile search failed")?;
+        rankings.insert(
+            qrel.query_id.clone(),
+            hits.iter().map(|hit| hit.source_id.clone()).collect(),
+        );
+        branch_observations.insert(
+            qrel.query_id.clone(),
+            hits.into_iter()
+                .map(|hit| BranchObservation {
+                    source_id: hit.source_id,
+                    lexical_score: Some(f64::from(hit.score)),
+                    vector_distance: None,
+                })
+                .collect(),
+        );
+    }
+    let (get_total, get_success, stale_failures) = if verify_get {
+        verify_rankings_with_get(fixture, &rankings)?
+    } else {
+        (0, 0, 0)
+    };
+    Ok((
+        snapshot,
+        QueryEvidence {
+            rankings,
+            branch_observations,
+            get_total,
+            get_success,
+            stale_failures,
+            hybrid_required: false,
+            hybrid_expected_queries: 0,
+            hybrid_path_queries: 0,
+        },
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_lexical_profile_dev_ab(
+    root: &Path,
+    fixture: &CliFixture,
+    corpus: &[CorpusRecord],
+    dev: &[QrelRecord],
+    production_evidence: &QueryEvidence,
+    integrated_git_head: &str,
+    corpus_sha256: &str,
+    qrels_dev_sha256: &str,
+    tantivy_schema_fingerprint: &str,
+) -> Result<(LexicalProfileAbReport, FrozenLexicalProfile), DynError> {
+    eprintln!("live-eval phase=lexical-profile-dev-ab status=running");
+    let (production_snapshot, production_v1_evidence) = run_lexical_profile_pass(
+        fixture,
+        dev,
+        production_evidence,
+        FrozenLexicalProfileName::ProductionV1,
+        TOP_K,
+        true,
+    )?;
+    if production_v1_evidence.rankings != production_evidence.rankings {
+        return Err("eval lexical V1 seam diverged from the production query protocol".into());
+    }
+    let production_v1 = evaluate_rankings(
+        corpus,
+        dev,
+        &production_v1_evidence,
+        &root.join("bm25-live/lexical-production-v1-dev-events.jsonl"),
+    )?;
+    let (candidate_snapshot, metadata_evidence) = run_lexical_profile_pass(
+        fixture,
+        dev,
+        production_evidence,
+        FrozenLexicalProfileName::MetadataBoostV1,
+        TOP_K,
+        true,
+    )?;
+    if candidate_snapshot.generation != production_snapshot.generation
+        || candidate_snapshot.path != production_snapshot.path
+    {
+        return Err("lexical A/B profiles did not use the same active Tantivy generation".into());
+    }
+    let metadata_boost_v1 = evaluate_rankings(
+        corpus,
+        dev,
+        &metadata_evidence,
+        &root.join("bm25-live/lexical-metadata-boost-v1-dev-events.jsonl"),
+    )?;
+    let selection = select_lexical_profile(&production_v1, &metadata_boost_v1);
+    let dev_refs = dev.iter().collect::<Vec<_>>();
+    let redaction = verify_redaction(root, corpus, &dev_refs)?;
+    let mut report = LexicalProfileAbReport {
+        schema_version: "qgh.lexical_profile_ab.v1",
+        integrated_git_head: integrated_git_head.to_string(),
+        corpus_sha256: corpus_sha256.to_string(),
+        qrels_dev_sha256: qrels_dev_sha256.to_string(),
+        active_tantivy_generation: production_snapshot.generation,
+        tantivy_schema_fingerprint: tantivy_schema_fingerprint.to_string(),
+        production_v1,
+        metadata_boost_v1,
+        selection,
+        redaction_passed: redaction.passed,
+    };
+    let mut report_bytes = with_newline(serde_json::to_vec_pretty(&report)?);
+    if contains_sensitive_payload(&report_bytes, corpus, &dev_refs) {
+        report.redaction_passed = false;
+        report_bytes = with_newline(serde_json::to_vec_pretty(&report)?);
+    }
+    if !report.redaction_passed {
+        return Err("lexical profile A/B report redaction failed".into());
+    }
+    let report_sha256 = format!("{:x}", Sha256::digest(&report_bytes));
+    write_atomic(&root.join("lexical-profile-ab-report.json"), &report_bytes)?;
+    let frozen = FrozenLexicalProfile {
+        production_profile: "production_v1",
+        comparison_candidate: "metadata_boost_v1",
+        selected_profile: report.selection.selected_profile,
+        selection_reasons: report.selection.reasons.clone(),
+        dev_report_sha256: report_sha256,
+        corpus_sha256: corpus_sha256.to_string(),
+        qrels_dev_sha256: qrels_dev_sha256.to_string(),
+        active_tantivy_generation: production_snapshot.generation,
+    };
+    Ok((report, frozen))
+}
+
+fn selected_hybrid_evidence(
+    fixture: &CliFixture,
+    qrels: &[QrelRecord],
+    production_primary: &QueryEvidence,
+    diagnostic: &QueryEvidence,
+    profile: FrozenLexicalProfileName,
+) -> Result<QueryEvidence, DynError> {
+    if profile == FrozenLexicalProfileName::ProductionV1 {
+        return Ok(production_primary.clone());
+    }
+    let (_, lexical) = run_lexical_profile_pass(
+        fixture,
+        qrels,
+        production_primary,
+        profile,
+        CANDIDATE_WINDOW,
+        false,
+    )?;
+    let mut rankings = BTreeMap::new();
+    let mut branch_observations = BTreeMap::new();
+    let mut hybrid_expected_queries = 0usize;
+    let mut hybrid_path_queries = 0usize;
+    for qrel in qrels {
+        if qrel.query_class == QueryClass::ExactIdentifier {
+            rankings.insert(
+                qrel.query_id.clone(),
+                production_primary
+                    .rankings
+                    .get(&qrel.query_id)
+                    .cloned()
+                    .ok_or("selected hybrid exact ranking missing")?,
+            );
+            branch_observations.insert(qrel.query_id.clone(), Vec::new());
+            continue;
+        }
+        let lexical_hits = lexical
+            .branch_observations
+            .get(&qrel.query_id)
+            .ok_or("selected lexical branch observations missing")?;
+        let model_scored = qrel.query_class != QueryClass::Negative;
+        hybrid_expected_queries += usize::from(model_scored);
+        let mut combined = BTreeMap::<String, BranchObservation>::new();
+        for hit in lexical_hits {
+            combined.insert(hit.source_id.clone(), hit.clone());
+        }
+        for hit in diagnostic
+            .branch_observations
+            .get(&qrel.query_id)
+            .ok_or("selected hybrid vector observations missing")?
+        {
+            if let Some(distance) = hit.vector_distance {
+                combined
+                    .entry(hit.source_id.clone())
+                    .or_insert(BranchObservation {
+                        source_id: hit.source_id.clone(),
+                        lexical_score: None,
+                        vector_distance: None,
+                    })
+                    .vector_distance = Some(distance);
+            }
+        }
+        let combined = combined.into_values().collect::<Vec<_>>();
+        hybrid_path_queries += usize::from(
+            model_scored
+                && combined
+                    .iter()
+                    .any(|hit| hit.lexical_score.is_some() && hit.vector_distance.is_some()),
+        );
+        rankings.insert(
+            qrel.query_id.clone(),
+            fuse_branch_observations(&combined, RRF_K, CANDIDATE_WINDOW)
+                .into_iter()
+                .take(TOP_K)
+                .collect(),
+        );
+        branch_observations.insert(qrel.query_id.clone(), combined);
+    }
+    let (get_total, get_success, stale_failures) = verify_rankings_with_get(fixture, &rankings)?;
+    Ok(QueryEvidence {
+        rankings,
+        branch_observations,
+        get_total,
+        get_success,
+        stale_failures,
+        hybrid_required: true,
+        hybrid_expected_queries,
+        hybrid_path_queries,
+    })
+}
+
 fn run_dev_mcp(fixture: &CliFixture, dev: &[QrelRecord]) -> Result<DevRunEvidence, DynError> {
     let protocol = DevQueryProtocol::frozen();
     let mut client = McpClient::start(fixture)?;
@@ -3553,9 +4092,17 @@ fn run_heldout_mcp(
             held_out_evidence = Some(evidence);
         }
     }
+    let (diagnostic, _) = query_pass(
+        &mut client,
+        held_out,
+        false,
+        DEV_DIAGNOSTIC_QUERY_LIMIT,
+        true,
+    )?;
     let peak_rss_bytes = client.finish()?;
     Ok(WarmEvidence {
         held_out: held_out_evidence.ok_or("held-out evidence missing")?,
+        diagnostic,
         latencies_ms: latencies,
         peak_rss_bytes,
     })
@@ -3839,6 +4386,12 @@ fn evaluate_rankings(
                     .issue_number
                     .is_some_and(|issue_number| source.issue_number != issue_number),
             );
+            hard_filter_violations += usize::from(
+                qrel.filters
+                    .source_type
+                    .as_deref()
+                    .is_some_and(|source_type| source.entity_type != source_type),
+            );
         }
         let ranked_refs = ranked.iter().map(String::as_str).collect::<Vec<_>>();
         let event = redacted_query_event(
@@ -3924,7 +4477,7 @@ fn evaluate_rankings(
         exact_top_1,
         hard_filter_violations,
         get_round_trip,
-        stale_leakage_live_fixture: None,
+        stale_leakage_live_fixture: Some(evidence.stale_failures),
         duplicate_crowding_queries,
         hybrid_expected_queries: evidence.hybrid_expected_queries,
         hybrid_path_queries: evidence.hybrid_path_queries,
@@ -4472,6 +5025,28 @@ limit = 10
         Ok(fs::metadata(self.db_path())?.len())
     }
 
+    fn active_tantivy_snapshot(&self) -> Result<ActiveTantivySnapshot, DynError> {
+        let connection = Connection::open(self.db_path())?;
+        let (generation, path): (i64, String) = connection.query_row(
+            "SELECT publication.tantivy_generation, generation.path
+             FROM retrieval_publication_pointer pointer
+             JOIN retrieval_publications publication
+               ON publication.publication_id = pointer.publication_id
+             JOIN index_generations generation
+               ON generation.generation = publication.tantivy_generation
+             WHERE pointer.id = 1
+               AND publication.active = 1
+               AND generation.active = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let path = PathBuf::from(path);
+        if !path.is_dir() {
+            return Err("active publication Tantivy generation is unavailable".into());
+        }
+        Ok(ActiveTantivySnapshot { generation, path })
+    }
+
     fn schema_fingerprints(&self) -> Result<(String, String), DynError> {
         let connection = Connection::open(self.db_path())?;
         let mut statement = connection.prepare(
@@ -4497,15 +5072,9 @@ limit = 10
             database_schema.push_str(&sql);
             database_schema.push('\n');
         }
-        let active_index_path: String = connection.query_row(
-            "SELECT path FROM index_generations
-             WHERE active = 1 ORDER BY generation DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )?;
-        let metadata: Value = serde_json::from_slice(&fs::read(
-            PathBuf::from(active_index_path).join("meta.json"),
-        )?)?;
+        let active_index_path = self.active_tantivy_snapshot()?.path;
+        let metadata: Value =
+            serde_json::from_slice(&fs::read(active_index_path.join("meta.json"))?)?;
         let schema = metadata
             .get("schema")
             .ok_or("Tantivy meta.json schema missing")?;

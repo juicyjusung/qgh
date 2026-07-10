@@ -38,6 +38,26 @@ enum LexicalRankingProfile {
     MetadataBoostV1,
 }
 
+/// Fixed lexical profiles available only to the release/live-qrels harness.
+///
+/// This deliberately exposes names, not boost values. Production callers do
+/// not use this type and remain pinned to `V1` through `search_with_filters`.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalLexicalProfile {
+    ProductionV1,
+    MetadataBoostV1,
+}
+
+impl From<EvalLexicalProfile> for LexicalRankingProfile {
+    fn from(profile: EvalLexicalProfile) -> Self {
+        match profile {
+            EvalLexicalProfile::ProductionV1 => Self::V1,
+            EvalLexicalProfile::MetadataBoostV1 => Self::MetadataBoostV1,
+        }
+    }
+}
+
 impl Default for SearchFilters {
     fn default() -> Self {
         Self {
@@ -290,17 +310,28 @@ fn search_with_filters_profile(
 /// This is intentionally not parameterized by boosts and is not used by the
 /// production query path, which remains pinned to `LexicalRankingProfile::V1`.
 #[doc(hidden)]
+pub fn search_with_lexical_profile_for_eval(
+    active_path: &Path,
+    query_text: &str,
+    filters: &SearchFilters,
+    profile: EvalLexicalProfile,
+    limit: usize,
+) -> Result<Vec<SearchHit>, QghError> {
+    search_with_filters_profile(active_path, query_text, filters, profile.into(), limit)
+}
+
+#[doc(hidden)]
 pub fn search_with_metadata_boost_v1_for_eval(
     active_path: &Path,
     query_text: &str,
     filters: &SearchFilters,
     limit: usize,
 ) -> Result<Vec<SearchHit>, QghError> {
-    search_with_filters_profile(
+    search_with_lexical_profile_for_eval(
         active_path,
         query_text,
         filters,
-        LexicalRankingProfile::MetadataBoostV1,
+        EvalLexicalProfile::MetadataBoostV1,
         limit,
     )
 }

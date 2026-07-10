@@ -520,16 +520,150 @@ fn primary_dev_metrics_use_the_production_query_protocol() {
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
-fn lexical_profile_remains_typed_and_frozen_until_integrated_lane_d_ab() {
+fn lexical_profile_freeze_contains_a_selected_profile_and_dev_report_binding() {
+    assert!(!RUNTIME_SUPPORT.contains("pending_integrated_lane_d_ab"));
     assert_eq!(
         live_model_eval_runtime::lexical_profile_freeze_for_test(),
         json!({
             "production_profile": "production_v1",
             "comparison_candidate": "metadata_boost_v1",
-            "state": "pending_integrated_lane_d_ab",
-            "may_select": false,
+            "selected_profile": "production_v1",
+            "selection_reasons": ["weighted_ndcg_not_strictly_improved"],
+            "dev_report_sha256": "report-sha256",
+            "corpus_sha256": "corpus-sha256",
+            "qrels_dev_sha256": "dev-sha256",
+            "active_tantivy_generation": 7,
         })
     );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn lexical_profile_selects_metadata_only_on_strict_clean_dev_improvement() {
+    let baseline = json!({
+        "weighted_ndcg_at_10": 0.50,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.50, 0.50, 0.50, 0.50],
+    });
+    let candidate = json!({
+        "weighted_ndcg_at_10": 0.51,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.50, 0.50, 0.50, 0.50],
+    });
+
+    assert_eq!(
+        live_model_eval_runtime::lexical_profile_selection_for_test(baseline, candidate),
+        json!({
+            "selected_profile": "metadata_boost_v1",
+            "reasons": [],
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn lexical_profile_keeps_v1_without_strict_weighted_dev_improvement() {
+    let metrics = json!({
+        "weighted_ndcg_at_10": 0.50,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.50, 0.50, 0.50, 0.50],
+    });
+
+    assert_eq!(
+        live_model_eval_runtime::lexical_profile_selection_for_test(metrics.clone(), metrics),
+        json!({
+            "selected_profile": "production_v1",
+            "reasons": ["weighted_ndcg_not_strictly_improved"],
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn lexical_profile_rejects_exact_or_comment_only_regression() {
+    let baseline = json!({
+        "weighted_ndcg_at_10": 0.50,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.50, 0.50, 0.50, 0.50],
+    });
+    let exact_regression = json!({
+        "weighted_ndcg_at_10": 0.60,
+        "exact_top_1": 0.99,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.50, 0.50, 0.50, 0.50],
+    });
+    let comment_regression = json!({
+        "weighted_ndcg_at_10": 0.60,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.49, 0.50, 0.50, 0.50],
+    });
+
+    assert_eq!(
+        live_model_eval_runtime::lexical_profile_selection_for_test(
+            baseline.clone(),
+            exact_regression,
+        ),
+        json!({
+            "selected_profile": "production_v1",
+            "reasons": ["exact_identifier_regression"],
+        })
+    );
+    assert_eq!(
+        live_model_eval_runtime::lexical_profile_selection_for_test(baseline, comment_regression),
+        json!({
+            "selected_profile": "production_v1",
+            "reasons": ["comment_only_regression"],
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn lexical_profile_rejects_filter_roundtrip_or_stale_regression() {
+    let baseline = json!({
+        "weighted_ndcg_at_10": 0.50,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.50, 0.50, 0.50, 0.50],
+    });
+    for (field, value, reason) in [
+        ("hard_filter_violations", json!(1), "hard_filter_regression"),
+        (
+            "get_round_trip",
+            json!(0.99),
+            "query_get_round_trip_regression",
+        ),
+        ("stale_leakage", json!(1), "stale_leakage_regression"),
+    ] {
+        let mut candidate = baseline.clone();
+        candidate["weighted_ndcg_at_10"] = json!(0.60);
+        candidate[field] = value;
+        let selection = live_model_eval_runtime::lexical_profile_selection_for_test(
+            baseline.clone(),
+            candidate,
+        );
+        assert_eq!(selection["selected_profile"], "production_v1");
+        assert_eq!(selection["reasons"], json!([reason]));
+    }
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -660,6 +794,109 @@ fn metadata_context_templates_are_exact_and_versioned() {
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
+fn context_probe_uses_only_the_embedding_generation_in_the_active_publication() {
+    let path = std::env::temp_dir().join(format!(
+        "qgh-live-model-context-publication-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE embedding_generations(
+               id INTEGER PRIMARY KEY, state TEXT, model_manifest_hash TEXT,
+               context_template_version TEXT
+             );
+             CREATE TABLE embedding_generation_chunks(
+               generation_id INTEGER, chunk_id INTEGER, context_hash TEXT
+             );
+             CREATE TABLE chunks(
+               id INTEGER PRIMARY KEY, source_id TEXT, chunker_fingerprint TEXT, body TEXT
+             );
+             CREATE TABLE source_entities(
+               source_id TEXT PRIMARY KEY, entity_type TEXT, host TEXT, repo TEXT
+             );
+             CREATE TABLE issue_metadata(source_id TEXT, issue_number INTEGER, title TEXT);
+             CREATE TABLE comment_metadata(
+               source_id TEXT, issue_number INTEGER, parent_issue_title TEXT
+             );
+             CREATE TABLE retrieval_publications(
+               publication_id INTEGER PRIMARY KEY, embedding_generation_id INTEGER, active INTEGER
+             );
+             CREATE TABLE retrieval_publication_pointer(
+               id INTEGER PRIMARY KEY, publication_id INTEGER
+             );
+             INSERT INTO embedding_generations VALUES
+               (7, 'active', 'manifest-a', 'qgh.context.v1'),
+               (8, 'ready', 'manifest-b', 'qgh.context.v1');
+             INSERT INTO chunks VALUES
+               (1, 'issue-source', 'chunker', 'issue chunk'),
+               (2, 'comment-source', 'chunker', 'comment chunk');
+             INSERT INTO source_entities VALUES
+               ('issue-source', 'issue', 'github.com', 'juicyjusung/qgh'),
+               ('comment-source', 'issue_comment', 'github.com', 'juicyjusung/qgh');
+             INSERT INTO issue_metadata VALUES ('issue-source', 47, 'Active title');
+             INSERT INTO comment_metadata VALUES ('comment-source', 47, 'Active title');
+             INSERT INTO embedding_generation_chunks VALUES
+               (7, 1, 'wrong-active-issue'),
+               (7, 2, 'wrong-active-comment');
+             INSERT INTO retrieval_publications VALUES (9, 7, 1);
+             INSERT INTO retrieval_publication_pointer VALUES (1, 9);",
+        )
+        .unwrap();
+    for (chunk_id, entity_type, body) in [
+        (1_i64, "issue", "issue chunk"),
+        (2_i64, "issue_comment", "comment chunk"),
+    ] {
+        let input = live_model_eval_runtime::context_input_for_test(
+            entity_type,
+            "github.com",
+            "juicyjusung/qgh",
+            47,
+            "Active title",
+            body,
+        );
+        let hash = qgh::context::embedding_context_hash(
+            "manifest-b",
+            "chunker",
+            qgh::context::METADATA_CONTEXT_TEMPLATE_VERSION,
+            &input,
+        );
+        connection
+            .execute(
+                "INSERT INTO embedding_generation_chunks VALUES (8, ?1, ?2)",
+                rusqlite::params![chunk_id, hash],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let evidence = live_model_eval_runtime::context_contract_for_test(
+        &path,
+        qgh::context::METADATA_CONTEXT_TEMPLATE_VERSION,
+    )
+    .expect("active publication is probeable");
+    assert_eq!(evidence["passed"], false);
+    assert_eq!(evidence["context_hash_mismatches"], 2);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute("DELETE FROM retrieval_publication_pointer", [])
+        .unwrap();
+    drop(connection);
+    assert!(live_model_eval_runtime::context_contract_for_test(
+        &path,
+        qgh::context::METADATA_CONTEXT_TEMPLATE_VERSION,
+    )
+    .is_err());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
 fn tier_selection_uses_size_for_light_and_quality_for_quality() {
     let candidates = [
         ("large-best", 900_u64, 0.95_f64, 0.80_f64, true),
@@ -784,6 +1021,35 @@ fn heldout_parse_occurs_after_frozen_config_write() {
         .find("parse_jsonl::<QrelRecord>(test_raw)")
         .unwrap();
     assert!(freeze < heldout_parse);
+}
+
+#[test]
+fn lexical_profile_is_selected_and_report_bound_before_heldout_then_never_reselected() {
+    let dev_ab = RUNTIME_SUPPORT
+        .find("let (lexical_profile_dev, frozen_lexical_profile) = run_lexical_profile_dev_ab")
+        .expect("dev A/B exists");
+    let freeze = RUNTIME_SUPPORT
+        .find("fs::write(root.join(\"frozen-config.json\")")
+        .expect("frozen config exists");
+    let heldout_parse = RUNTIME_SUPPORT
+        .find("parse_jsonl::<QrelRecord>(test_raw)")
+        .expect("held-out parse exists");
+    assert!(dev_ab < freeze && freeze < heldout_parse);
+    assert_eq!(
+        RUNTIME_SUPPORT
+            .matches("select_lexical_profile(&production_v1, &metadata_boost_v1)")
+            .count(),
+        1
+    );
+    assert!(RUNTIME_SUPPORT[heldout_parse..].contains("frozen_lexical_profile.selected_profile"));
+    for binding in [
+        "corpus_sha256",
+        "qrels_dev_sha256",
+        "active_tantivy_generation",
+        "dev_report_sha256",
+    ] {
+        assert!(RUNTIME_SUPPORT.contains(binding));
+    }
 }
 
 #[cfg(feature = "fastembed-provider")]
