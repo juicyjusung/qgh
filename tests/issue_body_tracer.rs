@@ -2851,7 +2851,7 @@ quantization = "none"
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
-fn embedding_sync_backfills_locally_skips_unchanged_sources_and_cleans_tombstones() {
+fn embedding_if_stale_fresh_skip_does_not_backfill_local_artifacts() {
     let fixture = TestFixture::new("embedding-sync-local-backfill");
     let server = FakeGitHub::start(issue_payload_with_pr());
     fixture.write_config(&server.base_url);
@@ -2880,48 +2880,13 @@ quantization = "none"
     assert_success(&local_backfill);
     let local_backfill_json = stdout_json(&local_backfill);
     assert_eq!(local_backfill_json["data"]["sync_state"], "skipped_fresh");
-    assert_embedding_sync_warning(&local_backfill_json);
+    assert!(warning_codes(&local_backfill_json).is_empty());
     assert_eq!(
         server.request_count(),
         request_count_after_seed,
-        "embedding backfill during fresh sync must use only local stored sources"
+        "fresh skip must not contact GitHub"
     );
-    let first_chunk_ids = fixture.sqlite_chunk_ids();
-    assert!(
-        !first_chunk_ids.is_empty(),
-        "local embedding backfill must chunk the existing corpus"
-    );
-
-    let unchanged = fixture.qgh(["sync", "--if-stale", "--max-age", "30m", "--json"]);
-    assert_success(&unchanged);
-    let unchanged_json = stdout_json(&unchanged);
-    assert_embedding_sync_warning(&unchanged_json);
-    assert_eq!(
-        server.request_count(),
-        request_count_after_seed,
-        "body_hash-unchanged embedding skip must not request GitHub"
-    );
-    assert_eq!(
-        fixture.sqlite_chunk_ids(),
-        first_chunk_ids,
-        "body_hash-unchanged sources must keep existing chunks instead of replacing them"
-    );
-
-    let comment_source_id = "qgh://github.com/issue-comment/IC_kwDOCOMMENT1";
-    fixture.insert_embedding_for_first_chunk(comment_source_id);
-    assert!(fixture.sqlite_chunk_count_for_source(comment_source_id) > 0);
-    assert_eq!(fixture.sqlite_chunk_embedding_count(), 1);
-
-    fixture.mark_source_tombstoned_in_sql(comment_source_id, "deleted");
-    let cleanup = fixture.qgh(["sync", "--if-stale", "--max-age", "30m", "--json"]);
-    assert_success(&cleanup);
-    assert_eq!(
-        server.request_count(),
-        request_count_after_seed,
-        "tombstone embedding cleanup must stay local"
-    );
-    assert_eq!(fixture.sqlite_chunk_count_for_source(comment_source_id), 0);
-    assert_eq!(fixture.sqlite_chunk_embedding_count(), 0);
+    fixture.assert_sqlite_chunks_empty();
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -3244,18 +3209,7 @@ quantization = "none"
     assert_success(&sync);
     let sync_json = stdout_json(&sync);
     assert_eq!(sync_json["data"]["sync_state"], "skipped_fresh");
-    assert!(
-        warning_codes(&sync_json).contains(&"embedding.sync_tokenizer_failed"),
-        "embedding runtime failure during sync must be a structured warning: {sync_json}"
-    );
-    assert_eq!(
-        json_object_keys(&sync_json["warnings"][0]),
-        BTreeSet::from([
-            "code".to_string(),
-            "message".to_string(),
-            "severity".to_string(),
-        ])
-    );
+    assert!(warning_codes(&sync_json).is_empty());
     assert_eq!(
         server.request_count(),
         request_count_after_seed,
@@ -3324,11 +3278,13 @@ fn cached_prepared_manifest_query_is_offline_and_falls_back_to_bm25() {
     );
 
     assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
+    let chunk_id = fixture.insert_chunk_for_source(
+        "qgh://github.com/issue/I_kwDOISSUE1",
+        "prepared manifest runtime fixture",
+    );
     fixture
         .insert_active_embedding_fingerprint_with_revision("local:offline-fixture", &manifest_hash);
-    for chunk_id in fixture.sqlite_chunk_ids() {
-        fixture.insert_embedding_for_chunk(chunk_id);
-    }
+    fixture.insert_embedding_for_chunk(chunk_id);
 
     let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
     assert_success(&query);
@@ -7315,19 +7271,6 @@ limit = 10
     }
 
     #[cfg(feature = "fastembed-provider")]
-    fn sqlite_chunk_ids(&self) -> Vec<i64> {
-        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
-        let conn = rusqlite::Connection::open(db_path).unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id FROM chunks ORDER BY source_id, source_version_id, id")
-            .unwrap();
-        stmt.query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-    }
-
-    #[cfg(feature = "fastembed-provider")]
     fn sqlite_chunk_ids_for_source(&self, source_id: &str) -> Vec<i64> {
         let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
         let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -7338,56 +7281,6 @@ limit = 10
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
-    }
-
-    #[cfg(feature = "fastembed-provider")]
-    fn sqlite_chunk_count_for_source(&self, source_id: &str) -> i64 {
-        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
-        let conn = rusqlite::Connection::open(db_path).unwrap();
-        conn.query_row(
-            "SELECT count(*) FROM chunks WHERE source_id = ?1",
-            [source_id],
-            |row| row.get(0),
-        )
-        .unwrap()
-    }
-
-    #[cfg(feature = "fastembed-provider")]
-    fn sqlite_chunk_embedding_count(&self) -> i64 {
-        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
-        let conn = rusqlite::Connection::open(db_path).unwrap();
-        conn.query_row("SELECT count(*) FROM chunk_embeddings", [], |row| {
-            row.get(0)
-        })
-        .unwrap()
-    }
-
-    #[cfg(feature = "fastembed-provider")]
-    fn insert_embedding_for_first_chunk(&self, source_id: &str) {
-        self.insert_active_embedding_fingerprint(DEFAULT_HF_MODEL_ID);
-        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
-        let conn = rusqlite::Connection::open(db_path).unwrap();
-        let chunk_id: i64 = conn
-            .query_row(
-                "SELECT id FROM chunks WHERE source_id = ?1 ORDER BY id LIMIT 1",
-                [source_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let fingerprint_id: i64 = conn
-            .query_row(
-                "SELECT id FROM embedding_fingerprints WHERE active = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        conn.execute(
-            "INSERT INTO chunk_embeddings
-                (chunk_id, fingerprint_id, vector_json, embedded_at)
-             VALUES (?1, ?2, '[0.1,0.2,0.3]', '2026-01-02T00:00:00Z')",
-            (chunk_id, fingerprint_id),
-        )
-        .unwrap();
     }
 
     fn insert_active_embedding_fingerprint(&self, model_id: &str) {
@@ -7772,33 +7665,6 @@ limit = 10
             )
             .unwrap();
         assert_eq!(changed, 1);
-    }
-
-    #[cfg(feature = "fastembed-provider")]
-    fn mark_source_tombstoned_in_sql(&self, source_id: &str, reason: &str) {
-        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
-        let conn = rusqlite::Connection::open(db_path).unwrap();
-        let changed = conn
-            .execute(
-                "UPDATE source_entities SET lifecycle_state = 'tombstoned' WHERE source_id = ?1",
-                [source_id],
-            )
-            .unwrap();
-        assert_eq!(changed, 1);
-        conn.execute(
-            "UPDATE source_versions SET lifecycle_state = 'tombstoned' WHERE source_id = ?1",
-            [source_id],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tombstones (source_id, reason, observed_at)
-             VALUES (?1, ?2, '2026-01-03T00:00:00Z')
-             ON CONFLICT(source_id) DO UPDATE SET
-                reason = excluded.reason,
-                observed_at = excluded.observed_at",
-            (source_id, reason),
-        )
-        .unwrap();
     }
 }
 
