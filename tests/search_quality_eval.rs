@@ -1,3 +1,5 @@
+#![cfg(feature = "vector-search")]
+
 use qgh::embedding::{
     EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_HF_MODEL_REVISION,
     DEFAULT_QUERY_PREFIX,
@@ -94,6 +96,8 @@ fn curated_search_quality_eval_gate_passes() {
     );
 
     let default_model_vectors = eval_model_vectors(MODEL_AB_CANDIDATES[0]);
+    fixture.write_config_with_embedding_model(&server.base_url, MODEL_AB_CANDIDATES[0].model_id);
+    assert_success(&fixture.qgh(&["query", "prepare vector schema", "--json"]));
     fixture.seed_eval_chunks(&default_model_vectors.source_vectors);
 
     let mut model_reports = Vec::new();

@@ -1401,9 +1401,17 @@ fn init_warns_when_repo_already_allowlisted_in_other_profile() {
         "config.duplicate_repo_allowlist"
     );
     assert_eq!(
-        init_json["warnings"][0]["details"]["duplicate_profile_ids"],
-        json!(["work"])
+        json_object_keys(&init_json["warnings"][0]),
+        BTreeSet::from([
+            "code".to_string(),
+            "message".to_string(),
+            "severity".to_string(),
+        ])
     );
+    assert!(init_json["warnings"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("work"));
 
     let human_init = fixture.qgh_without_profile_in(
         &nested_worktree_dir,
@@ -2249,6 +2257,7 @@ query_prefix = "query: "
     assert_eq!(status_json["data"]["embedding"]["fingerprint"], Value::Null);
 }
 
+#[cfg(feature = "vector-search")]
 #[test]
 fn status_embedding_coverage_counts_completed_and_missing_chunks() {
     let fixture = TestFixture::new("embedding-coverage-counts");
@@ -2256,6 +2265,8 @@ fn status_embedding_coverage_counts_completed_and_missing_chunks() {
     fixture.write_config(&server.base_url);
 
     assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.write_default_embedding_config(&server.base_url);
+    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
     let issue_chunk = fixture.insert_chunk_for_source(
         "qgh://github.com/issue/I_kwDOISSUE1",
         "issue embedding chunk",
@@ -2265,7 +2276,6 @@ fn status_embedding_coverage_counts_completed_and_missing_chunks() {
         "comment embedding chunk",
     );
     let requests_before_status = server.request_count();
-    fixture.write_default_embedding_config(&server.base_url);
 
     let missing = fixture.qgh(["status", "--json"]);
     assert_success(&missing);
@@ -2323,6 +2333,7 @@ fn status_embedding_coverage_counts_completed_and_missing_chunks() {
     );
 }
 
+#[cfg(feature = "vector-search")]
 #[test]
 fn status_embedding_coverage_reports_fingerprint_mismatch() {
     let fixture = TestFixture::new("embedding-coverage-mismatch");
@@ -2330,11 +2341,12 @@ fn status_embedding_coverage_reports_fingerprint_mismatch() {
     fixture.write_config(&server.base_url);
 
     assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.write_default_embedding_config(&server.base_url);
+    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
     let chunk_id = fixture.insert_chunk_for_source(
         "qgh://github.com/issue/I_kwDOISSUE1",
         "stale embedding chunk",
     );
-    fixture.write_default_embedding_config(&server.base_url);
     fixture.insert_active_embedding_fingerprint_with_revision("Other/model", "fixture-sha");
     fixture.insert_embedding_for_chunk(chunk_id);
 
@@ -2531,6 +2543,98 @@ query_prefix = "query: "
     fixture.assert_source_version_count(issue_source_id, 1);
 }
 
+#[cfg(feature = "vector-search")]
+#[test]
+fn embedding_config_without_vector_artifacts_keeps_bm25_query_available() {
+    let fixture = TestFixture::new("embedding-no-vector-artifacts-query");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let request_count_after_sync = server.request_count();
+
+    fixture.write_default_embedding_config(&server.base_url);
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+
+    assert_eq!(
+        query_json["data"]["results"][0]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+    assert_eq!(query_json["data"]["results"][0]["ranking"]["kind"], "bm25");
+    assert_eq!(
+        warning_codes(&query_json),
+        vec!["embedding.coverage_missing"]
+    );
+    assert_eq!(
+        server.request_count(),
+        request_count_after_sync,
+        "local query must not make GitHub or model acquisition requests"
+    );
+}
+
+#[cfg(not(feature = "vector-search"))]
+#[test]
+fn bm25_build_with_embedding_config_warns_and_keeps_query_available() {
+    let fixture = TestFixture::new("bm25-build-embedding-config-query");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let request_count_after_sync = server.request_count();
+    fixture.write_default_embedding_config(&server.base_url);
+
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    assert_eq!(query_json["data"]["results"][0]["ranking"]["kind"], "bm25");
+    assert_eq!(
+        warning_codes(&query_json),
+        vec!["embedding.vector_init_failed"]
+    );
+    assert_eq!(
+        json_object_keys(&query_json["warnings"][0]),
+        BTreeSet::from([
+            "code".to_string(),
+            "message".to_string(),
+            "severity".to_string(),
+        ])
+    );
+    assert_eq!(server.request_count(), request_count_after_sync);
+}
+
+#[cfg(feature = "vector-search")]
+#[test]
+fn vector_init_failure_returns_closed_warning_and_bm25_results() {
+    let fixture = TestFixture::new("embedding-vector-init-failure");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.write_default_embedding_config(&server.base_url);
+
+    let mut command = fixture.base_command();
+    let query = command
+        .env("QGH_TEST_VECTOR_INIT_FAILURE", "1")
+        .args(["--profile", "work", "query", "BM25 tracer", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+
+    assert_eq!(query_json["data"]["results"][0]["ranking"]["kind"], "bm25");
+    let warning = &query_json["warnings"][0];
+    assert_eq!(warning["code"], "embedding.vector_init_failed");
+    assert_eq!(warning["severity"], "warn");
+    assert_eq!(
+        json_object_keys(warning),
+        BTreeSet::from([
+            "code".to_string(),
+            "message".to_string(),
+            "severity".to_string(),
+        ])
+    );
+}
+
+#[cfg(feature = "vector-search")]
 #[test]
 fn embedding_fingerprint_mismatch_warns_and_keeps_bm25_results() {
     let fixture = TestFixture::new("embedding-fingerprint-mismatch");
@@ -2549,6 +2653,7 @@ query_prefix = "query: "
 "#,
     );
     assert_success(&fixture.qgh(["status", "--json"]));
+    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
     fixture.insert_active_embedding_fingerprint("Example/old-model");
 
     let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
@@ -2562,14 +2667,19 @@ query_prefix = "query: "
     let warning = &query_json["warnings"][0];
     assert_eq!(warning["code"], "embedding.fingerprint_mismatch");
     assert_eq!(
-        warning["hint"],
-        "Run `qgh embed --force` to recompute local embeddings."
+        json_object_keys(warning),
+        BTreeSet::from([
+            "code".to_string(),
+            "message".to_string(),
+            "severity".to_string(),
+        ])
     );
     let warning_text = warning.to_string();
     assert!(!warning_text.contains("Example/old-model"));
     assert!(!warning_text.contains("BM25 issue body tracer"));
 }
 
+#[cfg(feature = "vector-search")]
 #[test]
 fn embedding_fingerprint_revision_mismatch_warns_and_keeps_bm25_results() {
     let fixture = TestFixture::new("embedding-fingerprint-revision-mismatch");
@@ -2587,6 +2697,7 @@ pooling = "cls"
 query_prefix = "query: "
 "#,
     );
+    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
     fixture.insert_active_embedding_fingerprint_with_revision(DEFAULT_HF_MODEL_ID, "old-main-sha");
 
     let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
@@ -2603,6 +2714,7 @@ query_prefix = "query: "
     );
 }
 
+#[cfg(feature = "vector-search")]
 #[test]
 fn partial_embedding_coverage_warns_and_falls_back_to_bm25_results() {
     let fixture = TestFixture::new("embedding-coverage-partial-query");
@@ -2616,6 +2728,8 @@ fn partial_embedding_coverage_warns_and_falls_back_to_bm25_results() {
     let bm25_results = bm25_json["data"]["results"].clone();
     assert_eq!(bm25_json["warnings"], json!([]));
 
+    fixture.write_default_embedding_config(&server.base_url);
+    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
     let issue_chunk = fixture.insert_chunk_for_source(
         "qgh://github.com/issue/I_kwDOISSUE1",
         "issue embedding chunk",
@@ -2624,7 +2738,6 @@ fn partial_embedding_coverage_warns_and_falls_back_to_bm25_results() {
         "qgh://github.com/issue-comment/IC_kwDOCOMMENT1",
         "comment embedding chunk",
     );
-    fixture.write_default_embedding_config(&server.base_url);
     fixture.insert_matching_active_embedding_fingerprint();
     fixture.insert_embedding_for_chunk(issue_chunk);
 
@@ -2649,6 +2762,7 @@ fn partial_embedding_coverage_warns_and_falls_back_to_bm25_results() {
         .is_none());
 }
 
+#[cfg(feature = "vector-search")]
 #[test]
 fn missing_embedding_runtime_warns_and_does_not_break_local_commands() {
     let fixture = TestFixture::new("embedding-runtime-missing-fallback");
@@ -2675,6 +2789,7 @@ query_prefix = "query: "
 "#
         ),
     );
+    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
     let chunk_id = fixture.insert_chunk_for_source(source_id, "issue embedding chunk");
     fixture.insert_active_embedding_fingerprint_with_revision(
         &format!("model_path:{model_path}"),
@@ -2687,8 +2802,16 @@ query_prefix = "query: "
     let sync_json = stdout_json(&sync);
     assert_eq!(sync_json["data"]["sync_state"], "skipped_fresh");
     assert!(
-        warning_codes(&sync_json).contains(&"embedding.sync_failed"),
+        warning_codes(&sync_json).contains(&"embedding.sync_tokenizer_failed"),
         "embedding runtime failure during sync must be a structured warning: {sync_json}"
+    );
+    assert_eq!(
+        json_object_keys(&sync_json["warnings"][0]),
+        BTreeSet::from([
+            "code".to_string(),
+            "message".to_string(),
+            "severity".to_string(),
+        ])
     );
     assert_eq!(
         server.request_count(),
@@ -2701,11 +2824,16 @@ query_prefix = "query: "
     let query_json = stdout_json(&query);
     assert_eq!(
         warning_codes(&query_json),
-        vec!["embedding.hybrid_unavailable"]
+        vec!["embedding.runtime_unavailable"]
     );
-    assert!(query_json["warnings"][0]["details"]["cause_code"]
-        .as_str()
-        .is_some_and(|code| code.starts_with("embedding.")));
+    assert_eq!(
+        json_object_keys(&query_json["warnings"][0]),
+        BTreeSet::from([
+            "code".to_string(),
+            "message".to_string(),
+            "severity".to_string(),
+        ])
+    );
     assert_eq!(
         query_json["data"]["results"], bm25_results,
         "runtime fallback must preserve BM25 result schema/content"
@@ -6232,11 +6360,42 @@ limit = 10
             0,
             "BM25-only sync must not create sqlite-vec tables without [embedding]"
         );
+        assert_eq!(
+            self.sqlite_embedding_schema_table_count(),
+            0,
+            "BM25-only sync must not migrate embedding schema without [embedding]"
+        );
+    }
+
+    fn sqlite_embedding_schema_table_count(&self) -> i64 {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT count(*)
+             FROM sqlite_schema
+             WHERE type = 'table'
+               AND name IN ('chunks', 'embedding_fingerprints', 'chunk_embeddings')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     fn sqlite_chunk_count(&self) -> i64 {
         let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
         let conn = rusqlite::Connection::open(db_path).unwrap();
+        let chunks_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'chunks'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if !chunks_table_exists {
+            return 0;
+        }
         conn.query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))
             .unwrap()
     }
@@ -7648,17 +7807,21 @@ fn assert_embedding_sync_warning(output_json: &Value) {
     let warnings = output_json["warnings"].as_array().unwrap();
     let warning = warnings
         .iter()
-        .find(|warning| warning["code"] == "embedding.sync_failed")
+        .find(|warning| warning["code"] == "embedding.sync_refresh_failed")
         .expect("embedding sync warning");
     assert_eq!(warning["severity"], "warn");
     assert!(warning["message"]
         .as_str()
         .unwrap()
-        .contains("BM25 index refresh completed"));
-    assert!(warning["details"]["cause_code"]
-        .as_str()
-        .unwrap()
-        .starts_with("embedding."));
+        .contains("BM25 index refresh remains available"));
+    assert_eq!(
+        json_object_keys(warning),
+        BTreeSet::from([
+            "code".to_string(),
+            "message".to_string(),
+            "severity".to_string(),
+        ])
+    );
 }
 
 fn stdout_json_lines(output: &Output) -> Vec<Value> {

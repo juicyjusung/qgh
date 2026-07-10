@@ -868,23 +868,39 @@ fn refresh_embedding_for_sync_if_enabled(
     };
 
     let mut warnings = Vec::new();
+    if store.enable_vector().is_err() {
+        warnings.push(embedding_sync_warning(
+            "embedding.sync_vector_init_failed",
+            "Local vector storage initialization failed during sync. BM25 index refresh remains available.",
+        ));
+        return warnings;
+    }
     match store.cleanup_inactive_embedding_artifacts() {
         Ok(cleaned_chunks) if cleaned_chunks > 0 => progress.line(format_args!(
             "qgh sync: cleaned stale embedding artifacts chunks={cleaned_chunks}"
         )),
         Ok(_) => {}
-        Err(error) => warnings.push(embedding_sync_warning(&error)),
+        Err(_) => warnings.push(embedding_sync_warning(
+            "embedding.sync_cleanup_failed",
+            "Embedding artifact cleanup failed during sync. BM25 index refresh remains available.",
+        )),
     }
 
     let tokenizer = match embedding_tokenizer(embedding) {
         Ok(tokenizer) => tokenizer,
-        Err(error) => {
-            warnings.push(embedding_sync_warning(&error));
+        Err(_) => {
+            warnings.push(embedding_sync_warning(
+                "embedding.sync_tokenizer_failed",
+                "Embedding tokenizer initialization failed during sync. BM25 index refresh remains available.",
+            ));
             return warnings;
         }
     };
-    if let Err(error) = refresh_embedding_chunks(store, tokenizer.as_ref(), progress) {
-        warnings.push(embedding_sync_warning(&error));
+    if refresh_embedding_chunks(store, tokenizer.as_ref(), progress).is_err() {
+        warnings.push(embedding_sync_warning(
+            "embedding.sync_chunking_failed",
+            "Embedding chunk refresh failed during sync. BM25 index refresh remains available.",
+        ));
         return warnings;
     }
 
@@ -892,7 +908,10 @@ fn refresh_embedding_for_sync_if_enabled(
         Ok(embedded_chunks) => progress.line(format_args!(
             "qgh sync: refreshed chunk embeddings embedded={embedded_chunks}"
         )),
-        Err(error) => warnings.push(embedding_sync_warning(&error)),
+        Err(_) => warnings.push(embedding_sync_warning(
+            "embedding.sync_refresh_failed",
+            "Embedding refresh failed during sync. BM25 index refresh remains available.",
+        )),
     }
     warnings
 }
@@ -1008,19 +1027,12 @@ fn refresh_incremental_chunk_embeddings_with_provider(
     store.upsert_chunk_embeddings(&fingerprint, &embeddings)
 }
 
-fn embedding_sync_warning(error: &QghError) -> Value {
-    let mut warning = json!({
-        "code": "embedding.sync_failed",
+fn embedding_sync_warning(code: &'static str, message: &'static str) -> Value {
+    json!({
+        "code": code,
         "severity": "warn",
-        "message": "Embedding refresh failed during sync. BM25 index refresh completed without vector updates.",
-        "details": {
-            "cause_code": error.code
-        }
-    });
-    if let Some(hint) = &error.hint {
-        warning["hint"] = json!(hint);
-    }
-    warning
+        "message": message
+    })
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -1169,6 +1181,7 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
     }
 
     let mut store = Store::open(&profile.paths)?;
+    store.enable_vector()?;
     let runtime = embedding_runtime(embedding)?;
     let progress = StderrSyncProgress::new(false);
     let chunk_stats = refresh_embedding_chunks(&mut store, runtime.tokenizer.as_ref(), &progress)?;
@@ -1944,12 +1957,7 @@ fn finish_profile_init(
                 "Repo `{}` is also allowlisted in profile(s): {}. Profile auto-resolution will be ambiguous.",
                 repo,
                 bootstrap.duplicate_profile_ids.join(", ")
-            ),
-            "details": {
-                "repo": repo.clone(),
-                "duplicate_profile_ids": bootstrap.duplicate_profile_ids
-            },
-            "hint": "Run qgh with --profile <profile-id> or remove the repo from the other profile allowlists."
+            )
         }));
     }
     Ok(InitCommandOutcome {
@@ -2093,7 +2101,22 @@ pub fn query(
     let repo_policy = discover_repo_policy()?;
     let filters = QueryFilters::from_args(&args, &profile, repo_policy.as_ref(), repo_scope)?;
     let limit = effective_limit(&args, repo_policy.as_ref())?;
-    let store = Store::open(&profile.paths)?;
+    let mut store = Store::open(&profile.paths)?;
+    let mut vector_open_warnings = Vec::new();
+    let vector_enabled = if profile.embedding.is_some() {
+        match store.enable_vector() {
+            Ok(()) => true,
+            Err(_) => {
+                vector_open_warnings.push(embedding_warning(
+                    "embedding.vector_init_failed",
+                    "Local vector storage initialization failed. BM25 results are still returned.",
+                ));
+                false
+            }
+        }
+    } else {
+        false
+    };
     let overrides = freshness_overrides(args.max_age.as_deref(), args.require_fresh)?;
     if let Some(results) = exact_results(&store, &args.query, &filters, &profile.id)? {
         let last_successful_sync_at =
@@ -2116,7 +2139,10 @@ pub fn query(
         let coverage = coverage::evaluate(&store.coverage_snapshot()?, false);
         let mut warnings = freshness.warnings;
         warnings.extend(coverage.warnings);
-        warnings.extend(embedding_warnings(&profile, &store)?);
+        warnings.append(&mut vector_open_warnings);
+        if vector_enabled {
+            warnings.extend(embedding_warnings(&profile, &store)?);
+        }
         return Ok(LocalReadOutcome {
             data: json!({
             "profile_id": profile.id,
@@ -2130,8 +2156,11 @@ pub fn query(
             warnings,
         });
     }
-    let (hybrid_vector_hits, mut hybrid_warnings) =
-        hybrid_vector_hits(&profile, &store, &args.query, &filters, limit)?;
+    let (hybrid_vector_hits, mut hybrid_warnings) = if vector_enabled {
+        hybrid_vector_hits(&profile, &store, &args.query, &filters, limit)?
+    } else {
+        (None, vector_open_warnings)
+    };
     let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
     let lexical_limit = if hybrid_vector_hits.is_some() {
         hybrid_candidate_limit(limit)
@@ -2180,7 +2209,9 @@ pub fn query(
     let mut warnings = freshness.warnings;
     warnings.extend(coverage.warnings);
     warnings.append(&mut hybrid_warnings);
-    warnings.extend(embedding_warnings(&profile, &store)?);
+    if vector_enabled {
+        warnings.extend(embedding_warnings(&profile, &store)?);
+    }
     Ok(LocalReadOutcome {
         data: json!({
         "profile_id": profile.id,
@@ -2547,13 +2578,26 @@ fn hybrid_vector_hits(
     }
     let runtime = match embedding_runtime(embedding) {
         Ok(runtime) => runtime,
-        Err(error) => return Ok((None, vec![hybrid_fallback_warning(&error)])),
+        Err(_) => {
+            return Ok((
+                None,
+                vec![embedding_warning(
+                    "embedding.runtime_unavailable",
+                    "Local embedding runtime was unavailable. BM25 results are still returned.",
+                )],
+            ));
+        }
     };
     let query_vector = match runtime.provider.embed_query(query_text) {
         Ok(vector) => vector,
-        Err(error) => {
-            let error = embedding_error(error);
-            return Ok((None, vec![hybrid_fallback_warning(&error)]));
+        Err(_) => {
+            return Ok((
+                None,
+                vec![embedding_warning(
+                    "embedding.query_encoding_failed",
+                    "Local query embedding failed. BM25 results are still returned.",
+                )],
+            ));
         }
     };
     match store.vector_only_search(
@@ -2562,7 +2606,13 @@ fn hybrid_vector_hits(
         hybrid_candidate_limit(limit),
     ) {
         Ok(hits) => Ok((Some(hits), Vec::new())),
-        Err(error) => Ok((None, vec![hybrid_fallback_warning(&error)])),
+        Err(_) => Ok((
+            None,
+            vec![embedding_warning(
+                "embedding.vector_search_failed",
+                "Local vector search failed. BM25 results are still returned.",
+            )],
+        )),
     }
 }
 
@@ -2637,19 +2687,12 @@ fn embedding_coverage_state(
     }))
 }
 
-fn hybrid_fallback_warning(error: &QghError) -> Value {
-    let mut warning = json!({
-        "code": "embedding.hybrid_unavailable",
+fn embedding_warning(code: &'static str, message: &'static str) -> Value {
+    json!({
+        "code": code,
         "severity": "warn",
-        "message": "Hybrid vector retrieval was unavailable. BM25 results are still returned.",
-        "details": {
-            "cause_code": error.code
-        }
-    });
-    if let Some(hint) = &error.hint {
-        warning["hint"] = json!(hint);
-    }
-    warning
+        "message": message
+    })
 }
 
 fn effective_repo(
@@ -2807,8 +2850,7 @@ fn embedding_warnings(profile: &Profile, store: &Store) -> Result<Vec<Value>, Qg
         "fingerprint_mismatch" => Ok(vec![json!({
             "code": "embedding.fingerprint_mismatch",
             "severity": "warn_strong",
-            "message": "Stored embeddings were created with a different embedding fingerprint and will not be used for vector search. BM25 results are still returned.",
-            "hint": "Run `qgh embed --force` to recompute local embeddings."
+            "message": "Stored embeddings were created with a different embedding fingerprint and will not be used for vector search. BM25 results are still returned."
         })]),
         "complete" => Ok(Vec::new()),
         _ => unreachable!("embedding coverage state is closed"),
@@ -3693,15 +3735,23 @@ fn snippet(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "vector-search")]
     use crate::chunking::MarkdownChunk;
+    #[cfg(feature = "vector-search")]
     use crate::embedding::PoolingKind;
+    #[cfg(feature = "vector-search")]
     use crate::model::{IssueRecord, VectorSearchFilters};
+    #[cfg(feature = "vector-search")]
     use crate::paths::ProfilePaths;
+    #[cfg(feature = "vector-search")]
     use std::fs;
+    #[cfg(feature = "vector-search")]
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(feature = "vector-search")]
     struct MockEmbeddingProvider;
 
+    #[cfg(feature = "vector-search")]
     impl EmbeddingProvider for MockEmbeddingProvider {
         fn embed_documents(
             &self,
@@ -3819,10 +3869,12 @@ mod tests {
         assert!(ranking.get("probability").is_none());
     }
 
+    #[cfg(feature = "vector-search")]
     #[test]
     fn force_refresh_persists_vectors_under_new_fingerprint() {
         let paths = temp_profile_paths("command-embed-force");
         let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
         let source_id = "qgh://github.com/issue/I_COMMAND_EMBED";
         let issue = IssueRecord {
             source_id: source_id.to_string(),
@@ -3901,10 +3953,12 @@ mod tests {
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
+    #[cfg(feature = "vector-search")]
     #[test]
     fn sync_incremental_embedding_persists_vectors_and_skips_completed_chunks() {
         let paths = temp_profile_paths("sync-incremental-embedding");
         let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
         let source_id = "qgh://github.com/issue/I_SYNC_EMBED";
         let issue = IssueRecord {
             source_id: source_id.to_string(),
@@ -4002,10 +4056,12 @@ mod tests {
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
+    #[cfg(feature = "vector-search")]
     #[test]
     fn vector_only_smoke_prefilters_and_round_trips_sources() {
         let paths = temp_profile_paths("vector-only-smoke");
         let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
         let issues = vec![
             vector_issue("I_VECTOR_REPO", "other/repo", 1, "open", "bob", &["bug"]),
             vector_issue(
@@ -4123,6 +4179,7 @@ mod tests {
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
+    #[cfg(feature = "vector-search")]
     fn temp_profile_paths(name: &str) -> ProfilePaths {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4143,6 +4200,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "vector-search")]
     fn vector_issue(
         node_id: &str,
         repo: &str,
@@ -4174,6 +4232,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "vector-search")]
     fn test_chunk(body: String) -> MarkdownChunk {
         MarkdownChunk {
             chunk_index: 0,

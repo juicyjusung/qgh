@@ -9,7 +9,8 @@ repository = "https://github.com/juicyjusung/qgh"
 
 [features]
 default = []
-fastembed-provider = ["dep:fastembed", "dep:hf-hub", "dep:tokenizers"]
+vector-search = ["dep:sqlite-vec"]
+fastembed-provider = ["vector-search", "dep:fastembed", "dep:hf-hub", "dep:tokenizers"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -22,7 +23,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-sqlite-vec = "=0.1.9"
+sqlite-vec = { version = "=0.1.9", optional = true }
 tantivy = "0.22"
 thiserror = "1.0"
 tokio = { version = "1.38", features = ["macros", "rt-multi-thread"] }

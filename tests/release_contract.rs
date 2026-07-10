@@ -2195,7 +2195,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
 }
 
 #[test]
-fn bm25_only_build_keeps_embedding_runtime_optional_and_links_sqlite_vec() {
+fn bm25_only_build_excludes_vector_runtime_dependencies() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
     let manifest_toml: toml::Value = toml::from_str(&manifest).unwrap();
@@ -2205,8 +2205,14 @@ fn bm25_only_build_keeps_embedding_runtime_optional_and_links_sqlite_vec() {
         &Vec::<toml::Value>::new(),
         "default BM25-only build must not enable embedding runtime features"
     );
+    let vector_search = features["vector-search"].as_array().unwrap();
+    assert_eq!(
+        vector_search,
+        &[toml::Value::String("dep:sqlite-vec".to_string())],
+        "vector-search must own the optional sqlite-vec dependency"
+    );
     let fastembed_provider = features["fastembed-provider"].as_array().unwrap();
-    for feature in ["dep:fastembed", "dep:hf-hub"] {
+    for feature in ["vector-search", "dep:fastembed", "dep:hf-hub"] {
         assert!(
             fastembed_provider
                 .iter()
@@ -2216,18 +2222,35 @@ fn bm25_only_build_keeps_embedding_runtime_optional_and_links_sqlite_vec() {
     }
 
     let dependencies = manifest_toml["dependencies"].as_table().unwrap();
-    for crate_name in ["fastembed", "hf-hub"] {
+    for crate_name in ["fastembed", "hf-hub", "sqlite-vec"] {
         assert_eq!(
             dependencies[crate_name]["optional"].as_bool(),
             Some(true),
-            "BM25-only build must not require embedding runtime crate `{crate_name}`"
+            "BM25-only build must not require vector runtime crate `{crate_name}`"
         );
     }
-    assert_eq!(
-        dependencies["sqlite-vec"].as_str(),
-        Some("=0.1.9"),
-        "sqlite-vec must stay pinned to the stable static-link crate"
-    );
+
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let tree = Command::new(cargo)
+        .current_dir(&root)
+        .args([
+            "tree",
+            "--no-default-features",
+            "--edges",
+            "normal",
+            "--prefix",
+            "none",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&tree);
+    let tree = stdout_text(&tree);
+    for excluded in ["sqlite-vec", "fastembed", "hf-hub", "ort ", "ort-sys"] {
+        assert!(
+            !tree.contains(excluded),
+            "BM25-only dependency graph unexpectedly contains `{excluded}`:\n{tree}"
+        );
+    }
 }
 
 fn qgh(args: &[&str]) -> Output {
