@@ -8145,35 +8145,34 @@ fn validate_embedding_generation_vector_artifacts(
          WHERE gc.generation_id = ?1
          ORDER BY gc.chunk_id"
     );
-    let mappings = conn
-        .prepare(&mapping_sql)?
-        .query_map(params![generation_id], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-                row.get::<_, Option<Vec<u8>>>(7)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    if i64::try_from(mappings.len()).ok() != Some(total_chunks) {
-        return Err(embedding_generation_corrupt_error());
-    }
-    for (
-        expected_blob,
-        expected_checksum,
-        blob_dimension,
-        mapping_id,
-        stored_dimension,
-        stored_table,
-        vector_rowid,
-        indexed_blob,
-    ) in mappings
-    {
+    let mut statement = conn.prepare(&mapping_sql)?;
+    let mappings = statement.query_map(params![generation_id], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+            row.get::<_, Option<Vec<u8>>>(7)?,
+        ))
+    })?;
+    let mut validated_rows = 0i64;
+    for mapping in mappings {
+        validated_rows = validated_rows
+            .checked_add(1)
+            .ok_or_else(embedding_generation_corrupt_error)?;
+        let (
+            expected_blob,
+            expected_checksum,
+            blob_dimension,
+            mapping_id,
+            stored_dimension,
+            stored_table,
+            vector_rowid,
+            indexed_blob,
+        ) = mapping?;
         if usize::try_from(blob_dimension).ok() != Some(generation_dimension)
             || decode_embedding_blob(&expected_blob, generation_dimension).is_err()
             || embedding_blob_checksum(&expected_blob) != expected_checksum
@@ -8196,6 +8195,9 @@ fn validate_embedding_generation_vector_artifacts(
         if indexed_blob.as_deref() != Some(expected_blob.as_slice()) {
             return Err(embedding_generation_corrupt_error());
         }
+    }
+    if validated_rows != total_chunks {
+        return Err(embedding_generation_corrupt_error());
     }
     Ok(())
 }
