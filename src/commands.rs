@@ -2896,14 +2896,48 @@ fn embedding_coverage_state(
     if let Some((_generation_id, completed_chunks)) =
         store.active_embedding_generation_coverage()?
     {
+        let publication = store.active_retrieval_publication()?;
+        let expected = embedding_fingerprint_expectation(embedding);
+        let active_matches_config = publication
+            .as_ref()
+            .and_then(|publication| publication.output_dimension)
+            .zip(
+                publication
+                    .as_ref()
+                    .and_then(|publication| publication.model_manifest_hash.as_ref()),
+            )
+            .is_some_and(|(dimension, hash)| {
+                let seed = crate::embedding::EmbeddingFingerprintSeed {
+                    provider: expected.provider.clone(),
+                    model_id: expected.model_id.clone().unwrap_or_default(),
+                    model_revision: expected.model_revision.clone().unwrap_or_default(),
+                    pooling: expected
+                        .pooling
+                        .unwrap_or(crate::embedding::PoolingKind::Mean),
+                    query_prefix: expected.query_prefix.clone().unwrap_or_default(),
+                };
+                *hash == seed.with_dimension(dimension).hash()
+            });
         return Ok(Some(EmbeddingCoverageState {
             active_fingerprint: None,
-            active_matches_config: true,
+            active_matches_config,
             artifact_corrupt: false,
             total_chunks: completed_chunks,
-            completed_chunks,
-            missing_chunks: 0,
-            mismatched_chunks: 0,
+            completed_chunks: if active_matches_config {
+                completed_chunks
+            } else {
+                0
+            },
+            missing_chunks: if active_matches_config {
+                0
+            } else {
+                completed_chunks
+            },
+            mismatched_chunks: if active_matches_config {
+                0
+            } else {
+                completed_chunks
+            },
         }));
     }
     let expectation = embedding_fingerprint_expectation(embedding);
