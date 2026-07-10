@@ -6,7 +6,11 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(feature = "fastembed-provider")]
+use std::io::{Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
+#[cfg(feature = "fastembed-provider")]
+use std::sync::Arc;
 use std::sync::Mutex;
 
 pub use crate::context::{
@@ -588,11 +592,24 @@ impl EmbeddingRuntimeContract {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PreparedModelSnapshot {
     pub manifest: ModelManifestV1,
     pub root: PathBuf,
     paths: BTreeMap<ArtifactRole, Vec<PathBuf>>,
+    #[cfg(feature = "fastembed-provider")]
+    runtime_state: Arc<Mutex<VerifiedRuntimeState>>,
+}
+
+impl fmt::Debug for PreparedModelSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedModelSnapshot")
+            .field("manifest", &self.manifest)
+            .field("root", &self.root)
+            .field("paths", &self.paths)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -642,6 +659,35 @@ struct ArtifactFileIdentity {
     ctime_nanos: i64,
 }
 
+#[cfg(feature = "fastembed-provider")]
+struct VerifiedRuntimeArtifact {
+    role: ArtifactRole,
+    relative_path: String,
+    expected_sha256: String,
+    expected_byte_size: u64,
+    identity: ArtifactFileIdentity,
+    file: File,
+}
+
+#[cfg(feature = "fastembed-provider")]
+struct VerifiedRuntimeState {
+    artifacts: Vec<VerifiedRuntimeArtifact>,
+    payload: Option<PreparedRuntimePayload>,
+    tokenizer: Option<tokenizers::Tokenizer>,
+    consumed: bool,
+}
+
+#[cfg(feature = "fastembed-provider")]
+struct PreparedRuntimeArtifact {
+    relative_path: String,
+    bytes: Vec<u8>,
+}
+
+#[cfg(feature = "fastembed-provider")]
+struct PreparedRuntimePayload {
+    artifacts: BTreeMap<ArtifactRole, Vec<PreparedRuntimeArtifact>>,
+}
+
 impl PreparedModelSnapshot {
     pub fn path_for_role(&self, role: ArtifactRole) -> Option<&Path> {
         self.paths
@@ -657,6 +703,201 @@ impl PreparedModelSnapshot {
             .flatten()
             .map(PathBuf::as_path)
     }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn runtime_tokenizer(&self) -> Result<tokenizers::Tokenizer, EmbeddingProviderError> {
+        let mut state = self
+            .runtime_state
+            .lock()
+            .expect("prepared runtime state mutex poisoned");
+        ensure_runtime_payload(&mut state)?;
+        state.tokenizer.clone().ok_or_else(runtime_payload_error)
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn take_runtime_payload(&self) -> Result<PreparedRuntimePayload, EmbeddingProviderError> {
+        let mut state = self
+            .runtime_state
+            .lock()
+            .expect("prepared runtime state mutex poisoned");
+        ensure_runtime_payload(&mut state)?;
+        let payload = state.payload.take().ok_or_else(runtime_payload_error)?;
+        state.consumed = true;
+        Ok(payload)
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
+impl PreparedRuntimePayload {
+    fn take_one(&mut self, role: ArtifactRole) -> Result<Vec<u8>, EmbeddingProviderError> {
+        let mut artifacts = self.artifacts.remove(&role).ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.model_file_missing",
+                "Prepared runtime payload is missing a required artifact.",
+            )
+            .with_details(json!({ "role": role }))
+        })?;
+        if artifacts.len() != 1 {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.manifest_artifacts_invalid",
+                "Prepared runtime payload has an invalid artifact cardinality.",
+            )
+            .with_details(json!({ "role": role })));
+        }
+        Ok(artifacts.pop().expect("one runtime artifact").bytes)
+    }
+
+    fn take_relative(
+        &mut self,
+        role: ArtifactRole,
+        relative_path: &str,
+    ) -> Result<Vec<u8>, EmbeddingProviderError> {
+        let artifacts = self.artifacts.get_mut(&role).ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.model_file_missing",
+                "Prepared runtime payload is missing a required artifact.",
+            )
+            .with_details(json!({ "role": role }))
+        })?;
+        let index = artifacts
+            .iter()
+            .position(|artifact| artifact.relative_path == relative_path)
+            .ok_or_else(|| {
+                EmbeddingProviderError::structured(
+                    "embedding.model_file_missing",
+                    "Prepared runtime payload is missing a declared artifact.",
+                )
+                .with_details(json!({ "role": role }))
+            })?;
+        Ok(artifacts.swap_remove(index).bytes)
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn ensure_runtime_payload(state: &mut VerifiedRuntimeState) -> Result<(), EmbeddingProviderError> {
+    if state.payload.is_some() {
+        return Ok(());
+    }
+    if state.consumed {
+        return Err(runtime_payload_error());
+    }
+    checked_runtime_payload_size(
+        state
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.expected_byte_size),
+    )?;
+
+    let mut artifacts = BTreeMap::<ArtifactRole, Vec<PreparedRuntimeArtifact>>::new();
+    for artifact in &mut state.artifacts {
+        let bytes = read_verified_runtime_artifact(artifact)?;
+        artifacts
+            .entry(artifact.role)
+            .or_default()
+            .push(PreparedRuntimeArtifact {
+                relative_path: artifact.relative_path.clone(),
+                bytes,
+            });
+    }
+    let tokenizer_bytes = artifacts
+        .get(&ArtifactRole::Tokenizer)
+        .and_then(|artifacts| artifacts.first())
+        .map(|artifact| artifact.bytes.as_slice())
+        .ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.model_file_missing",
+                "Prepared runtime payload is missing a tokenizer artifact.",
+            )
+            .with_details(json!({ "role": ArtifactRole::Tokenizer }))
+        })?;
+    let tokenizer = tokenizers::Tokenizer::from_bytes(tokenizer_bytes).map_err(|_| {
+        EmbeddingProviderError::structured(
+            "embedding.tokenizer_init_failed",
+            "Failed to initialize prepared embedding tokenizer.",
+        )
+        .with_details(json!({ "role": ArtifactRole::Tokenizer }))
+    })?;
+    state.tokenizer = Some(tokenizer);
+    state.payload = Some(PreparedRuntimePayload { artifacts });
+    Ok(())
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn checked_runtime_payload_size(
+    sizes: impl IntoIterator<Item = u64>,
+) -> Result<usize, EmbeddingProviderError> {
+    sizes.into_iter().try_fold(0usize, |total, size| {
+        let size = usize::try_from(size).map_err(|_| {
+            EmbeddingProviderError::structured(
+                "embedding.artifact_size_mismatch",
+                "Prepared model artifact size exceeds the runtime address space.",
+            )
+        })?;
+        total.checked_add(size).ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.artifact_size_mismatch",
+                "Prepared model artifacts exceed the runtime address space.",
+            )
+        })
+    })
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn read_verified_runtime_artifact(
+    artifact: &mut VerifiedRuntimeArtifact,
+) -> Result<Vec<u8>, EmbeddingProviderError> {
+    let before = artifact_file_identity(&artifact.file.metadata()?);
+    if before != artifact.identity {
+        return Err(artifact_changed_error());
+    }
+    artifact.file.seek(SeekFrom::Start(0))?;
+    let capacity = usize::try_from(artifact.expected_byte_size).map_err(|_| {
+        EmbeddingProviderError::structured(
+            "embedding.artifact_size_mismatch",
+            "Prepared model artifact size exceeds the runtime address space.",
+        )
+    })?;
+    let read_limit = artifact.expected_byte_size.checked_add(1).ok_or_else(|| {
+        EmbeddingProviderError::structured(
+            "embedding.artifact_size_mismatch",
+            "Prepared model artifact size exceeds the supported range.",
+        )
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|_| {
+        EmbeddingProviderError::structured(
+            "embedding.artifact_size_mismatch",
+            "Prepared model artifact cannot fit in runtime memory.",
+        )
+    })?;
+    (&mut artifact.file)
+        .take(read_limit)
+        .read_to_end(&mut bytes)?;
+    let after = artifact_file_identity(&artifact.file.metadata()?);
+    if after != before {
+        return Err(artifact_changed_error());
+    }
+    if bytes.len() as u64 != artifact.expected_byte_size {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.artifact_size_mismatch",
+            "Prepared model artifact size does not match the manifest.",
+        ));
+    }
+    if hex_digest(&Sha256::digest(&bytes)) != artifact.expected_sha256 {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.artifact_checksum_mismatch",
+            "Prepared model artifact checksum does not match the manifest.",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn runtime_payload_error() -> EmbeddingProviderError {
+    EmbeddingProviderError::structured(
+        "embedding.runtime_unavailable",
+        "Prepared model runtime payload is unavailable.",
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -971,6 +1212,8 @@ impl PreparedModelStore {
         inspection: PreparedModelInspection,
     ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
         let mut paths = BTreeMap::<ArtifactRole, Vec<PathBuf>>::new();
+        #[cfg(feature = "fastembed-provider")]
+        let mut runtime_artifacts = Vec::with_capacity(inspection.artifacts.len());
         for artifact in &inspection.artifacts {
             let mut file = File::open(&artifact.canonical_path)?;
             let opened_identity = artifact_file_identity(&file.metadata()?);
@@ -998,11 +1241,27 @@ impl PreparedModelStore {
                 .entry(artifact.role)
                 .or_default()
                 .push(artifact.canonical_path.clone());
+            #[cfg(feature = "fastembed-provider")]
+            runtime_artifacts.push(VerifiedRuntimeArtifact {
+                role: artifact.role,
+                relative_path: artifact.relative_path.clone(),
+                expected_sha256: artifact.expected_sha256.clone(),
+                expected_byte_size: artifact.expected_byte_size,
+                identity: opened_identity,
+                file,
+            });
         }
         Ok(PreparedModelSnapshot {
             manifest: inspection.manifest,
             root: inspection.root,
             paths,
+            #[cfg(feature = "fastembed-provider")]
+            runtime_state: Arc::new(Mutex::new(VerifiedRuntimeState {
+                artifacts: runtime_artifacts,
+                payload: None,
+                tokenizer: None,
+                consumed: false,
+            })),
         })
     }
 
@@ -2326,36 +2585,29 @@ fn fastembed_user_defined_model(
 ) -> Result<fastembed::UserDefinedEmbeddingModel, EmbeddingProviderError> {
     use fastembed::{QuantizationMode, TokenizerFiles, UserDefinedEmbeddingModel};
 
+    let mut payload = snapshot.take_runtime_payload()?;
     let tokenizer_files = TokenizerFiles {
-        tokenizer_file: fs::read(required_prepared_path(snapshot, ArtifactRole::Tokenizer)?)?,
-        config_file: fs::read(required_prepared_path(snapshot, ArtifactRole::Config)?)?,
-        special_tokens_map_file: fs::read(required_prepared_path(
-            snapshot,
-            ArtifactRole::SpecialTokensMap,
-        )?)?,
-        tokenizer_config_file: fs::read(required_prepared_path(
-            snapshot,
-            ArtifactRole::TokenizerConfig,
-        )?)?,
+        tokenizer_file: payload.take_one(ArtifactRole::Tokenizer)?,
+        config_file: payload.take_one(ArtifactRole::Config)?,
+        special_tokens_map_file: payload.take_one(ArtifactRole::SpecialTokensMap)?,
+        tokenizer_config_file: payload.take_one(ArtifactRole::TokenizerConfig)?,
     };
-    let mut model = UserDefinedEmbeddingModel::new(
-        fs::read(required_prepared_path(snapshot, ArtifactRole::OnnxModel)?)?,
-        tokenizer_files,
-    )
-    .with_pooling(match snapshot.manifest.pooling {
-        PoolingKind::Cls => fastembed::Pooling::Cls,
-        PoolingKind::Mean => fastembed::Pooling::Mean,
-    })
-    .with_quantization(match snapshot.manifest.quantization {
-        QuantizationKind::None => QuantizationMode::None,
-        QuantizationKind::Static => QuantizationMode::Static,
-        QuantizationKind::Dynamic => {
-            return Err(EmbeddingProviderError::structured(
+    let mut model =
+        UserDefinedEmbeddingModel::new(payload.take_one(ArtifactRole::OnnxModel)?, tokenizer_files)
+            .with_pooling(match snapshot.manifest.pooling {
+                PoolingKind::Cls => fastembed::Pooling::Cls,
+                PoolingKind::Mean => fastembed::Pooling::Mean,
+            })
+            .with_quantization(match snapshot.manifest.quantization {
+                QuantizationKind::None => QuantizationMode::None,
+                QuantizationKind::Static => QuantizationMode::Static,
+                QuantizationKind::Dynamic => {
+                    return Err(EmbeddingProviderError::structured(
                 "embedding.dynamic_quantization_unsupported",
                 "Dynamic quantization is not supported for persistent embedding generations.",
             ));
-        }
-    });
+                }
+            });
     for artifact in snapshot
         .manifest
         .artifacts
@@ -2370,24 +2622,10 @@ fn fastembed_user_defined_model(
         })?;
         model = model.with_external_initializer(
             initializer_name,
-            fs::read(snapshot.root.join(&artifact.relative_path))?,
+            payload.take_relative(ArtifactRole::OnnxExternalData, &artifact.relative_path)?,
         );
     }
     Ok(model)
-}
-
-#[cfg(feature = "fastembed-provider")]
-fn required_prepared_path(
-    snapshot: &PreparedModelSnapshot,
-    role: ArtifactRole,
-) -> Result<&Path, EmbeddingProviderError> {
-    snapshot.path_for_role(role).ok_or_else(|| {
-        EmbeddingProviderError::structured(
-            "embedding.model_file_missing",
-            "Prepared model snapshot is missing a required runtime artifact.",
-        )
-        .with_details(json!({ "role": role }))
-    })
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -2401,12 +2639,12 @@ impl FastembedEngine {
             fastembed_user_defined_model(snapshot)?,
             InitOptionsUserDefined::new().with_max_length(snapshot.manifest.max_length),
         )
-        .map_err(|error| {
+        .map_err(|_| {
             EmbeddingProviderError::structured(
                 "embedding.fastembed_init_failed",
                 "Failed to initialize fastembed prepared model.",
             )
-            .with_details(json!({ "error": error.to_string() }))
+            .with_details(json!({ "role": "runtime" }))
         })?;
         Ok(Self {
             model: Mutex::new(model),
@@ -2438,12 +2676,12 @@ impl FastembedEngine {
             model,
             InitOptionsUserDefined::new().with_max_length(8192),
         )
-        .map_err(|error| {
+        .map_err(|_| {
             EmbeddingProviderError::structured(
                 "embedding.fastembed_init_failed",
                 "Failed to initialize fastembed local model.",
             )
-            .with_details(json!({ "error": error.to_string() }))
+            .with_details(json!({ "role": "runtime" }))
         })?;
         Ok(Self {
             model: Mutex::new(model),
@@ -2482,11 +2720,7 @@ impl FastembedTokenizer {
     pub fn from_prepared_snapshot(
         snapshot: &PreparedModelSnapshot,
     ) -> Result<Self, EmbeddingProviderError> {
-        let tokenizer_path = required_prepared_path(snapshot, ArtifactRole::Tokenizer)?;
-        let tokenizer = tokenizer_from_local_bytes(
-            tokenizer_path,
-            "Failed to initialize prepared embedding tokenizer.",
-        )?;
+        let tokenizer = snapshot.runtime_tokenizer()?;
         Ok(Self { tokenizer })
     }
 
@@ -3001,9 +3235,8 @@ fn relative_file_name(root: &Path, file: &Path) -> Result<String, EmbeddingProvi
 }
 
 impl From<std::io::Error> for EmbeddingProviderError {
-    fn from(value: std::io::Error) -> Self {
+    fn from(_: std::io::Error) -> Self {
         EmbeddingProviderError::structured("embedding.io", "Embedding provider I/O failed.")
-            .with_details(json!({ "error": value.to_string() }))
     }
 }
 
@@ -3320,6 +3553,56 @@ mod tests {
         let error = store.verify(inspection).unwrap_err();
 
         assert_eq!(error.code(), "embedding.artifact_changed");
+    }
+
+    #[cfg(all(feature = "fastembed-provider", unix))]
+    #[test]
+    fn verified_runtime_payload_fails_closed_after_path_swaps() {
+        use std::os::unix::fs::symlink;
+
+        for (index, relative_path) in ["tokenizer.json", "model.onnx", "weights.bin"]
+            .into_iter()
+            .enumerate()
+        {
+            let root = temp_dir(&format!("qgh-verified-runtime-swap-{index}"));
+            let snapshot_root = root.join("snapshot");
+            let manifest_path = write_runtime_payload_fixture(&snapshot_root);
+            let store = PreparedModelStore::new(root.join("unused"));
+            let snapshot = store
+                .verify(store.inspect_manifest(&manifest_path).unwrap())
+                .unwrap();
+
+            let artifact_path = snapshot_root.join(relative_path);
+            fs::rename(
+                &artifact_path,
+                snapshot_root.join(format!("{index}.original")),
+            )
+            .unwrap();
+            let outside = root.join(format!("outside-{index}"));
+            fs::write(&outside, b"replacement-outside-bytes").unwrap();
+            symlink(&outside, &artifact_path).unwrap();
+
+            let error = match FastembedTokenizer::from_prepared_snapshot(&snapshot) {
+                Ok(_) => panic!("swapped runtime artifact must fail closed"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error.code(),
+                "embedding.artifact_changed" | "embedding.artifact_checksum_mismatch"
+            ));
+            assert!(!error
+                .details()
+                .to_string()
+                .contains("replacement-outside-bytes"));
+        }
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn verified_runtime_payload_rejects_cumulative_address_space_overflow() {
+        assert_eq!(checked_runtime_payload_size([1, 2, 3]).unwrap(), 6);
+        let error = checked_runtime_payload_size([u64::MAX, 1]).unwrap_err();
+        assert_eq!(error.code(), "embedding.artifact_size_mismatch");
     }
 
     #[cfg(unix)]
@@ -3697,64 +3980,21 @@ mod tests {
     #[test]
     fn prepared_fastembed_model_includes_declared_external_initializer() {
         let root = temp_dir("qgh-external-initializer");
-        let files = [
-            (
-                ArtifactRole::OnnxModel,
-                "model.onnx",
-                b"graph".as_slice(),
-                None,
-            ),
-            (
-                ArtifactRole::OnnxExternalData,
-                "weights.bin",
-                b"weights".as_slice(),
-                Some("weights.bin"),
-            ),
-            (
-                ArtifactRole::Tokenizer,
-                "tokenizer.json",
-                b"{}".as_slice(),
-                None,
-            ),
-            (ArtifactRole::Config, "config.json", b"{}".as_slice(), None),
-            (
-                ArtifactRole::SpecialTokensMap,
-                "special_tokens_map.json",
-                b"{}".as_slice(),
-                None,
-            ),
-            (
-                ArtifactRole::TokenizerConfig,
-                "tokenizer_config.json",
-                b"{}".as_slice(),
-                None,
-            ),
-        ];
-        let mut artifacts = Vec::new();
-        for (role, relative_path, bytes, initializer_name) in files {
-            fs::write(root.join(relative_path), bytes).unwrap();
-            artifacts.push(fixture_artifact(
-                role,
-                relative_path,
-                bytes,
-                initializer_name,
-            ));
-        }
-        let manifest_path = root.join("manifest.json");
-        fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&fixture_manifest(artifacts)).unwrap(),
-        )
-        .unwrap();
+        let manifest_path = write_runtime_payload_fixture(&root);
         let snapshot = PreparedModelStore::new(root.join("unused"))
             .load_manifest(&manifest_path)
             .unwrap();
 
         let model = fastembed_user_defined_model(&snapshot).unwrap();
 
+        assert_eq!(model.onnx_file, b"original-model");
+        assert!(tokenizers::Tokenizer::from_bytes(&model.tokenizer_files.tokenizer_file).is_ok());
+        assert_eq!(model.tokenizer_files.config_file, b"{}");
+        assert_eq!(model.tokenizer_files.special_tokens_map_file, b"{}");
+        assert_eq!(model.tokenizer_files.tokenizer_config_file, b"{}");
         assert_eq!(model.external_initializers.len(), 1);
         assert_eq!(model.external_initializers[0].file_name, "weights.bin");
-        assert_eq!(model.external_initializers[0].buffer, b"weights");
+        assert_eq!(model.external_initializers[0].buffer, b"original-weights");
     }
 
     fn fixture_manifest(artifacts: Vec<ModelArtifactV1>) -> ModelManifestV1 {
@@ -3801,6 +4041,64 @@ mod tests {
             .map(|(role, path, bytes)| {
                 fs::write(root.join(path), bytes).unwrap();
                 fixture_artifact(*role, path, bytes, None)
+            })
+            .collect();
+        let manifest_path = root.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&fixture_manifest(artifacts)).unwrap(),
+        )
+        .unwrap();
+        manifest_path
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn write_runtime_payload_fixture(root: &Path) -> PathBuf {
+        use tokenizers::models::wordlevel::WordLevel;
+
+        fs::create_dir_all(root).unwrap();
+        let tokenizer_bytes = tokenizers::Tokenizer::new(WordLevel::default())
+            .to_string(false)
+            .unwrap()
+            .into_bytes();
+        let declarations = [
+            (
+                ArtifactRole::OnnxModel,
+                "model.onnx",
+                b"original-model".as_slice(),
+                None,
+            ),
+            (
+                ArtifactRole::OnnxExternalData,
+                "weights.bin",
+                b"original-weights".as_slice(),
+                Some("weights.bin"),
+            ),
+            (
+                ArtifactRole::Tokenizer,
+                "tokenizer.json",
+                tokenizer_bytes.as_slice(),
+                None,
+            ),
+            (ArtifactRole::Config, "config.json", b"{}".as_slice(), None),
+            (
+                ArtifactRole::SpecialTokensMap,
+                "special_tokens_map.json",
+                b"{}".as_slice(),
+                None,
+            ),
+            (
+                ArtifactRole::TokenizerConfig,
+                "tokenizer_config.json",
+                b"{}".as_slice(),
+                None,
+            ),
+        ];
+        let artifacts = declarations
+            .iter()
+            .map(|(role, relative_path, bytes, initializer_name)| {
+                fs::write(root.join(relative_path), bytes).unwrap();
+                fixture_artifact(*role, relative_path, bytes, *initializer_name)
             })
             .collect();
         let manifest_path = root.join("manifest.json");

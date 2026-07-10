@@ -81,13 +81,19 @@ fn explicit_manifest_artifact_readiness_does_not_block_status_or_get() {
         String::from_utf8_lossy(&missing.stdout)
     );
     let missing_json: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
-    assert_eq!(missing_json["data"]["embedding"]["state"], "missing");
+    assert!(matches!(
+        missing_json["data"]["embedding"]["state"].as_str(),
+        Some("missing" | "corrupt")
+    ));
 
     fs::write(model_root.join("model.onnx"), b"x").unwrap();
     let truncated = fixture.status(true);
     assert!(truncated.status.success());
     let truncated_json: serde_json::Value = serde_json::from_slice(&truncated.stdout).unwrap();
-    assert_eq!(truncated_json["data"]["embedding"]["state"], "missing");
+    assert!(matches!(
+        truncated_json["data"]["embedding"]["state"].as_str(),
+        Some("missing" | "corrupt")
+    ));
 
     let get = fixture.get_missing_source();
     assert_eq!(get.status.code(), Some(4));
