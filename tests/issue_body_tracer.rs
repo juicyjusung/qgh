@@ -341,6 +341,68 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
 }
 
 #[test]
+fn malformed_tantivy_query_is_content_free_across_cli_and_mcp_errors() {
+    let fixture = TestFixture::new("malformed-tantivy-query-content-free");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let private_marker = "PRIVATE_QUERY_FIELD_MARKER_0f92";
+    let malformed_query = format!("{private_marker}:secret");
+
+    let json_output = fixture.qgh(["query", &malformed_query, "--json"]);
+    assert_eq!(json_output.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&json_output)["error"]["code"],
+        "validation.invalid_query"
+    );
+    assert!(!stdout_text(&json_output).contains(private_marker));
+    assert!(!stderr_text(&json_output).contains(private_marker));
+
+    let human_output = fixture.qgh(["query", &malformed_query]);
+    assert_eq!(human_output.status.code(), Some(2));
+    assert!(stdout_text(&human_output).is_empty());
+    assert!(stderr_text(&human_output).contains("validation.invalid_query"));
+    assert!(!stderr_text(&human_output).contains(private_marker));
+
+    let mcp_output = fixture.mcp([
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "qgh-test", "version": "0" }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": { "query": malformed_query }
+            }
+        }),
+    ]);
+    assert_success(&mcp_output);
+    let messages = stdout_json_lines(&mcp_output);
+    let result = &messages[1]["result"];
+    assert_eq!(result["isError"], true);
+    assert_eq!(
+        result["structuredContent"]["error"]["code"],
+        "validation.invalid_query"
+    );
+    assert!(!stdout_text(&mcp_output).contains(private_marker));
+    assert!(!stderr_text(&mcp_output).contains(private_marker));
+}
+
+#[test]
 fn normal_query_fails_closed_when_active_tantivy_artifact_is_missing() {
     let fixture = TestFixture::new("query-missing-active-tantivy");
     let server = FakeGitHub::start(issue_payload_with_pr());

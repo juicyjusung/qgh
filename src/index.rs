@@ -466,8 +466,11 @@ fn search_with_filters_profile(
         }
     }
     let expanded_query = expand_cjk_query(query_text);
-    let query = parser.parse_query(&expanded_query).map_err(|e| {
-        QghError::validation("validation.invalid_query", format!("Invalid query: {e}"))
+    let query = parser.parse_query(&expanded_query).map_err(|_| {
+        QghError::validation(
+            "validation.invalid_query",
+            "The query could not be parsed by the local search index.",
+        )
     })?;
     let filter_fields = FilterFields {
         entity_type,
