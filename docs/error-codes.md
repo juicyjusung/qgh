@@ -9,6 +9,7 @@ Stable error families:
 - `freshness.*`: local snapshot freshness failures.
 - `auth.*`: token source failures.
 - `github.*`: GitHub request failures outside structured backoff state.
+- `sync.*`: sync page-commit and confirmed issue-transfer-chain failures.
 - `embedding.*`: local embedding preparation and source-snapshot failures.
 - `source.*`: missing or tombstoned source lookups.
 - `purge.*`: fail-closed purge, retry, publication, and read/write-fence failures.
@@ -23,6 +24,16 @@ Common codes include `config.no_matching_profile`, `config.ambiguous_profile`,
 `auth.token_unavailable`, `source.not_found`, `source.tombstoned`,
 `source.outside_effective_scope`, `purge.failed`, `purge.retry_failed`,
 `purge.read_fenced`, and `purge.write_fenced`.
+
+Typed GitHub lifecycle adapters may return `github.invalid_issue_json` or
+`github.invalid_comment_json` when a successful response cannot be decoded.
+`sync.commit_page_failed` and `validation.lifecycle_failed` are content-free
+fallbacks for local page-commit and lifecycle-candidate validation failures.
+Targeted issue refresh may return `sync.transfer_cycle` or
+`sync.transfer_chain_too_long`; confirmed transitions observed before either
+terminal failure are queued for purge before the error is surfaced. The
+`github.confirmed_lifecycle_requires_typed_handling` guard is reserved for
+internal legacy adapters and is not emitted by current CLI command paths.
 
 When a confirmed lifecycle or explicit allowlist-removal purge is incomplete,
 the affected source, issue, or repository remains fail closed. Retrieval may

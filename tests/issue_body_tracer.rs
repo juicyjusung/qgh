@@ -6030,6 +6030,45 @@ fn sync_issue_marks_permission_loss_with_distinct_reason() {
 }
 
 #[test]
+fn sync_issue_permission_loss_purges_entire_repo_and_preserves_unrelated_repo() {
+    let fixture = TestFixture::new("targeted-refresh-repo-permission");
+    let server = MultiRepoFakeGitHub::start();
+    server.set_mode(MULTI_REPO_OWNER_TWO_ISSUES);
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    server.set_mode(MULTI_REPO_OWNER_PERMISSION_LOSS);
+    let refresh = fixture.qgh(["sync", "issue", "42", "--repo", "owner/repo", "--json"]);
+    assert_success(&refresh);
+    let refresh_json = stdout_json(&refresh);
+    assert_eq!(
+        refresh_json["data"]["lifecycle"]["reason"],
+        "permission_loss"
+    );
+    assert_eq!(refresh_json["data"]["issues"]["tombstoned"], 2);
+    assert_eq!(refresh_json["data"]["comments"]["tombstoned"], 0);
+
+    for source_id in [
+        "qgh://github.com/issue/I_POLICY_OWNER",
+        "qgh://github.com/issue/I_POLICY_OWNER_SECOND",
+    ] {
+        let removed = fixture.qgh(["get", source_id, "--json"]);
+        assert_eq!(removed.status.code(), Some(4));
+        assert_eq!(
+            stdout_json(&removed)["error"]["details"]["reason"],
+            "permission_loss"
+        );
+    }
+
+    let unrelated = fixture.qgh(["get", "qgh://github.com/issue/I_POLICY_OTHER", "--json"]);
+    assert_success(&unrelated);
+    assert_eq!(
+        stdout_json(&unrelated)["data"]["source"]["repo"],
+        "other/repo"
+    );
+}
+
+#[test]
 fn sync_issue_auth_failure_does_not_tombstone_local_sources() {
     let fixture = TestFixture::new("targeted-refresh-auth-failed");
     let server = TargetedRefreshFakeGitHub::start();
@@ -7668,6 +7707,7 @@ impl Drop for FakeGitHub {
 
 struct MultiRepoFakeGitHub {
     base_url: String,
+    mode: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -7678,8 +7718,10 @@ impl MultiRepoFakeGitHub {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{}", addr);
+        let mode = Arc::new(AtomicUsize::new(MULTI_REPO_ACTIVE));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let thread_mode = Arc::clone(&mode);
         let thread_requests = Arc::clone(&requests);
         let thread_stop = Arc::clone(&stop);
 
@@ -7689,7 +7731,9 @@ impl MultiRepoFakeGitHub {
                     break;
                 }
                 match stream {
-                    Ok(stream) => handle_multi_repo_connection(stream, &thread_requests),
+                    Ok(stream) => {
+                        handle_multi_repo_connection(stream, &thread_mode, &thread_requests)
+                    }
                     Err(_) => break,
                 }
             }
@@ -7697,6 +7741,7 @@ impl MultiRepoFakeGitHub {
 
         Self {
             base_url,
+            mode,
             requests,
             stop,
             handle: Some(handle),
@@ -7710,6 +7755,10 @@ impl MultiRepoFakeGitHub {
     fn clear_requests(&self) {
         self.requests.lock().unwrap().clear();
     }
+
+    fn set_mode(&self, mode: usize) {
+        self.mode.store(mode, Ordering::SeqCst);
+    }
 }
 
 impl Drop for MultiRepoFakeGitHub {
@@ -7722,21 +7771,48 @@ impl Drop for MultiRepoFakeGitHub {
     }
 }
 
-fn handle_multi_repo_connection(mut stream: TcpStream, requests: &Arc<Mutex<Vec<String>>>) {
+const MULTI_REPO_ACTIVE: usize = 1;
+const MULTI_REPO_OWNER_TWO_ISSUES: usize = 2;
+const MULTI_REPO_OWNER_PERMISSION_LOSS: usize = 3;
+
+fn handle_multi_repo_connection(
+    mut stream: TcpStream,
+    mode: &Arc<AtomicUsize>,
+    requests: &Arc<Mutex<Vec<String>>>,
+) {
     let mut buffer = [0_u8; 8192];
     let bytes_read = stream.read(&mut buffer).unwrap_or(0);
     let request = String::from_utf8_lossy(&buffer[..bytes_read]);
     let request_line = request.lines().next().unwrap_or("").to_string();
     requests.lock().unwrap().push(request_line.clone());
+    let mode = mode.load(Ordering::SeqCst);
 
     let (status, body) = if request_line.starts_with("GET /repos/owner/repo/issues?")
         && request_line.contains("state=all")
     {
-        ("200 OK", multi_repo_owner_issue_payload())
+        if mode == MULTI_REPO_OWNER_TWO_ISSUES {
+            ("200 OK", multi_repo_owner_two_issue_payload())
+        } else {
+            ("200 OK", multi_repo_owner_issue_payload())
+        }
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?") {
         ("200 OK", "[]")
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42 ") {
-        ("200 OK", multi_repo_owner_issue_object_payload())
+        if mode == MULTI_REPO_OWNER_PERMISSION_LOSS {
+            ("403 Forbidden", r#"{"message":"resource not accessible"}"#)
+        } else {
+            ("200 OK", multi_repo_owner_issue_object_payload())
+        }
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/43/comments?") {
+        ("200 OK", "[]")
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/43 ") {
+        ("200 OK", multi_repo_owner_second_issue_object_payload())
+    } else if request_line.starts_with("GET /repos/owner/repo ") {
+        if mode == MULTI_REPO_OWNER_PERMISSION_LOSS {
+            ("403 Forbidden", r#"{"message":"resource not accessible"}"#)
+        } else {
+            ("200 OK", r#"{"full_name":"owner/repo"}"#)
+        }
     } else if request_line.starts_with("GET /repos/other/repo/issues?")
         && request_line.contains("state=all")
     {
@@ -7745,6 +7821,8 @@ fn handle_multi_repo_connection(mut stream: TcpStream, requests: &Arc<Mutex<Vec<
         ("200 OK", "[]")
     } else if request_line.starts_with("GET /repos/other/repo/issues/7 ") {
         ("200 OK", multi_repo_other_issue_object_payload())
+    } else if request_line.starts_with("GET /repos/other/repo ") {
+        ("200 OK", r#"{"full_name":"other/repo"}"#)
     } else {
         ("404 Not Found", r#"{"message":"not found"}"#)
     };
@@ -7964,6 +8042,47 @@ fn multi_repo_owner_issue_payload() -> &'static str {
     ]"#
 }
 
+fn multi_repo_owner_two_issue_payload() -> &'static str {
+    r#"[
+      {
+        "id": 3001,
+        "node_id": "I_POLICY_OWNER",
+        "number": 42,
+        "title": "Owner repo policy issue",
+        "body": "shared repo policy tracer from the owner repository.",
+        "state": "open",
+        "locked": false,
+        "comments": 0,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:05Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}],
+        "milestone": null,
+        "assignees": []
+      },
+      {
+        "id": 3003,
+        "node_id": "I_POLICY_OWNER_SECOND",
+        "number": 43,
+        "title": "Second owner repo policy issue",
+        "body": "second owner repository lifecycle tracer.",
+        "state": "open",
+        "locked": false,
+        "comments": 0,
+        "html_url": "https://github.com/owner/repo/issues/43",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:06Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}],
+        "milestone": null,
+        "assignees": []
+      }
+    ]"#
+}
+
 fn multi_repo_owner_issue_object_payload() -> &'static str {
     r#"{
         "id": 3001,
@@ -7977,6 +8096,27 @@ fn multi_repo_owner_issue_object_payload() -> &'static str {
         "html_url": "https://github.com/owner/repo/issues/42",
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": "2026-01-02T03:04:05Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}],
+        "milestone": null,
+        "assignees": []
+    }"#
+}
+
+fn multi_repo_owner_second_issue_object_payload() -> &'static str {
+    r#"{
+        "id": 3003,
+        "node_id": "I_POLICY_OWNER_SECOND",
+        "number": 43,
+        "title": "Second owner repo policy issue",
+        "body": "second owner repository lifecycle tracer.",
+        "state": "open",
+        "locked": false,
+        "comments": 0,
+        "html_url": "https://github.com/owner/repo/issues/43",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:06Z",
         "closed_at": null,
         "user": {"login": "bob"},
         "labels": [{"name": "bug"}],
@@ -8240,38 +8380,47 @@ fn handle_lifecycle_connection(
     requests.lock().unwrap().push(request_line.clone());
     let mode = mode.load(Ordering::SeqCst);
 
-    let (status, body) = if request_line.starts_with("GET /repos/owner/repo/issues?")
+    let (status, body, location) = if request_line.starts_with("GET /repos/owner/repo/issues?")
         && request_line.contains("state=all")
         && request_line.contains("per_page=100")
     {
-        ("200 OK", issue_payload_with_pr())
+        ("200 OK", issue_payload_with_pr(), None)
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?")
         && request_line.contains("per_page=100")
     {
         if mode == LIFECYCLE_DELETED_COMMENT {
-            ("200 OK", "[]")
+            ("200 OK", "[]", None)
         } else {
-            ("200 OK", issue_comments_payload())
+            ("200 OK", issue_comments_payload(), None)
         }
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42 ") {
         if mode == LIFECYCLE_UNAVAILABLE_ISSUE {
-            ("404 Not Found", r#"{"message":"not found"}"#)
+            ("404 Not Found", r#"{"message":"not found"}"#, None)
         } else if mode == LIFECYCLE_MOVED_ISSUE {
-            ("301 Moved Permanently", r#"{"message":"moved"}"#)
+            (
+                "301 Moved Permanently",
+                r#"{"message":"moved"}"#,
+                Some("/repos/owner/repo/issues/43"),
+            )
         } else {
-            ("200 OK", issue_object_payload())
+            ("200 OK", issue_object_payload(), None)
         }
     } else if request_line.starts_with("GET /repos/owner/repo/issues/comments/5001 ") {
         if mode == LIFECYCLE_DELETED_COMMENT {
-            ("404 Not Found", r#"{"message":"not found"}"#)
+            ("404 Not Found", r#"{"message":"not found"}"#, None)
         } else {
-            ("200 OK", issue_comment_object_payload())
+            ("200 OK", issue_comment_object_payload(), None)
         }
+    } else if request_line.starts_with("GET /repos/owner/repo ") {
+        ("200 OK", r#"{"full_name":"owner/repo"}"#, None)
     } else {
-        ("404 Not Found", r#"{"message":"not found"}"#)
+        ("404 Not Found", r#"{"message":"not found"}"#, None)
     };
+    let location_header = location
+        .map(|location| format!("location: {location}\r\n"))
+        .unwrap_or_default();
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{location_header}x-ratelimit-remaining: 4999\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();
@@ -9131,6 +9280,16 @@ fn handle_targeted_refresh_connection(
             targeted_transferred_comment_object_payload(),
             None,
         )
+    } else if request_line.starts_with("GET /repos/owner/repo ") {
+        if mode == TARGET_REFRESH_PERMISSION_LOSS {
+            (
+                "403 Forbidden",
+                r#"{"message":"resource not accessible"}"#,
+                None,
+            )
+        } else {
+            ("200 OK", r#"{"full_name":"owner/repo"}"#, None)
+        }
     } else {
         ("404 Not Found", r#"{"message":"not found"}"#, None)
     };

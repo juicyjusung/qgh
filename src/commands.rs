@@ -33,7 +33,7 @@ use crate::resolution::ResolvedRepoScope;
 use crate::store::{PendingPurgeView, PurgeTarget, PurgeTrigger, RetrievalPublicationView, Store};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -189,7 +189,7 @@ pub async fn sync(
             merge_sync_summary(&mut summary, page_summary);
             Ok(())
         };
-        github::fetch_issues(
+        github::fetch_issues_classified(
             &fetch_profile,
             &token,
             &cursors,
@@ -199,51 +199,68 @@ pub async fn sync(
         )
         .await?
     };
-    let fetched = match fetched {
-        github::FetchOutcome::Fetched(fetched) => fetched,
-        github::FetchOutcome::Backoff(backoff) => {
-            progress.line(format_args!(
-                "qgh sync: backoff reason={} scope={} retry_after_seconds={}",
-                backoff.reason, backoff.scope, backoff.retry_after_seconds
-            ));
-            let backoff = store.record_backoff_state(
-                &backoff.reason,
-                &backoff.scope,
-                backoff.retry_after_seconds,
-                backoff.reset_at.as_deref(),
-            )?;
-            let status = store.status()?;
-            let warnings = if summary.is_some() {
-                vec![incomplete_snapshot_publication_warning()]
-            } else {
-                Vec::new()
-            };
-            return Ok(local_read_outcome(
-                json!({
-                    "profile_id": profile.id,
-                    "sync_state": "backoff",
-                    "backoff": backoff,
-                    "sync": {
-                        "last_successful_sync": status.last_sync_at,
-                        "scheduler": {
-                            "max_in_flight_requests": profile.max_in_flight_requests,
-                            "hard_cap": 16
+    let github::ClassifiedFetchOutcome {
+        result: fetched,
+        interruption,
+        terminal_error,
+    } = fetched;
+    let purge_requests = confirmed_fetch_purge_requests(
+        &fetched.confirmed_permission_lost_repos,
+        &fetched.confirmed_source_deletions,
+    )?;
+    queue_and_finish_purges(&mut store, &purge_requests)?;
+    if let Some(error) = terminal_error {
+        repair_lexical_successor_if_required(&profile, &mut store)?;
+        return Err(error);
+    }
+    if let Some(interruption) = interruption {
+        repair_lexical_successor_if_required(&profile, &mut store)?;
+        match interruption_disposition(interruption) {
+            InterruptionDisposition::Error(error) => return Err(error),
+            InterruptionDisposition::Backoff(backoff) => {
+                progress.line(format_args!(
+                    "qgh sync: backoff reason={} scope={} retry_after_seconds={}",
+                    backoff.reason, backoff.scope, backoff.retry_after_seconds
+                ));
+                let backoff = store.record_backoff_state(
+                    &backoff.reason,
+                    &backoff.scope,
+                    backoff.retry_after_seconds,
+                    backoff.reset_at.as_deref(),
+                )?;
+                let status = store.status()?;
+                let warnings = if summary.is_some() {
+                    vec![incomplete_snapshot_publication_warning()]
+                } else {
+                    Vec::new()
+                };
+                return Ok(local_read_outcome(
+                    json!({
+                        "profile_id": profile.id,
+                        "sync_state": "backoff",
+                        "backoff": backoff,
+                        "sync": {
+                            "last_successful_sync": status.last_sync_at,
+                            "scheduler": {
+                                "max_in_flight_requests": profile.max_in_flight_requests,
+                                "hard_cap": 16
+                            }
+                        },
+                        "sources": {
+                            "issue_count": status.issue_count,
+                            "comment_count": status.comment_count,
+                            "tombstone_count": status.tombstone_count
+                        },
+                        "index": {
+                            "active_generation": status.active_generation,
+                            "dirty_task_count": status.dirty_task_count
                         }
-                    },
-                    "sources": {
-                        "issue_count": status.issue_count,
-                        "comment_count": status.comment_count,
-                        "tombstone_count": status.tombstone_count
-                    },
-                    "index": {
-                        "active_generation": status.active_generation,
-                        "dirty_task_count": status.dirty_task_count
-                    }
-                }),
-                warnings,
-            ));
+                    }),
+                    warnings,
+                ));
+            }
         }
-    };
+    }
     progress.line(format_args!(
         "qgh sync: fetched issues={} comments={} skipped_pull_requests={}",
         fetched.issues, fetched.comments, fetched.skipped_pull_requests
@@ -270,7 +287,7 @@ pub async fn sync(
                         canonical_url: issue.canonical_url,
                     })
             };
-            github::fetch_repo_comments(
+            github::fetch_repo_comments_classified(
                 &fetch_profile,
                 &token,
                 &comment_cursors,
@@ -291,7 +308,23 @@ pub async fn sync(
         )?;
         merge_sync_summary(&mut summary, page_summary);
         repo_comment_stats = Some((outcome.skipped_pr_comments, outcome.deferred_comments));
-        if let Some(backoff) = outcome.backoff {
+        let purge_requests =
+            confirmed_fetch_purge_requests(&outcome.confirmed_permission_lost_repos, &[])?;
+        queue_and_finish_purges(&mut store, &purge_requests)?;
+        if let Some(error) = outcome.terminal_error {
+            repair_lexical_successor_if_required(&profile, &mut store)?;
+            return Err(error);
+        }
+        let mut backoff = outcome.backoff;
+        if let Some(interruption) = outcome.interruption {
+            repair_lexical_successor_if_required(&profile, &mut store)?;
+            match interruption_disposition(interruption) {
+                InterruptionDisposition::Backoff(plan) => backoff = Some(plan),
+                InterruptionDisposition::Error(error) => return Err(error),
+            }
+        }
+        if let Some(backoff) = backoff {
+            repair_lexical_successor_if_required(&profile, &mut store)?;
             progress.line(format_args!(
                 "qgh sync: comment backoff reason={} scope={} retry_after_seconds={}",
                 backoff.reason, backoff.scope, backoff.retry_after_seconds
@@ -397,10 +430,6 @@ pub async fn sync(
                 }
             };
             let candidates = reconciliation_candidates_scoped_to_repo(candidates, repo_scope);
-            let candidates_by_source_id = candidates
-                .iter()
-                .map(|candidate| (candidate.source_id.clone(), candidate.clone()))
-                .collect::<BTreeMap<_, _>>();
             let estimated_api_cost_class = estimate_api_cost_class(candidates.len());
             progress.line(format_args!(
                 "qgh sync: reconciling sources={} mode={mode_str}",
@@ -409,23 +438,29 @@ pub async fn sync(
             let result =
                 github::reconcile_sources(&fetch_profile, &token, &candidates, Some(&progress))
                     .await?;
-            let mut purge_requests = Vec::new();
-            for unavailable in result.unavailable_sources {
-                let candidate = candidates_by_source_id
-                    .get(&unavailable.source_id)
-                    .ok_or_else(|| {
-                        QghError::new(
-                            "purge.lifecycle_candidate_missing",
-                            "Confirmed lifecycle state did not match a reconciliation candidate.",
-                            6,
-                        )
-                    })?;
-                purge_requests.push((
-                    purge_target_for_candidate(candidate, &unavailable.reason),
-                    purge_trigger_for_lifecycle_reason(&unavailable.reason),
-                ));
-            }
+            let purge_requests = reconciliation_purge_requests(
+                &result.unavailable_sources,
+                &result.confirmed_permission_lost_repos,
+            )?;
             let purge = queue_and_finish_purges(&mut store, &purge_requests)?;
+            if let Some(error) = result.terminal_error {
+                repair_lexical_successor_if_required(&profile, &mut store)?;
+                return Err(error);
+            }
+            if let Some(interruption) = result.interruption {
+                repair_lexical_successor_if_required(&profile, &mut store)?;
+                match interruption_disposition(interruption) {
+                    InterruptionDisposition::Error(error) => return Err(error),
+                    InterruptionDisposition::Backoff(backoff) => {
+                        return sync_backoff_outcome(
+                            &profile,
+                            &mut store,
+                            backoff,
+                            vec![incomplete_snapshot_publication_warning()],
+                        )
+                    }
+                }
+            }
             let tombstoned_sources = purge.purged_sources;
             store.record_reconciliation_run(
                 mode_str,
@@ -497,6 +532,45 @@ pub async fn sync(
     ))
 }
 
+fn sync_backoff_outcome(
+    profile: &Profile,
+    store: &mut Store,
+    backoff: github::BackoffPlan,
+    warnings: Vec<Value>,
+) -> Result<LocalReadOutcome, QghError> {
+    let backoff = store.record_backoff_state(
+        &backoff.reason,
+        &backoff.scope,
+        backoff.retry_after_seconds,
+        backoff.reset_at.as_deref(),
+    )?;
+    let status = store.status()?;
+    Ok(local_read_outcome(
+        json!({
+            "profile_id": profile.id,
+            "sync_state": "backoff",
+            "backoff": backoff,
+            "sync": {
+                "last_successful_sync": status.last_sync_at,
+                "scheduler": {
+                    "max_in_flight_requests": profile.max_in_flight_requests,
+                    "hard_cap": 16
+                }
+            },
+            "sources": {
+                "issue_count": status.issue_count,
+                "comment_count": status.comment_count,
+                "tombstone_count": status.tombstone_count
+            },
+            "index": {
+                "active_generation": status.active_generation,
+                "dirty_task_count": status.dirty_task_count
+            }
+        }),
+        warnings,
+    ))
+}
+
 async fn backfill_sync(
     profile: &Profile,
     fetch_profile: &Profile,
@@ -525,7 +599,7 @@ async fn backfill_sync(
             merge_sync_summary(&mut summary, page_summary);
             Ok(())
         };
-        github::fetch_backfill_issues(
+        github::fetch_backfill_issues_classified(
             fetch_profile,
             token,
             &cursors,
@@ -535,6 +609,25 @@ async fn backfill_sync(
             &mut commit_page,
         )
         .await?
+    };
+    let purge_requests = confirmed_fetch_purge_requests(
+        &outcome.confirmed_permission_lost_repos,
+        &outcome.confirmed_source_deletions,
+    )?;
+    queue_and_finish_purges(store, &purge_requests)?;
+    if let Some(error) = outcome.terminal_error.clone() {
+        repair_lexical_successor_if_required(profile, store)?;
+        return Err(error);
+    }
+    let interruption_backoff = match outcome.interruption.clone() {
+        None => None,
+        Some(interruption) => {
+            repair_lexical_successor_if_required(profile, store)?;
+            match interruption_disposition(interruption) {
+                InterruptionDisposition::Backoff(plan) => Some(plan),
+                InterruptionDisposition::Error(error) => return Err(error),
+            }
+        }
     };
 
     // History cursors are per-repo; the coverage envelope reports the
@@ -558,7 +651,8 @@ async fn backfill_sync(
     }
     store.update_coverage(&coverage)?;
 
-    if let Some(backoff) = outcome.backoff {
+    if let Some(backoff) = outcome.backoff.or(interruption_backoff) {
+        repair_lexical_successor_if_required(profile, store)?;
         progress.line(format_args!(
             "qgh sync: backfill backoff reason={} scope={} retry_after_seconds={}",
             backoff.reason, backoff.scope, backoff.retry_after_seconds
@@ -665,10 +759,19 @@ pub async fn sync_issue(
         repo.full_name()
     ));
 
-    let outcome =
-        github::fetch_target_issue(&profile, &token, &repo, issue_number, Some(&progress)).await?;
-    match outcome {
-        github::TargetIssueFetchOutcome::Backoff(backoff) => {
+    let outcome = github::fetch_target_issue_classified(
+        &profile,
+        &token,
+        &repo,
+        issue_number,
+        Some(&progress),
+    )
+    .await?;
+    let mut purge_requests = target_transition_purge_requests(&outcome.confirmed_transitions)?;
+    match outcome.terminal {
+        github::ClassifiedTargetIssueTerminal::Backoff(backoff) => {
+            queue_confirmed_target_purges(&mut store, &purge_requests)?;
+            repair_lexical_successor_if_required(&profile, &mut store)?;
             progress.line(format_args!(
                 "qgh sync issue: backoff reason={} scope={} retry_after_seconds={}",
                 backoff.reason, backoff.scope, backoff.retry_after_seconds
@@ -710,7 +813,27 @@ pub async fn sync_issue(
                 Vec::new(),
             ))
         }
-        github::TargetIssueFetchOutcome::Fetched(fetched) => {
+        github::ClassifiedTargetIssueTerminal::AuthenticationFailed => {
+            queue_confirmed_target_purges(&mut store, &purge_requests)?;
+            repair_lexical_successor_if_required(&profile, &mut store)?;
+            Err(QghError::auth(
+                "GitHub authentication failed during lifecycle verification.",
+            ))
+        }
+        github::ClassifiedTargetIssueTerminal::Transient(_)
+        | github::ClassifiedTargetIssueTerminal::AmbiguousForbidden => {
+            queue_confirmed_target_purges(&mut store, &purge_requests)?;
+            repair_lexical_successor_if_required(&profile, &mut store)?;
+            Err(QghError::github(
+                "GitHub request ended without a confirmed destructive lifecycle state.",
+            ))
+        }
+        github::ClassifiedTargetIssueTerminal::Failed(error) => {
+            queue_confirmed_target_purges(&mut store, &purge_requests)?;
+            repair_lexical_successor_if_required(&profile, &mut store)?;
+            Err(error)
+        }
+        github::ClassifiedTargetIssueTerminal::Fetched(fetched) => {
             progress.line(format_args!(
                 "qgh sync issue: fetched issue=1 comments={}",
                 fetched.comments.len()
@@ -725,54 +848,20 @@ pub async fn sync_issue(
                 .into_iter()
                 .filter(|source_id| !incoming_comment_ids.contains(source_id.as_str()))
                 .collect::<Vec<_>>();
-            let transferred = fetched.lifecycle.reason.as_deref() == Some("transferred")
-                && (fetched.issue.repo != repo.full_name() || fetched.issue.number != issue_number);
-            let transferred_issue_count = if transferred
-                && store
-                    .find_issue_by_repo_number(&repo.full_name(), issue_number)?
-                    .is_some()
-            {
-                1
-            } else {
-                0
-            };
-            let transferred_comment_count = if transferred {
-                store
-                    .active_comment_source_ids_for_issue(&repo.full_name(), issue_number)?
-                    .len()
-            } else {
-                0
-            };
-            let mut purge_requests = deleted_comment_ids
-                .iter()
-                .map(|source_id| {
-                    (
-                        PurgeTarget::Source {
-                            source_id: source_id.clone(),
-                        },
-                        PurgeTrigger::ConfirmedDelete,
-                    )
-                })
-                .collect::<Vec<_>>();
-            if transferred {
-                purge_requests.push((
-                    PurgeTarget::Issue {
-                        repo: repo.full_name(),
-                        issue_number,
+            purge_requests.extend(deleted_comment_ids.iter().map(|source_id| {
+                (
+                    PurgeTarget::Source {
+                        source_id: source_id.clone(),
                     },
-                    PurgeTrigger::ConfirmedTombstone,
-                ));
-            }
-            queue_and_finish_purges(&mut store, &purge_requests)?;
+                    PurgeTrigger::ConfirmedDelete,
+                )
+            }));
+            let purged = queue_confirmed_target_purges(&mut store, &purge_requests)?;
             let mut summary =
                 store.upsert_target_issue_refresh(&fetched.issue, &fetched.comments)?;
-            summary.deleted_comments += deleted_comment_ids.len();
-            summary.tombstoned_comments += deleted_comment_ids.len();
-            if transferred {
-                summary.tombstoned_issues += transferred_issue_count;
-                summary.tombstoned_comments += transferred_comment_count;
-                summary.deleted_comments += transferred_comment_count;
-            }
+            summary.deleted_comments += purged.comments;
+            summary.tombstoned_issues += purged.issues;
+            summary.tombstoned_comments += purged.comments;
             let repair = repair_lexical_successor_if_required(&profile, &mut store)?;
             progress.line(format_args!(
                 "qgh sync issue: stored comments added={} updated={} deleted={}",
@@ -797,34 +886,23 @@ pub async fn sync_issue(
                 index.warnings,
             ))
         }
-        github::TargetIssueFetchOutcome::Unavailable(lifecycle) => {
-            let reason = lifecycle.reason.as_deref().unwrap_or("unavailable");
+        github::ClassifiedTargetIssueTerminal::Confirmed {
+            state,
+            repo: confirmed_repo,
+            issue_number: confirmed_issue_number,
+            lifecycle,
+        } => {
+            let reason = state.reason();
             progress.line(format_args!(
                 "qgh sync issue: lifecycle status={} reason={}",
                 lifecycle.status, reason
             ));
-            let tombstoned_issues = usize::from(
-                store
-                    .find_issue_by_repo_number(&repo.full_name(), issue_number)?
-                    .is_some(),
-            );
-            let tombstoned_comments = store
-                .active_comment_source_ids_for_issue(&repo.full_name(), issue_number)?
-                .len();
-            let target = if reason == "permission_loss" {
-                PurgeTarget::Repository {
-                    repo: repo.full_name(),
-                }
-            } else {
-                PurgeTarget::Issue {
-                    repo: repo.full_name(),
-                    issue_number,
-                }
-            };
-            queue_and_finish_purges(
-                &mut store,
-                &[(target, purge_trigger_for_lifecycle_reason(reason))],
-            )?;
+            purge_requests.push(terminal_confirmed_purge_request(
+                state,
+                &confirmed_repo,
+                confirmed_issue_number,
+            ));
+            let purged = queue_confirmed_target_purges(&mut store, &purge_requests)?;
             let successor = repair_lexical_successor_if_required(&profile, &mut store)?;
             let sync_run_id = match &successor {
                 SuccessorRepairOutcome::Repaired {
@@ -851,9 +929,9 @@ pub async fn sync_issue(
                 upserted_comments: 0,
                 added_comments: 0,
                 updated_comments: 0,
-                deleted_comments: tombstoned_comments,
-                tombstoned_issues,
-                tombstoned_comments,
+                deleted_comments: purged.comments,
+                tombstoned_issues: purged.issues,
+                tombstoned_comments: purged.comments,
             };
             store.clear_backoff_state()?;
             let index = rebuild_after_successor_repair(&profile, &mut store, &progress, successor)?;
@@ -1150,7 +1228,8 @@ fn queue_and_finish_purges(
     store: &mut Store,
     requests: &[(PurgeTarget, PurgeTrigger)],
 ) -> Result<PurgeBatchOutcome, QghError> {
-    store.queue_purges(requests)?;
+    let requests = canonicalize_purge_requests(store, requests)?;
+    store.queue_purges(&requests)?;
     let outcomes = match store.retry_pending_purges() {
         Ok(outcomes) => outcomes,
         Err(_) => {
@@ -1165,6 +1244,45 @@ fn queue_and_finish_purges(
     Ok(PurgeBatchOutcome {
         purged_sources: outcomes.iter().map(|outcome| outcome.purged_sources).sum(),
     })
+}
+
+fn canonicalize_purge_requests(
+    store: &Store,
+    requests: &[(PurgeTarget, PurgeTrigger)],
+) -> Result<Vec<(PurgeTarget, PurgeTrigger)>, QghError> {
+    let repository_targets = requests
+        .iter()
+        .filter_map(|(target, _)| match target {
+            PurgeTarget::Repository { repo } => Some(repo.as_str()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let issue_targets = requests
+        .iter()
+        .filter_map(|(target, _)| match target {
+            PurgeTarget::Issue { repo, issue_number } => Some((repo.as_str(), *issue_number)),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+
+    let mut canonical = Vec::new();
+    for (target, trigger) in requests {
+        let subsumed = match target {
+            PurgeTarget::Repository { .. } => false,
+            PurgeTarget::Issue { repo, .. } => repository_targets.contains(repo.as_str()),
+            PurgeTarget::Source { source_id } => store
+                .get_reconciliation_candidate(source_id)?
+                .is_some_and(|candidate| {
+                    repository_targets.contains(candidate.repo.as_str())
+                        || issue_targets
+                            .contains(&(candidate.repo.as_str(), candidate.issue_number))
+                }),
+        };
+        if !subsumed {
+            canonical.push((target.clone(), *trigger));
+        }
+    }
+    Ok(canonical)
 }
 
 fn purge_retry_error(remaining: &[PendingPurgeView]) -> QghError {
@@ -1198,30 +1316,249 @@ fn purge_retry_error(remaining: &[PendingPurgeView]) -> QghError {
     }))
 }
 
-fn purge_trigger_for_lifecycle_reason(reason: &str) -> PurgeTrigger {
-    match reason {
-        "transferred" => PurgeTrigger::ConfirmedTombstone,
-        "permission_loss" => PurgeTrigger::PermissionLoss,
-        _ => PurgeTrigger::ConfirmedDelete,
+fn confirmed_fetch_purge_requests(
+    permission_losses: &[github::ConfirmedRepositoryPermissionLoss],
+    source_deletions: &[github::ConfirmedSourceDeletion],
+) -> Result<Vec<(PurgeTarget, PurgeTrigger)>, QghError> {
+    let mut requests = permission_losses
+        .iter()
+        .map(|confirmed| {
+            (
+                PurgeTarget::Repository {
+                    repo: confirmed.repo.clone(),
+                },
+                PurgeTrigger::PermissionLoss,
+            )
+        })
+        .collect::<Vec<_>>();
+    for confirmed in source_deletions {
+        let target = match confirmed.entity_type.as_str() {
+            "issue" => PurgeTarget::Issue {
+                repo: confirmed.repo.clone(),
+                issue_number: confirmed.issue_number,
+            },
+            "issue_comment" => PurgeTarget::Source {
+                source_id: confirmed.source_id.clone(),
+            },
+            _ => {
+                return Err(QghError::new(
+                    "purge.lifecycle_candidate_missing",
+                    "Confirmed lifecycle evidence has an unsupported source type.",
+                    6,
+                ))
+            }
+        };
+        requests.push((target, PurgeTrigger::ConfirmedDelete));
+    }
+    Ok(requests)
+}
+
+enum InterruptionDisposition {
+    Backoff(github::BackoffPlan),
+    Error(QghError),
+}
+
+fn interruption_disposition(
+    interruption: github::LifecycleInterruption,
+) -> InterruptionDisposition {
+    match interruption {
+        github::LifecycleInterruption::AuthenticationFailed => InterruptionDisposition::Error(
+            QghError::auth("GitHub authentication failed during lifecycle verification."),
+        ),
+        github::LifecycleInterruption::Transient(_)
+        | github::LifecycleInterruption::AmbiguousForbidden => {
+            InterruptionDisposition::Error(QghError::github(
+                "GitHub request ended without a confirmed destructive lifecycle state.",
+            ))
+        }
+        github::LifecycleInterruption::Backoff(plan) => InterruptionDisposition::Backoff(plan),
     }
 }
 
-fn purge_target_for_candidate(candidate: &ReconciliationCandidate, reason: &str) -> PurgeTarget {
-    if reason == "permission_loss" {
-        return PurgeTarget::Repository {
-            repo: candidate.repo.clone(),
+fn reconciliation_purge_requests(
+    failures: &[github::LifecycleFailure],
+    permission_losses: &[github::ConfirmedRepositoryPermissionLoss],
+) -> Result<Vec<(PurgeTarget, PurgeTrigger)>, QghError> {
+    let mut requests = permission_losses
+        .iter()
+        .map(|confirmed| {
+            (
+                PurgeTarget::Repository {
+                    repo: confirmed.repo.clone(),
+                },
+                PurgeTrigger::PermissionLoss,
+            )
+        })
+        .collect::<Vec<_>>();
+    for failure in failures {
+        let target = match failure.entity_type.as_str() {
+            "issue" => PurgeTarget::Issue {
+                repo: failure.repo.clone(),
+                issue_number: failure.issue_number,
+            },
+            "issue_comment" => PurgeTarget::Source {
+                source_id: failure.source_id.clone(),
+            },
+            _ => {
+                return Err(QghError::new(
+                    "purge.lifecycle_candidate_missing",
+                    "Confirmed lifecycle evidence has an unsupported source type.",
+                    6,
+                ))
+            }
         };
+        let trigger = match failure.state {
+            github::ConfirmedRemoteState::SourceDeleted => PurgeTrigger::ConfirmedDelete,
+            github::ConfirmedRemoteState::SourceTransferred => PurgeTrigger::ConfirmedTombstone,
+            github::ConfirmedRemoteState::RepositoryPermissionLoss => {
+                return Err(QghError::new(
+                    "purge.lifecycle_candidate_missing",
+                    "Repository permission evidence must identify the repository target.",
+                    6,
+                ))
+            }
+        };
+        requests.push((target, trigger));
     }
-    if candidate.entity_type == "issue" {
-        PurgeTarget::Issue {
-            repo: candidate.repo.clone(),
-            issue_number: candidate.issue_number,
-        }
-    } else {
-        PurgeTarget::Source {
-            source_id: candidate.source_id.clone(),
+    Ok(requests)
+}
+
+fn target_transition_purge_requests(
+    transitions: &[github::ConfirmedIssueTransition],
+) -> Result<Vec<(PurgeTarget, PurgeTrigger)>, QghError> {
+    transitions
+        .iter()
+        .map(|transition| match transition.state {
+            github::ConfirmedRemoteState::SourceTransferred => Ok((
+                PurgeTarget::Issue {
+                    repo: transition.source_repo.clone(),
+                    issue_number: transition.source_issue_number,
+                },
+                PurgeTrigger::ConfirmedTombstone,
+            )),
+            github::ConfirmedRemoteState::SourceDeleted
+            | github::ConfirmedRemoteState::RepositoryPermissionLoss => Err(QghError::new(
+                "purge.lifecycle_candidate_missing",
+                "Confirmed issue transition has an invalid lifecycle state.",
+                6,
+            )),
+        })
+        .collect()
+}
+
+fn terminal_confirmed_purge_request(
+    state: github::ConfirmedRemoteState,
+    repo: &str,
+    issue_number: i64,
+) -> (PurgeTarget, PurgeTrigger) {
+    match state {
+        github::ConfirmedRemoteState::SourceDeleted => (
+            PurgeTarget::Issue {
+                repo: repo.to_string(),
+                issue_number,
+            },
+            PurgeTrigger::ConfirmedDelete,
+        ),
+        github::ConfirmedRemoteState::SourceTransferred => (
+            PurgeTarget::Issue {
+                repo: repo.to_string(),
+                issue_number,
+            },
+            PurgeTrigger::ConfirmedTombstone,
+        ),
+        github::ConfirmedRemoteState::RepositoryPermissionLoss => (
+            PurgeTarget::Repository {
+                repo: repo.to_string(),
+            },
+            PurgeTrigger::PermissionLoss,
+        ),
+    }
+}
+
+fn candidate_confirmed_purge_request(
+    candidate: &ReconciliationCandidate,
+    state: github::ConfirmedRemoteState,
+) -> (PurgeTarget, PurgeTrigger) {
+    match state {
+        github::ConfirmedRemoteState::RepositoryPermissionLoss => (
+            PurgeTarget::Repository {
+                repo: candidate.repo.clone(),
+            },
+            PurgeTrigger::PermissionLoss,
+        ),
+        github::ConfirmedRemoteState::SourceDeleted
+        | github::ConfirmedRemoteState::SourceTransferred => {
+            let target = if candidate.entity_type == "issue" {
+                PurgeTarget::Issue {
+                    repo: candidate.repo.clone(),
+                    issue_number: candidate.issue_number,
+                }
+            } else {
+                PurgeTarget::Source {
+                    source_id: candidate.source_id.clone(),
+                }
+            };
+            let trigger = if state == github::ConfirmedRemoteState::SourceTransferred {
+                PurgeTrigger::ConfirmedTombstone
+            } else {
+                PurgeTrigger::ConfirmedDelete
+            };
+            (target, trigger)
         }
     }
+}
+
+#[derive(Default)]
+struct ActivePurgeCounts {
+    issues: usize,
+    comments: usize,
+}
+
+fn active_purge_counts(
+    store: &Store,
+    requests: &[(PurgeTarget, PurgeTrigger)],
+) -> Result<ActivePurgeCounts, QghError> {
+    let requests = canonicalize_purge_requests(store, requests)?;
+    let mut counts = ActivePurgeCounts::default();
+    for source in store.active_index_sources()? {
+        let matched = requests.iter().any(|(target, _)| match target {
+            PurgeTarget::Source { source_id } => source.source_id == *source_id,
+            PurgeTarget::Issue { repo, issue_number } => {
+                source.repo == *repo && source.issue_number == *issue_number
+            }
+            PurgeTarget::Repository { repo } => source.repo == *repo,
+        });
+        if matched {
+            if source.entity_type == "issue" {
+                counts.issues += 1;
+            } else {
+                counts.comments += 1;
+            }
+        }
+    }
+    Ok(counts)
+}
+
+fn queue_confirmed_target_purges(
+    store: &mut Store,
+    requests: &[(PurgeTarget, PurgeTrigger)],
+) -> Result<ActivePurgeCounts, QghError> {
+    let requests = canonicalize_purge_requests(store, requests)?;
+    let counts = active_purge_counts(store, &requests)?;
+    let outcome = queue_and_finish_purges(store, &requests)?;
+    let expected = counts.issues + counts.comments;
+    if outcome.purged_sources != expected {
+        return Err(QghError::new(
+            "purge.retry_failed",
+            "Confirmed lifecycle cleanup completed with an inconsistent source count.",
+            6,
+        )
+        .with_details(json!({
+            "expected_source_count": expected,
+            "purged_source_count": outcome.purged_sources
+        })));
+    }
+    Ok(counts)
 }
 
 struct IndexRebuildOutcome {
@@ -4174,18 +4511,17 @@ async fn lifecycle_check_for_get(
     Ok(match resolve_token(profile) {
         Ok(token) => {
             if let Some(candidate) = store.get_reconciliation_candidate(source_id)? {
-                match github::check_source_lifecycle(profile, &token, &candidate).await {
-                    Ok(github::LifecycleCheck::Active) => json!({
+                match github::check_source_lifecycle_classified(profile, &token, &candidate, None)
+                    .await
+                {
+                    Ok(github::ClassifiedLifecycleCheck::Active) => json!({
                         "status": "active",
                         "remote_checked": true
                     }),
-                    Ok(github::LifecycleCheck::Unavailable { reason }) => {
+                    Ok(github::ClassifiedLifecycleCheck::Confirmed { state, .. }) => {
                         queue_and_finish_purges(
                             store,
-                            &[(
-                                purge_target_for_candidate(&candidate, &reason),
-                                purge_trigger_for_lifecycle_reason(&reason),
-                            )],
+                            &[candidate_confirmed_purge_request(&candidate, state)],
                         )?;
                         repair_lexical_successor_if_required(profile, store)?;
                         let tombstone = store.get_tombstone(source_id)?.ok_or_else(|| {
@@ -4201,6 +4537,24 @@ async fn lifecycle_check_for_get(
                             &tombstone.observed_at,
                         ));
                     }
+                    Ok(github::ClassifiedLifecycleCheck::AuthenticationFailed) => json!({
+                        "status": "not_checked",
+                        "error_code": QghError::auth(
+                            "GitHub authentication failed during lifecycle verification."
+                        ).code,
+                        "remote_checked": false
+                    }),
+                    Ok(
+                        github::ClassifiedLifecycleCheck::Backoff(_)
+                        | github::ClassifiedLifecycleCheck::Transient(_)
+                        | github::ClassifiedLifecycleCheck::AmbiguousForbidden,
+                    ) => json!({
+                        "status": "not_checked",
+                        "error_code": QghError::github(
+                            "GitHub request ended without a confirmed destructive lifecycle state."
+                        ).code,
+                        "remote_checked": false
+                    }),
                     Err(error) => json!({
                         "status": "not_checked",
                         "error_code": error.code,
@@ -4869,15 +5223,61 @@ mod tests {
     use crate::embedding::PoolingKind;
     #[cfg(feature = "vector-search")]
     use crate::model::{IssueRecord, VectorSearchFilters};
-    #[cfg(feature = "vector-search")]
     use crate::paths::ProfilePaths;
-    #[cfg(feature = "vector-search")]
     use std::fs;
-    #[cfg(feature = "vector-search")]
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(feature = "vector-search")]
     struct MockEmbeddingProvider;
+
+    #[test]
+    fn repository_purge_subsumes_only_same_repo_targets() {
+        let paths = temp_profile_paths("canonical-repository-purge");
+        let store = Store::open(&paths).unwrap();
+        let requests = vec![
+            (
+                PurgeTarget::Issue {
+                    repo: "owner/repo".to_string(),
+                    issue_number: 42,
+                },
+                PurgeTrigger::ConfirmedDelete,
+            ),
+            (
+                PurgeTarget::Repository {
+                    repo: "owner/repo".to_string(),
+                },
+                PurgeTrigger::PermissionLoss,
+            ),
+            (
+                PurgeTarget::Issue {
+                    repo: "other/repo".to_string(),
+                    issue_number: 7,
+                },
+                PurgeTrigger::ConfirmedTombstone,
+            ),
+        ];
+
+        let canonical = canonicalize_purge_requests(&store, &requests).unwrap();
+        assert_eq!(
+            canonical,
+            vec![
+                (
+                    PurgeTarget::Repository {
+                        repo: "owner/repo".to_string(),
+                    },
+                    PurgeTrigger::PermissionLoss,
+                ),
+                (
+                    PurgeTarget::Issue {
+                        repo: "other/repo".to_string(),
+                        issue_number: 7,
+                    },
+                    PurgeTrigger::ConfirmedTombstone,
+                ),
+            ]
+        );
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
 
     #[cfg(feature = "vector-search")]
     impl EmbeddingProvider for MockEmbeddingProvider {
@@ -5152,6 +5552,9 @@ mod tests {
         store
             .upsert_sources_for_run("sync-incremental-embed", &[issue], &[], 0, &[])
             .unwrap();
+        store
+            .mark_sync_run_completed("sync-incremental-embed")
+            .unwrap();
         let source_version_id = store.latest_source_version_id(source_id).unwrap().unwrap();
         store
             .replace_chunks_for_source_version(
@@ -5388,7 +5791,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "vector-search")]
     fn temp_profile_paths(name: &str) -> ProfilePaths {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)

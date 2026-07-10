@@ -9,6 +9,7 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::header::{HeaderMap, ETAG, IF_NONE_MATCH, LINK, LOCATION, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde::Deserialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration as StdDuration;
@@ -1110,11 +1111,15 @@ async fn fetch_target_issue_classified_with_client(
             current_issue_number,
         );
         if !visited.insert(identity) {
-            finish_target!(ClassifiedTargetIssueTerminal::Failed(transfer_cycle_error()));
+            finish_target!(ClassifiedTargetIssueTerminal::Failed(transfer_cycle_error(
+                repo,
+                issue_number,
+                &alias_chain,
+            )));
         }
         if visited.len() > TRANSFER_FOLLOW_LIMIT {
             finish_target!(ClassifiedTargetIssueTerminal::Failed(
-                transfer_chain_too_long_error()
+                transfer_chain_too_long_error(repo, issue_number, &alias_chain)
             ));
         }
 
@@ -2530,18 +2535,37 @@ fn unsupported_source_type_error() -> QghError {
     )
 }
 
-fn transfer_cycle_error() -> QghError {
+fn transfer_cycle_error(repo: &RepoRef, issue_number: i64, alias_chain: &[String]) -> QghError {
     QghError::validation(
         "sync.transfer_cycle",
         "Issue transfer alias chain contains a cycle.",
     )
+    .with_details(json!({
+        "repo": repo.full_name(),
+        "issue_number": issue_number,
+        "alias_chain": alias_chain
+    }))
+    .with_hint(
+        "Run targeted refresh for the final issue location after the transfer is corrected upstream.",
+    )
 }
 
-fn transfer_chain_too_long_error() -> QghError {
+fn transfer_chain_too_long_error(
+    repo: &RepoRef,
+    issue_number: i64,
+    alias_chain: &[String],
+) -> QghError {
     QghError::validation(
         "sync.transfer_chain_too_long",
         "Issue transfer alias chain exceeded the follow limit.",
     )
+    .with_details(json!({
+        "repo": repo.full_name(),
+        "issue_number": issue_number,
+        "alias_chain": alias_chain,
+        "max_redirects": 8
+    }))
+    .with_hint("Run targeted refresh for the final issue location directly.")
 }
 
 fn content_free_commit_error(error: QghError) -> QghError {
@@ -3995,10 +4019,9 @@ mod permission_classification_tests {
             panic!("transfer cycle must remain typed");
         };
         assert_eq!(error.code, "sync.transfer_cycle");
-        assert!(error
-            .details
-            .as_object()
-            .is_some_and(serde_json::Map::is_empty));
+        assert_eq!(error.details["repo"], "owner/a");
+        assert_eq!(error.details["issue_number"], 1);
+        assert_eq!(error.details["alias_chain"].as_array().unwrap().len(), 2);
 
         let repos = (0..=8)
             .map(|index| RepoRef {
@@ -4026,10 +4049,10 @@ mod permission_classification_tests {
             panic!("transfer follow limit must remain typed");
         };
         assert_eq!(error.code, "sync.transfer_chain_too_long");
-        assert!(error
-            .details
-            .as_object()
-            .is_some_and(serde_json::Map::is_empty));
+        assert_eq!(error.details["repo"], "owner/r0");
+        assert_eq!(error.details["issue_number"], 1);
+        assert_eq!(error.details["alias_chain"].as_array().unwrap().len(), 8);
+        assert_eq!(error.details["max_redirects"], 8);
     }
 
     #[tokio::test]
