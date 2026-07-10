@@ -1565,6 +1565,178 @@ impl PreparedModelStore {
             .join(format!("{}.json", prepared_request_key(options)))
     }
 
+    #[cfg(feature = "fastembed-provider")]
+    fn acquisition_pin_path(&self, options: &FastembedProviderOptions) -> PathBuf {
+        self.root
+            .join("requests")
+            .join(format!("{}.pin.json", prepared_request_key(options)))
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn ensure_requests_root(&self) -> Result<PathBuf, EmbeddingProviderError> {
+        fs::create_dir_all(&self.root)?;
+        fs::create_dir_all(self.root.join("requests"))?;
+        canonical_store_subdirectory(
+            &self.root,
+            "requests",
+            "embedding.acquisition_pin_invalid",
+            "Prepared model acquisition pin storage is invalid.",
+        )
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn read_acquisition_pin(
+        &self,
+        options: &FastembedProviderOptions,
+        reference: &HfModelReference,
+    ) -> Result<Option<HfModelReference>, EmbeddingProviderError> {
+        let pin_path = self.acquisition_pin_path(options);
+        let metadata = match fs::symlink_metadata(&pin_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.acquisition_pin_invalid",
+                    "Prepared model acquisition pin could not be inspected.",
+                ));
+            }
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_PREPARED_ALIAS_BYTES
+        {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.acquisition_pin_invalid",
+                "Prepared model acquisition pin must be a bounded regular non-symlink file.",
+            ));
+        }
+        let requests_root = self.ensure_requests_root()?;
+        if !fs::canonicalize(&pin_path)?.starts_with(&requests_root) {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.acquisition_pin_invalid",
+                "Prepared model acquisition pin escapes its local store.",
+            ));
+        }
+        let bytes = read_bounded_file(
+            &pin_path,
+            &artifact_file_identity(&metadata),
+            MAX_PREPARED_ALIAS_BYTES,
+            "embedding.acquisition_pin_invalid",
+            "Prepared model acquisition pin changed or exceeds the supported size.",
+        )?;
+        let pin: PreparedModelAcquisitionPinV1 = serde_json::from_slice(&bytes).map_err(|_| {
+            EmbeddingProviderError::structured(
+                "embedding.acquisition_pin_invalid",
+                "Prepared model acquisition pin is invalid.",
+            )
+        })?;
+        if pin.schema_version != PREPARED_MODEL_ACQUISITION_PIN_SCHEMA_VERSION
+            || pin.model_id != reference.model_id
+            || pin.requested_revision != reference.revision
+            || !is_commit_sha(&pin.resolved_revision)
+        {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.acquisition_pin_invalid",
+                "Prepared model acquisition pin does not match the configured model reference.",
+            ));
+        }
+        Ok(Some(HfModelReference {
+            model_id: pin.model_id,
+            revision: pin.resolved_revision,
+        }))
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn publish_acquisition_pin(
+        &self,
+        options: &FastembedProviderOptions,
+        reference: &HfModelReference,
+        resolved_revision: String,
+    ) -> Result<HfModelReference, EmbeddingProviderError> {
+        if !is_commit_sha(&resolved_revision) {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.manifest_revision_invalid",
+                "Model acquisition did not resolve an immutable revision.",
+            ));
+        }
+        self.ensure_requests_root()?;
+        let pin_path = self.acquisition_pin_path(options);
+        let pin = PreparedModelAcquisitionPinV1 {
+            schema_version: PREPARED_MODEL_ACQUISITION_PIN_SCHEMA_VERSION.to_string(),
+            model_id: reference.model_id.clone(),
+            requested_revision: reference.revision.clone(),
+            resolved_revision: resolved_revision.clone(),
+        };
+        let staging = pin_path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        write_new_bytes(
+            &staging,
+            &serde_json::to_vec_pretty(&pin).expect("acquisition pin serializes"),
+        )?;
+        let published = fs::hard_link(&staging, &pin_path);
+        let _ = fs::remove_file(&staging);
+        match published {
+            Ok(()) => Ok(HfModelReference {
+                model_id: reference.model_id.clone(),
+                revision: resolved_revision,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => self
+                .read_acquisition_pin(options, reference)?
+                .ok_or_else(|| {
+                    EmbeddingProviderError::structured(
+                        "embedding.acquisition_pin_invalid",
+                        "Prepared model acquisition pin disappeared during publication.",
+                    )
+                }),
+            Err(_) => Err(EmbeddingProviderError::structured(
+                "embedding.acquisition_pin_invalid",
+                "Prepared model acquisition pin could not be published.",
+            )),
+        }
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn resolve_or_pin_hf_reference_with(
+        &self,
+        options: &FastembedProviderOptions,
+        reference: &HfModelReference,
+        resolve: impl FnOnce() -> Result<String, EmbeddingProviderError>,
+    ) -> Result<HfModelReference, EmbeddingProviderError> {
+        if let Some(pinned) = self.read_acquisition_pin(options, reference)? {
+            return Ok(pinned);
+        }
+        self.publish_acquisition_pin(options, reference, resolve()?)
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn resolve_or_pin_hf_reference(
+        &self,
+        options: &FastembedProviderOptions,
+        reference: &HfModelReference,
+        cache_dir: &Path,
+    ) -> Result<HfModelReference, EmbeddingProviderError> {
+        self.resolve_or_pin_hf_reference_with(options, reference, || {
+            let mut repo = HfHubModelRepository::new(
+                &reference.model_id,
+                &reference.revision,
+                cache_dir.to_path_buf(),
+                options.token_source_env.clone(),
+            )?;
+            repo.revision()?.ok_or_else(|| {
+                EmbeddingProviderError::structured(
+                    "embedding.manifest_revision_invalid",
+                    "Model acquisition did not resolve an immutable revision.",
+                )
+            })
+        })
+    }
+
     fn materialize(
         &self,
         options: &FastembedProviderOptions,
@@ -1618,7 +1790,14 @@ impl PreparedModelStore {
                     external_initializer_name: source.external_initializer_name,
                 });
             }
-            manifest.artifacts = artifacts;
+            if manifest.artifacts.is_empty() {
+                manifest.artifacts = artifacts;
+            } else if manifest.artifacts != artifacts {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.acquisition_artifact_mismatch",
+                    "Materialized model artifacts do not match the declared manifest.",
+                ));
+            }
             manifest.validate_contract()?;
             let manifest_hash = manifest.hash();
             fs::write(
@@ -1653,6 +1832,10 @@ impl PreparedModelStore {
         })();
         if staging.exists() {
             let _ = fs::remove_dir_all(staging);
+        }
+        #[cfg(feature = "fastembed-provider")]
+        if result.is_ok() {
+            let _ = fs::remove_file(self.acquisition_pin_path(options));
         }
         result
     }
@@ -1697,31 +1880,21 @@ impl PreparedModelStore {
             .clone()
             .map(Ok)
             .unwrap_or_else(default_hf_cache_dir)?;
-        let mut repo = HfHubModelRepository::new(
-            &reference.model_id,
-            &reference.revision,
-            cache_dir.clone(),
-            options.token_source_env.clone(),
-        )?;
+        let pinned = self.resolve_or_pin_hf_reference(options, &reference, &cache_dir)?;
         if let Some(preset) = preset {
-            let resolved_revision = repo.revision()?.ok_or_else(|| {
-                EmbeddingProviderError::structured(
-                    "embedding.manifest_revision_invalid",
-                    "Preset acquisition did not resolve an immutable revision.",
-                )
-            })?;
-            if resolved_revision != preset.revision {
+            if pinned.revision != preset.revision {
                 return Err(EmbeddingProviderError::structured(
                     "embedding.preset_revision_mismatch",
                     "Preset repository did not resolve to its pinned commit.",
                 ));
             }
-        } else {
-            // Resolve mutable references before using their cached artifacts.
-            // Full model acquisition will bind the eventual prepared manifest
-            // to the same immutable repository identity.
-            let _ = repo.revision()?;
         }
+        let mut repo = HfHubModelRepository::new(
+            &pinned.model_id,
+            &pinned.revision,
+            cache_dir.clone(),
+            options.token_source_env.clone(),
+        )?;
         let artifacts = tokenizer_artifact_paths(|file| repo.get(file))?;
         load_unmanifested_tokenizer(&cache_dir, artifacts)
     }
@@ -1763,14 +1936,15 @@ impl PreparedModelStore {
             .clone()
             .map(Ok)
             .unwrap_or_else(default_hf_cache_dir)?;
+        let pinned = self.resolve_or_pin_hf_reference(options, &reference, &cache_dir)?;
         let mut repo = HfHubModelRepository::new(
-            &reference.model_id,
-            &reference.revision,
+            &pinned.model_id,
+            &pinned.revision,
             cache_dir,
             options.token_source_env.clone(),
         )?;
         let mut snapshot = resolve_hf_model_snapshot(
-            &reference.model_id,
+            &pinned.model_id,
             ManualModelBehavior {
                 file: options.file.clone(),
                 pooling: options.pooling,
@@ -1778,6 +1952,12 @@ impl PreparedModelStore {
             },
             &mut repo,
         )?;
+        if snapshot.model_revision != pinned.revision {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.hf_revision_mismatch",
+                "Resolved model artifacts do not match the pinned revision.",
+            ));
+        }
         if snapshot.path_for(MODULES_FILE).is_none() {
             snapshot
                 .paths
@@ -1789,7 +1969,7 @@ impl PreparedModelStore {
             preset_id: None,
             provider: ModelProviderKind::Fastembed,
             model_source: ModelSourceV1::Hf {
-                model_id: reference.model_id,
+                model_id: pinned.model_id,
                 resolved_revision: snapshot.model_revision.clone(),
             },
             artifacts: Vec::new(),
@@ -1818,24 +1998,24 @@ impl PreparedModelStore {
             .clone()
             .map(Ok)
             .unwrap_or_else(default_hf_cache_dir)?;
-        let mut repo = HfHubModelRepository::new(
-            preset.model_id,
-            preset.revision,
-            cache_dir,
-            options.token_source_env.clone(),
-        )?;
-        let resolved_revision = repo.revision()?.ok_or_else(|| {
-            EmbeddingProviderError::structured(
-                "embedding.manifest_revision_invalid",
-                "Preset acquisition did not resolve an immutable revision.",
-            )
-        })?;
-        if resolved_revision != preset.revision {
+        let reference = HfModelReference {
+            model_id: preset.model_id.to_string(),
+            revision: preset.revision.to_string(),
+        };
+        let pinned = self.resolve_or_pin_hf_reference(options, &reference, &cache_dir)?;
+        if pinned.revision != preset.revision {
             return Err(EmbeddingProviderError::structured(
                 "embedding.preset_revision_mismatch",
                 "Preset repository did not resolve to its pinned commit.",
             ));
         }
+        let mut repo = HfHubModelRepository::new(
+            &pinned.model_id,
+            &pinned.revision,
+            cache_dir,
+            options.token_source_env.clone(),
+        )?;
+        let resolved_revision = pinned.revision;
         let mut paths = BTreeMap::new();
         for file in required_runtime_files(preset.model_file) {
             paths.insert(file.to_string(), repo.get(file)?);
@@ -1999,12 +2179,24 @@ fn load_unmanifested_tokenizer(
 }
 
 const PREPARED_MODEL_ALIAS_SCHEMA_VERSION: &str = "qgh.prepared_model_alias.v1";
+#[cfg(feature = "fastembed-provider")]
+const PREPARED_MODEL_ACQUISITION_PIN_SCHEMA_VERSION: &str = "qgh.prepared_model_acquisition_pin.v1";
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PreparedModelAliasV1 {
     schema_version: String,
     manifest_hash: String,
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedModelAcquisitionPinV1 {
+    schema_version: String,
+    model_id: String,
+    requested_revision: String,
+    resolved_revision: String,
 }
 
 struct RuntimeArtifactSource {
@@ -3352,13 +3544,31 @@ pub fn resolve_fastembed_snapshot(
         .cache_dir
         .map(Ok)
         .unwrap_or_else(default_hf_cache_dir)?;
-    let mut repo = HfHubModelRepository::new(
+    let mut discovery = HfHubModelRepository::new(
         &reference.model_id,
         &reference.revision,
+        cache_dir.clone(),
+        options.token_source_env.clone(),
+    )?;
+    let resolved_revision = discovery.revision()?.ok_or_else(|| {
+        EmbeddingProviderError::structured(
+            "embedding.manifest_revision_invalid",
+            "Model acquisition did not resolve an immutable revision.",
+        )
+    })?;
+    if !is_commit_sha(&resolved_revision) {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.manifest_revision_invalid",
+            "Model acquisition did not resolve an immutable revision.",
+        ));
+    }
+    let mut repo = HfHubModelRepository::new(
+        &reference.model_id,
+        &resolved_revision,
         cache_dir,
         options.token_source_env,
     )?;
-    resolve_hf_model_snapshot(
+    let snapshot = resolve_hf_model_snapshot(
         &reference.model_id,
         ManualModelBehavior {
             file: options.file,
@@ -3366,7 +3576,14 @@ pub fn resolve_fastembed_snapshot(
             query_prefix: options.query_prefix,
         },
         &mut repo,
-    )
+    )?;
+    if snapshot.model_revision != resolved_revision {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.hf_revision_mismatch",
+            "Resolved model artifacts do not match the pinned revision.",
+        ));
+    }
+    Ok(snapshot)
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -4058,6 +4275,28 @@ mod tests {
     }
 
     #[test]
+    fn materialization_rejects_bytes_that_drift_from_explicit_manifest() {
+        let root = temp_dir("qgh-explicit-manifest-copy-drift");
+        let source_root = root.join("source");
+        let manifest_path = write_prepared_manifest_fixture(&source_root, b"graph-one");
+        let verifier = PreparedModelStore::new(root.join("verifier"));
+        let verified = verifier.load_manifest(&manifest_path).unwrap();
+        fs::write(source_root.join("model.onnx"), b"graph-two").unwrap();
+        let sources = runtime_artifact_sources_from_prepared(&verified);
+        let options = FastembedProviderOptions {
+            manifest_path: Some(manifest_path),
+            ..FastembedProviderOptions::default()
+        };
+        let destination = PreparedModelStore::new(root.join("destination"));
+
+        let error = destination
+            .materialize(&options, verified.manifest.clone(), sources)
+            .unwrap_err();
+
+        assert_eq!(error.code(), "embedding.acquisition_artifact_mismatch");
+    }
+
+    #[test]
     fn verification_rejects_artifact_replaced_after_inspection() {
         let root = temp_dir("qgh-prepared-replaced-after-inspection");
         let snapshot_root = root.join("snapshot");
@@ -4287,6 +4526,38 @@ mod tests {
             .details()
             .to_string()
             .contains(&root.to_string_lossy()[..]));
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn tokenizer_and_full_acquisition_reuse_one_resolved_hf_pin() {
+        let root = temp_dir("qgh-hf-acquisition-pin");
+        let store = PreparedModelStore::new(root.join("prepared"));
+        let options = FastembedProviderOptions {
+            model: Some("hf:example/model@main".to_string()),
+            ..FastembedProviderOptions::default()
+        };
+        let reference = HfModelReference {
+            model_id: "example/model".to_string(),
+            revision: "main".to_string(),
+        };
+        let resolves = std::cell::Cell::new(0_u32);
+        let first = store
+            .resolve_or_pin_hf_reference_with(&options, &reference, || {
+                resolves.set(resolves.get() + 1);
+                Ok("a".repeat(40))
+            })
+            .unwrap();
+        let second = store
+            .resolve_or_pin_hf_reference_with(&options, &reference, || {
+                resolves.set(resolves.get() + 1);
+                Ok("b".repeat(40))
+            })
+            .unwrap();
+
+        assert_eq!(first.revision, "a".repeat(40));
+        assert_eq!(second, first);
+        assert_eq!(resolves.get(), 1);
     }
 
     #[cfg(feature = "fastembed-provider")]
