@@ -3,7 +3,7 @@ mod purge_fs;
 use self::purge_fs::{
     anchored_file_names, anchored_regular_file_fingerprint, filesystem_identity,
     filesystem_identity_from_file, open_anchored_directory, remove_anchored_empty_directory,
-    sync_directory, unlink_anchored_regular_file, AnchoredFileFingerprint,
+    sync_directory, unlink_anchored_regular_file, AnchoredFileFingerprint, FilesystemIdentity,
 };
 use crate::chunking::MarkdownChunk;
 use crate::context::{prepare_embedding_input, EmbeddingSourceContext, PreparedEmbeddingInput};
@@ -95,6 +95,30 @@ struct TantivyPurgeDeletion {
     filesystem_identity: String,
     phase: TantivyPurgePhase,
     files: Vec<TantivyPurgeFile>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexBuildDeletionPhase {
+    Verified,
+    MarkerDeleted,
+}
+
+impl IndexBuildDeletionPhase {
+    fn from_stored(value: &str) -> Result<Self, QghError> {
+        match value {
+            "verified" => Ok(Self::Verified),
+            "marker_deleted" => Ok(Self::MarkerDeleted),
+            _ => Err(purge_error()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IndexBuildDeletion {
+    owner_token: String,
+    quarantine_path: String,
+    filesystem_identity: String,
+    phase: IndexBuildDeletionPhase,
 }
 
 #[cfg(test)]
@@ -378,6 +402,8 @@ pub struct Store {
     #[cfg(test)]
     purge_filesystem_failure_point: Option<TantivyPurgeFailurePoint>,
     #[cfg(test)]
+    cleanup_swap_quarantine_after_open: Option<i64>,
+    #[cfg(test)]
     activation_failure: Option<QghError>,
 }
 
@@ -545,6 +571,8 @@ impl Store {
             purge_unlink_failure_after: None,
             #[cfg(test)]
             purge_filesystem_failure_point: None,
+            #[cfg(test)]
+            cleanup_swap_quarantine_after_open: None,
             #[cfg(test)]
             activation_failure: None,
         }
@@ -1705,6 +1733,11 @@ impl Store {
     }
 
     #[cfg(test)]
+    fn swap_build_cleanup_quarantine_after_open(&mut self, generation: i64) {
+        self.cleanup_swap_quarantine_after_open = Some(generation);
+    }
+
+    #[cfg(test)]
     fn should_fail_tantivy_purge_after_unlink(&mut self, completed: usize) -> bool {
         if self.purge_unlink_failure_after == Some(completed) {
             self.purge_unlink_failure_after = None;
@@ -1723,6 +1756,26 @@ impl Store {
             return true;
         }
         false
+    }
+
+    #[cfg(test)]
+    fn inject_build_cleanup_quarantine_swap_after_open(
+        &mut self,
+        generation: i64,
+        quarantine_path: &Path,
+    ) -> Result<(), QghError> {
+        if self.cleanup_swap_quarantine_after_open != Some(generation) {
+            return Ok(());
+        }
+        self.cleanup_swap_quarantine_after_open = None;
+        let displaced_path = self
+            .index_root
+            .join(format!(".qgh-test-displaced-build-cleanup-{generation}"));
+        fs::rename(quarantine_path, &displaced_path).map_err(|_| purge_error())?;
+        fs::create_dir(quarantine_path).map_err(|_| purge_error())?;
+        fs::write(quarantine_path.join("foreign-sentinel"), b"preserve")
+            .map_err(|_| purge_error())?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2332,7 +2385,7 @@ impl Store {
         generations: &[(i64, String, i64, Option<String>, String)],
     ) -> Result<(), QghError> {
         self.validate_index_root_confinement()?;
-        if !self.index_root.exists() {
+        if !filesystem_entry_exists(&self.index_root)? {
             return Ok(());
         }
         if fs::symlink_metadata(&self.index_root)
@@ -2361,7 +2414,10 @@ impl Store {
             if let Some(deletion) = deletion.as_ref() {
                 self.validate_tantivy_purge_deletion(deletion, owner_token, &quarantine_path)?;
             }
-            match (expected_path.exists(), quarantine_path.exists()) {
+            match (
+                filesystem_entry_exists(&expected_path)?,
+                filesystem_entry_exists(&quarantine_path)?,
+            ) {
                 (false, false) => {
                     if let Some(deletion) = deletion {
                         if deletion.phase != TantivyPurgePhase::MarkerDeleted {
@@ -2549,7 +2605,7 @@ impl Store {
         quarantine_path: &Path,
         mut deletion: TantivyPurgeDeletion,
     ) -> Result<(), QghError> {
-        if !quarantine_path.exists() {
+        if !filesystem_entry_exists(quarantine_path)? {
             if deletion.phase == TantivyPurgePhase::MarkerDeleted {
                 return self.finish_missing_tantivy_purge_deletion(generation, &deletion);
             }
@@ -2729,7 +2785,7 @@ impl Store {
             return Err(purge_error());
         }
         let profile_root = fs::canonicalize(&self.profile_dir).map_err(|_| purge_error())?;
-        if self.index_root.exists() {
+        if filesystem_entry_exists(&self.index_root)? {
             let metadata = fs::symlink_metadata(&self.index_root).map_err(|_| purge_error())?;
             if metadata.file_type().is_symlink() {
                 return Err(purge_error());
@@ -2763,10 +2819,8 @@ impl Store {
         owner_token: &str,
     ) -> Result<bool, QghError> {
         self.validate_index_root_confinement()?;
-        let tx = self
+        let lease_matches = self
             .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let lease_matches = tx
             .query_row(
                 "SELECT 1 FROM index_build_leases
                  WHERE generation = ?1 AND owner_token = ?2",
@@ -2776,11 +2830,11 @@ impl Store {
             .optional()?
             .is_some();
         if !lease_matches {
-            tx.commit()?;
             return Ok(false);
         }
         let expected_path = self.index_root.join(format!("generation-{generation}"));
-        let generation_state = tx
+        let generation_state = self
+            .conn
             .query_row(
                 "SELECT path, source_count, source_inventory_hash
                  FROM index_generations WHERE generation = ?1",
@@ -2800,46 +2854,82 @@ impl Store {
         if Path::new(&stored_path) != expected_path {
             return Err(purge_error());
         }
+        let source_count = usize::try_from(source_count).map_err(|_| purge_error())?;
+        let source_inventory_hash = source_inventory_hash.ok_or_else(purge_error)?;
         let shadow_path = self.index_root.join(format!("shadow-{generation}"));
-        if shadow_path.exists()
-            && crate::index::validate_owned_build_directory(&shadow_path, generation, owner_token)
-                .is_err()
+        let sealed_quarantine =
+            tantivy_purge_quarantine_path(&self.index_root, generation, owner_token);
+        let build_quarantine =
+            index_build_cleanup_quarantine_path(&self.index_root, generation, owner_token);
+        let expected_present = filesystem_entry_exists(&expected_path)?;
+        let shadow_present = filesystem_entry_exists(&shadow_path)?;
+        let sealed_quarantine_present = filesystem_entry_exists(&sealed_quarantine)?;
+        let build_quarantine_present = filesystem_entry_exists(&build_quarantine)?;
+        let sealed_pending =
+            self.tantivy_purge_deletion(generation)?.is_some() || sealed_quarantine_present;
+        let build_pending =
+            self.index_build_deletion(generation)?.is_some() || build_quarantine_present;
+        if (expected_present && shadow_present)
+            || (sealed_pending && build_pending)
+            || ((expected_present || shadow_present) && (sealed_pending || build_pending))
         {
-            crate::index::validate_owned_generation_directory(
+            return Err(purge_error());
+        }
+
+        if expected_present {
+            self.cleanup_proven_index_artifact(
+                generation,
+                owner_token,
+                source_count,
+                &source_inventory_hash,
+                Some(&expected_path),
+            )?;
+        } else if shadow_present {
+            if validate_cleanup_tantivy_artifact(
                 &shadow_path,
                 generation,
                 owner_token,
-            )
-            .map_err(|_| purge_error())?;
-        }
-        if expected_path.exists() {
-            let source_count = usize::try_from(source_count).map_err(|_| purge_error())?;
-            let source_inventory_hash = source_inventory_hash.ok_or_else(purge_error)?;
-            validate_managed_tantivy_generation_path(
-                &self.profile_dir,
-                &self.index_root,
-                generation,
-                &expected_path,
-            )
-            .map_err(|_| purge_error())?;
-            crate::index::validate_owned_generation_directory(
-                &expected_path,
-                generation,
-                owner_token,
-            )
-            .map_err(|_| purge_error())?;
-            validate_tantivy_generation_artifact(
-                &expected_path,
                 source_count,
                 &source_inventory_hash,
             )
-            .map_err(|_| purge_error())?;
+            .is_ok()
+            {
+                self.cleanup_proven_index_artifact(
+                    generation,
+                    owner_token,
+                    source_count,
+                    &source_inventory_hash,
+                    Some(&shadow_path),
+                )?;
+            } else {
+                self.cleanup_unsealed_index_build(generation, owner_token, Some(&shadow_path))?;
+            }
+        } else if sealed_pending {
+            self.cleanup_proven_index_artifact(
+                generation,
+                owner_token,
+                source_count,
+                &source_inventory_hash,
+                None,
+            )?;
+        } else if build_pending {
+            self.cleanup_unsealed_index_build(generation, owner_token, None)?;
         }
-        if shadow_path.exists() {
-            fs::remove_dir_all(&shadow_path).map_err(|_| purge_error())?;
-        }
-        if expected_path.exists() {
-            fs::remove_dir_all(&expected_path).map_err(|_| purge_error())?;
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let lease_still_matches = tx
+            .query_row(
+                "SELECT 1 FROM index_build_leases
+                 WHERE generation = ?1 AND owner_token = ?2",
+                params![generation, owner_token],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !lease_still_matches {
+            return Err(purge_error());
         }
         tx.execute(
             "DELETE FROM retrieval_publication_pointer
@@ -2864,6 +2954,322 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    fn cleanup_proven_index_artifact(
+        &mut self,
+        generation: i64,
+        owner_token: &str,
+        source_count: usize,
+        source_inventory_hash: &str,
+        source_path: Option<&Path>,
+    ) -> Result<(), QghError> {
+        let quarantine_path =
+            tantivy_purge_quarantine_path(&self.index_root, generation, owner_token);
+        let deletion = self.tantivy_purge_deletion(generation)?;
+        if let Some(deletion) = deletion.as_ref() {
+            self.validate_tantivy_purge_deletion(deletion, owner_token, &quarantine_path)?;
+        }
+        let source_exists = source_path
+            .map(filesystem_entry_exists)
+            .transpose()?
+            .unwrap_or(false);
+        match (source_exists, filesystem_entry_exists(&quarantine_path)?) {
+            (true, true) => return Err(purge_error()),
+            (true, false) => {
+                if deletion.is_some() {
+                    return Err(purge_error());
+                }
+                let source_path = source_path.ok_or_else(purge_error)?;
+                validate_cleanup_tantivy_artifact(
+                    source_path,
+                    generation,
+                    owner_token,
+                    source_count,
+                    source_inventory_hash,
+                )?;
+                let identity = filesystem_identity(source_path)?;
+                crate::index::rename_without_replacement(source_path, &quarantine_path)
+                    .map_err(|_| purge_error())?;
+                sync_directory(&self.index_root)?;
+                if filesystem_identity(&quarantine_path)? != identity {
+                    return Err(purge_error());
+                }
+                validate_cleanup_tantivy_artifact(
+                    &quarantine_path,
+                    generation,
+                    owner_token,
+                    source_count,
+                    source_inventory_hash,
+                )?;
+                let deletion = self.register_tantivy_purge_deletion(
+                    generation,
+                    owner_token,
+                    &quarantine_path,
+                )?;
+                self.remove_quarantined_tantivy_generation(generation, &quarantine_path, deletion)?;
+            }
+            (false, true) => {
+                let deletion = match deletion {
+                    Some(deletion) => deletion,
+                    None => {
+                        validate_cleanup_tantivy_artifact(
+                            &quarantine_path,
+                            generation,
+                            owner_token,
+                            source_count,
+                            source_inventory_hash,
+                        )?;
+                        self.register_tantivy_purge_deletion(
+                            generation,
+                            owner_token,
+                            &quarantine_path,
+                        )?
+                    }
+                };
+                self.remove_quarantined_tantivy_generation(generation, &quarantine_path, deletion)?;
+            }
+            (false, false) => {
+                if let Some(deletion) = deletion {
+                    self.finish_missing_tantivy_purge_deletion(generation, &deletion)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup_unsealed_index_build(
+        &mut self,
+        generation: i64,
+        owner_token: &str,
+        shadow_path: Option<&Path>,
+    ) -> Result<(), QghError> {
+        let quarantine_path =
+            index_build_cleanup_quarantine_path(&self.index_root, generation, owner_token);
+        let deletion = self.index_build_deletion(generation)?;
+        if let Some(deletion) = deletion.as_ref() {
+            self.validate_index_build_deletion(deletion, owner_token, &quarantine_path)?;
+        }
+        let shadow_exists = shadow_path
+            .map(filesystem_entry_exists)
+            .transpose()?
+            .unwrap_or(false);
+        match (shadow_exists, filesystem_entry_exists(&quarantine_path)?) {
+            (true, true) => return Err(purge_error()),
+            (true, false) => {
+                if deletion.is_some() {
+                    return Err(purge_error());
+                }
+                let shadow_path = shadow_path.ok_or_else(purge_error)?;
+                let identity =
+                    validate_marker_only_index_build(shadow_path, generation, owner_token)?;
+                crate::index::rename_without_replacement(shadow_path, &quarantine_path)
+                    .map_err(|_| purge_error())?;
+                sync_directory(&self.index_root)?;
+                if filesystem_identity(&quarantine_path)? != identity {
+                    return Err(purge_error());
+                }
+                validate_marker_only_index_build(&quarantine_path, generation, owner_token)?;
+                let deletion =
+                    self.register_index_build_deletion(generation, owner_token, &quarantine_path)?;
+                self.remove_quarantined_index_build(generation, &quarantine_path, deletion)?;
+            }
+            (false, true) => {
+                let deletion = match deletion {
+                    Some(deletion) => deletion,
+                    None => {
+                        validate_marker_only_index_build(
+                            &quarantine_path,
+                            generation,
+                            owner_token,
+                        )?;
+                        self.register_index_build_deletion(
+                            generation,
+                            owner_token,
+                            &quarantine_path,
+                        )?
+                    }
+                };
+                self.remove_quarantined_index_build(generation, &quarantine_path, deletion)?;
+            }
+            (false, false) => {
+                if let Some(deletion) = deletion {
+                    self.finish_missing_index_build_deletion(generation, &deletion)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn index_build_deletion(
+        &self,
+        generation: i64,
+    ) -> Result<Option<IndexBuildDeletion>, QghError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT owner_token, quarantine_path, filesystem_identity, phase
+                 FROM index_build_deletions WHERE generation = ?1",
+                params![generation],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((owner_token, quarantine_path, filesystem_identity, phase)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(IndexBuildDeletion {
+            owner_token,
+            quarantine_path,
+            filesystem_identity,
+            phase: IndexBuildDeletionPhase::from_stored(&phase)?,
+        }))
+    }
+
+    fn validate_index_build_deletion(
+        &self,
+        deletion: &IndexBuildDeletion,
+        owner_token: &str,
+        quarantine_path: &Path,
+    ) -> Result<(), QghError> {
+        if deletion.owner_token != owner_token
+            || Path::new(&deletion.quarantine_path) != quarantine_path
+        {
+            return Err(purge_error());
+        }
+        Ok(())
+    }
+
+    fn register_index_build_deletion(
+        &self,
+        generation: i64,
+        owner_token: &str,
+        quarantine_path: &Path,
+    ) -> Result<IndexBuildDeletion, QghError> {
+        let identity = validate_marker_only_index_build(quarantine_path, generation, owner_token)?
+            .durable_key();
+        let quarantine_path = quarantine_path
+            .to_str()
+            .ok_or_else(purge_error)?
+            .to_string();
+        self.conn.execute(
+            "INSERT INTO index_build_deletions
+                (generation, owner_token, quarantine_path, filesystem_identity,
+                 phase, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'verified', ?5)",
+            params![
+                generation,
+                owner_token,
+                quarantine_path,
+                identity,
+                now_rfc3339()
+            ],
+        )?;
+        self.index_build_deletion(generation)?
+            .ok_or_else(purge_error)
+    }
+
+    fn remove_quarantined_index_build(
+        &mut self,
+        generation: i64,
+        quarantine_path: &Path,
+        mut deletion: IndexBuildDeletion,
+    ) -> Result<(), QghError> {
+        if !filesystem_entry_exists(quarantine_path)? {
+            if deletion.phase == IndexBuildDeletionPhase::MarkerDeleted {
+                return self.finish_missing_index_build_deletion(generation, &deletion);
+            }
+            return Err(purge_error());
+        }
+        let identity = filesystem_identity(quarantine_path)?;
+        if identity.durable_key() != deletion.filesystem_identity {
+            return Err(purge_error());
+        }
+        let directory = open_anchored_directory(quarantine_path)?;
+        if filesystem_identity_from_file(&directory)? != identity {
+            return Err(purge_error());
+        }
+        #[cfg(test)]
+        self.inject_build_cleanup_quarantine_swap_after_open(generation, quarantine_path)?;
+        if filesystem_identity(quarantine_path)? != identity {
+            return Err(purge_error());
+        }
+
+        if deletion.phase == IndexBuildDeletionPhase::Verified {
+            let names = anchored_file_names(&directory)?;
+            if !names.is_empty() {
+                validate_marker_only_index_build_directory(
+                    &directory,
+                    generation,
+                    &deletion.owner_token,
+                )?;
+                let marker = owned_build_marker_fingerprint(generation, &deletion.owner_token);
+                unlink_anchored_regular_file(
+                    &directory,
+                    std::ffi::OsStr::new(TANTIVY_OWNER_MARKER_FILE),
+                    &marker,
+                )?;
+            }
+            let changed = self.conn.execute(
+                "UPDATE index_build_deletions SET phase = 'marker_deleted', updated_at = ?1
+                 WHERE generation = ?2 AND owner_token = ?3
+                   AND filesystem_identity = ?4 AND phase = 'verified'",
+                params![
+                    now_rfc3339(),
+                    generation,
+                    deletion.owner_token,
+                    deletion.filesystem_identity
+                ],
+            )?;
+            if changed != 1 {
+                return Err(purge_error());
+            }
+            deletion.phase = IndexBuildDeletionPhase::MarkerDeleted;
+        }
+
+        if !anchored_file_names(&directory)?.is_empty() {
+            return Err(purge_error());
+        }
+        if filesystem_identity(quarantine_path)? != identity {
+            return Err(purge_error());
+        }
+        let parent = open_anchored_directory(&self.index_root)?;
+        remove_anchored_empty_directory(
+            &parent,
+            quarantine_path.file_name().ok_or_else(purge_error)?,
+            &identity,
+        )?;
+        self.finish_missing_index_build_deletion(generation, &deletion)
+    }
+
+    fn finish_missing_index_build_deletion(
+        &self,
+        generation: i64,
+        deletion: &IndexBuildDeletion,
+    ) -> Result<(), QghError> {
+        if deletion.phase != IndexBuildDeletionPhase::MarkerDeleted {
+            return Err(purge_error());
+        }
+        let changed = self.conn.execute(
+            "DELETE FROM index_build_deletions
+             WHERE generation = ?1 AND owner_token = ?2
+               AND filesystem_identity = ?3 AND phase = 'marker_deleted'",
+            params![
+                generation,
+                deletion.owner_token,
+                deletion.filesystem_identity
+            ],
+        )?;
+        if changed != 1 {
+            return Err(purge_error());
+        }
+        Ok(())
     }
 
     fn purge_target_has_sensitive_content(&self, target: &PurgeTarget) -> Result<bool, QghError> {
@@ -7571,6 +7977,15 @@ impl Store {
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS index_build_deletions (
+                generation INTEGER PRIMARY KEY,
+                owner_token TEXT NOT NULL,
+                quarantine_path TEXT NOT NULL,
+                filesystem_identity TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK (phase IN ('verified', 'marker_deleted')),
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS index_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id TEXT NOT NULL,
@@ -8338,6 +8753,70 @@ fn tantivy_purge_quarantine_path(index_root: &Path, generation: i64, owner_token
     ))
 }
 
+fn index_build_cleanup_quarantine_path(
+    index_root: &Path,
+    generation: i64,
+    owner_token: &str,
+) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(b"qgh.index-build-cleanup.v1");
+    hasher.update(generation.to_le_bytes());
+    hash_text(&mut hasher, owner_token);
+    let digest = digest_hex(hasher);
+    index_root.join(format!(
+        ".qgh-aborted-generation-{generation}-{}",
+        &digest[..32]
+    ))
+}
+
+fn owned_build_marker_fingerprint(generation: i64, owner_token: &str) -> AnchoredFileFingerprint {
+    let marker = crate::index::owned_build_marker(generation, owner_token);
+    let mut hasher = Sha256::new();
+    hasher.update(marker.as_bytes());
+    AnchoredFileFingerprint {
+        byte_len: u64::try_from(marker.len()).expect("owner marker length fits u64"),
+        sha256: digest_hex(hasher),
+    }
+}
+
+fn validate_marker_only_index_build(
+    path: &Path,
+    generation: i64,
+    owner_token: &str,
+) -> Result<FilesystemIdentity, QghError> {
+    let identity = filesystem_identity(path)?;
+    let directory = open_anchored_directory(path)?;
+    if filesystem_identity_from_file(&directory)? != identity
+        || filesystem_identity(path)? != identity
+    {
+        return Err(purge_error());
+    }
+    validate_marker_only_index_build_directory(&directory, generation, owner_token)?;
+    if filesystem_identity(path)? != identity {
+        return Err(purge_error());
+    }
+    Ok(identity)
+}
+
+fn validate_marker_only_index_build_directory(
+    directory: &fs::File,
+    generation: i64,
+    owner_token: &str,
+) -> Result<(), QghError> {
+    let names = anchored_file_names(directory)?;
+    if names.len() != 1 || names[0] != std::ffi::OsStr::new(TANTIVY_OWNER_MARKER_FILE) {
+        return Err(purge_error());
+    }
+    if anchored_regular_file_fingerprint(
+        directory,
+        std::ffi::OsStr::new(TANTIVY_OWNER_MARKER_FILE),
+    )? != owned_build_marker_fingerprint(generation, owner_token)
+    {
+        return Err(purge_error());
+    }
+    Ok(())
+}
+
 fn validate_quarantined_tantivy_generation(
     quarantine_path: &Path,
     generation: i64,
@@ -8349,6 +8828,25 @@ fn validate_quarantined_tantivy_generation(
         .map_err(|_| purge_error())?;
     validate_tantivy_generation_artifact(
         quarantine_path,
+        expected_source_count,
+        expected_source_inventory_hash,
+    )
+    .map_err(|_| purge_error())
+}
+
+fn validate_cleanup_tantivy_artifact(
+    path: &Path,
+    generation: i64,
+    owner_token: &str,
+    expected_source_count: usize,
+    expected_source_inventory_hash: &str,
+) -> Result<(), QghError> {
+    if crate::index::validate_owned_generation_directory(path, generation, owner_token).is_err() {
+        crate::index::validate_unsealed_owned_tantivy_directory(path, generation, owner_token)
+            .map_err(|_| purge_error())?;
+    }
+    validate_tantivy_generation_artifact(
+        path,
         expected_source_count,
         expected_source_inventory_hash,
     )
@@ -8445,6 +8943,14 @@ fn purge_error() -> QghError {
         "Purge did not complete; retry using the persisted safe failure stage.",
         6,
     )
+}
+
+fn filesystem_entry_exists(path: &Path) -> Result<bool, QghError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(purge_error()),
+    }
 }
 
 fn purge_tombstone_reason(
@@ -15441,6 +15947,398 @@ mod tests {
             .index_path_for_generation(generation)
             .unwrap()
             .is_none());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn dropping_builder_cleans_marker_only_shadow_with_anchored_unlink() {
+        let paths = temp_profile_paths("index-marker-only-shadow-drop");
+        let mut builder = Store::open(&paths).unwrap();
+        let (generation, generation_path) = builder
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        let shadow_path = paths.index_root.join(format!("shadow-{generation}"));
+        assert!(shadow_path.join(TANTIVY_OWNER_MARKER_FILE).exists());
+
+        drop(builder);
+
+        assert!(!generation_path.exists());
+        assert!(!shadow_path.exists());
+        let reopened = Store::open(&paths).unwrap();
+        let rows: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM index_generations) +
+                    (SELECT count(*) FROM index_build_leases) +
+                    (SELECT count(*) FROM index_build_deletions)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn dropping_builder_cleans_proven_unsealed_tantivy_shadow() {
+        let paths = temp_profile_paths("index-proven-unsealed-shadow-drop");
+        let mut builder = Store::open(&paths).unwrap();
+        let (generation, generation_path) = builder
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        let owner_token = builder
+            .index_build_tokens
+            .get(&generation)
+            .cloned()
+            .unwrap();
+        builder
+            .rebuild_reserved_index_generation(generation, &[])
+            .unwrap();
+        let shadow_path = paths.index_root.join(format!("shadow-{generation}"));
+        fs::rename(&generation_path, &shadow_path).unwrap();
+        fs::write(
+            shadow_path.join(TANTIVY_OWNER_MARKER_FILE),
+            crate::index::owned_build_marker(generation, &owner_token),
+        )
+        .unwrap();
+        crate::index::validate_unsealed_owned_tantivy_directory(
+            &shadow_path,
+            generation,
+            &owner_token,
+        )
+        .unwrap();
+
+        drop(builder);
+
+        assert!(!shadow_path.exists());
+        let reopened = Store::open(&paths).unwrap();
+        let rows: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM index_generations) +
+                    (SELECT count(*) FROM index_build_leases) +
+                    (SELECT count(*) FROM tantivy_purge_deletions)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn dropping_builder_preserves_unsealed_shadow_with_unproven_extra_file() {
+        let paths = temp_profile_paths("index-unsealed-shadow-extra-drop");
+        let mut builder = Store::open(&paths).unwrap();
+        let (generation, _) = builder
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        let shadow_path = paths.index_root.join(format!("shadow-{generation}"));
+        let unproven = shadow_path.join("partial-private-segment");
+        fs::write(&unproven, b"PRIVATE_UNSEALED_BUILD_CONTENT").unwrap();
+
+        drop(builder);
+
+        assert!(shadow_path.exists());
+        assert!(shadow_path.join(TANTIVY_OWNER_MARKER_FILE).exists());
+        assert_eq!(
+            fs::read(&unproven).unwrap(),
+            b"PRIVATE_UNSEALED_BUILD_CONTENT"
+        );
+        let reopened = Store::open(&paths).unwrap();
+        let lease_count: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT count(*) FROM index_build_leases WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lease_count, 1);
+        let deletion_count: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT count(*) FROM index_build_deletions WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deletion_count, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_reclaims_dead_marker_only_build_lease() {
+        let paths = temp_profile_paths("purge-dead-marker-only-build-lease");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_DEAD_MARKER_ONLY_LEASE";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-dead-marker-only-lease",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "dead-marker-only-private",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        let shadow_path = paths.index_root.join(format!("shadow-{generation}"));
+        store.index_build_tokens.remove(&generation);
+        store
+            .conn
+            .execute(
+                "UPDATE index_build_leases SET owner_pid = -1 WHERE generation = ?1",
+                params![generation],
+            )
+            .unwrap();
+
+        let outcome = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.purged_sources, 1);
+        assert!(!shadow_path.exists());
+        let lease_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM index_build_leases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lease_count, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_reclaims_dead_proven_unsealed_tantivy_shadow() {
+        let paths = temp_profile_paths("purge-dead-proven-unsealed-shadow");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_DEAD_UNSEALED_SHADOW";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-dead-unsealed-shadow",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "dead-unsealed-shadow-private",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        let owner_token = store.index_build_tokens.get(&generation).cloned().unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        let shadow_path = paths.index_root.join(format!("shadow-{generation}"));
+        fs::rename(&generation_path, &shadow_path).unwrap();
+        fs::write(
+            shadow_path.join(TANTIVY_OWNER_MARKER_FILE),
+            crate::index::owned_build_marker(generation, &owner_token),
+        )
+        .unwrap();
+        store.index_build_tokens.remove(&generation);
+        store
+            .conn
+            .execute(
+                "UPDATE index_build_leases SET owner_pid = -1 WHERE generation = ?1",
+                params![generation],
+            )
+            .unwrap();
+
+        let outcome = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.purged_sources, 1);
+        assert!(!shadow_path.exists());
+        assert!(store.pending_purges().unwrap().is_empty());
+        let lease_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM index_build_leases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lease_count, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_keeps_dead_unsealed_shadow_with_unknown_entry_and_lease() {
+        let paths = temp_profile_paths("purge-dead-unsealed-shadow-unknown");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_DEAD_UNSEALED_UNKNOWN";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-dead-unsealed-unknown",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "dead-unsealed-unknown-private",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        let shadow_path = paths.index_root.join(format!("shadow-{generation}"));
+        let foreign = shadow_path.join("foreign-backup-marker");
+        fs::write(&foreign, b"preserve").unwrap();
+        store.index_build_tokens.remove(&generation);
+        store
+            .conn
+            .execute(
+                "UPDATE index_build_leases SET owner_pid = -1 WHERE generation = ?1",
+                params![generation],
+            )
+            .unwrap();
+
+        let error = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "purge.failed");
+        assert!(foreign.exists());
+        assert!(shadow_path.join(TANTIVY_OWNER_MARKER_FILE).exists());
+        let lease: (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT owner_pid, owner_token FROM index_build_leases
+                 WHERE generation = ?1",
+                params![generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lease.0, -1);
+        assert!(!lease.1.is_empty());
+        assert_eq!(
+            store.pending_purges().unwrap()[0].failure_stage,
+            Some(PurgeFailureStage::Tantivy)
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn marker_only_cleanup_detects_quarantine_swap_without_deleting_either_tree() {
+        let paths = temp_profile_paths("index-marker-only-cleanup-swap");
+        let mut builder = Store::open(&paths).unwrap();
+        let (generation, _) = builder
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        let owner_token = builder
+            .index_build_tokens
+            .get(&generation)
+            .cloned()
+            .unwrap();
+        let quarantine_path =
+            index_build_cleanup_quarantine_path(&paths.index_root, generation, &owner_token);
+        let displaced_path = paths
+            .index_root
+            .join(format!(".qgh-test-displaced-build-cleanup-{generation}"));
+        builder.swap_build_cleanup_quarantine_after_open(generation);
+
+        let error = builder
+            .cleanup_owned_index_generation(generation)
+            .unwrap_err();
+
+        assert_eq!(error.code, "purge.failed");
+        assert!(quarantine_path.join("foreign-sentinel").exists());
+        assert!(displaced_path.join(TANTIVY_OWNER_MARKER_FILE).exists());
+        let state: (String, String) = builder
+            .conn
+            .query_row(
+                "SELECT phase, filesystem_identity FROM index_build_deletions
+                 WHERE generation = ?1",
+                params![generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, "verified");
+        assert_ne!(
+            state.1,
+            filesystem_identity(&quarantine_path).unwrap().durable_key()
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn marker_only_cleanup_resumes_after_marker_unlink_before_phase_commit() {
+        let paths = temp_profile_paths("index-marker-only-cleanup-resume");
+        let mut builder = Store::open(&paths).unwrap();
+        let (generation, _) = builder
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        let owner_token = builder
+            .index_build_tokens
+            .get(&generation)
+            .cloned()
+            .unwrap();
+        let shadow_path = paths.index_root.join(format!("shadow-{generation}"));
+        let quarantine_path =
+            index_build_cleanup_quarantine_path(&paths.index_root, generation, &owner_token);
+        crate::index::rename_without_replacement(&shadow_path, &quarantine_path).unwrap();
+        sync_directory(&paths.index_root).unwrap();
+        builder
+            .register_index_build_deletion(generation, &owner_token, &quarantine_path)
+            .unwrap();
+        fs::remove_file(quarantine_path.join(TANTIVY_OWNER_MARKER_FILE)).unwrap();
+
+        builder.cleanup_owned_index_generation(generation).unwrap();
+
+        assert!(!quarantine_path.exists());
+        let rows: i64 = builder
+            .conn
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM index_generations) +
+                    (SELECT count(*) FROM index_build_leases) +
+                    (SELECT count(*) FROM index_build_deletions)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }

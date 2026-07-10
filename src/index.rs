@@ -331,6 +331,15 @@ fn validate_legacy_tantivy_file_inventory(path: &Path) -> Result<(), QghError> {
     Ok(())
 }
 
+pub(crate) fn validate_unsealed_owned_tantivy_directory(
+    path: &Path,
+    generation: i64,
+    owner_token: &str,
+) -> Result<(), QghError> {
+    validate_owned_build_directory(path, generation, owner_token)?;
+    validate_legacy_tantivy_file_inventory(path)
+}
+
 pub(crate) fn validate_owned_build_directory(
     path: &Path,
     generation: i64,
@@ -382,6 +391,10 @@ fn index_build_marker(generation: i64, owner_token: &str) -> String {
     hasher.update(generation.to_le_bytes());
     hasher.update(owner_token.as_bytes());
     format!("qgh.index-build-owner.v1:{}", digest_hex(hasher))
+}
+
+pub(crate) fn owned_build_marker(generation: i64, owner_token: &str) -> String {
+    index_build_marker(generation, owner_token)
 }
 
 fn sealed_index_build_marker(generation: i64, owner_token: &str, tree_digest: &str) -> String {
