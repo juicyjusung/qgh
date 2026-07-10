@@ -6,6 +6,29 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 #[test]
+fn released_error_schema_covers_stable_embedding_error_codes() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let error_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/error.schema.json")).unwrap(),
+    )
+    .unwrap();
+    let published = error_schema["$defs"]["error_code"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|code| code.as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
+    let emitted = stable_embedding_error_codes_from_source(&root);
+    let missing = emitted.difference(&published).cloned().collect::<Vec<_>>();
+
+    assert!(
+        missing.is_empty(),
+        "released error schema is missing stable embedding errors: {missing:?}"
+    );
+    assert_eq!(error_schema["additionalProperties"], false);
+}
+
+#[test]
 fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     let help = qgh(&["--help"]);
     assert_success(&help);
@@ -2438,6 +2461,47 @@ fn format_schema_location(schema_path: &str, json_path: &[String]) -> String {
     } else {
         format!("{schema_path}:{}", json_path.join("."))
     }
+}
+
+fn stable_embedding_error_codes_from_source(root: &std::path::Path) -> BTreeSet<String> {
+    const WARNING_CODES: &[&str] = &[
+        "embedding.artifact_corrupt",
+        "embedding.coverage_missing",
+        "embedding.coverage_partial",
+        "embedding.fingerprint_mismatch",
+        "embedding.generation_cleanup_failed",
+        "embedding.query_dimension_mismatch",
+        "embedding.query_encoding_failed",
+        "embedding.runtime_unavailable",
+        "embedding.sync_chunking_failed",
+        "embedding.sync_refresh_failed",
+        "embedding.sync_tokenizer_failed",
+        "embedding.sync_vector_init_failed",
+        "embedding.tombstone_cleanup_failed",
+        "embedding.vector_init_failed",
+        "embedding.vector_search_failed",
+    ];
+    let warning_codes = WARNING_CODES.iter().copied().collect::<BTreeSet<_>>();
+    let mut codes = BTreeSet::new();
+    for entry in fs::read_dir(root.join("src")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = fs::read_to_string(path).unwrap();
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let mut rest = production;
+        while let Some(offset) = rest.find("\"embedding.") {
+            rest = &rest[offset + 1..];
+            let end = rest.find('"').expect("embedding code literal is closed");
+            let code = &rest[..end];
+            if !code.starts_with("embedding.test_") && !warning_codes.contains(code) {
+                codes.insert(code.to_string());
+            }
+            rest = &rest[end + 1..];
+        }
+    }
+    codes
 }
 
 fn binary() -> String {
