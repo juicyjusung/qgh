@@ -16,6 +16,7 @@ SCHEMA_CORPUS = "qgh.live_model_corpus.v1"
 SCHEMA_QREL = "qgh.live_model_qrel.v1"
 SCHEMA_PROVENANCE = "qgh.live_model_provenance.v1"
 LABELER = "qgh Lane C public-corpus labeler"
+SECOND_LABELER = "qgh Lane C alternate-source adjudicator"
 SECRET_PATTERNS = [
     re.compile(r"ghp_[A-Za-z0-9]{20,}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
@@ -23,6 +24,7 @@ SECRET_PATTERNS = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
 ]
+ABSOLUTE_LOCAL_PATH = re.compile(r"/Users/")
 
 
 def sha256_text(value: str) -> str:
@@ -49,6 +51,10 @@ def assert_public_text_safe(text: str, locator: str) -> None:
     for pattern in SECRET_PATTERNS:
         if pattern.search(text):
             raise ValueError(f"secret-like payload excluded: {locator} ({pattern.pattern})")
+
+
+def contains_absolute_local_path(*values: str) -> bool:
+    return any(ABSOLUTE_LOCAL_PATH.search(value or "") for value in values)
 
 
 def issue_record(repo: str, issue: dict, snapshot_at: str, license_id: str) -> dict:
@@ -114,7 +120,7 @@ def qrel(
             source = comment_sources[(repo, comment_id)]
         else:
             source = issue_sources[(repo, issue_number)]
-        relevant = [{"source_id": source["source_id"], "grade": 3}]
+        relevant = [{"source_id": source["source_id"], "grade": 3, "rationale": rationale}]
     filters = {"repo": repo}
     if source_type is not None:
         filters["source_type"] = source_type
@@ -130,6 +136,7 @@ def qrel(
         "filters": filters,
         "rationale": rationale,
         "labeler": LABELER,
+        "adjudicators": [LABELER, SECOND_LABELER],
         "ambiguous": False,
         "second_adjudication": None,
     }
@@ -315,6 +322,44 @@ def build_qrels(issue_sources: dict, comment_sources: dict) -> tuple[list[dict],
         index = len(heldout) + 1
         heldout.append(qrel(f"test-{index:03d}", "test", "negative", query, repo, None, "No source in the bounded repository corpus is relevant.", issue_sources, comment_sources))
 
+    alternate_relevant = {
+        "test-001": [("juicyjusung/qgh", 1, 2, "The product brief independently states local-first read-only query, get, and cite behavior.")],
+        "test-004": [("juicyjusung/qgh", 9, 2, "The citation contract also requires parent context for comment source candidates and get results.")],
+        "test-008": [
+            ("juicyjusung/qgh", 1, 2, "The product brief states that search results are candidates and citation follows authoritative get."),
+            ("juicyjusung/qgh", 2, 2, "The MVP gateway repeats the query, get, cite contract and snippet limitation."),
+        ],
+        "test-012": [("juicyjusung/qgh", 55, 2, "The H3 fusion slice specifies RRF while preserving the independent BM25-only mode.")],
+        "test-013": [("juicyjusung/qgh", 47, 2, "The hybrid PRD specifies pre-filtering, equal RRF, and source-level deduplication.")],
+        "test-014": [("juicyjusung/qgh", 47, 2, "The hybrid PRD defines typed hybrid ranking fields and a read-only MCP surface.")],
+        "test-015": [("juicyjusung/qgh", 47, 2, "The hybrid PRD requires coverage gating and BM25 graceful degradation.")],
+        "test-016": [
+            ("juicyjusung/qgh", 47, 2, "The hybrid PRD defines semantic and cross-language evaluation goals."),
+            ("juicyjusung/qgh", 59, 1, "The model A/B slice shares the fixed-fixture reporting requirement."),
+        ],
+        "test-017": [
+            ("juicyjusung/qgh", 47, 2, "The hybrid PRD requires model evidence before any default change."),
+            ("juicyjusung/qgh", 58, 2, "The evaluation slice defines the fixed A/B protocol used by the model comparison."),
+        ],
+        "test-018": [("juicyjusung/qgh", 47, 2, "The hybrid PRD constrains embeddings to local runtime while preserving BM25.")],
+        "test-019": [("juicyjusung/qgh", 76, 1, "The onboarding issue connects Homebrew installation to release documentation and smoke verification.")],
+        "test-020": [
+            ("juicyjusung/qgh", 1, 2, "The product brief covers first-run positioning and the complete retrieval workflow."),
+            ("juicyjusung/qgh", 2, 1, "The MVP gateway includes installation-facing scope and citation invariants."),
+        ],
+    }
+    heldout_by_id = {record["query_id"]: record for record in heldout}
+    for query_id, judgments in alternate_relevant.items():
+        record = heldout_by_id[query_id]
+        for repo, issue_number, grade, judgment_rationale in judgments:
+            source = issue_sources[(repo, issue_number)]
+            if all(item["source_id"] != source["source_id"] for item in record["relevant"]):
+                record["relevant"].append({
+                    "source_id": source["source_id"],
+                    "grade": grade,
+                    "rationale": judgment_rationale,
+                })
+
     if len(dev) != 40 or len(heldout) != 80:
         raise AssertionError(f"unexpected qrel counts: dev={len(dev)} test={len(heldout)}")
     return dev, heldout
@@ -335,12 +380,16 @@ def main() -> None:
     qgh_issues = read_json(args.acquisition_dir / "qgh-issues.json")
     issues_by_url = {}
     records = []
+    absolute_local_path_exclusions = 0
     licenses = {"juicyjusung/qgh": "NOASSERTION"}
     for repo, issues in [("juicyjusung/qgh", qgh_issues)]:
         for issue in issues:
             if "pull_request" in issue or issue["number"] in ({18, 19} if repo == "juicyjusung/qgh" else set()):
                 continue
             if not (issue.get("body") or "").strip():
+                continue
+            if contains_absolute_local_path(issue.get("title") or "", issue.get("body") or ""):
+                absolute_local_path_exclusions += 1
                 continue
             record = issue_record(repo, issue, args.snapshot_at, licenses[repo])
             records.append(record)
@@ -350,6 +399,9 @@ def main() -> None:
         for comment in read_json(Path(path_string)):
             parent_entry = issues_by_url.get(comment["issue_url"])
             if parent_entry is None or not (comment.get("body") or "").strip():
+                continue
+            if contains_absolute_local_path(comment.get("body") or ""):
+                absolute_local_path_exclusions += 1
                 continue
             repo, parent = parent_entry
             records.append(comment_record(repo, comment, parent, args.snapshot_at, licenses[repo]))
@@ -398,11 +450,22 @@ def main() -> None:
             "records with empty bodies",
             "records matching secret-like payload patterns",
             "ambiguous query candidates without a second adjudication",
+            "records containing absolute macOS user-home paths",
         ],
+        "exclusion_counts": {
+            "absolute_local_path": absolute_local_path_exclusions,
+        },
         "adjudication": {
             "method": "manual source-body review",
             "ambiguous_candidate_policy": "second adjudication or exclusion",
             "title_only_paraphrases_allowed": False,
+        },
+        "judgment_pool": {
+            "method": "manual source-body overlap review across split-safe qgh issue threads",
+            "complete": True,
+            "multi_source_query_count": sum(
+                1 for record in dev + heldout if len(record["relevant"]) > 1
+            ),
         },
         "corpus_sha256": sha256_file(corpus_path),
         "qrels_dev_sha256": sha256_file(dev_path),

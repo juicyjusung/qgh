@@ -16,6 +16,8 @@ const CORPUS_JSONL: &str = include_str!("fixtures/live-model-eval/corpus.jsonl")
 const DEV_QRELS_JSONL: &str = include_str!("fixtures/live-model-eval/qrels-dev.jsonl");
 const TEST_QRELS_JSONL: &str = include_str!("fixtures/live-model-eval/qrels-test.jsonl");
 const PROVENANCE_JSON: &str = include_str!("fixtures/live-model-eval/provenance.json");
+const MODEL_PREP_SCRIPT: &str = include_str!("support/prepare_live_model_eval_models.py");
+const RUNTIME_SUPPORT: &str = include_str!("support/live_model_eval_runtime.rs");
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +54,7 @@ enum QueryClass {
 struct RelevantSource {
     source_id: String,
     grade: u8,
+    rationale: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +80,7 @@ struct QrelRecord {
     filters: QueryFilters,
     rationale: String,
     labeler: String,
+    adjudicators: Vec<String>,
     ambiguous: bool,
     second_adjudication: Option<serde_json::Value>,
 }
@@ -108,12 +112,28 @@ struct FixtureProvenance {
     acquisition: AcquisitionProvenance,
     repositories: Vec<RepositoryProvenance>,
     exclusions: Vec<String>,
+    exclusion_counts: ExclusionCounts,
     adjudication: AdjudicationProvenance,
+    judgment_pool: JudgmentPoolProvenance,
     corpus_sha256: String,
     qrels_dev_sha256: String,
     qrels_test_sha256: String,
     dev_query_count: usize,
     test_query_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExclusionCounts {
+    absolute_local_path: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JudgmentPoolProvenance {
+    method: String,
+    complete: bool,
+    multi_source_query_count: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,8 +219,49 @@ fn public_corpus_records_are_strict_and_hash_addressed() {
 }
 
 #[test]
+fn public_corpus_excludes_absolute_local_paths() {
+    let records = parse_jsonl::<CorpusRecord>(CORPUS_JSONL);
+    assert!(records
+        .iter()
+        .all(|record| !record.title.contains("/Users/") && !record.body.contains("/Users/")));
+}
+
+#[test]
 fn qrels_are_strict_balanced_and_split_by_issue_thread() {
     assert_qrels_contract(CORPUS_JSONL, DEV_QRELS_JSONL, TEST_QRELS_JSONL);
+}
+
+#[test]
+fn qrels_include_pooled_alternates_and_two_adjudicators() {
+    let corpus = parse_jsonl::<CorpusRecord>(CORPUS_JSONL);
+    let source_issues = corpus
+        .iter()
+        .map(|source| (source.source_id.as_str(), source.issue_number))
+        .collect::<BTreeMap<_, _>>();
+    let test = parse_jsonl::<QrelRecord>(TEST_QRELS_JSONL);
+    let multi_source = test
+        .iter()
+        .filter(|qrel| qrel.relevant.len() > 1)
+        .collect::<Vec<_>>();
+    assert!(multi_source.len() >= 10);
+    assert!(test.iter().all(|qrel| qrel.adjudicators.len() >= 2));
+    assert!(multi_source
+        .iter()
+        .flat_map(|qrel| &qrel.relevant)
+        .any(|judgment| judgment.grade < 3));
+    let test_001 = test
+        .iter()
+        .find(|qrel| qrel.query_id == "test-001")
+        .unwrap();
+    assert_eq!(
+        test_001
+            .relevant
+            .iter()
+            .filter_map(|judgment| source_issues.get(judgment.source_id.as_str()))
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([1, 2])
+    );
 }
 
 #[test]
@@ -338,6 +399,12 @@ fn live_runtime_entrypoint_is_explicitly_opt_in() {
     assert!(live_eval_opt_in(Some("1")));
 }
 
+#[test]
+fn prepared_manifests_target_context_v1() {
+    assert!(MODEL_PREP_SCRIPT.contains(r#""context_template_version": "qgh.context.v1""#));
+    assert!(!MODEL_PREP_SCRIPT.contains("qgh.context.none.v1"));
+}
+
 #[cfg(feature = "fastembed-provider")]
 #[test]
 fn dev_grid_fuses_real_branch_observations_with_deterministic_ties() {
@@ -351,6 +418,119 @@ fn dev_grid_fuses_real_branch_observations_with_deterministic_ties() {
         2,
     );
     assert_eq!(ranked, ["source-b", "source-a", "source-c"]);
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn metadata_context_templates_are_exact_and_versioned() {
+    assert_eq!(
+        live_model_eval_runtime::context_input_for_test(
+            "issue",
+            "github.com",
+            "juicyjusung/qgh",
+            47,
+            "Hybrid search",
+            "chunk body",
+        ),
+        "Repository: github.com/juicyjusung/qgh\nIssue #47: Hybrid search\n\nchunk body"
+    );
+    assert_eq!(
+        live_model_eval_runtime::context_input_for_test(
+            "issue_comment",
+            "github.com",
+            "juicyjusung/qgh",
+            47,
+            "Hybrid search",
+            "comment chunk",
+        ),
+        "Repository: github.com/juicyjusung/qgh\nComment on issue #47: Hybrid search\n\ncomment chunk"
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn tier_selection_uses_size_for_light_and_quality_for_quality() {
+    let candidates = [
+        ("large-best", 900_u64, 0.95_f64, 0.80_f64, true),
+        ("small-near", 400_u64, 0.948_f64, 0.82_f64, true),
+        ("tiny-too-far", 100_u64, 0.80_f64, 0.99_f64, true),
+    ];
+    assert_eq!(
+        live_model_eval_runtime::select_tier_for_test(&candidates, true),
+        Some("small-near".to_string())
+    );
+    assert_eq!(
+        live_model_eval_runtime::select_tier_for_test(&candidates, false),
+        Some("small-near".to_string())
+    );
+
+    let quality_tie = [
+        ("larger", 800_u64, 0.950_f64, 0.88_f64, true),
+        ("smaller", 400_u64, 0.948_f64, 0.88_f64, true),
+    ];
+    assert_eq!(
+        live_model_eval_runtime::select_tier_for_test(&quality_tie, false),
+        Some("smaller".to_string())
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn target_root_rejects_lookalikes_and_parent_traversal() {
+    let cwd = std::env::current_dir().unwrap();
+    assert!(live_model_eval_runtime::target_root_allowed_for_test(
+        &cwd,
+        std::path::Path::new("target/qgh-eval/run")
+    ));
+    assert!(!live_model_eval_runtime::target_root_allowed_for_test(
+        &cwd,
+        std::path::Path::new("target/qgh-eval-evil/run")
+    ));
+    assert!(!live_model_eval_runtime::target_root_allowed_for_test(
+        &cwd,
+        std::path::Path::new("target/qgh-eval/../escape")
+    ));
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn hybrid_gate_requires_every_model_scored_query_to_use_hybrid() {
+    assert!(live_model_eval_runtime::hybrid_gate_for_test(20, 20));
+    assert!(!live_model_eval_runtime::hybrid_gate_for_test(20, 19));
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn weighted_quality_uses_the_frozen_class_weights() {
+    assert!((live_model_eval_runtime::weighted_score_for_test([1.0; 6]) - 1.0).abs() < 1e-12);
+    assert!(
+        (live_model_eval_runtime::weighted_score_for_test([0.0, 0.0, 1.0, 0.0, 0.0, 0.0]) - 0.10)
+            .abs()
+            < 1e-12
+    );
+    assert!(
+        (live_model_eval_runtime::weighted_score_for_test([0.0, 0.0, 0.0, 0.0, 1.0, 1.0]) - 0.10)
+            .abs()
+            < 1e-12
+    );
+}
+
+#[test]
+fn heldout_parse_occurs_after_frozen_config_write() {
+    let freeze = RUNTIME_SUPPORT
+        .find("fs::write(root.join(\"frozen-config.json\")")
+        .unwrap();
+    let heldout_parse = RUNTIME_SUPPORT
+        .find("parse_jsonl::<QrelRecord>(test_raw)")
+        .unwrap();
+    assert!(freeze < heldout_parse);
+}
+
+#[test]
+fn runtime_records_schema_fingerprints_and_derives_redaction_state() {
+    assert!(RUNTIME_SUPPORT.contains("database_schema_fingerprint"));
+    assert!(RUNTIME_SUPPORT.contains("tantivy_schema_fingerprint"));
+    assert!(!RUNTIME_SUPPORT.contains("raw_query_or_body_logged: false"));
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -388,6 +568,25 @@ fn live_model_runtime_smoke() {
         .unwrap_or_else(|| std::path::PathBuf::from("target/qgh-eval"));
     live_model_eval_runtime::run_smoke(&root, CORPUS_JSONL, DEV_QRELS_JSONL)
         .expect("qgh-only runtime smoke completes");
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+#[ignore = "loads one local model and probes stored issue/comment context hashes"]
+fn live_model_context_contract_smoke() {
+    assert_eq!(
+        std::env::var("QGH_LIVE_MODEL_EVAL_CONTEXT_SMOKE").as_deref(),
+        Ok("1"),
+        "set QGH_LIVE_MODEL_EVAL_CONTEXT_SMOKE=1 to run the context probe"
+    );
+    let root = std::env::var_os("QGH_LIVE_MODEL_EVAL_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target/qgh-eval"));
+    let manifest = std::env::var_os("QGH_LIVE_MODEL_EVAL_CONTEXT_MANIFEST")
+        .map(std::path::PathBuf::from)
+        .expect("set QGH_LIVE_MODEL_EVAL_CONTEXT_MANIFEST");
+    live_model_eval_runtime::run_context_probe_smoke(&root, CORPUS_JSONL, &manifest)
+        .expect("context contract runtime smoke completes");
 }
 
 fn parse_jsonl<T: for<'de> Deserialize<'de>>(raw: &str) -> Vec<T> {
@@ -454,6 +653,7 @@ fn assert_qrels_contract(corpus_raw: &str, dev_raw: &str, test_raw: &str) {
             assert!(!qrel.query.trim().is_empty());
             assert!(!qrel.rationale.trim().is_empty());
             assert!(!qrel.labeler.trim().is_empty());
+            assert!(qrel.adjudicators.len() >= 2);
             assert!(
                 !qrel.ambiguous,
                 "ambiguous records must be adjudicated or excluded"
@@ -463,9 +663,10 @@ fn assert_qrels_contract(corpus_raw: &str, dev_raw: &str, test_raw: &str) {
                 assert!(qrel.relevant.is_empty());
                 continue;
             }
-            assert_eq!(qrel.relevant.len(), 1);
+            assert!(!qrel.relevant.is_empty());
             for relevant in &qrel.relevant {
                 assert!((1..=3).contains(&relevant.grade));
+                assert!(!relevant.rationale.trim().is_empty());
                 let (repo, issue_number, entity_type) = source_threads
                     .get(relevant.source_id.as_str())
                     .expect("gold source must exist in corpus");
@@ -533,6 +734,13 @@ fn assert_provenance_contract(
         "second adjudication or exclusion"
     );
     assert!(!provenance.adjudication.title_only_paraphrases_allowed);
+    assert_eq!(provenance.exclusion_counts.absolute_local_path, 2);
+    assert!(provenance.judgment_pool.complete);
+    assert!(provenance.judgment_pool.multi_source_query_count >= 10);
+    assert!(provenance
+        .judgment_pool
+        .method
+        .contains("source-body overlap review"));
     for repository in provenance.repositories {
         assert_eq!(repository.visibility, "public");
         assert!(!repository.license.is_empty());

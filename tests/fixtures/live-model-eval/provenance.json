@@ -9,24 +9,33 @@
     "method": "manual source-body review",
     "title_only_paraphrases_allowed": false
   },
-  "corpus_sha256": "8333e4a5291d911fcafcf23319b30445e18e526c93f0a929ef898240131c5df1",
+  "corpus_sha256": "c80b1e20e342e71055a08d46402a905dff757c787cb964fbf15fbbc060cf183c",
   "dev_query_count": 40,
+  "exclusion_counts": {
+    "absolute_local_path": 2
+  },
   "exclusions": [
     "pull requests returned by the Issues endpoint",
     "qgh operational loop state/run-log issues #18 and #19",
     "records with empty bodies",
     "records matching secret-like payload patterns",
-    "ambiguous query candidates without a second adjudication"
+    "ambiguous query candidates without a second adjudication",
+    "records containing absolute macOS user-home paths"
   ],
-  "qrels_dev_sha256": "7f56373c239c3fe37d04edb90cecc4b13972209dc168c2b515b5b4a10b3efecc",
-  "qrels_test_sha256": "1fd49bc903cb6c0287ef3627993b05eda9eeccad09ec1b1ca0e8281c0ca5299d",
+  "judgment_pool": {
+    "complete": true,
+    "method": "manual source-body overlap review across split-safe qgh issue threads",
+    "multi_source_query_count": 12
+  },
+  "qrels_dev_sha256": "7e4daa6376fff4f013b088596c4b98ce99aa52340cc7df76046f82ed1d555494",
+  "qrels_test_sha256": "f279b5c1cf3eebcbc43cf4b2f3684661335160a780e851a7d67cd889963b1c43",
   "repositories": [
     {
       "issues_api": "https://api.github.com/repos/juicyjusung/qgh/issues?state=all&per_page=100",
       "license": "NOASSERTION",
       "repo": "juicyjusung/qgh",
       "repo_url": "https://github.com/juicyjusung/qgh",
-      "source_count": 156,
+      "source_count": 154,
       "visibility": "public"
     }
   ],

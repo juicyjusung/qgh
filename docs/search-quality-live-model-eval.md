@@ -2,50 +2,55 @@
 
 ## Status
 
-The committed fixture and harness are ready for the integrated live run. No model or preset is selected by this lane. Numbers produced from this branch alone are pre-integration harness validation, not final quality or promotion evidence: the prepared manifests still declare `qgh.context.none.v1`, while embedding generations use `qgh.context.v1`. The full model, held-out, and 50,000-chunk run must execute once on the Lane D+A+B integrated SHA after the context builder, provider inputs, hashes, and validation all agree on `qgh.context.v1`.
+The fixture and harness are ready for the integrated live run, but this lane selects no model. Eligibility is derived from recorded context, quality, resource, host, stale, hard-filter, judgment-pool, and redaction evidence; it is not hard-coded.
 
-An earlier mixed-repository Arctic run was terminated before its resource phase. It is excluded from evidence. The corrected qgh-only runtime smoke did execute the release binary through sync, MCP query, and real `get`; it reported `get_round_trip=1.0`, no raw query/body logging, and artifact SHA-256 `76d00230c3a79a53622126322ea1fbd147690c899fbe5f9b7db15d56b8cd54e1` under ignored `target/qgh-eval/`.
+Prepared manifests now declare `qgh.context.v1`. A small real GTE run over one public issue thread proved that the current branch still hashes raw chunks: all 3 stored generation context hashes disagreed with the deterministic issue/comment metadata inputs, so the probe derived `blocked_context_contract`. Its ignored artifact SHA-256 is `3ea108ab39b494aa3454156a761c764debb6b009c1c00127e073af81315e4880`. The same probe must return zero mismatches after the Lane D context builder is integrated, before held-out or 50,000-chunk evidence can be eligible.
+
+The corrected qgh-only runtime smoke executed the release binary through sync, MCP query, and real `get`; it reported `get_round_trip=1.0`, verified stderr/artifact redaction, and captured database and Tantivy schema fingerprints. Artifact SHA-256: `15ae5036085ce34371dfa14a1331cd865b864dcab0ff8cea250a2ab8544ea5b3` under ignored `target/qgh-eval/`.
 
 ## Public fixture
 
-The snapshot contains only public `juicyjusung/qgh` Issues and issue comments acquired without authentication from GitHub REST at `2026-07-10T08:20:22Z`. Pull requests, empty bodies, operational loop issues #18/#19, secret-like payloads, and ambiguous candidates without a second adjudication are excluded. No private content or second repository is present.
+The snapshot contains only public `juicyjusung/qgh` Issues and issue comments acquired without authentication from GitHub REST at `2026-07-10T08:20:22Z`. Pull requests, empty bodies, operational loop issues #18/#19, secret-like payloads, two comments containing absolute local user-home paths, and ambiguous candidates without a second adjudication are excluded. No private content or second repository is present.
 
 | Artifact | Contract |
 | --- | --- |
-| Corpus | 156 qgh issue/comment sources; SHA-256 `8333e4a5291d911fcafcf23319b30445e18e526c93f0a929ef898240131c5df1` |
-| Dev qrels | Exactly 40; SHA-256 `7f56373c239c3fe37d04edb90cecc4b13972209dc168c2b515b5b4a10b3efecc` |
-| Held-out qrels | Exactly 80; SHA-256 `1fd49bc903cb6c0287ef3627993b05eda9eeccad09ec1b1ca0e8281c0ca5299d` |
+| Corpus | 154 qgh issue/comment sources; SHA-256 `c80b1e20e342e71055a08d46402a905dff757c787cb964fbf15fbbc060cf183c` |
+| Dev qrels | Exactly 40; SHA-256 `7e4daa6376fff4f013b088596c4b98ce99aa52340cc7df76046f82ed1d555494` |
+| Held-out qrels | Exactly 80; SHA-256 `f279b5c1cf3eebcbc43cf4b2f3684661335160a780e851a7d67cd889963b1c43` |
 
-Held-out counts are English semantic 20, Korean semantic 15, Korean-query-to-English-source 10, English-query-to-Korean-source 10, exact/identifier 10, comment-only 5, long/context-dependent 5, and negative 5. Each gold record has a grade, source identity, rationale, and labeler. The English semantic items were adjudicated from source-body acceptance or normative sections; title-only paraphrases are not allowed. An issue and all of its comments remain in one split.
+Held-out counts are English semantic 20, Korean semantic 15, Korean-query-to-English-source 10, English-query-to-Korean-source 10, exact/identifier 10, comment-only 5, long/context-dependent 5, and negative 5. Twelve held-out queries have manually pooled alternate qgh sources with graded relevance, including the overlapping product contract for `test-001`; every record names two adjudicators. The pool is complete for the defined snapshot/body-overlap review, not a claim of exhaustive semantic truth outside that bounded pool. Title-only paraphrases are forbidden, and an issue and all comments remain in one split.
 
 ## Frozen evaluation protocol
 
-All BM25 and candidate dev runs finish before `frozen-config.json` is written. The held-out set is opened only after that write. Repeated held-out passes are permitted only for latency under the same frozen production configuration; the final pass supplies the one scored ranking and real qgh Store/`get` round-trip.
+All BM25 and candidate dev runs finish before `frozen-config.json` is written. The held-out JSONL is not parsed until after that write. Frozen evidence includes corpus/qrels, database-schema, Tantivy-schema, model-manifest, chunker, context, fusion, and lexical-profile fingerprints.
 
-Production fusion is equal RRF with `k=60`. The production query limit is 20 and `HYBRID_OVERFETCH_FACTOR=4`, so the actual candidate window is 80. qgh exposes no runtime seam for either value. A dev-only offline diagnostic attempts `k={20,60,100}` and windows `{40,80,100}` from a separate `limit=100` query. A cell is marked incomplete when the fused MCP response does not expose enough lexical and vector branch candidates; missing candidates are never treated as absent or zero, and this diagnostic cannot select a deployable configuration.
+Production fusion is equal RRF with `k=60`. The production query limit is 20 and `HYBRID_OVERFETCH_FACTOR=4`, so the actual candidate window is 80. qgh exposes no runtime seam for either value. A dev-only offline diagnostic attempts `k={20,60,100}` and windows `{40,80,100}` from a separate `limit=100` query. Cells lacking provable lexical/vector branch coverage are incomplete; missing candidates are never zero-filled, and the diagnostic cannot select a deployable configuration.
 
-Reports include nDCG@10, MRR@10, Recall@5/@10/@20, exact top-1, hard-filter violations, real `get` round-trip, duplicate crowding, and negative top-result rate. The live corpus does not inject a stale source, so it records stale leakage as unverified rather than a misleading zero. Promotion additionally requires a passed result hash from:
+Reports include nDCG@10, MRR@10, Recall@5/@10/@20, exact top-1, hard-filter violations, real `get` round-trip, duplicate crowding, and negative top-result rate. Every model-scored semantic/comment/long query must expose a real hybrid-ranked result; a BM25 fallback fails the quality gate. The light tier first keeps candidates within 0.02 weighted nDCG@10 of the best passing model, then selects the smallest snapshot. The quality tier keeps candidates within 0.005 weighted nDCG@10 of the best, then uses weighted MRR@10 and finally snapshot size as tie-breakers.
+
+The live corpus does not inject stale state and its single-repository filters are insufficient as standalone hard-filter evidence. Promotion therefore requires passed result hashes for both external gates:
 
 ```sh
 cargo test --all-features --test issue_body_tracer full_reconciliation_tombstones_deleted_comments_and_updates_status -- --exact
+cargo test --all-features --test search_quality_eval curated_search_quality_eval_gate_passes -- --exact
 ```
 
-That focused contract gate passed on this lane (`1 passed`, 116 filtered out), but it must run again on the integrated SHA and be supplied to the live report.
+Normal-run stderr is retained only in memory for comparison against every raw query/body. Generated event/report/frozen artifacts are also scanned. The report derives its redaction status from that audit and blocks promotion on any violation.
 
 ## Models and resource protocol
 
 The candidates are pinned to:
 
 - `Snowflake/snowflake-arctic-embed-l-v2.0@ac6544c8a46e00af67e330e85a9028c66b8cfd9a`
-- `dragonkue/snowflake-arctic-embed-l-v2.0-ko@55ec6e9358a56d56af759bc8372e970caf8c305f`
+- `dragonkue/snowflake-arctic-embed-l-v2.0-ko@55ec6e9358a56af759bc8372e970caf8c305f`
 - `Alibaba-NLP/gte-modernbert-base@e7f32e3c00f91d699e8c43b53106206bcc72bb22`
 
-Dragonkue currently has no `onnx/model.onnx` in the pinned public revision. The existing fastembed `UserDefinedEmbeddingModel` path therefore returns a real `embedding.hf_download_failed` blocker; no synthetic replacement is allowed.
+Dragonkue currently has no `onnx/model.onnx` in the pinned public revision. The existing fastembed `UserDefinedEmbeddingModel` path therefore reports `embedding.hf_download_failed`; no synthetic replacement is allowed.
 
-The reference host is `Mac16,8 / Apple M4 Pro 14-core / 48 GB / macOS 26.5.1`, on AC power with Low Power Mode off. The manifest records sanitized `system_profiler`, `sw_vers`, current power mode, rustc/cargo, fastembed `5.17.2`, and ORT `2.0.0-rc.12`; a mismatch blocks promotion.
+The reference host is `Mac16,8 / Apple M4 Pro 14-core / 48 GB / macOS 26.5.1`, on AC power with Low Power Mode off. The manifest records sanitized hardware/OS/power fields, rustc/cargo, fastembed `5.17.2`, and ORT `2.0.0-rc.12`; a mismatch blocks promotion.
 
-The resource run starts from exactly 50,000 repeated public qgh chunks verified as 900 tokens by the candidate tokenizer. Seed insertion finishes first. The harness then verifies the exact count, checkpoints/truncates WAL, records normalized main-DB-plus-WAL bytes, and only then times production `qgh embed --force`. It checkpoints again before computing vector DB growth, so seed body bytes and seed time are excluded. Peak RSS is isolated per candidate. Warm query latency intentionally includes the current end-to-end manifest path, including the current artifact read and SHA-256 validation before the runtime-cache lookup on each request; the harness does not normalize that cost away. The required protocol is batch 8 and intra-op threads 4; the current runtime hard-codes batch 16 and does not expose intra-op threads, so those mismatches remain promotion blockers even when effective-runtime measurements complete.
+The resource run starts from exactly 50,000 repeated public qgh chunks verified as 900 tokens by the candidate tokenizer. Seed insertion, exact count, and WAL checkpoint finish before the timer and storage baseline. Production `qgh embed --force` alone supplies throughput; a second checkpoint normalizes main-DB-plus-WAL growth. Warm latency includes current end-to-end artifact read and SHA-256 validation before runtime-cache lookup. Required batch 8 and intra-op 4 remain blockers because the current runtime uses batch 16 and does not expose intra-op.
 
 ## Required integrated run
 
-After context-v1 integration, build the release binary, prepare the pinned manifests, rerun the stale contract gate, and launch the ignored live test with its result SHA-256 in the two `QGH_LIVE_MODEL_EVAL_STALE_GATE_*` variables. Machine artifacts stay under ignored `target/qgh-eval/`. The run must complete BM25, all reachable model profiles, five fresh-process cold samples, warmup plus three measured passes, and the corrected 50,000-chunk profile before any candidate can be considered.
+After context-v1 integration, rebuild qgh, prepare the pinned manifests, run both external contract gates, and pass their status/result hashes through the documented `QGH_LIVE_MODEL_EVAL_{STALE,FILTER}_GATE_*` variables. Machine artifacts stay under canonical ignored `target/qgh-eval/`; lookalike, parent-traversal, and symlink escape paths are rejected. Only then run BM25, all reachable model profiles, five fresh-process cold samples, warmup plus three measured passes, and the corrected 50,000-chunk profile.

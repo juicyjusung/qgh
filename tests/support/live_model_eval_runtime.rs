@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering as AtomicOrdering},
-    Arc,
+    Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -43,6 +43,7 @@ const DRAGONKUE_MODEL_ID: &str = "dragonkue/snowflake-arctic-embed-l-v2.0-ko";
 const DRAGONKUE_REVISION: &str = "55ec6e9358a56d56af759bc8372e970caf8c305f";
 
 type DynError = Box<dyn Error>;
+static STDERR_AUDIT: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
 
 #[derive(Debug, Serialize)]
 struct HostRecord {
@@ -82,11 +83,13 @@ struct RetrievalMetrics {
     query_count: usize,
     per_class: BTreeMap<QueryClass, ClassMetrics>,
     weighted_ndcg_at_10: f64,
+    weighted_mrr_at_10: f64,
     exact_top_1: f64,
     hard_filter_violations: usize,
     get_round_trip: f64,
     stale_leakage_live_fixture: Option<usize>,
     duplicate_crowding_queries: usize,
+    hybrid_expected_queries: usize,
     hybrid_path_queries: usize,
     quality_gate_failures: Vec<String>,
 }
@@ -140,12 +143,48 @@ struct Blocker {
     evidence: Value,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ContextContractEvidence {
+    required_template_version: &'static str,
+    manifest_template_version: String,
+    generation_template_version: String,
+    issue_rows_checked: usize,
+    comment_rows_checked: usize,
+    context_hash_mismatches: usize,
+    passed: bool,
+}
+
+#[derive(Debug)]
+struct ContextContractFailure {
+    manifest_hash: String,
+    evidence: ContextContractEvidence,
+}
+
+impl std::fmt::Display for ContextContractFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "stored embedding context contract did not match qgh.context.v1"
+        )
+    }
+}
+
+impl Error for ContextContractFailure {}
+
 #[derive(Debug, Serialize)]
 struct ExternalContractGate {
     name: &'static str,
     command: &'static str,
     status: String,
     result_sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RedactionEvidence {
+    stderr_streams_checked: usize,
+    artifact_files_checked: usize,
+    violation_artifacts: Vec<String>,
+    passed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -156,6 +195,7 @@ struct CandidateReport {
     runtime: String,
     status: String,
     manifest_hash: Option<String>,
+    context_contract: Option<ContextContractEvidence>,
     dev_metrics: Option<RetrievalMetrics>,
     held_out_metrics: Option<RetrievalMetrics>,
     offline_dev_diagnostics: Vec<OfflineFusionDiagnostic>,
@@ -186,8 +226,10 @@ struct FrozenConfig {
     required_chunk_tokens: usize,
     required_batch_size: usize,
     required_intra_op_threads: usize,
-    evaluation_state: &'static str,
-    context_contract_status: &'static str,
+    database_schema_version: &'static str,
+    vector_schema_version: &'static str,
+    database_schema_fingerprint: String,
+    tantivy_schema_fingerprint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,10 +245,13 @@ struct FullReport {
     selected_light_candidate: Option<String>,
     selected_quality_candidate: Option<String>,
     raw_query_or_body_logged: bool,
+    redaction: RedactionEvidence,
+    evaluation_state: String,
     promotion_eligible: bool,
-    required_integrated_rerun: &'static str,
+    promotion_blockers: Vec<String>,
     host_protocol_failures: Vec<String>,
     stale_contract_gate: ExternalContractGate,
+    hard_filter_contract_gate: ExternalContractGate,
 }
 
 #[derive(Debug, Serialize)]
@@ -214,11 +259,24 @@ struct SmokeReport {
     schema_version: &'static str,
     corpus_sha256: String,
     corpus_source_count: usize,
+    database_schema_fingerprint: String,
+    tantivy_schema_fingerprint: String,
     query_id: String,
     query_sha256: String,
     ranked_source_count: usize,
     get_round_trip: f64,
     raw_query_or_body_logged: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextProbeSmokeReport {
+    schema_version: &'static str,
+    corpus_source_count: usize,
+    manifest_hash: String,
+    context_contract: ContextContractEvidence,
+    evaluation_state: &'static str,
+    raw_query_or_body_logged: bool,
+    redaction: RedactionEvidence,
 }
 
 #[derive(Default)]
@@ -238,6 +296,8 @@ struct QueryEvidence {
     get_total: usize,
     get_success: usize,
     stale_failures: usize,
+    hybrid_required: bool,
+    hybrid_expected_queries: usize,
     hybrid_path_queries: usize,
 }
 
@@ -355,6 +415,265 @@ pub(super) fn fuse_for_test(
     )
 }
 
+fn context_input(
+    entity_type: &str,
+    host: &str,
+    repo: &str,
+    issue_number: u64,
+    title: &str,
+    chunk: &str,
+) -> String {
+    match entity_type {
+        "issue" => format!("Repository: {host}/{repo}\nIssue #{issue_number}: {title}\n\n{chunk}"),
+        "issue_comment" => format!(
+            "Repository: {host}/{repo}\nComment on issue #{issue_number}: {title}\n\n{chunk}"
+        ),
+        _ => String::new(),
+    }
+}
+
+fn probe_context_contract(
+    db_path: &Path,
+    manifest_template_version: &str,
+) -> Result<ContextContractEvidence, DynError> {
+    let connection = Connection::open(db_path)?;
+    let (generation_id, model_manifest_hash, generation_template_version): (i64, String, String) =
+        connection.query_row(
+            "SELECT id, model_manifest_hash, context_template_version
+         FROM embedding_generations
+         WHERE state IN ('ready', 'active')
+         ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let mut statement = connection.prepare(
+        "SELECT egc.context_hash, c.chunker_fingerprint, c.body,
+                se.entity_type, se.host, se.repo,
+                coalesce(im.issue_number, cm.issue_number),
+                CASE WHEN se.entity_type = 'issue' THEN im.title
+                     ELSE cm.parent_issue_title END
+         FROM embedding_generation_chunks egc
+         JOIN chunks c ON c.id = egc.chunk_id
+         JOIN source_entities se ON se.source_id = c.source_id
+         LEFT JOIN issue_metadata im ON im.source_id = c.source_id
+         LEFT JOIN comment_metadata cm ON cm.source_id = c.source_id
+         WHERE egc.generation_id = ?1
+         ORDER BY se.entity_type, c.id",
+    )?;
+    let rows = statement.query_map(params![generation_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)? as u64,
+            row.get::<_, String>(7)?,
+        ))
+    })?;
+    let mut issue_rows_checked = 0usize;
+    let mut comment_rows_checked = 0usize;
+    let mut context_hash_mismatches = 0usize;
+    for row in rows {
+        let (
+            stored_context_hash,
+            chunker_fingerprint,
+            chunk,
+            entity_type,
+            host,
+            repo,
+            issue_number,
+            title,
+        ) = row?;
+        issue_rows_checked += usize::from(entity_type == "issue");
+        comment_rows_checked += usize::from(entity_type == "issue_comment");
+        let embedding_input =
+            context_input(&entity_type, &host, &repo, issue_number, &title, &chunk);
+        let expected_context_hash = digest_hex(&format!(
+            "{model_manifest_hash}\0{chunker_fingerprint}\0{generation_template_version}\0{embedding_input}"
+        ));
+        context_hash_mismatches +=
+            usize::from(embedding_input.is_empty() || stored_context_hash != expected_context_hash);
+    }
+    let passed = manifest_template_version == "qgh.context.v1"
+        && generation_template_version == "qgh.context.v1"
+        && issue_rows_checked > 0
+        && comment_rows_checked > 0
+        && context_hash_mismatches == 0;
+    Ok(ContextContractEvidence {
+        required_template_version: "qgh.context.v1",
+        manifest_template_version: manifest_template_version.to_string(),
+        generation_template_version,
+        issue_rows_checked,
+        comment_rows_checked,
+        context_hash_mismatches,
+        passed,
+    })
+}
+
+pub(super) fn context_input_for_test(
+    entity_type: &str,
+    host: &str,
+    repo: &str,
+    issue_number: u64,
+    title: &str,
+    chunk: &str,
+) -> String {
+    context_input(entity_type, host, repo, issue_number, title, chunk)
+}
+
+pub(super) fn select_tier_for_test(
+    candidates: &[(&str, u64, f64, f64, bool)],
+    light: bool,
+) -> Option<String> {
+    let mut eligible = candidates
+        .iter()
+        .filter(|candidate| candidate.4)
+        .collect::<Vec<_>>();
+    let best_ndcg = eligible
+        .iter()
+        .map(|candidate| candidate.2)
+        .reduce(f64::max)?;
+    if light {
+        eligible.retain(|candidate| best_ndcg - candidate.2 <= 0.02 + f64::EPSILON);
+        eligible.sort_by_key(|candidate| (candidate.1, candidate.0));
+    } else {
+        eligible.retain(|candidate| best_ndcg - candidate.2 <= 0.005 + f64::EPSILON);
+        eligible.sort_by(|left, right| {
+            right
+                .3
+                .partial_cmp(&left.3)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.0.cmp(right.0))
+        });
+    }
+    eligible.first().map(|candidate| candidate.0.to_string())
+}
+
+pub(super) fn hybrid_gate_for_test(expected: usize, observed: usize) -> bool {
+    expected == observed
+}
+
+fn weighted_score(values: [f64; 6]) -> f64 {
+    0.50 * values[0]
+        + 0.20 * values[1]
+        + 0.10 * values[2]
+        + 0.10 * values[3]
+        + 0.05 * values[4]
+        + 0.05 * values[5]
+}
+
+pub(super) fn weighted_score_for_test(values: [f64; 6]) -> f64 {
+    weighted_score(values)
+}
+
+fn target_root_allowed(cwd: &Path, root: &Path) -> bool {
+    if root
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let allowed = cwd.join("target/qgh-eval");
+    let candidate = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        cwd.join(root)
+    };
+    candidate.starts_with(allowed)
+}
+
+pub(super) fn target_root_allowed_for_test(cwd: &Path, root: &Path) -> bool {
+    target_root_allowed(cwd, root)
+}
+
+fn reset_stderr_audit() {
+    STDERR_AUDIT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("stderr audit lock")
+        .clear();
+}
+
+fn record_stderr(stderr: &[u8]) {
+    STDERR_AUDIT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("stderr audit lock")
+        .push(stderr.to_vec());
+}
+
+fn verify_redaction(
+    root: &Path,
+    corpus: &[CorpusRecord],
+    qrels: &[&QrelRecord],
+) -> Result<RedactionEvidence, DynError> {
+    let stderr = STDERR_AUDIT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .map_err(|_| "stderr audit lock poisoned")?;
+    let mut violation_artifacts = Vec::new();
+    for (index, stream) in stderr.iter().enumerate() {
+        if contains_sensitive_payload(stream, corpus, qrels) {
+            violation_artifacts.push(format!("stderr-stream-{index}"));
+        }
+    }
+    let mut artifact_files = Vec::new();
+    collect_redaction_artifacts(root, &mut artifact_files)?;
+    for path in &artifact_files {
+        let bytes = fs::read(path)?;
+        if contains_sensitive_payload(&bytes, corpus, qrels) {
+            let relative = path.strip_prefix(root).unwrap_or(path);
+            violation_artifacts.push(relative.to_string_lossy().to_string());
+        }
+    }
+    Ok(RedactionEvidence {
+        stderr_streams_checked: stderr.len(),
+        artifact_files_checked: artifact_files.len(),
+        passed: violation_artifacts.is_empty(),
+        violation_artifacts,
+    })
+}
+
+fn contains_sensitive_payload(
+    bytes: &[u8],
+    corpus: &[CorpusRecord],
+    qrels: &[&QrelRecord],
+) -> bool {
+    let rendered = String::from_utf8_lossy(bytes);
+    corpus
+        .iter()
+        .map(|source| source.body.as_str())
+        .chain(qrels.iter().map(|qrel| qrel.query.as_str()))
+        .filter(|value| !value.is_empty())
+        .any(|value| rendered.contains(value))
+}
+
+fn collect_redaction_artifacts(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), DynError> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_redaction_artifacts(&path, files)?;
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.contains("events")
+            || name.contains("report")
+            || name == "frozen-config.json"
+            || name == "qgh-only-runtime-smoke.json"
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
 struct WarmEvidence {
     held_out: QueryEvidence,
     latencies_ms: Vec<f64>,
@@ -366,6 +685,7 @@ struct PreparedCandidate {
     model_id: String,
     revision: String,
     manifest_hash: String,
+    context_contract: ContextContractEvidence,
     fixture: CliFixture,
     manifest_path: PathBuf,
     snapshot_bytes: u64,
@@ -386,6 +706,7 @@ pub(super) fn run(
     provenance_raw: &str,
 ) -> Result<(), DynError> {
     ensure_target_root(root)?;
+    reset_stderr_audit();
     fs::create_dir_all(root)?;
     for stale in [
         "bm25-live",
@@ -396,7 +717,6 @@ pub(super) fn run(
     }
     let corpus = parse_jsonl::<CorpusRecord>(corpus_raw);
     let dev = parse_jsonl::<QrelRecord>(dev_raw);
-    let held_out = parse_jsonl::<QrelRecord>(test_raw);
     let provenance: FixtureProvenance = serde_json::from_str(provenance_raw)?;
     let binary = eval_binary()?;
     let host = host_record(&binary);
@@ -407,6 +727,14 @@ pub(super) fn run(
             .result_sha256
             .as_deref()
             .is_some_and(is_sha256);
+    let hard_filter_contract_gate = hard_filter_contract_gate();
+    let hard_filter_contract_verified = hard_filter_contract_gate.status == "passed"
+        && hard_filter_contract_gate
+            .result_sha256
+            .as_deref()
+            .is_some_and(is_sha256);
+    let judgment_pool_verified = provenance.judgment_pool.complete
+        && provenance.judgment_pool.multi_source_query_count >= 10;
     let server = PublicSnapshotServer::start(&corpus)?;
     eprintln!("live-eval phase=bm25-dev-real-store status=running");
     let bm25_fixture = CliFixture::new(
@@ -416,6 +744,8 @@ pub(super) fn run(
     )?;
     bm25_fixture.write_config(None)?;
     bm25_fixture.sync()?;
+    let (database_schema_fingerprint, tantivy_schema_fingerprint) =
+        bm25_fixture.schema_fingerprints()?;
     let bm25_dev_evidence = run_single_pass(&bm25_fixture, &dev)?;
     let bm25_dev = evaluate_rankings(
         &corpus,
@@ -454,7 +784,7 @@ pub(super) fn run(
         qrels_test_sha256: digest_hex(test_raw),
         chunker_version: CHUNKER_VERSION,
         chunker_fingerprint: CHUNKER_FINGERPRINT,
-        context_profile: "required_generation=qgh.context.v1; current_manifest=qgh.context.none.v1",
+        context_profile: "qgh.context.v1",
         fusion: "production_equal_rrf",
         rrf_k: RRF_K,
         candidate_window: CANDIDATE_WINDOW,
@@ -466,13 +796,16 @@ pub(super) fn run(
         required_chunk_tokens: 900,
         required_batch_size: REQUIRED_BATCH_SIZE,
         required_intra_op_threads: REQUIRED_INTRA_OP_THREADS,
-        evaluation_state: "pre_integration_harness_validation_only",
-        context_contract_status: "blocked_manifest_context_none_vs_generation_context_v1",
+        database_schema_version: "qgh.db.v1",
+        vector_schema_version: "qgh.vector.v1",
+        database_schema_fingerprint,
+        tantivy_schema_fingerprint,
     };
     let frozen_bytes = serde_json::to_vec_pretty(&frozen)?;
     let frozen_config_hash = digest_hex(std::str::from_utf8(&frozen_bytes)?);
     fs::write(root.join("frozen-config.json"), with_newline(frozen_bytes))?;
 
+    let held_out = parse_jsonl::<QrelRecord>(test_raw);
     eprintln!("live-eval phase=heldout-open-once status=running");
     let bm25_evidence = run_single_pass(&bm25_fixture, &held_out)?;
     let bm25 = evaluate_rankings(
@@ -491,6 +824,8 @@ pub(super) fn run(
             Err(report) => *report,
         });
     }
+    let audited_qrels = dev.iter().chain(&held_out).collect::<Vec<_>>();
+    let redaction = verify_redaction(root, &corpus, &audited_qrels)?;
     for candidate in &mut candidates {
         candidate
             .light_gate_failures
@@ -506,11 +841,70 @@ pub(super) fn run(
                 .quality_resource_gate_failures
                 .push("stale_contract_external_evidence_required".to_string());
         }
+        if !hard_filter_contract_verified {
+            candidate
+                .light_gate_failures
+                .push("hard_filter_contract_external_evidence_required".to_string());
+            candidate
+                .quality_resource_gate_failures
+                .push("hard_filter_contract_external_evidence_required".to_string());
+        }
+        if !judgment_pool_verified {
+            candidate
+                .light_gate_failures
+                .push("pooled_judgment_coverage_required".to_string());
+            candidate
+                .quality_resource_gate_failures
+                .push("pooled_judgment_coverage_required".to_string());
+        }
+        if !redaction.passed {
+            candidate
+                .light_gate_failures
+                .push("raw_query_or_body_logged".to_string());
+            candidate
+                .quality_resource_gate_failures
+                .push("raw_query_or_body_logged".to_string());
+        }
     }
 
     let selected_light_candidate = select_candidate(&candidates, true);
     let selected_quality_candidate = select_candidate(&candidates, false);
-    let report = FullReport {
+    let promotion_eligible =
+        selected_light_candidate.is_some() || selected_quality_candidate.is_some();
+    let context_blocked = candidates.iter().any(|candidate| {
+        candidate
+            .context_contract
+            .as_ref()
+            .is_some_and(|evidence| !evidence.passed)
+    });
+    let mut promotion_blockers = host_protocol_failures.clone();
+    if !stale_contract_verified {
+        promotion_blockers.push("stale_contract_external_evidence_required".to_string());
+    }
+    if !hard_filter_contract_verified {
+        promotion_blockers.push("hard_filter_contract_external_evidence_required".to_string());
+    }
+    if !judgment_pool_verified {
+        promotion_blockers.push("pooled_judgment_coverage_required".to_string());
+    }
+    if context_blocked {
+        promotion_blockers.push("context_contract_failed".to_string());
+    }
+    if !redaction.passed {
+        promotion_blockers.push("raw_query_or_body_logged".to_string());
+    }
+    if !promotion_eligible && promotion_blockers.is_empty() {
+        promotion_blockers.push("no_passing_candidate".to_string());
+    }
+    let evaluation_state = if promotion_eligible {
+        "promotion_eligible"
+    } else if context_blocked {
+        "blocked_context_contract"
+    } else {
+        "completed_not_eligible"
+    }
+    .to_string();
+    let mut report = FullReport {
         schema_version: "qgh.live_model_eval_report.v1",
         run_finished_at: command_output("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
         corpus_snapshot_at: provenance.snapshot_at,
@@ -521,14 +915,26 @@ pub(super) fn run(
         candidates,
         selected_light_candidate,
         selected_quality_candidate,
-        raw_query_or_body_logged: false,
-        promotion_eligible: false,
-        required_integrated_rerun:
-            "rerun all model/profile and 50k gates after Lane D+A+B context-v1 integration",
+        raw_query_or_body_logged: !redaction.passed,
+        redaction,
+        evaluation_state,
+        promotion_eligible,
+        promotion_blockers,
         host_protocol_failures,
         stale_contract_gate,
+        hard_filter_contract_gate,
     };
-    write_pretty(root.join("live-model-eval-report.json"), &report)?;
+    let report_path = root.join("live-model-eval-report.json");
+    let preflight_bytes = with_newline(serde_json::to_vec_pretty(&report)?);
+    if contains_sensitive_payload(&preflight_bytes, &corpus, &audited_qrels) {
+        return Err("final report redaction preflight failed".into());
+    }
+    report.redaction.artifact_files_checked += 1;
+    let report_bytes = with_newline(serde_json::to_vec_pretty(&report)?);
+    if contains_sensitive_payload(&report_bytes, &corpus, &audited_qrels) {
+        return Err("final report redaction verification failed".into());
+    }
+    fs::write(&report_path, report_bytes)?;
     println!(
         "{}",
         serde_json::to_string(&json!({
@@ -546,6 +952,7 @@ pub(super) fn run(
 
 pub(super) fn run_smoke(root: &Path, corpus_raw: &str, dev_raw: &str) -> Result<(), DynError> {
     ensure_target_root(root)?;
+    reset_stderr_audit();
     fs::create_dir_all(root)?;
     let corpus = parse_jsonl::<CorpusRecord>(corpus_raw);
     let dev = parse_jsonl::<QrelRecord>(dev_raw);
@@ -562,6 +969,8 @@ pub(super) fn run_smoke(root: &Path, corpus_raw: &str, dev_raw: &str) -> Result<
     )?;
     fixture.write_config(None)?;
     fixture.sync()?;
+    let (database_schema_fingerprint, tantivy_schema_fingerprint) =
+        fixture.schema_fingerprints()?;
     let evidence = run_single_pass(&fixture, std::slice::from_ref(qrel))?;
     let ranked_source_count = evidence.rankings.get(&qrel.query_id).map_or(0, Vec::len);
     if ranked_source_count == 0
@@ -570,17 +979,83 @@ pub(super) fn run_smoke(root: &Path, corpus_raw: &str, dev_raw: &str) -> Result<
     {
         return Err("qgh-only runtime smoke did not query -> get round-trip".into());
     }
+    let redaction = verify_redaction(root, &corpus, &[qrel])?;
     let report = SmokeReport {
         schema_version: "qgh.live_model_eval_smoke.v1",
         corpus_sha256: digest_hex(corpus_raw),
         corpus_source_count: corpus.len(),
+        database_schema_fingerprint,
+        tantivy_schema_fingerprint,
         query_id: qrel.query_id.clone(),
         query_sha256: digest_hex(&qrel.query),
         ranked_source_count,
         get_round_trip: evidence.get_success as f64 / evidence.get_total as f64,
-        raw_query_or_body_logged: false,
+        raw_query_or_body_logged: !redaction.passed,
     };
     write_pretty(root.join("qgh-only-runtime-smoke.json"), &report)?;
+    Ok(())
+}
+
+pub(super) fn run_context_probe_smoke(
+    root: &Path,
+    corpus_raw: &str,
+    manifest_path: &Path,
+) -> Result<(), DynError> {
+    ensure_target_root(root)?;
+    reset_stderr_audit();
+    fs::create_dir_all(root)?;
+    let corpus = parse_jsonl::<CorpusRecord>(corpus_raw);
+    let comment = corpus
+        .iter()
+        .find(|source| source.entity_type == "issue_comment")
+        .ok_or("context smoke comment missing")?;
+    let issue = corpus
+        .iter()
+        .find(|source| {
+            source.entity_type == "issue"
+                && source.repo == comment.repo
+                && source.issue_number == comment.issue_number
+        })
+        .ok_or("context smoke parent issue missing")?;
+    let subset = vec![issue.clone(), comment.clone()];
+    let manifest = ModelManifestV1::from_json_slice(&fs::read(manifest_path)?)?;
+    let manifest_hash = manifest.hash();
+    let binary = eval_binary()?;
+    let server = PublicSnapshotServer::start(&subset)?;
+    let fixture = CliFixture::new(
+        root.join("context-contract-runtime-smoke"),
+        binary,
+        server.base_url.clone(),
+    )?;
+    fixture.write_config(None)?;
+    fixture.sync()?;
+    fixture.write_config(Some(manifest_path))?;
+    let embed = fixture.qgh(&["embed", "--force", "--json"])?;
+    let envelope: Value = serde_json::from_slice(&embed.stdout)?;
+    if envelope["data"]["chunks"]["embedded"]
+        .as_u64()
+        .unwrap_or_default()
+        == 0
+    {
+        return Err("context smoke embedded no chunks".into());
+    }
+    let context_contract =
+        probe_context_contract(&fixture.db_path(), &manifest.context_template_version)?;
+    let redaction = verify_redaction(root, &subset, &[])?;
+    let report = ContextProbeSmokeReport {
+        schema_version: "qgh.live_model_eval_context_probe.v1",
+        corpus_source_count: subset.len(),
+        manifest_hash,
+        evaluation_state: if context_contract.passed {
+            "context_contract_passed"
+        } else {
+            "blocked_context_contract"
+        },
+        raw_query_or_body_logged: !redaction.passed,
+        redaction,
+        context_contract,
+    };
+    write_pretty(root.join("context-contract-runtime-smoke.json"), &report)?;
     Ok(())
 }
 
@@ -609,18 +1084,30 @@ fn prepare_candidate_dev(
     ) {
         Ok(prepared) => Ok(prepared),
         Err(error) => {
-            eprintln!("live-eval candidate={candidate} status=blocked code=eval.runtime_failed");
-            Err(Box::new(blocked_candidate(
+            let context_failure = error.downcast_ref::<ContextContractFailure>();
+            let code = if context_failure.is_some() {
+                "eval.context_contract_failed"
+            } else {
+                "eval.runtime_failed"
+            };
+            eprintln!("live-eval candidate={candidate} status=blocked code={code}");
+            let mut report = blocked_candidate(
                 candidate,
                 model_id,
                 revision,
-                "eval.runtime_failed",
+                code,
                 safe_error_message(&error.to_string()),
                 json!({
                     "manifest_name": manifest_path.file_name().and_then(|name| name.to_str()),
                     "manifest_exists": manifest_path.is_file(),
                 }),
-            )))
+            );
+            if let Some(failure) = context_failure {
+                report.manifest_hash = Some(failure.manifest_hash.clone());
+                report.context_contract = Some(failure.evidence.clone());
+                report.status = "blocked_context_contract".to_string();
+            }
+            Err(Box::new(report))
         }
     }
 }
@@ -663,6 +1150,14 @@ fn try_prepare_candidate_dev(
         return Err("embedding completed without any chunks".into());
     }
     let db_growth = fixture.db_bytes()?.saturating_sub(db_bytes_before);
+    let context_contract =
+        probe_context_contract(&fixture.db_path(), &manifest.context_template_version)?;
+    if !context_contract.passed {
+        return Err(Box::new(ContextContractFailure {
+            manifest_hash,
+            evidence: context_contract,
+        }));
+    }
 
     eprintln!("live-eval candidate={candidate} phase=cold-processes status=running");
     let mut cold_samples_ms = Vec::with_capacity(COLD_PROCESS_RUNS);
@@ -688,6 +1183,7 @@ fn try_prepare_candidate_dev(
         model_id: model_id.to_string(),
         revision: revision.to_string(),
         manifest_hash,
+        context_contract,
         fixture,
         manifest_path: manifest_path.to_path_buf(),
         snapshot_bytes,
@@ -713,25 +1209,27 @@ fn finish_candidate(
         Ok((held_out_metrics, resources)) => {
             let light_gate_failures = live_resource_failures(&resources, true);
             let quality_resource_gate_failures = live_resource_failures(&resources, false);
+            let candidate_eligible = held_out_metrics.quality_gate_failures.is_empty()
+                && (light_gate_failures.is_empty() || quality_resource_gate_failures.is_empty());
             let report = CandidateReport {
                 candidate: prepared.candidate.clone(),
                 model_id: prepared.model_id.clone(),
                 resolved_revision: prepared.revision.clone(),
                 runtime: "qgh release binary / fastembed UserDefinedEmbeddingModel".to_string(),
-                status: "pre_integration_validation_resource_blocked".to_string(),
+                status: if candidate_eligible {
+                    "completed_eligible".to_string()
+                } else {
+                    "completed_not_eligible".to_string()
+                },
                 manifest_hash: Some(prepared.manifest_hash.clone()),
+                context_contract: Some(prepared.context_contract),
                 dev_metrics: Some(prepared.dev_metrics),
                 held_out_metrics: Some(held_out_metrics),
                 offline_dev_diagnostics: prepared.offline_dev_diagnostics,
                 resources: Some(resources),
                 light_gate_failures,
                 quality_resource_gate_failures,
-                blocker: Some(Blocker {
-                    code: "eval.context_contract_not_integrated".to_string(),
-                    message: "Manifest context-none and generation context-v1 are not an integrated final-eval contract.".to_string(),
-                    details: json!({}),
-                    evidence: json!({"required_rerun": "Lane D+A+B integrated SHA"}),
-                }),
+                blocker: None,
                 synthetic_substitution: false,
             };
             let _ = write_pretty(prepared.fixture.root.join("report.json"), &report);
@@ -744,6 +1242,7 @@ fn finish_candidate(
             runtime: "qgh release binary / fastembed UserDefinedEmbeddingModel".to_string(),
             status: "blocked_after_dev".to_string(),
             manifest_hash: Some(prepared.manifest_hash),
+            context_contract: Some(prepared.context_contract),
             dev_metrics: Some(prepared.dev_metrics),
             held_out_metrics: None,
             offline_dev_diagnostics: prepared.offline_dev_diagnostics,
@@ -844,6 +1343,7 @@ fn blocked_candidate(
         runtime: "qgh release binary / fastembed UserDefinedEmbeddingModel".to_string(),
         status: "blocked".to_string(),
         manifest_hash: None,
+        context_contract: None,
         dev_metrics: None,
         held_out_metrics: None,
         offline_dev_diagnostics: Vec::new(),
@@ -899,6 +1399,7 @@ fn dragonkue_blocker(root: &Path) -> CandidateReport {
         runtime: "qgh fastembed UserDefinedEmbeddingModel".to_string(),
         status: "blocked".to_string(),
         manifest_hash: None,
+        context_contract: None,
         dev_metrics: None,
         held_out_metrics: None,
         offline_dev_diagnostics: Vec::new(),
@@ -1071,14 +1572,14 @@ fn dragonkue_evidence() -> Value {
 
 fn run_single_pass(fixture: &CliFixture, qrels: &[QrelRecord]) -> Result<QueryEvidence, DynError> {
     let mut client = McpClient::start(fixture)?;
-    let evidence = query_pass(&mut client, qrels, true, TOP_K)?.0;
+    let evidence = query_pass(&mut client, qrels, true, TOP_K, false)?.0;
     let _ = client.finish()?;
     Ok(evidence)
 }
 
 fn run_dev_mcp(fixture: &CliFixture, dev: &[QrelRecord]) -> Result<(QueryEvidence, u64), DynError> {
     let mut client = McpClient::start(fixture)?;
-    let (dev_evidence, _) = query_pass(&mut client, dev, true, 100)?;
+    let (dev_evidence, _) = query_pass(&mut client, dev, true, 100, true)?;
     let peak_rss_bytes = client.finish()?;
     Ok((dev_evidence, peak_rss_bytes))
 }
@@ -1089,13 +1590,14 @@ fn run_heldout_mcp(
 ) -> Result<WarmEvidence, DynError> {
     let mut client = McpClient::start(fixture)?;
     for _ in 0..WARMUP_RUNS {
-        let _ = query_pass(&mut client, held_out, false, TOP_K)?;
+        let _ = query_pass(&mut client, held_out, false, TOP_K, true)?;
     }
     let mut latencies = Vec::with_capacity(held_out.len() * MEASURED_RUNS);
     let mut held_out_evidence = None;
     for measured in 0..MEASURED_RUNS {
         let capture_get = measured + 1 == MEASURED_RUNS;
-        let (evidence, mut pass_latencies) = query_pass(&mut client, held_out, capture_get, TOP_K)?;
+        let (evidence, mut pass_latencies) =
+            query_pass(&mut client, held_out, capture_get, TOP_K, true)?;
         latencies.append(&mut pass_latencies);
         if capture_get {
             held_out_evidence = Some(evidence);
@@ -1114,6 +1616,7 @@ fn query_pass(
     qrels: &[QrelRecord],
     verify_get: bool,
     query_limit: usize,
+    expect_hybrid: bool,
 ) -> Result<(QueryEvidence, Vec<f64>), DynError> {
     let mut rankings = BTreeMap::new();
     let mut branch_observations = BTreeMap::new();
@@ -1121,6 +1624,7 @@ fn query_pass(
     let mut get_total = 0usize;
     let mut get_success = 0usize;
     let mut stale_failures = 0usize;
+    let mut hybrid_expected_queries = 0usize;
     let mut hybrid_path_queries = 0usize;
     for qrel in qrels {
         let mut arguments = json!({
@@ -1138,10 +1642,17 @@ fn query_pass(
         let results = structured["data"]["results"]
             .as_array()
             .ok_or("query result array missing")?;
+        let model_scored = !matches!(
+            qrel.query_class,
+            QueryClass::ExactIdentifier | QueryClass::Negative
+        );
+        hybrid_expected_queries += usize::from(expect_hybrid && model_scored);
         hybrid_path_queries += usize::from(
-            results
-                .iter()
-                .any(|result| result["ranking"]["kind"].as_str() == Some("hybrid")),
+            expect_hybrid
+                && model_scored
+                && results
+                    .iter()
+                    .any(|result| result["ranking"]["kind"].as_str() == Some("hybrid")),
         );
         let ranked = results
             .iter()
@@ -1185,6 +1696,8 @@ fn query_pass(
             get_total,
             get_success,
             stale_failures,
+            hybrid_required: expect_hybrid,
+            hybrid_expected_queries,
             hybrid_path_queries,
         },
         latencies,
@@ -1279,14 +1792,14 @@ fn offline_fusion_diagnostics(
                         .map_or(0.0, |(count, sum)| sum / (*count).max(1) as f64)
                 };
                 (
-                    Some(
-                        0.50 * mean(QueryClass::EnglishSemantic)
-                            + 0.20 * mean(QueryClass::KoreanSemantic)
-                            + 0.10 * mean(QueryClass::KoQueryEnSource)
-                            + 0.10 * mean(QueryClass::EnQueryKoSource)
-                            + 0.05 * mean(QueryClass::CommentOnly)
-                            + 0.05 * mean(QueryClass::LongContext),
-                    ),
+                    Some(weighted_score([
+                        mean(QueryClass::EnglishSemantic),
+                        mean(QueryClass::KoreanSemantic),
+                        mean(QueryClass::KoQueryEnSource),
+                        mean(QueryClass::EnQueryKoSource),
+                        mean(QueryClass::CommentOnly),
+                        mean(QueryClass::LongContext),
+                    ])),
                     Some(if exact_total == 0 {
                         1.0
                     } else {
@@ -1417,6 +1930,7 @@ fn evaluate_rankings(
         evidence.get_success as f64 / evidence.get_total as f64
     };
     let weighted_ndcg_at_10 = weighted_ndcg(&per_class);
+    let weighted_mrr_at_10 = weighted_mrr(&per_class);
     let mut quality_gate_failures = Vec::new();
     if exact_top_1 < 0.95 {
         quality_gate_failures.push("exact_top_1".to_string());
@@ -1444,15 +1958,25 @@ fn evaluate_rankings(
     if evidence.stale_failures != 0 {
         quality_gate_failures.push("unexpected_tombstone_during_get".to_string());
     }
+    if evidence.hybrid_required
+        && !hybrid_gate_for_test(
+            evidence.hybrid_expected_queries,
+            evidence.hybrid_path_queries,
+        )
+    {
+        quality_gate_failures.push("hybrid_path_coverage".to_string());
+    }
     Ok(RetrievalMetrics {
         query_count: qrels.len(),
         per_class,
         weighted_ndcg_at_10,
+        weighted_mrr_at_10,
         exact_top_1,
         hard_filter_violations,
         get_round_trip,
         stale_leakage_live_fixture: None,
         duplicate_crowding_queries,
+        hybrid_expected_queries: evidence.hybrid_expected_queries,
         hybrid_path_queries: evidence.hybrid_path_queries,
         quality_gate_failures,
     })
@@ -1460,12 +1984,26 @@ fn evaluate_rankings(
 
 fn weighted_ndcg(per_class: &BTreeMap<QueryClass, ClassMetrics>) -> f64 {
     let metric = |class| per_class.get(&class).map_or(0.0, |value| value.ndcg_at_10);
-    0.50 * metric(QueryClass::EnglishSemantic)
-        + 0.20 * metric(QueryClass::KoreanSemantic)
-        + 0.15 * metric(QueryClass::KoQueryEnSource)
-        + 0.10 * metric(QueryClass::EnQueryKoSource)
-        + 0.025 * metric(QueryClass::CommentOnly)
-        + 0.025 * metric(QueryClass::LongContext)
+    weighted_score([
+        metric(QueryClass::EnglishSemantic),
+        metric(QueryClass::KoreanSemantic),
+        metric(QueryClass::KoQueryEnSource),
+        metric(QueryClass::EnQueryKoSource),
+        metric(QueryClass::CommentOnly),
+        metric(QueryClass::LongContext),
+    ])
+}
+
+fn weighted_mrr(per_class: &BTreeMap<QueryClass, ClassMetrics>) -> f64 {
+    let metric = |class| per_class.get(&class).map_or(0.0, |value| value.mrr_at_10);
+    weighted_score([
+        metric(QueryClass::EnglishSemantic),
+        metric(QueryClass::KoreanSemantic),
+        metric(QueryClass::KoQueryEnSource),
+        metric(QueryClass::EnQueryKoSource),
+        metric(QueryClass::CommentOnly),
+        metric(QueryClass::LongContext),
+    ])
 }
 
 fn live_resource_failures(resources: &ResourceEvidence, light: bool) -> Vec<String> {
@@ -1522,19 +2060,59 @@ fn select_candidate(candidates: &[CandidateReport], light: bool) -> Option<Strin
             }
         })
         .collect::<Vec<_>>();
-    eligible.sort_by(|left, right| {
-        let left_ndcg = left
-            .held_out_metrics
-            .as_ref()
-            .map_or(0.0, |metrics| metrics.weighted_ndcg_at_10);
-        let right_ndcg = right
-            .held_out_metrics
-            .as_ref()
-            .map_or(0.0, |metrics| metrics.weighted_ndcg_at_10);
-        right_ndcg
-            .partial_cmp(&left_ndcg)
-            .unwrap_or(Ordering::Equal)
-    });
+    let best_ndcg = eligible
+        .iter()
+        .filter_map(|candidate| candidate.held_out_metrics.as_ref())
+        .map(|metrics| metrics.weighted_ndcg_at_10)
+        .reduce(f64::max)?;
+    if light {
+        eligible.retain(|candidate| {
+            candidate.held_out_metrics.as_ref().is_some_and(|metrics| {
+                best_ndcg - metrics.weighted_ndcg_at_10 <= 0.02 + f64::EPSILON
+            })
+        });
+        eligible.sort_by(|left, right| {
+            left.resources
+                .as_ref()
+                .map_or(u64::MAX, |resources| {
+                    resources.complete_model_snapshot_bytes
+                })
+                .cmp(&right.resources.as_ref().map_or(u64::MAX, |resources| {
+                    resources.complete_model_snapshot_bytes
+                }))
+                .then_with(|| left.candidate.cmp(&right.candidate))
+        });
+    } else {
+        eligible.retain(|candidate| {
+            candidate.held_out_metrics.as_ref().is_some_and(|metrics| {
+                best_ndcg - metrics.weighted_ndcg_at_10 <= 0.005 + f64::EPSILON
+            })
+        });
+        eligible.sort_by(|left, right| {
+            let left_mrr = left
+                .held_out_metrics
+                .as_ref()
+                .map_or(0.0, |metrics| metrics.weighted_mrr_at_10);
+            let right_mrr = right
+                .held_out_metrics
+                .as_ref()
+                .map_or(0.0, |metrics| metrics.weighted_mrr_at_10);
+            right_mrr
+                .partial_cmp(&left_mrr)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    left.resources
+                        .as_ref()
+                        .map_or(u64::MAX, |resources| {
+                            resources.complete_model_snapshot_bytes
+                        })
+                        .cmp(&right.resources.as_ref().map_or(u64::MAX, |resources| {
+                            resources.complete_model_snapshot_bytes
+                        }))
+                })
+                .then_with(|| left.candidate.cmp(&right.candidate))
+        });
+    }
     eligible
         .first()
         .map(|candidate| candidate.candidate.clone())
@@ -1634,6 +2212,7 @@ env = "QGH_PUBLIC_FIXTURE_AUTH"
 
     fn qgh(&self, arguments: &[&str]) -> Result<Output, DynError> {
         let output = self.base_command().args(arguments).output()?;
+        record_stderr(&output.stderr);
         if !output.status.success() {
             return Err(command_failure(&output).into());
         }
@@ -1650,6 +2229,7 @@ env = "QGH_PUBLIC_FIXTURE_AUTH"
         self.apply_env(&mut command);
         let started = Instant::now();
         let output = command.output()?;
+        record_stderr(&output.stderr);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
         if !output.status.success() {
             return Err(command_failure(&output).into());
@@ -1684,6 +2264,7 @@ env = "QGH_PUBLIC_FIXTURE_AUTH"
             child.id()
         );
         let output = child.wait_with_output()?;
+        record_stderr(&output.stderr);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
         if !output.status.success() {
             return Err(command_failure(&output).into());
@@ -1718,6 +2299,7 @@ env = "QGH_PUBLIC_FIXTURE_AUTH"
         self.apply_env(&mut command);
         let started = Instant::now();
         let output = command.output()?;
+        record_stderr(&output.stderr);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
         if !output.status.success() {
             return Err(command_failure(&output).into());
@@ -1756,6 +2338,49 @@ env = "QGH_PUBLIC_FIXTURE_AUTH"
 
     fn db_bytes(&self) -> Result<u64, DynError> {
         Ok(fs::metadata(self.db_path())?.len())
+    }
+
+    fn schema_fingerprints(&self) -> Result<(String, String), DynError> {
+        let connection = Connection::open(self.db_path())?;
+        let mut statement = connection.prepare(
+            "SELECT type, name, coalesce(sql, '')
+             FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%'
+             ORDER BY type, name",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut database_schema = String::new();
+        for row in rows {
+            let (kind, name, sql) = row?;
+            database_schema.push_str(&kind);
+            database_schema.push('\0');
+            database_schema.push_str(&name);
+            database_schema.push('\0');
+            database_schema.push_str(&sql);
+            database_schema.push('\n');
+        }
+        let active_index_path: String = connection.query_row(
+            "SELECT path FROM index_generations
+             WHERE active = 1 ORDER BY generation DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let metadata: Value = serde_json::from_slice(&fs::read(
+            PathBuf::from(active_index_path).join("meta.json"),
+        )?)?;
+        let schema = metadata
+            .get("schema")
+            .ok_or("Tantivy meta.json schema missing")?;
+        Ok((
+            digest_hex(&database_schema),
+            digest_hex(&serde_json::to_string(schema)?),
+        ))
     }
 }
 
@@ -1850,6 +2475,7 @@ impl McpClient {
         if let Some(mut pipe) = self.stderr.take() {
             pipe.read_to_string(&mut stderr)?;
         }
+        record_stderr(stderr.as_bytes());
         if !status.success() {
             return Err("MCP server exited unsuccessfully".into());
         }
@@ -2256,6 +2882,22 @@ fn stale_contract_gate() -> ExternalContractGate {
     }
 }
 
+fn hard_filter_contract_gate() -> ExternalContractGate {
+    let status = std::env::var("QGH_LIVE_MODEL_EVAL_FILTER_GATE_STATUS")
+        .ok()
+        .filter(|value| value == "passed")
+        .unwrap_or_else(|| "unverified".to_string());
+    let result_sha256 = std::env::var("QGH_LIVE_MODEL_EVAL_FILTER_GATE_SHA256")
+        .ok()
+        .filter(|value| is_sha256(value));
+    ExternalContractGate {
+        name: "same_repo_hard_filter_contract",
+        command: "cargo test --all-features --test search_quality_eval curated_search_quality_eval_gate_passes -- --exact",
+        status,
+        result_sha256,
+    }
+}
+
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -2272,9 +2914,28 @@ fn command_output(command: &str, arguments: &[&str]) -> String {
 }
 
 fn ensure_target_root(root: &Path) -> Result<(), DynError> {
-    let normalized = root.to_string_lossy().replace('\\', "/");
-    if !normalized.contains("target/qgh-eval") {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    if !target_root_allowed(&cwd, root) {
         return Err("live eval artifacts must stay under target/qgh-eval".into());
+    }
+    let allowed = cwd.join("target/qgh-eval");
+    fs::create_dir_all(&allowed)?;
+    let allowed = allowed.canonicalize()?;
+    let candidate = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        cwd.join(root)
+    };
+    let relative = candidate.strip_prefix(cwd.join("target/qgh-eval"))?;
+    let mut cursor = allowed.clone();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err("live eval root contains a non-normal path component".into());
+        };
+        cursor.push(component);
+        if cursor.exists() && !cursor.canonicalize()?.starts_with(&allowed) {
+            return Err("live eval root escapes target/qgh-eval through a symlink".into());
+        }
     }
     Ok(())
 }

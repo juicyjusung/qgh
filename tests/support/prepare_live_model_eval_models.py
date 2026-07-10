@@ -159,7 +159,7 @@ def prepare_manifest(
         "output_dimension": native_dimension,
         "max_length": max_length,
         "quantization": "none",
-        "context_template_version": "qgh.context.none.v1",
+        "context_template_version": "qgh.context.v1",
     }
     manifest_path = root / "manifest.json"
     manifest_path.write_text(
