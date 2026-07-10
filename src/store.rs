@@ -364,9 +364,103 @@ impl Store {
             purge_queue_failure_after_first: false,
         };
         store.migrate()?;
+        store.detach_unbound_tantivy_publication()?;
         store.enforce_pending_purge_guards()?;
         store.content_write_epoch = read_content_write_epoch(&store.conn)?;
         Ok(store)
+    }
+
+    /// Detaches an active publication whose Tantivy artifact does not carry the
+    /// reserved canonical source inventory digest. The artifact and embedding
+    /// payload stay intact for rollback/repair, but query cannot trust them.
+    fn detach_unbound_tantivy_publication(&mut self) -> Result<(), QghError> {
+        type ActiveArtifact = (i64, i64, String, i64, Option<String>, Option<i64>);
+
+        let active_artifact = self
+            .conn
+            .query_row(
+                "SELECT rp.publication_id, ig.generation, ig.path, ig.source_count,
+                        ig.source_inventory_hash, rp.embedding_generation_id
+                 FROM retrieval_publication_pointer p
+                 JOIN retrieval_publications rp ON rp.publication_id = p.publication_id
+                 JOIN index_generations ig ON ig.generation = rp.tantivy_generation
+                 WHERE p.id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            publication_id,
+            generation,
+            stored_path,
+            source_count,
+            source_inventory_hash,
+            embedding_generation_id,
+        )): Option<ActiveArtifact> = active_artifact
+        else {
+            return Ok(());
+        };
+        let expected_path = self.index_root.join(format!("generation-{generation}"));
+        let artifact_bound = Path::new(&stored_path) == expected_path
+            && usize::try_from(source_count)
+                .ok()
+                .is_some_and(|source_count| {
+                    source_inventory_hash
+                        .as_deref()
+                        .is_some_and(|inventory_hash| {
+                            validate_tantivy_generation_artifact(
+                                &expected_path,
+                                source_count,
+                                inventory_hash,
+                            )
+                            .is_ok()
+                        })
+                });
+        if artifact_bound {
+            return Ok(());
+        }
+
+        let embedding_table_exists = table_exists(&self.conn, "embedding_generations")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let detached = tx.execute(
+            "DELETE FROM retrieval_publication_pointer
+             WHERE id = 1 AND publication_id = ?1",
+            params![publication_id],
+        )?;
+        if detached == 0 {
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE retrieval_publications SET active = 0 WHERE publication_id = ?1",
+            params![publication_id],
+        )?;
+        tx.execute(
+            "UPDATE index_generations SET active = 0 WHERE generation = ?1",
+            params![generation],
+        )?;
+        if embedding_table_exists {
+            if let Some(embedding_generation_id) = embedding_generation_id {
+                tx.execute(
+                    "UPDATE embedding_generations SET state = 'ready'
+                     WHERE id = ?1 AND state = 'active'",
+                    params![embedding_generation_id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     #[cfg(feature = "vector-search")]
@@ -3663,22 +3757,37 @@ impl Store {
             self.cleanup_owned_index_generation(generation)?;
             return Err(error);
         }
-        if let Err(error) = validate_tantivy_generation_artifact(&expected_path, source_count) {
-            drop(tx);
-            self.cleanup_owned_index_generation(generation)?;
-            return Err(error);
-        }
-        let generation_epoch = tx
+        let generation_state = tx
             .query_row(
-                "SELECT write_epoch FROM index_generations WHERE generation = ?1",
+                "SELECT write_epoch, source_inventory_hash
+                 FROM index_generations WHERE generation = ?1",
                 params![generation],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
             )
             .optional()?;
-        if generation_epoch != Some(expected_epoch) {
+        let Some((generation_epoch, source_inventory_hash)) = generation_state else {
             drop(tx);
             self.cleanup_owned_index_generation(generation)?;
             return Err(write_fence_error());
+        };
+        if generation_epoch != expected_epoch {
+            drop(tx);
+            self.cleanup_owned_index_generation(generation)?;
+            return Err(write_fence_error());
+        }
+        let Some(source_inventory_hash) = source_inventory_hash else {
+            drop(tx);
+            self.cleanup_owned_index_generation(generation)?;
+            return Err(source_inventory_mismatch_error());
+        };
+        if let Err(error) = validate_tantivy_generation_artifact(
+            &expected_path,
+            source_count,
+            &source_inventory_hash,
+        ) {
+            drop(tx);
+            self.cleanup_owned_index_generation(generation)?;
+            return Err(error);
         }
         let lease_matches = if let Some(owner_token) = owner_token.as_deref() {
             tx.query_row(
@@ -3841,7 +3950,7 @@ impl Store {
         if sources.len() != source_count {
             return Err(source_inventory_mismatch_error());
         }
-        let inventory_hash = source_inventory_hash(&sources);
+        let inventory_hash = crate::index::source_inventory_digest(&sources);
         let source_snapshot_epoch = read_source_snapshot_epoch(&self.conn)?;
         let identity = self
             .conn
@@ -4179,7 +4288,7 @@ impl Store {
             Ok(Some(RetrievalBuildSnapshot {
                 identity,
                 expected_publication_id,
-                source_inventory_hash: source_inventory_hash(&sources),
+                source_inventory_hash: crate::index::source_inventory_digest(&sources),
                 embedding_inventory_hash: embedding_inventory_hash(&embedding_chunks),
                 sources,
                 embedding_chunks,
@@ -4201,7 +4310,9 @@ impl Store {
         &self,
         snapshot: &RetrievalBuildSnapshot,
     ) -> Result<(), QghError> {
-        if source_inventory_hash(&snapshot.sources) != snapshot.source_inventory_hash {
+        if crate::index::source_inventory_digest(&snapshot.sources)
+            != snapshot.source_inventory_hash
+        {
             return Err(source_inventory_mismatch_error());
         }
         if embedding_inventory_hash(&snapshot.embedding_chunks) != snapshot.embedding_inventory_hash
@@ -4226,7 +4337,8 @@ impl Store {
         }
         let current_sources = self.active_index_sources()?;
         if current_sources.len() != snapshot.sources.len()
-            || source_inventory_hash(&current_sources) != snapshot.source_inventory_hash
+            || crate::index::source_inventory_digest(&current_sources)
+                != snapshot.source_inventory_hash
         {
             return Err(source_inventory_mismatch_error());
         }
@@ -4865,7 +4977,8 @@ impl Store {
             .index_root
             .join(format!("generation-{tantivy_generation}"));
         let authoritative_sources = self.active_index_sources()?;
-        let authoritative_source_inventory_hash = source_inventory_hash(&authoritative_sources);
+        let authoritative_source_inventory_hash =
+            crate::index::source_inventory_digest(&authoritative_sources);
         let authoritative_embedding_chunks = self.active_contextual_embedding_chunks()?;
         let authoritative_embedding_inventory_hash =
             embedding_inventory_hash(&authoritative_embedding_chunks);
@@ -5051,17 +5164,24 @@ impl Store {
             self.cleanup_owned_index_generation(tantivy_generation)?;
             return Err(source_inventory_mismatch_error());
         }
-        let artifact_ready = Path::new(&index_path) == expected_generation_path
-            && usize::try_from(source_count)
-                .ok()
-                .is_some_and(|source_count| {
-                    validate_tantivy_generation_artifact(&expected_generation_path, source_count)
-                        .is_ok()
-                });
-        if !artifact_ready {
+        if Path::new(&index_path) != expected_generation_path {
             drop(tx);
             self.cleanup_owned_index_generation(tantivy_generation)?;
             return Err(tantivy_artifact_not_ready_error());
+        }
+        let Some(source_count) = usize::try_from(source_count).ok() else {
+            drop(tx);
+            self.cleanup_owned_index_generation(tantivy_generation)?;
+            return Err(tantivy_artifact_not_ready_error());
+        };
+        if let Err(error) = validate_tantivy_generation_artifact(
+            &expected_generation_path,
+            source_count,
+            &authoritative_source_inventory_hash,
+        ) {
+            drop(tx);
+            self.cleanup_owned_index_generation(tantivy_generation)?;
+            return Err(error);
         }
         let lease_matches = if let Some(owner_token) = owner_token.as_deref() {
             tx.query_row(
@@ -6500,6 +6620,7 @@ fn repository_from_cursor_endpoint(endpoint: &str) -> Option<&str> {
 fn validate_tantivy_generation_artifact(
     generation_path: &Path,
     expected_source_count: usize,
+    expected_source_inventory_hash: &str,
 ) -> Result<(), QghError> {
     let metadata =
         fs::symlink_metadata(generation_path).map_err(|_| tantivy_artifact_not_ready_error())?;
@@ -6514,6 +6635,11 @@ fn validate_tantivy_generation_artifact(
     let observed_source_count = reader.searcher().num_docs() as usize;
     if observed_source_count != expected_source_count {
         return Err(tantivy_artifact_not_ready_error());
+    }
+    let artifact_inventory_hash = crate::index::committed_source_inventory_digest(&index)
+        .map_err(|_| tantivy_artifact_not_ready_error())?;
+    if artifact_inventory_hash.as_deref() != Some(expected_source_inventory_hash) {
+        return Err(source_inventory_mismatch_error());
     }
     Ok(())
 }
@@ -7018,36 +7144,6 @@ fn source_snapshot_identity_hash(identity: &SourceSnapshotIdentity) -> String {
     hasher.update(identity.sync_run_id.as_bytes());
     hasher.update([0]);
     hasher.update(identity.epoch.to_le_bytes());
-    digest_hex(hasher)
-}
-
-fn source_inventory_hash(sources: &[IndexSource]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"qgh.source_inventory.v1");
-    hasher.update((sources.len() as u64).to_le_bytes());
-    for source in sources {
-        hash_text(&mut hasher, &source.source_id);
-        hash_text(&mut hasher, &source.entity_type);
-        hash_text(&mut hasher, &source.repo);
-        hasher.update(source.issue_number.to_le_bytes());
-        hash_text(&mut hasher, &source.state);
-        hasher.update((source.labels.len() as u64).to_le_bytes());
-        for label in &source.labels {
-            hash_text(&mut hasher, label);
-        }
-        match &source.author {
-            Some(author) => {
-                hasher.update([1]);
-                hash_text(&mut hasher, author);
-            }
-            None => hasher.update([0]),
-        }
-        hash_text(&mut hasher, &source.title);
-        hash_text(&mut hasher, &source.body);
-        hash_text(&mut hasher, &source.parent_issue_title);
-        hash_text(&mut hasher, &source.github_updated_at);
-        hash_text(&mut hasher, &source.indexed_at);
-    }
     digest_hex(hasher)
 }
 
@@ -12534,6 +12630,61 @@ mod tests {
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
+    #[test]
+    fn open_detaches_publication_when_tantivy_inventory_manifest_is_missing() {
+        let paths = temp_profile_paths("publication-missing-artifact-inventory");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_MISSING_ARTIFACT_INVENTORY";
+        store
+            .upsert_sources_for_run(
+                "sync-missing-artifact-inventory",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "missing-artifact-inventory",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-missing-artifact-inventory")
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (generation, generation_path) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .activate_retrieval_publication(
+                snapshot.identity().sync_run_id(),
+                generation,
+                None,
+                snapshot.expected_publication_id(),
+            )
+            .unwrap();
+
+        let index = tantivy::Index::open_in_dir(&generation_path).unwrap();
+        let mut writer = index
+            .writer::<tantivy::TantivyDocument>(50_000_000)
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        drop(store);
+
+        let reopened = Store::open(&paths).unwrap();
+        assert!(reopened.active_retrieval_publication().unwrap().is_none());
+        assert_eq!(reopened.active_index_generation().unwrap(), None);
+        let error = reopened
+            .validate_query_publication_snapshot(None)
+            .unwrap_err();
+        assert_eq!(error.code, "publication.source_snapshot_incomplete");
+        assert!(generation_path.exists());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
     #[cfg(feature = "vector-search")]
     #[test]
     fn open_demotes_embedding_for_detached_pre_epoch_publication_without_deleting_payload() {
@@ -12731,6 +12882,57 @@ mod tests {
 
         let error = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &forged)
+            .unwrap_err();
+        assert_eq!(error.code, "publication.source_inventory_mismatch");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn activation_rejects_same_count_tantivy_artifact_from_different_inventory() {
+        let paths = temp_profile_paths("publication-artifact-inventory-mismatch");
+        let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run(
+                "sync-artifact-inventory",
+                &[
+                    test_issue(
+                        "qgh://github.com/issue/I_ARTIFACT_INVENTORY_ONE",
+                        "owner/repo",
+                        "artifact-one",
+                    ),
+                    test_issue(
+                        "qgh://github.com/issue/I_ARTIFACT_INVENTORY_TWO",
+                        "owner/repo",
+                        "artifact-two",
+                    ),
+                ],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-artifact-inventory")
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (generation, _) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        let mut altered_sources = snapshot.sources().to_vec();
+        for (index, source) in altered_sources.iter_mut().enumerate() {
+            source.title = format!("Altered artifact title {index}");
+            source.body = format!("Altered artifact body {index}");
+        }
+        crate::index::rebuild(&paths.index_root, generation, &altered_sources).unwrap();
+
+        let error = store
+            .activate_retrieval_publication(
+                snapshot.identity().sync_run_id(),
+                generation,
+                None,
+                snapshot.expected_publication_id(),
+            )
             .unwrap_err();
         assert_eq!(error.code, "publication.source_inventory_mismatch");
 

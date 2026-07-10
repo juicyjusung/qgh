@@ -1,12 +1,15 @@
 use crate::error::QghError;
 use crate::model::IndexSource;
 use crate::paths::{ensure_private_dir, set_private_dir};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{Field, IndexRecordOption, Schema, Value, STORED, STRING, TEXT};
 use tantivy::{Index, TantivyDocument, Term};
+
+const SOURCE_INVENTORY_COMMIT_PREFIX: &str = "qgh.source_inventory.v1:";
 
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -74,7 +77,14 @@ pub fn rebuild(
             .add_document(index_source_document(&fields, source))
             .map_err(|e| QghError::index(e.to_string()))?;
     }
-    writer
+    let mut prepared_commit = writer
+        .prepare_commit()
+        .map_err(|e| QghError::index(e.to_string()))?;
+    prepared_commit.set_payload(&format!(
+        "{SOURCE_INVENTORY_COMMIT_PREFIX}{}",
+        source_inventory_digest(sources)
+    ));
+    prepared_commit
         .commit()
         .map_err(|e| QghError::index(e.to_string()))?;
     writer
@@ -83,6 +93,61 @@ pub fn rebuild(
     fs::rename(&shadow_path, &generation_path)?;
     set_private_dir(&generation_path)?;
     Ok(generation_path)
+}
+
+pub(crate) fn source_inventory_digest(sources: &[IndexSource]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"qgh.source_inventory.v1");
+    hasher.update((sources.len() as u64).to_le_bytes());
+    for source in sources {
+        hash_text(&mut hasher, &source.source_id);
+        hash_text(&mut hasher, &source.entity_type);
+        hash_text(&mut hasher, &source.repo);
+        hasher.update(source.issue_number.to_le_bytes());
+        hash_text(&mut hasher, &source.state);
+        hasher.update((source.labels.len() as u64).to_le_bytes());
+        for label in &source.labels {
+            hash_text(&mut hasher, label);
+        }
+        match &source.author {
+            Some(author) => {
+                hasher.update([1]);
+                hash_text(&mut hasher, author);
+            }
+            None => hasher.update([0]),
+        }
+        hash_text(&mut hasher, &source.title);
+        hash_text(&mut hasher, &source.body);
+        hash_text(&mut hasher, &source.parent_issue_title);
+        hash_text(&mut hasher, &source.github_updated_at);
+        hash_text(&mut hasher, &source.indexed_at);
+    }
+    digest_hex(hasher)
+}
+
+pub(crate) fn committed_source_inventory_digest(index: &Index) -> Result<Option<String>, QghError> {
+    let payload = index
+        .load_metas()
+        .map_err(|error| QghError::index(error.to_string()))?
+        .payload;
+    Ok(payload.and_then(|payload| {
+        let digest = payload.strip_prefix(SOURCE_INVENTORY_COMMIT_PREFIX)?;
+        (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| digest.to_string())
+    }))
+}
+
+fn hash_text(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn digest_hex(hasher: Sha256) -> String {
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub fn search(
