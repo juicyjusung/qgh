@@ -92,6 +92,13 @@ impl Store {
         format!("sync-{}", now_run_id_suffix())
     }
 
+    pub fn begin_read_snapshot(&self) -> Result<(), QghError> {
+        self.conn.execute_batch("BEGIN")?;
+        self.conn
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
+        Ok(())
+    }
+
     pub fn open(paths: &ProfilePaths) -> Result<Self, QghError> {
         ensure_private_dir(&paths.profile_dir)?;
         ensure_private_dir(&paths.cache_dir)?;
@@ -1331,6 +1338,21 @@ impl Store {
                 "The published embedding generation vector index is missing.",
             ));
         }
+        let indexed_rows: i64 = self.conn.query_row(
+            &format!(
+                "SELECT count(*) FROM {vector_table} v
+                 JOIN embedding_generation_vector_rows m ON m.vector_rowid = v.rowid
+                 WHERE m.generation_id = ?1"
+            ),
+            params![generation_id],
+            |row| row.get(0),
+        )?;
+        if indexed_rows != total_chunks {
+            return Err(QghError::validation(
+                "embedding.generation_corrupt",
+                "The published embedding vector index coverage is incomplete.",
+            ));
+        }
         let candidate_limit = limit.saturating_mul(4).max(limit).max(1);
         let mut prefilter_sql = String::from(
             "SELECT c2.id FROM chunks c2
@@ -1345,6 +1367,7 @@ impl Store {
             Value::Integer(generation_id),
         ];
         push_vector_filter_sql(filters, &mut prefilter_sql, &mut params);
+        params.push(Value::Integer(generation_id));
         params.push(Value::Integer(limit as i64));
         let sql = format!(
             "WITH vector_candidates AS (
@@ -1352,8 +1375,13 @@ impl Store {
                 FROM {vector_table} v
                 JOIN embedding_generation_vector_rows m ON m.vector_rowid = v.rowid
                 WHERE v.embedding MATCH ? AND v.k = ?
+                  AND v.rowid IN (
+                      SELECT filtered.vector_rowid
+                      FROM embedding_generation_vector_rows filtered
+                      WHERE filtered.generation_id = ?
+                        AND filtered.chunk_id IN ({prefilter_sql})
+                  )
                   AND m.generation_id = ?
-                  AND m.chunk_id IN ({prefilter_sql})
                 ORDER BY v.distance
              )
              SELECT gc.vector_blob, gc.vector_dimension, gc.vector_checksum,
@@ -2225,6 +2253,15 @@ impl Store {
                 "A staged vector dimension does not match the generation dimension.",
             ));
         }
+        if chunks.iter().any(|chunk| {
+            !chunk.vector.iter().all(|value| value.is_finite())
+                || chunk.vector.iter().all(|value| *value == 0.0)
+        }) {
+            return Err(QghError::validation(
+                "embedding.generation_invalid_vector",
+                "Staged vectors must contain finite, non-zero values.",
+            ));
+        }
         let vector_table = generation_vector_table_name(dimension);
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
@@ -2493,14 +2530,18 @@ impl Store {
                 "SELECT eg.id, eg.total_chunks, eg.completed_chunks,
                         (eg.state IN ('active', 'ready')
                          AND eg.total_chunks = eg.completed_chunks
-                         AND eg.total_chunks = count(DISTINCT egc.chunk_id)
-                         AND eg.total_chunks = count(DISTINCT egvr.chunk_id))
+                         AND eg.total_chunks = (
+                             SELECT count(*) FROM embedding_generation_chunks
+                             WHERE generation_id = eg.id
+                         )
+                         AND eg.total_chunks = (
+                             SELECT count(*) FROM embedding_generation_vector_rows
+                             WHERE generation_id = eg.id
+                         ))
                  FROM retrieval_publication_pointer p
              JOIN retrieval_publications rp ON rp.publication_id = p.publication_id
              JOIN embedding_generations eg ON eg.id = rp.embedding_generation_id
-             LEFT JOIN embedding_generation_chunks egc ON egc.generation_id = eg.id
-             LEFT JOIN embedding_generation_vector_rows egvr ON egvr.generation_id = eg.id
-             WHERE p.id = 1 GROUP BY eg.id",
+             WHERE p.id = 1",
                 [],
                 |row| {
                     Ok((

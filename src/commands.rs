@@ -2352,6 +2352,7 @@ pub fn query(
     } else {
         false
     };
+    store.begin_read_snapshot()?;
     let overrides = freshness_overrides(args.max_age.as_deref(), args.require_fresh)?;
     let publication = store.active_retrieval_publication()?;
     if let Some(results) = exact_results(&store, &args.query, &filters, &profile.id)? {
