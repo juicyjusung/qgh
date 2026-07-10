@@ -1573,6 +1573,13 @@ impl PreparedModelStore {
     }
 
     #[cfg(feature = "fastembed-provider")]
+    fn acquisition_pin_lock_path(&self, options: &FastembedProviderOptions) -> PathBuf {
+        self.root
+            .join("requests")
+            .join(format!("{}.pin.lock", prepared_request_key(options)))
+    }
+
+    #[cfg(feature = "fastembed-provider")]
     fn ensure_requests_root(&self) -> Result<PathBuf, EmbeddingProviderError> {
         fs::create_dir_all(&self.root)?;
         fs::create_dir_all(self.root.join("requests"))?;
@@ -1585,13 +1592,38 @@ impl PreparedModelStore {
     }
 
     #[cfg(feature = "fastembed-provider")]
-    fn read_acquisition_pin(
+    fn acquire_pin_mutation_lock(
         &self,
         options: &FastembedProviderOptions,
-        reference: &HfModelReference,
-    ) -> Result<Option<HfModelReference>, EmbeddingProviderError> {
-        let pin_path = self.acquisition_pin_path(options);
-        let metadata = match fs::symlink_metadata(&pin_path) {
+    ) -> Result<AcquisitionPinMutationLock, EmbeddingProviderError> {
+        self.ensure_requests_root()?;
+        let path = self.acquisition_pin_lock_path(options);
+        for _ in 0..10_000 {
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(AcquisitionPinMutationLock { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::yield_now();
+                }
+                Err(_) => {
+                    return Err(EmbeddingProviderError::structured(
+                        "embedding.acquisition_pin_lock_failed",
+                        "Prepared model acquisition pin lock could not be created.",
+                    ));
+                }
+            }
+        }
+        Err(EmbeddingProviderError::structured(
+            "embedding.acquisition_pin_busy",
+            "Prepared model acquisition pin is busy or requires stale-lock cleanup.",
+        ))
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn read_acquisition_pin_record_at(
+        &self,
+        pin_path: &Path,
+    ) -> Result<Option<PreparedModelAcquisitionPinV1>, EmbeddingProviderError> {
+        let metadata = match fs::symlink_metadata(pin_path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(_) => {
@@ -1611,14 +1643,14 @@ impl PreparedModelStore {
             ));
         }
         let requests_root = self.ensure_requests_root()?;
-        if !fs::canonicalize(&pin_path)?.starts_with(&requests_root) {
+        if !fs::canonicalize(pin_path)?.starts_with(&requests_root) {
             return Err(EmbeddingProviderError::structured(
                 "embedding.acquisition_pin_invalid",
                 "Prepared model acquisition pin escapes its local store.",
             ));
         }
         let bytes = read_bounded_file(
-            &pin_path,
+            pin_path,
             &artifact_file_identity(&metadata),
             MAX_PREPARED_ALIAS_BYTES,
             "embedding.acquisition_pin_invalid",
@@ -1631,10 +1663,27 @@ impl PreparedModelStore {
             )
         })?;
         if pin.schema_version != PREPARED_MODEL_ACQUISITION_PIN_SCHEMA_VERSION
-            || pin.model_id != reference.model_id
-            || pin.requested_revision != reference.revision
             || !is_commit_sha(&pin.resolved_revision)
         {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.acquisition_pin_invalid",
+                "Prepared model acquisition pin has an invalid contract.",
+            ));
+        }
+        Ok(Some(pin))
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn read_acquisition_pin(
+        &self,
+        options: &FastembedProviderOptions,
+        reference: &HfModelReference,
+    ) -> Result<Option<HfModelReference>, EmbeddingProviderError> {
+        let pin = self.read_acquisition_pin_record_at(&self.acquisition_pin_path(options))?;
+        let Some(pin) = pin else {
+            return Ok(None);
+        };
+        if pin.model_id != reference.model_id || pin.requested_revision != reference.revision {
             return Err(EmbeddingProviderError::structured(
                 "embedding.acquisition_pin_invalid",
                 "Prepared model acquisition pin does not match the configured model reference.",
@@ -1644,6 +1693,44 @@ impl PreparedModelStore {
             model_id: pin.model_id,
             revision: pin.resolved_revision,
         }))
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn acquisition_pin_for_manifest(
+        &self,
+        options: &FastembedProviderOptions,
+        manifest: &ModelManifestV1,
+    ) -> Result<Option<PreparedModelAcquisitionPinV1>, EmbeddingProviderError> {
+        let ModelSourceV1::Hf {
+            model_id,
+            resolved_revision,
+        } = &manifest.model_source
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .read_acquisition_pin_record_at(&self.acquisition_pin_path(options))?
+            .filter(|pin| pin.model_id == *model_id && pin.resolved_revision == *resolved_revision))
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn retire_acquisition_pin(
+        &self,
+        options: &FastembedProviderOptions,
+        expected: &PreparedModelAcquisitionPinV1,
+    ) -> Result<(), EmbeddingProviderError> {
+        let _lock = self.acquire_pin_mutation_lock(options)?;
+        let pin_path = self.acquisition_pin_path(options);
+        let current = self.read_acquisition_pin_record_at(&pin_path)?;
+        if current.as_ref() == Some(expected) {
+            fs::remove_file(pin_path).map_err(|_| {
+                EmbeddingProviderError::structured(
+                    "embedding.acquisition_pin_retire_failed",
+                    "Prepared model acquisition pin could not be retired.",
+                )
+            })?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "fastembed-provider")]
@@ -1667,6 +1754,10 @@ impl PreparedModelStore {
             requested_revision: reference.revision.clone(),
             resolved_revision: resolved_revision.clone(),
         };
+        let _lock = self.acquire_pin_mutation_lock(options)?;
+        if let Some(existing) = self.read_acquisition_pin(options, reference)? {
+            return Ok(existing);
+        }
         let staging = pin_path.with_extension(format!(
             "tmp-{}-{}",
             std::process::id(),
@@ -1743,6 +1834,8 @@ impl PreparedModelStore {
         mut manifest: ModelManifestV1,
         sources: Vec<RuntimeArtifactSource>,
     ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
+        #[cfg(feature = "fastembed-provider")]
+        let acquisition_pin = self.acquisition_pin_for_manifest(options, &manifest)?;
         fs::create_dir_all(self.root.join("snapshots"))?;
         fs::create_dir_all(self.root.join("requests"))?;
         canonical_store_subdirectory(
@@ -1835,7 +1928,9 @@ impl PreparedModelStore {
         }
         #[cfg(feature = "fastembed-provider")]
         if result.is_ok() {
-            let _ = fs::remove_file(self.acquisition_pin_path(options));
+            if let Some(expected) = acquisition_pin.as_ref() {
+                let _ = self.retire_acquisition_pin(options, expected);
+            }
         }
         result
     }
@@ -2190,13 +2285,25 @@ struct PreparedModelAliasV1 {
 }
 
 #[cfg(feature = "fastembed-provider")]
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PreparedModelAcquisitionPinV1 {
     schema_version: String,
     model_id: String,
     requested_revision: String,
     resolved_revision: String,
+}
+
+#[cfg(feature = "fastembed-provider")]
+struct AcquisitionPinMutationLock {
+    path: PathBuf,
+}
+
+#[cfg(feature = "fastembed-provider")]
+impl Drop for AcquisitionPinMutationLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
 }
 
 struct RuntimeArtifactSource {
@@ -4558,6 +4665,44 @@ mod tests {
         assert_eq!(first.revision, "a".repeat(40));
         assert_eq!(second, first);
         assert_eq!(resolves.get(), 1);
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn late_materialization_cannot_retire_a_newer_hf_pin() {
+        let root = temp_dir("qgh-hf-acquisition-pin-interleaving");
+        let store = PreparedModelStore::new(root.join("prepared"));
+        let options = FastembedProviderOptions {
+            model: Some("hf:example/model@main".to_string()),
+            ..FastembedProviderOptions::default()
+        };
+        let reference = HfModelReference {
+            model_id: "example/model".to_string(),
+            revision: "main".to_string(),
+        };
+        store
+            .publish_acquisition_pin(&options, &reference, "a".repeat(40))
+            .unwrap();
+        let older = store
+            .read_acquisition_pin_record_at(&store.acquisition_pin_path(&options))
+            .unwrap()
+            .unwrap();
+
+        store.retire_acquisition_pin(&options, &older).unwrap();
+        store
+            .publish_acquisition_pin(&options, &reference, "b".repeat(40))
+            .unwrap();
+        store.retire_acquisition_pin(&options, &older).unwrap();
+
+        let resolves = std::cell::Cell::new(0_u32);
+        let full = store
+            .resolve_or_pin_hf_reference_with(&options, &reference, || {
+                resolves.set(resolves.get() + 1);
+                Ok("c".repeat(40))
+            })
+            .unwrap();
+        assert_eq!(full.revision, "b".repeat(40));
+        assert_eq!(resolves.get(), 0);
     }
 
     #[cfg(feature = "fastembed-provider")]
