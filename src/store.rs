@@ -1559,6 +1559,12 @@ impl Store {
                 }
             }
         }
+        let owned_generation_vector_mappings =
+            if table_exists(&tx, "embedding_generation_vector_rows")? {
+                validate_purge_generation_vector_mapping_ownership(&tx, &affected_generations)?
+            } else {
+                BTreeMap::new()
+            };
         let has_legacy_json_embeddings = has_chunks
             && table_exists(&tx, "chunk_embeddings")?
             && source_ids.iter().try_fold(false, |found, source_id| {
@@ -1642,33 +1648,19 @@ impl Store {
 
         for generation_id in &affected_generations {
             if table_exists(&tx, "embedding_generation_vector_rows")? {
-                let mappings = tx
-                    .prepare(
-                        "SELECT dimension, vector_table, vector_rowid
-                         FROM embedding_generation_vector_rows
-                         WHERE generation_id = ?1",
-                    )?
-                    .query_map(params![generation_id], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)? as usize,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                for (dimension, table, rowid) in mappings {
-                    if table != generation_vector_table_name(dimension) {
-                        return Err(purge_error());
-                    }
+                let mappings = owned_generation_vector_mappings
+                    .get(generation_id)
+                    .ok_or_else(purge_error)?;
+                for (table, dimension, rowid) in mappings {
                     #[cfg(feature = "vector-search")]
-                    if table_exists(&tx, &table)? {
+                    {
                         tx.execute(
                             &format!("DELETE FROM {table} WHERE rowid = ?1"),
                             params![rowid],
                         )?;
                     }
                     #[cfg(not(feature = "vector-search"))]
-                    delete_vec0_shadow_row(&tx, &table, dimension, rowid)?;
+                    delete_vec0_shadow_row(&tx, table, *dimension, *rowid)?;
                 }
                 tx.execute(
                     "DELETE FROM embedding_generation_vector_rows WHERE generation_id = ?1",
@@ -7523,6 +7515,87 @@ fn validate_generation_vector_mapping_ownership(
     Ok(expected_table)
 }
 
+fn validate_purge_generation_vector_mapping_ownership(
+    conn: &Connection,
+    generation_ids: &BTreeSet<i64>,
+) -> Result<BTreeMap<i64, Vec<(String, usize, i64)>>, QghError> {
+    let mut validated = BTreeMap::new();
+    for generation_id in generation_ids {
+        let stored_generation_dimension: i64 = conn.query_row(
+            "SELECT output_dimension FROM embedding_generations WHERE id = ?1",
+            params![generation_id],
+            |row| row.get(0),
+        )?;
+        let generation_dimension = usize::try_from(stored_generation_dimension)
+            .ok()
+            .filter(|dimension| *dimension > 0)
+            .ok_or_else(embedding_generation_corrupt_error)?;
+        let generation_chunk_count: i64 = conn.query_row(
+            "SELECT count(*) FROM embedding_generation_chunks WHERE generation_id = ?1",
+            params![generation_id],
+            |row| row.get(0),
+        )?;
+        let mappings = conn
+            .prepare(
+                "SELECT m.id, m.chunk_id, m.dimension, m.vector_table, m.vector_rowid,
+                        EXISTS(
+                            SELECT 1 FROM embedding_generation_chunks gc
+                            WHERE gc.generation_id = m.generation_id
+                              AND gc.chunk_id = m.chunk_id
+                        )
+                 FROM embedding_generation_vector_rows m
+                 WHERE m.generation_id = ?1
+                 ORDER BY m.id",
+            )?
+            .query_map(params![generation_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if i64::try_from(mappings.len()).ok() != Some(generation_chunk_count) {
+            return Err(embedding_generation_corrupt_error());
+        }
+        let mut owned = Vec::with_capacity(mappings.len());
+        for (mapping_id, _chunk_id, dimension, table, rowid, owns_chunk) in mappings {
+            if !owns_chunk {
+                return Err(embedding_generation_corrupt_error());
+            }
+            let owned_table = validate_generation_vector_mapping_ownership(
+                mapping_id,
+                dimension,
+                &table,
+                rowid,
+                generation_dimension,
+            )?;
+            #[cfg(feature = "vector-search")]
+            {
+                if !generation_vector_table_schema_matches(
+                    conn,
+                    &owned_table,
+                    generation_dimension,
+                )? || !conn.query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {owned_table} WHERE rowid = ?1)"),
+                    params![rowid],
+                    |row| row.get::<_, bool>(0),
+                )? {
+                    return Err(embedding_generation_corrupt_error());
+                }
+            }
+            #[cfg(not(feature = "vector-search"))]
+            validate_vec0_shadow_row_ownership(conn, &owned_table, generation_dimension, rowid)?;
+            owned.push((owned_table, generation_dimension, rowid));
+        }
+        validated.insert(*generation_id, owned);
+    }
+    Ok(validated)
+}
+
 fn embedding_generation_content_rows_valid(
     conn: &Connection,
     generation_id: i64,
@@ -7816,12 +7889,95 @@ fn vec0_shadow_payload_exists(conn: &Connection) -> Result<bool, QghError> {
 }
 
 #[cfg(not(feature = "vector-search"))]
+fn validate_vec0_shadow_row_ownership(
+    conn: &Connection,
+    base: &str,
+    dimension: usize,
+    vector_rowid: i64,
+) -> Result<(), QghError> {
+    if base != generation_vector_table_name(dimension) || !is_qgh_generation_vector_table(base) {
+        return Err(purge_error());
+    }
+    let chunks_table = format!("{base}_chunks");
+    let rowids_table = format!("{base}_rowids");
+    let vectors_table = format!("{base}_vector_chunks00");
+    for table in [&chunks_table, &rowids_table, &vectors_table] {
+        if !table_exists(conn, table)? {
+            return Err(purge_error());
+        }
+    }
+    let Some((stored_id, chunk_id, chunk_offset)) = conn
+        .query_row(
+            &format!(
+                "SELECT id, chunk_id, chunk_offset FROM \"{rowids_table}\"
+                 WHERE rowid = ?1"
+            ),
+            params![vector_rowid],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Err(purge_error());
+    };
+    let chunk_offset = usize::try_from(chunk_offset).map_err(|_| purge_error())?;
+    if stored_id != vector_rowid {
+        return Err(purge_error());
+    }
+    let (size, validity, rowids): (i64, Vec<u8>, Vec<u8>) = conn.query_row(
+        &format!("SELECT size, validity, rowids FROM \"{chunks_table}\" WHERE rowid = ?1"),
+        params![chunk_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let vectors: Vec<u8> = conn.query_row(
+        &format!("SELECT vectors FROM \"{vectors_table}\" WHERE rowid = ?1"),
+        params![chunk_id],
+        |row| row.get(0),
+    )?;
+    let size = usize::try_from(size).map_err(|_| purge_error())?;
+    let rowid_width = std::mem::size_of::<i64>();
+    let vector_width = dimension
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(purge_error)?;
+    let rowid_start = chunk_offset
+        .checked_mul(rowid_width)
+        .ok_or_else(purge_error)?;
+    let rowid_end = rowid_start
+        .checked_add(rowid_width)
+        .ok_or_else(purge_error)?;
+    let vector_start = chunk_offset
+        .checked_mul(vector_width)
+        .ok_or_else(purge_error)?;
+    let vector_end = vector_start
+        .checked_add(vector_width)
+        .ok_or_else(purge_error)?;
+    let validity_byte = chunk_offset / 8;
+    let validity_mask = 1_u8 << (chunk_offset % 8);
+    if chunk_offset >= size
+        || validity
+            .get(validity_byte)
+            .is_none_or(|byte| byte & validity_mask == 0)
+        || rowids.get(rowid_start..rowid_end) != Some(vector_rowid.to_ne_bytes().as_slice())
+        || vectors.get(vector_start..vector_end).is_none()
+    {
+        return Err(purge_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "vector-search"))]
 fn delete_vec0_shadow_row(
     conn: &Connection,
     base: &str,
     dimension: usize,
     vector_rowid: i64,
 ) -> Result<(), QghError> {
+    validate_vec0_shadow_row_ownership(conn, base, dimension, vector_rowid)?;
     if base != generation_vector_table_name(dimension) || !is_qgh_generation_vector_table(base) {
         return Err(purge_error());
     }
@@ -11121,10 +11277,13 @@ mod tests {
                     VALUES (42, '{other_id}', {other_version});
                  CREATE TABLE embedding_generations (
                     id INTEGER PRIMARY KEY, state TEXT NOT NULL,
+                    output_dimension INTEGER NOT NULL,
                     write_epoch INTEGER NOT NULL DEFAULT 0
                  );
-                 INSERT INTO embedding_generations (id, state) VALUES (1, 'ready');
-                 INSERT INTO embedding_generations (id, state) VALUES (2, 'ready');
+                 INSERT INTO embedding_generations (id, state, output_dimension)
+                    VALUES (1, 'ready', 2);
+                 INSERT INTO embedding_generations (id, state, output_dimension)
+                    VALUES (2, 'ready', 2);
                  CREATE TABLE embedding_generation_chunks (
                     generation_id INTEGER NOT NULL, chunk_id INTEGER NOT NULL,
                     source_version_id INTEGER NOT NULL
@@ -11303,6 +11462,168 @@ mod tests {
         assert!(delete_vec0_shadow_row(&conn, &base, 2, 404).is_err());
     }
 
+    #[cfg(not(feature = "vector-search"))]
+    #[test]
+    fn bm25_only_purge_rejects_unowned_generation_shadow_mapping_and_retries_after_repair() {
+        let paths = temp_profile_paths("purge-bm25-unowned-generation-shadow");
+        let mut store = Store::open(&paths).unwrap();
+        let target_id = "qgh://github.com/issue/I_PURGE_BM25_UNOWNED_TARGET";
+        let retained_id = "qgh://github.com/issue/I_PURGE_BM25_UNOWNED_RETAINED";
+        let private_marker = "PRIVATE_BM25_UNOWNED_MAPPING_45d1";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-bm25-unowned-generation-shadow",
+                &[
+                    test_issue(target_id, "owner/target", private_marker),
+                    test_issue(retained_id, "owner/retained", "retained-safe"),
+                ],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let target_version = store.latest_source_version_id(target_id).unwrap().unwrap();
+        let retained_version = store
+            .latest_source_version_id(retained_id)
+            .unwrap()
+            .unwrap();
+        let vector_table = generation_vector_table_name(2);
+        let shadow_chunks = format!("{vector_table}_chunks");
+        let shadow_rowids = format!("{vector_table}_rowids");
+        let shadow_vectors = format!("{vector_table}_vector_chunks00");
+        store
+            .conn
+            .execute_batch(&format!(
+                "CREATE TABLE chunks (
+                    id INTEGER PRIMARY KEY, source_id TEXT NOT NULL,
+                    source_version_id INTEGER NOT NULL
+                 );
+                 INSERT INTO chunks VALUES (41, '{target_id}', {target_version});
+                 INSERT INTO chunks VALUES (42, '{retained_id}', {retained_version});
+                 CREATE TABLE embedding_generations (
+                    id INTEGER PRIMARY KEY, state TEXT NOT NULL,
+                    output_dimension INTEGER NOT NULL, write_epoch INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO embedding_generations VALUES (1, 'ready', 2, 0);
+                 INSERT INTO embedding_generations VALUES (2, 'ready', 2, 0);
+                 CREATE TABLE embedding_generation_chunks (
+                    generation_id INTEGER NOT NULL, chunk_id INTEGER NOT NULL,
+                    source_version_id INTEGER NOT NULL
+                 );
+                 INSERT INTO embedding_generation_chunks VALUES (1, 41, {target_version});
+                 INSERT INTO embedding_generation_chunks VALUES (2, 42, {retained_version});
+                 CREATE TABLE embedding_generation_vector_rows (
+                    id INTEGER PRIMARY KEY, generation_id INTEGER NOT NULL,
+                    chunk_id INTEGER NOT NULL, dimension INTEGER NOT NULL,
+                    vector_table TEXT NOT NULL, vector_rowid INTEGER NOT NULL
+                 );
+                 INSERT INTO embedding_generation_vector_rows
+                    VALUES (101, 1, 41, 2, '{vector_table}', 102);
+                 INSERT INTO embedding_generation_vector_rows
+                    VALUES (102, 2, 42, 2, '{vector_table}', 102);
+                 CREATE TABLE {shadow_chunks} (
+                    chunk_id INTEGER PRIMARY KEY, size INTEGER NOT NULL,
+                    validity BLOB NOT NULL, rowids BLOB NOT NULL
+                 );
+                 CREATE TABLE {shadow_rowids} (
+                    rowid INTEGER PRIMARY KEY, id, chunk_id INTEGER, chunk_offset INTEGER
+                 );
+                 INSERT INTO {shadow_rowids} VALUES (101, 101, 1, 0);
+                 INSERT INTO {shadow_rowids} VALUES (102, 102, 1, 1);
+                 CREATE TABLE {shadow_vectors} (
+                    rowid PRIMARY KEY, vectors BLOB NOT NULL
+                 );"
+            ))
+            .unwrap();
+        let target_vector = encode_embedding_blob(&[0.1, 0.2]);
+        let retained_vector = encode_embedding_blob(&[0.3, 0.4]);
+        let mut rowids_blob = Vec::new();
+        rowids_blob.extend_from_slice(&101_i64.to_ne_bytes());
+        rowids_blob.extend_from_slice(&102_i64.to_ne_bytes());
+        let mut vectors_blob = target_vector.clone();
+        vectors_blob.extend_from_slice(&retained_vector);
+        store
+            .conn
+            .execute(
+                &format!(
+                    "INSERT INTO {shadow_chunks} (chunk_id, size, validity, rowids)
+                     VALUES (1, 2, ?1, ?2)"
+                ),
+                params![vec![0b0000_0011_u8], rowids_blob],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                &format!("INSERT INTO {shadow_vectors} (rowid, vectors) VALUES (1, ?1)"),
+                params![vectors_blob],
+            )
+            .unwrap();
+
+        let error = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: target_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "purge.failed");
+        assert!(!serde_json::to_string(&error)
+            .unwrap()
+            .contains(private_marker));
+        assert_eq!(
+            store.pending_purges().unwrap()[0].failure_stage,
+            Some(PurgeFailureStage::Storage)
+        );
+        assert_eq!(store.embedding_generation_state(1).unwrap(), "ready");
+        assert_eq!(store.embedding_generation_state(2).unwrap(), "ready");
+        let mapping_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM embedding_generation_vector_rows",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mapping_count, 2);
+        let retained_shadow_count: i64 = store
+            .conn
+            .query_row(
+                &format!("SELECT count(*) FROM {shadow_rowids} WHERE rowid = 102"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_shadow_count, 1);
+
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_generation_vector_rows
+                 SET vector_rowid = id WHERE generation_id = 1",
+                [],
+            )
+            .unwrap();
+        store.retry_pending_purges().unwrap();
+
+        assert!(store.embedding_generation_state(1).is_err());
+        assert_eq!(store.embedding_generation_state(2).unwrap(), "ready");
+        let retained_shadow_count: i64 = store
+            .conn
+            .query_row(
+                &format!("SELECT count(*) FROM {shadow_rowids} WHERE rowid = 102"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_shadow_count, 1);
+        assert!(store.pending_purges().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
     #[cfg(feature = "vector-search")]
     #[test]
     fn purge_discards_active_and_previous_embedding_generations_whole() {
@@ -11419,6 +11740,152 @@ mod tests {
             count, 1,
             "target-free vec0 row was not preserved in {table}"
         );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn purge_rejects_unowned_generation_vector_mapping_and_retries_after_repair() {
+        let paths = temp_profile_paths("purge-unowned-generation-vector");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let target_id = "qgh://github.com/issue/I_PURGE_UNOWNED_VECTOR_TARGET";
+        let retained_id = "qgh://github.com/issue/I_PURGE_UNOWNED_VECTOR_RETAINED";
+        let private_marker = "PRIVATE_UNOWNED_VECTOR_MAPPING_12c8";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-unowned-vector-retained",
+                &[test_issue(
+                    retained_id,
+                    "owner/retained",
+                    "retained-vector-safe",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let retained_chunk = insert_chunk(&mut store, retained_id, "retained vector chunk");
+        let retained_generation = stage_test_generation(
+            &mut store,
+            "manifest-purge-unowned-retained",
+            &[retained_chunk],
+        );
+        store
+            .upsert_sources_for_run(
+                "sync-purge-unowned-vector-target",
+                &[
+                    test_issue(target_id, "owner/target", private_marker),
+                    test_issue(retained_id, "owner/retained", "retained-vector-safe"),
+                ],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let target_chunk = insert_chunk(&mut store, target_id, private_marker);
+        let affected_generation = stage_test_generation(
+            &mut store,
+            "manifest-purge-unowned-affected",
+            &[target_chunk, retained_chunk],
+        );
+        let retained_mapping_id: i64 = store
+            .conn
+            .query_row(
+                "SELECT id FROM embedding_generation_vector_rows
+                 WHERE generation_id = ?1 AND chunk_id = ?2",
+                params![retained_generation, retained_chunk],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let target_mapping_id: i64 = store
+            .conn
+            .query_row(
+                "SELECT id FROM embedding_generation_vector_rows
+                 WHERE generation_id = ?1 AND chunk_id = ?2",
+                params![affected_generation, target_chunk],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_generation_vector_rows
+                 SET vector_rowid = ?2 WHERE id = ?1",
+                params![target_mapping_id, retained_mapping_id],
+            )
+            .unwrap();
+
+        let error = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: target_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "purge.failed");
+        assert!(!serde_json::to_string(&error)
+            .unwrap()
+            .contains(private_marker));
+        assert_eq!(
+            store.pending_purges().unwrap()[0].failure_stage,
+            Some(PurgeFailureStage::Storage)
+        );
+        assert_eq!(
+            store
+                .embedding_generation_state(affected_generation)
+                .unwrap(),
+            "ready"
+        );
+        assert_eq!(
+            store
+                .embedding_generation_state(retained_generation)
+                .unwrap(),
+            "ready"
+        );
+        let vector_table = generation_vector_table_name(2);
+        let retained_vector_count: i64 = store
+            .conn
+            .query_row(
+                &format!("SELECT count(*) FROM {vector_table} WHERE rowid = ?1"),
+                params![retained_mapping_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_vector_count, 1);
+
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_generation_vector_rows
+                 SET vector_rowid = id WHERE id = ?1",
+                params![target_mapping_id],
+            )
+            .unwrap();
+        store.retry_pending_purges().unwrap();
+
+        assert!(store
+            .embedding_generation_state(affected_generation)
+            .is_err());
+        assert_eq!(
+            store
+                .embedding_generation_state(retained_generation)
+                .unwrap(),
+            "ready"
+        );
+        let retained_vector_count: i64 = store
+            .conn
+            .query_row(
+                &format!("SELECT count(*) FROM {vector_table} WHERE rowid = ?1"),
+                params![retained_mapping_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_vector_count, 1);
+        assert!(store.pending_purges().unwrap().is_empty());
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
