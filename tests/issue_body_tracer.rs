@@ -970,9 +970,22 @@ quantization = "none"
     );
     let sync = fixture.qgh(["sync", "--json"]);
     assert_success(&sync);
-    assert!(warning_codes(&stdout_json(&sync))
+    let sync_json = stdout_json(&sync);
+    assert!(warning_codes(&sync_json)
         .iter()
         .any(|code| code.starts_with("embedding.sync_") && code.ends_with("_failed")));
+    let reported_generation = sync_json["data"]["index"]["active_generation"]
+        .as_i64()
+        .unwrap();
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(
+        status["data"]["index"]["active_generation"],
+        reported_generation
+    );
+    assert_eq!(
+        fixture.active_retrieval_publication_generation(),
+        reported_generation
+    );
 
     let query = fixture.qgh(["query", "shared repo policy tracer", "--json"]);
     assert_success(&query);
@@ -3993,6 +4006,7 @@ fn sync_resumes_from_last_committed_issue_page_after_mid_pagination_backoff() {
     assert_success(&limited_sync);
     let limited_json = stdout_json(&limited_sync);
     assert_eq!(limited_json["data"]["sync_state"], "backoff");
+    assert!(warning_codes(&limited_json).contains(&"publication.incomplete_snapshot_deferred"));
     assert_eq!(
         limited_json["data"]["backoff"]["reason"],
         "secondary_rate_limit"
@@ -4080,6 +4094,39 @@ fn sync_resumes_from_last_committed_issue_page_after_mid_pagination_backoff() {
         stdout_json(&query)["data"]["results"][0]["source_id"],
         resumed_id
     );
+}
+
+#[test]
+fn first_backfill_backoff_does_not_publish_or_fabricate_embedding_snapshot() {
+    let fixture = TestFixture::new("backfill-backoff-embedding-provenance");
+    let server = PaginatedBackoffFakeGitHub::start();
+    fixture.write_config_with_repos_and_embedding(
+        &server.base_url,
+        &["owner/repo"],
+        r#"
+[embedding]
+provider = "local"
+model_path = "/definitely/not/a/model"
+file = "onnx/model.onnx"
+pooling = "cls"
+query_prefix = "query: "
+quantization = "none"
+"#,
+    );
+
+    let backfill = fixture.qgh(["sync", "--backfill", "--json"]);
+    assert_success(&backfill);
+    let backfill_json = stdout_json(&backfill);
+    assert_eq!(backfill_json["data"]["sync_state"], "backoff");
+    assert!(warning_codes(&backfill_json).contains(&"publication.incomplete_snapshot_deferred"));
+    assert!(!warning_codes(&backfill_json)
+        .iter()
+        .any(|code| code.starts_with("embedding.sync_")));
+    assert_eq!(
+        fixture.embedding_sync_run_reference_count("embedding-sync"),
+        0
+    );
+    assert_eq!(fixture.active_retrieval_publication_count(), 0);
 }
 
 #[test]
@@ -5697,6 +5744,55 @@ fn incremental_sync_records_new_versions_and_uses_since_overlap_and_etag() {
     );
     fixture.assert_source_version_count(issue_id, 2);
     fixture.assert_source_version_count(comment_id, 2);
+}
+
+#[test]
+fn completed_sync_publishes_new_lexical_snapshot_when_embedding_refresh_fails() {
+    let fixture = TestFixture::new("completed-sync-lexical-embedding-fallback");
+    let server = EditingFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    server.set_mode(TARGET_REFRESH_DIFF);
+    fixture.write_config_with_repos_and_embedding(
+        &server.base_url,
+        &["owner/repo"],
+        r#"
+[embedding]
+provider = "local"
+model_path = "/definitely/not/a/model"
+file = "onnx/model.onnx"
+pooling = "cls"
+query_prefix = "query: "
+quantization = "none"
+"#,
+    );
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+    let sync_json = stdout_json(&sync);
+    assert!(warning_codes(&sync_json)
+        .iter()
+        .any(|code| code.starts_with("embedding.sync_") && code.ends_with("_failed")));
+    let reported_generation = sync_json["data"]["index"]["active_generation"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        fixture.active_retrieval_publication_generation(),
+        reported_generation
+    );
+
+    let updated = fixture.qgh(["query", "updated issue body", "--json"]);
+    assert_success(&updated);
+    assert_eq!(
+        stdout_json(&updated)["data"]["results"][0]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+    let stale = fixture.qgh(["query", "round-trip through get before citation", "--json"]);
+    assert_success(&stale);
+    assert!(stdout_json(&stale)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -7327,6 +7423,54 @@ limit = 10
             .unwrap();
         assert_eq!(completed, 1);
         assert_eq!(snapshot_kind, expected_snapshot_kind);
+    }
+
+    fn active_retrieval_publication_generation(&self) -> i64 {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT rp.tantivy_generation
+             FROM retrieval_publication_pointer p
+             JOIN retrieval_publications rp ON rp.publication_id = p.publication_id
+             WHERE p.id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn active_retrieval_publication_count(&self) -> i64 {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT count(*) FROM retrieval_publication_pointer",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn embedding_sync_run_reference_count(&self, sync_run_id: &str) -> i64 {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'embedding_generations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if table_exists == 0 {
+            return 0;
+        }
+        conn.query_row(
+            "SELECT count(*) FROM embedding_generations
+             WHERE source_sync_run_id = ?1 OR source_snapshot_hash = ?1",
+            [sync_run_id],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     fn set_last_sync_age_seconds(&self, age_seconds: i64) {

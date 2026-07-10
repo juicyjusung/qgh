@@ -3707,19 +3707,6 @@ impl Store {
             .map_err(QghError::from)
     }
 
-    pub fn latest_sync_run_id(&self) -> Result<Option<String>, QghError> {
-        self.conn
-            .query_row(
-                "SELECT id FROM sync_runs
-                 WHERE snapshot_kind = 'remote_sync'
-                 ORDER BY started_at DESC, rowid DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(QghError::from)
-    }
-
     pub fn source_version_hash(&self, source_version_id: i64) -> Result<Option<String>, QghError> {
         self.conn
             .query_row(
@@ -6464,10 +6451,6 @@ mod tests {
         assert_ne!(successor, remote_sync_run_id);
         assert_eq!(
             store.latest_successful_sync_run_id().unwrap().as_deref(),
-            Some(remote_sync_run_id)
-        );
-        assert_eq!(
-            store.latest_sync_run_id().unwrap().as_deref(),
             Some(remote_sync_run_id)
         );
         assert_eq!(

@@ -20,6 +20,12 @@ diagnostics. Progress lines and human summaries are not a stable
 machine-readable API; use `--json` for automation.
 `sync --if-stale --json` returns `data.sync_state: "skipped_fresh"` when the
 local snapshot is still within the effective max-age and no network sync runs.
+A completed source sync publishes its newly built lexical generation even when
+configured local embedding refresh fails; the response keeps the embedding
+warning and reports the actual active lexical generation. A partial sync or
+backfill interrupted by backoff does not fabricate a source-snapshot id or
+publish its partial corpus, and reports
+`publication.incomplete_snapshot_deferred` instead.
 
 `sync issue <number>` is the explicit targeted refresh path for one issue and
 its complete per-issue comment list. Its `sync` envelope includes `target`,

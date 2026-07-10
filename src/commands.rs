@@ -213,6 +213,11 @@ pub async fn sync(
                 backoff.reset_at.as_deref(),
             )?;
             let status = store.status()?;
+            let warnings = if summary.is_some() {
+                vec![incomplete_snapshot_publication_warning()]
+            } else {
+                Vec::new()
+            };
             return Ok(local_read_outcome(
                 json!({
                     "profile_id": profile.id,
@@ -235,7 +240,7 @@ pub async fn sync(
                         "dirty_task_count": status.dirty_task_count
                     }
                 }),
-                Vec::new(),
+                warnings,
             ));
         }
     };
@@ -320,7 +325,7 @@ pub async fn sync(
                         "dirty_task_count": status.dirty_task_count
                     }
                 }),
-                Vec::new(),
+                vec![incomplete_snapshot_publication_warning()],
             ));
         }
     }
@@ -564,7 +569,7 @@ async fn backfill_sync(
             backoff.retry_after_seconds,
             backoff.reset_at.as_deref(),
         )?;
-        let warnings = rebuild_bm25_index(profile, store, progress)?.warnings;
+        let warnings = vec![incomplete_snapshot_publication_warning()];
         let status = store.status()?;
         return Ok(local_read_outcome(
             json!({
@@ -944,6 +949,18 @@ fn rebuild_bm25_index(
     store: &mut Store,
     progress: &StderrSyncProgress,
 ) -> Result<IndexRebuildOutcome, QghError> {
+    let Some(source_snapshot_sync_run_id) = store.latest_successful_sync_run_id()? else {
+        let status = store.status()?;
+        let generation = store
+            .active_retrieval_publication()?
+            .map(|publication| publication.tantivy_generation)
+            .unwrap_or(status.active_generation);
+        return Ok(IndexRebuildOutcome {
+            generation,
+            dirty_task_count: status.dirty_task_count,
+            warnings: vec![incomplete_snapshot_publication_warning()],
+        });
+    };
     let (mut warnings, embedding_generation_id) =
         refresh_embedding_for_sync_if_enabled(profile, store, progress);
     let sources = store.active_index_sources()?;
@@ -958,45 +975,53 @@ fn rebuild_bm25_index(
     let expected_publication_id = store
         .active_retrieval_publication()?
         .map(|publication| publication.publication_id);
-    if profile.embedding.is_none() || embedding_generation_id.is_some() {
-        if let Some(sync_run_id) = store.latest_sync_run_id()? {
-            match store.activate_retrieval_publication(
-                &sync_run_id,
-                generation,
-                embedding_generation_id,
-                expected_publication_id,
-            ) {
-                Ok(_) if profile.embedding.is_some() => {
-                    match cleanup_old_embedding_generations(store) {
-                        Ok(removed) if removed > 0 => progress.line(format_args!(
-                            "qgh sync: cleaned expired embedding generations count={removed}"
-                        )),
-                        Ok(_) => {}
-                        Err(_) => warnings.push(embedding_sync_warning(
-                            "embedding.generation_cleanup_failed",
-                            "Expired embedding generation cleanup failed after publication. Retrieval remains available.",
-                        )),
-                    }
-                }
+    match store.activate_retrieval_publication(
+        &source_snapshot_sync_run_id,
+        generation,
+        embedding_generation_id,
+        expected_publication_id,
+    ) {
+        Ok(_) if embedding_generation_id.is_some() => {
+            match cleanup_old_embedding_generations(store) {
+                Ok(removed) if removed > 0 => progress.line(format_args!(
+                    "qgh sync: cleaned expired embedding generations count={removed}"
+                )),
                 Ok(_) => {}
                 Err(_) => warnings.push(embedding_sync_warning(
-                    "publication.activation_failed",
-                    "Retrieval publication activation failed after BM25 rebuild. The previous publication remains active.",
+                    "embedding.generation_cleanup_failed",
+                    "Expired embedding generation cleanup failed after publication. Retrieval remains available.",
                 )),
             }
         }
+        Ok(_) => {}
+        Err(_) => warnings.push(embedding_sync_warning(
+            "publication.activation_failed",
+            "Retrieval publication activation failed after BM25 rebuild. The previous publication remains active.",
+        )),
     }
+    let status = store.status()?;
+    let active_generation = store
+        .active_retrieval_publication()?
+        .map(|publication| publication.tantivy_generation)
+        .unwrap_or(status.active_generation);
     progress.line(format_args!(
-        "qgh sync: published BM25 index generation={} sources={}",
+        "qgh sync: active BM25 index generation={} built_generation={} sources={}",
+        active_generation,
         generation,
         sources.len()
     ));
-    let status = store.status()?;
     Ok(IndexRebuildOutcome {
-        generation,
+        generation: active_generation,
         dirty_task_count: status.dirty_task_count,
         warnings,
     })
+}
+
+fn incomplete_snapshot_publication_warning() -> Value {
+    embedding_sync_warning(
+        "publication.incomplete_snapshot_deferred",
+        "Retrieval publication was deferred because the current source sync is incomplete. The previous publication remains active.",
+    )
 }
 
 /// Publishes a source-safe lexical successor after destructive lifecycle
@@ -1105,15 +1130,13 @@ fn rebuild_after_successor_repair(
     progress: &StderrSyncProgress,
     repair: SuccessorRepairOutcome,
 ) -> Result<IndexRebuildOutcome, QghError> {
-    if profile.embedding.is_none() {
-        if let SuccessorRepairOutcome::Repaired { generation, .. } = repair {
-            let status = store.status()?;
-            return Ok(IndexRebuildOutcome {
-                generation,
-                dirty_task_count: status.dirty_task_count,
-                warnings: Vec::new(),
-            });
-        }
+    if let SuccessorRepairOutcome::Repaired { generation, .. } = repair {
+        let status = store.status()?;
+        return Ok(IndexRebuildOutcome {
+            generation,
+            dirty_task_count: status.dirty_task_count,
+            warnings: Vec::new(),
+        });
     }
     rebuild_bm25_index(profile, store, progress)
 }
@@ -1379,9 +1402,13 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
     }
     let dimension = embedding_dimension(&vectors)?;
     let fingerprint = fingerprint_seed.with_dimension(dimension);
-    let source_sync_run_id = store
-        .latest_successful_sync_run_id()?
-        .unwrap_or_else(|| "embedding-sync".to_string());
+    let source_sync_run_id = store.latest_successful_sync_run_id()?.ok_or_else(|| {
+        QghError::new(
+            "embedding.source_snapshot_missing",
+            "Embedding refresh requires a completed remote source snapshot.",
+            6,
+        )
+    })?;
     let model_manifest_hash = fingerprint.hash();
     let context_template_version = "qgh.context.v1".to_string();
     let spec = crate::store::EmbeddingGenerationSpec {
