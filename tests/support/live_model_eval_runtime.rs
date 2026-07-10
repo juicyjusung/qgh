@@ -52,35 +52,84 @@ const FILTER_PROBE_SENTINEL: &str = "bounded-adversarial-filter-sentinel";
 const FILTER_PROBE_PRESET: &str = "arctic-l-v2-fp32";
 const CONTRACT_GATE_BUNDLE_FILE: &str = "contract-gate-bundle.json";
 
-const REQUIRED_CONTRACT_GATES: [(&str, &str); 7] = [
-    (
-        "edit_reconciliation",
-        "cargo test --all-features --test issue_body_tracer sync_issue_refreshes_target_issue_and_reconciles_comment_diff -- --exact",
-    ),
-    (
-        "delete_and_stale_exclusion",
-        "cargo test --all-features --test issue_body_tracer full_reconciliation_tombstones_deleted_comments_and_updates_status -- --exact",
-    ),
-    (
-        "purge_pending_retry",
-        "cargo test --all-features store::tests::purge_retry_finishes_idempotently_and_clears_pending -- --exact",
-    ),
-    (
-        "parent_context_invalidation",
-        "cargo test --all-features embedding::tests::parent_issue_title_change_invalidates_comment_context_hash -- --exact",
-    ),
-    (
-        "concurrent_publication_snapshot",
-        "cargo test --all-features --test issue_body_tracer concurrent_cli_sync_and_mcp_reads_keep_index_queryable -- --exact",
-    ),
-    (
-        "bm25_search_quality",
-        "cargo test --all-features --test search_quality_eval",
-    ),
-    (
-        "hard_filter_exclusion",
-        "cargo test --all-features --test live_model_eval production_hard_filter_contract_excludes_competing_sources -- --exact",
-    ),
+struct ContractGateSpec {
+    name: &'static str,
+    arguments: &'static [&'static str],
+}
+
+const REQUIRED_CONTRACT_GATES: [ContractGateSpec; 7] = [
+    ContractGateSpec {
+        name: "edit_reconciliation",
+        arguments: &[
+            "test",
+            "--all-features",
+            "--test",
+            "issue_body_tracer",
+            "sync_issue_refreshes_target_issue_and_reconciles_comment_diff",
+            "--",
+            "--exact",
+        ],
+    },
+    ContractGateSpec {
+        name: "delete_and_stale_exclusion",
+        arguments: &[
+            "test",
+            "--all-features",
+            "--test",
+            "issue_body_tracer",
+            "full_reconciliation_tombstones_deleted_comments_and_updates_status",
+            "--",
+            "--exact",
+        ],
+    },
+    ContractGateSpec {
+        name: "purge_pending_retry",
+        arguments: &[
+            "test",
+            "--all-features",
+            "store::tests::purge_retry_finishes_idempotently_and_clears_pending",
+            "--",
+            "--exact",
+        ],
+    },
+    ContractGateSpec {
+        name: "parent_context_invalidation",
+        arguments: &[
+            "test",
+            "--all-features",
+            "embedding::tests::parent_issue_title_change_invalidates_comment_context_hash",
+            "--",
+            "--exact",
+        ],
+    },
+    ContractGateSpec {
+        name: "concurrent_publication_snapshot",
+        arguments: &[
+            "test",
+            "--all-features",
+            "--test",
+            "issue_body_tracer",
+            "concurrent_cli_sync_and_mcp_reads_keep_index_queryable",
+            "--",
+            "--exact",
+        ],
+    },
+    ContractGateSpec {
+        name: "bm25_search_quality",
+        arguments: &["test", "--all-features", "--test", "search_quality_eval"],
+    },
+    ContractGateSpec {
+        name: "hard_filter_exclusion",
+        arguments: &[
+            "test",
+            "--all-features",
+            "--test",
+            "live_model_eval",
+            "production_hard_filter_contract_excludes_competing_sources",
+            "--",
+            "--exact",
+        ],
+    },
 ];
 
 type DynError = Box<dyn Error>;
@@ -214,6 +263,7 @@ struct Blocker {
 struct BackfillIntegrityEvidence {
     raw_chunks: usize,
     generation_state: String,
+    generation_output_dimension: usize,
     generation_total_chunks: usize,
     generation_completed_chunks: usize,
     generation_chunk_rows: usize,
@@ -346,11 +396,10 @@ fn load_contract_gate_bundle(
     {
         return Err("canonical live-eval contract gate bundle identity mismatch".into());
     }
-    for (actual, (expected_name, expected_command)) in
-        bundle.gates.iter().zip(REQUIRED_CONTRACT_GATES)
-    {
-        let expected_result_artifact = format!("contract-gates/{expected_name}.json");
-        if actual.name != expected_name
+    for (actual, expected) in bundle.gates.iter().zip(REQUIRED_CONTRACT_GATES) {
+        let expected_command = contract_gate_command(&expected);
+        let expected_result_artifact = format!("contract-gates/{}.json", expected.name);
+        if actual.name != expected.name
             || actual.command != expected_command
             || actual.exit_status != 0
             || actual.result_artifact != expected_result_artifact
@@ -421,61 +470,8 @@ fn is_git_object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn contract_gate_arguments(name: &str) -> Option<&'static [&'static str]> {
-    match name {
-        "edit_reconciliation" => Some(&[
-            "test",
-            "--all-features",
-            "--test",
-            "issue_body_tracer",
-            "sync_issue_refreshes_target_issue_and_reconciles_comment_diff",
-            "--",
-            "--exact",
-        ]),
-        "delete_and_stale_exclusion" => Some(&[
-            "test",
-            "--all-features",
-            "--test",
-            "issue_body_tracer",
-            "full_reconciliation_tombstones_deleted_comments_and_updates_status",
-            "--",
-            "--exact",
-        ]),
-        "purge_pending_retry" => Some(&[
-            "test",
-            "--all-features",
-            "store::tests::purge_retry_finishes_idempotently_and_clears_pending",
-            "--",
-            "--exact",
-        ]),
-        "parent_context_invalidation" => Some(&[
-            "test",
-            "--all-features",
-            "embedding::tests::parent_issue_title_change_invalidates_comment_context_hash",
-            "--",
-            "--exact",
-        ]),
-        "concurrent_publication_snapshot" => Some(&[
-            "test",
-            "--all-features",
-            "--test",
-            "issue_body_tracer",
-            "concurrent_cli_sync_and_mcp_reads_keep_index_queryable",
-            "--",
-            "--exact",
-        ]),
-        "bm25_search_quality" => Some(&["test", "--all-features", "--test", "search_quality_eval"]),
-        "hard_filter_exclusion" => Some(&[
-            "test",
-            "--all-features",
-            "--test",
-            "live_model_eval",
-            "production_hard_filter_contract_excludes_competing_sources",
-            "--",
-            "--exact",
-        ]),
-        _ => None,
-    }
+fn contract_gate_command(spec: &ContractGateSpec) -> String {
+    format!("cargo {}", spec.arguments.join(" "))
 }
 
 fn observed_contract_test_count(stdout: &[u8], stderr: &[u8]) -> usize {
@@ -556,25 +552,24 @@ fn run_contract_gate_bundle(
     }
 
     let mut gates = Vec::with_capacity(REQUIRED_CONTRACT_GATES.len());
-    for (name, command) in REQUIRED_CONTRACT_GATES {
-        let arguments = contract_gate_arguments(name)
-            .ok_or("canonical live-eval contract gate command is unavailable")?;
+    for spec in REQUIRED_CONTRACT_GATES {
+        let command = contract_gate_command(&spec);
         let output = Command::new("cargo")
-            .args(arguments)
+            .args(spec.arguments)
             .current_dir(repo_root)
             .output()
             .map_err(|_| "canonical live-eval contract gate could not be executed")?;
         let observed_test_count = observed_contract_test_count(&output.stdout, &output.stderr);
         if !output.status.success() || output.status.code() != Some(0) || observed_test_count != 1 {
-            return Err(format!("canonical live-eval contract gate failed: {name}").into());
+            return Err(format!("canonical live-eval contract gate failed: {}", spec.name).into());
         }
-        let result_artifact = format!("contract-gates/{name}.json");
+        let result_artifact = format!("contract-gates/{}.json", spec.name);
         let result = ContractGateResult {
             schema_version: "qgh.live_model_eval_gate_result.v1".to_string(),
-            name: name.to_string(),
+            name: spec.name.to_string(),
             git_sha: git_sha.to_string(),
             binary_sha256: binary_sha256.to_string(),
-            command: command.to_string(),
+            command: command.clone(),
             exit_status: 0,
             observed_test_count,
             command_output_sha256: command_output_sha256(&output),
@@ -583,8 +578,8 @@ fn run_contract_gate_bundle(
         let result_bytes = with_newline(serde_json::to_vec_pretty(&result)?);
         write_atomic(&root.join(&result_artifact), &result_bytes)?;
         gates.push(ContractGateRecord {
-            name: name.to_string(),
-            command: command.to_string(),
+            name: spec.name.to_string(),
+            command,
             exit_status: 0,
             result_artifact,
             result_sha256: format!("{:x}", Sha256::digest(&result_bytes)),
@@ -616,14 +611,15 @@ pub(super) fn contract_gate_bundle_json_for_test(
     binary_sha256: &str,
 ) -> Result<Value, DynError> {
     let mut gates = Vec::new();
-    for (name, command) in REQUIRED_CONTRACT_GATES {
-        let result_artifact = format!("contract-gates/{name}.json");
+    for spec in REQUIRED_CONTRACT_GATES {
+        let command = contract_gate_command(&spec);
+        let result_artifact = format!("contract-gates/{}.json", spec.name);
         let result = ContractGateResult {
             schema_version: "qgh.live_model_eval_gate_result.v1".to_string(),
-            name: name.to_string(),
+            name: spec.name.to_string(),
             git_sha: git_sha.to_string(),
             binary_sha256: binary_sha256.to_string(),
-            command: command.to_string(),
+            command: command.clone(),
             exit_status: 0,
             observed_test_count: 1,
             command_output_sha256: "e".repeat(64),
@@ -636,8 +632,8 @@ pub(super) fn contract_gate_bundle_json_for_test(
         }
         fs::write(&path, &result_bytes)?;
         gates.push(ContractGateRecord {
-            name: name.to_string(),
-            command: command.to_string(),
+            name: spec.name.to_string(),
+            command,
             exit_status: 0,
             result_artifact,
             result_sha256: format!("{:x}", Sha256::digest(&result_bytes)),
@@ -3319,10 +3315,12 @@ fn verify_backfill_integrity(
         publication_embedding_generation_id,
         publication_active,
         generation_state,
+        generation_output_dimension,
         generation_total_chunks,
         generation_completed_chunks,
-    ): (i64, bool, String, usize, usize) = connection.query_row(
-        "SELECT eg.id, rp.active, eg.state, eg.total_chunks, eg.completed_chunks
+    ): (i64, bool, String, usize, usize, usize) = connection.query_row(
+        "SELECT eg.id, rp.active, eg.state, eg.output_dimension,
+                eg.total_chunks, eg.completed_chunks
          FROM retrieval_publication_pointer p
          JOIN retrieval_publications rp ON rp.publication_id = p.publication_id
          JOIN embedding_generations eg ON eg.id = rp.embedding_generation_id
@@ -3335,6 +3333,7 @@ fn verify_backfill_integrity(
                 row.get(2)?,
                 row.get(3)?,
                 row.get(4)?,
+                row.get(5)?,
             ))
         },
     )?;
@@ -3363,13 +3362,10 @@ fn verify_backfill_integrity(
         [publication_embedding_generation_id],
         |row| row.get(0),
     )?;
-    if !vector_table
-        .strip_prefix("embedding_generation_vectors_d")
-        .is_some_and(|suffix| {
-            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-        })
-    {
-        return Err("50k backfill vector table identity is invalid".into());
+    let expected_vector_table =
+        format!("embedding_generation_vectors_d{generation_output_dimension}");
+    if vector_table != expected_vector_table {
+        return Err("50k backfill vector table does not match the generation dimension".into());
     }
     let vec0_rows: usize = connection.query_row(
         &format!(
@@ -3383,6 +3379,7 @@ fn verify_backfill_integrity(
     let evidence = BackfillIntegrityEvidence {
         raw_chunks,
         generation_state,
+        generation_output_dimension,
         generation_total_chunks,
         generation_completed_chunks,
         generation_chunk_rows,

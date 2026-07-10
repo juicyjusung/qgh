@@ -576,7 +576,8 @@ fn backfill_success_requires_complete_generation_mapping_vec0_and_publication_co
         .execute_batch(
             "CREATE TABLE chunks(id INTEGER PRIMARY KEY);
              CREATE TABLE embedding_generations(
-               id INTEGER PRIMARY KEY, state TEXT, total_chunks INTEGER, completed_chunks INTEGER
+               id INTEGER PRIMARY KEY, state TEXT, output_dimension INTEGER,
+               total_chunks INTEGER, completed_chunks INTEGER
              );
              CREATE TABLE embedding_generation_chunks(generation_id INTEGER, chunk_id INTEGER);
              CREATE TABLE embedding_generation_vector_rows(
@@ -588,7 +589,7 @@ fn backfill_success_requires_complete_generation_mapping_vec0_and_publication_co
              );
              CREATE TABLE retrieval_publication_pointer(id INTEGER PRIMARY KEY, publication_id INTEGER);
              INSERT INTO chunks VALUES (1), (2);
-             INSERT INTO embedding_generations VALUES (7, 'active', 2, 2);
+             INSERT INTO embedding_generations VALUES (7, 'active', 4, 2, 2);
              INSERT INTO embedding_generation_chunks VALUES (7, 1), (7, 2);
              INSERT INTO embedding_generation_vector_rows
                VALUES (7, 'embedding_generation_vectors_d4', 1),
@@ -602,6 +603,8 @@ fn backfill_success_requires_complete_generation_mapping_vec0_and_publication_co
     let evidence = live_model_eval_runtime::backfill_integrity_for_test(&path, 2)
         .expect("complete publication");
     assert_eq!(evidence["generation_total_chunks"], 2);
+    assert_eq!(evidence["generation_output_dimension"], 4);
+    assert_eq!(evidence["vector_table"], "embedding_generation_vectors_d4");
     assert_eq!(evidence["vector_mapping_rows"], 2);
     assert_eq!(evidence["vec0_rows"], 2);
     let connection = rusqlite::Connection::open(&path).unwrap();
@@ -618,10 +621,9 @@ fn backfill_success_requires_complete_generation_mapping_vec0_and_publication_co
         .execute_batch(
             "INSERT INTO embedding_generation_vectors_d4 VALUES (2);
              CREATE TABLE embedding_generation_vectors_d8(rowid INTEGER PRIMARY KEY);
-             INSERT INTO embedding_generation_vectors_d8 VALUES (2);
+             INSERT INTO embedding_generation_vectors_d8 VALUES (1), (2);
              UPDATE embedding_generation_vector_rows
-             SET vector_table = 'embedding_generation_vectors_d8'
-             WHERE vector_rowid = 2;",
+             SET vector_table = 'embedding_generation_vectors_d8';",
         )
         .unwrap();
     drop(connection);
@@ -918,6 +920,24 @@ fn canonical_gate_bundle_is_strict_and_bound_to_git_binary_and_file_hash() {
             "concurrent_publication_snapshot",
             "bm25_search_quality",
             "hard_filter_exclusion",
+        ]
+    );
+    let commands = bundle["gates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|gate| gate["command"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        commands,
+        [
+            "cargo test --all-features --test issue_body_tracer sync_issue_refreshes_target_issue_and_reconciles_comment_diff -- --exact",
+            "cargo test --all-features --test issue_body_tracer full_reconciliation_tombstones_deleted_comments_and_updates_status -- --exact",
+            "cargo test --all-features store::tests::purge_retry_finishes_idempotently_and_clears_pending -- --exact",
+            "cargo test --all-features embedding::tests::parent_issue_title_change_invalidates_comment_context_hash -- --exact",
+            "cargo test --all-features --test issue_body_tracer concurrent_cli_sync_and_mcp_reads_keep_index_queryable -- --exact",
+            "cargo test --all-features --test search_quality_eval",
+            "cargo test --all-features --test live_model_eval production_hard_filter_contract_excludes_competing_sources -- --exact",
         ]
     );
     let path = root.join("contract-gate-bundle.json");
