@@ -982,8 +982,16 @@ fn lexical_heldout_blockers(
     candidate: &LexicalSelectionSignals,
 ) -> Vec<String> {
     let mut blockers = Vec::new();
-    if candidate.weighted_ndcg_at_10 < baseline.weighted_ndcg_at_10 {
-        blockers.push("heldout_weighted_ndcg_regression".to_string());
+    match candidate
+        .weighted_ndcg_at_10
+        .partial_cmp(&baseline.weighted_ndcg_at_10)
+    {
+        Some(Ordering::Less) => blockers.push("heldout_weighted_ndcg_regression".to_string()),
+        Some(Ordering::Equal) => {
+            blockers.push("heldout_weighted_ndcg_not_strictly_improved".to_string());
+        }
+        Some(Ordering::Greater) => {}
+        None => blockers.push("heldout_weighted_ndcg_invalid".to_string()),
     }
     if candidate.exact_top_1 < baseline.exact_top_1 || candidate.exact_top_1 < 0.95 {
         blockers.push("exact_identifier_regression".to_string());
@@ -1218,6 +1226,89 @@ struct FullReport {
     promotion_blockers: Vec<String>,
     host_protocol_failures: Vec<String>,
     contract_gate_bundle: VerifiedContractGateBundle,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GlobalEvaluationDecision {
+    promotion_eligible: bool,
+    evaluation_state: String,
+    promotion_blockers: Vec<String>,
+}
+
+struct LexicalGlobalSignal<'a> {
+    frozen_dev_selection: FrozenLexicalProfileName,
+    effective_profile: FrozenLexicalProfileName,
+    promotion_eligible: bool,
+    blockers: &'a [String],
+}
+
+fn finalize_global_evaluation(
+    candidate_promotion_eligible: bool,
+    mut promotion_blockers: Vec<String>,
+    lexical: LexicalGlobalSignal<'_>,
+) -> GlobalEvaluationDecision {
+    let production_profile = production_frozen_lexical_profile();
+    if lexical.frozen_dev_selection != production_profile {
+        if lexical.promotion_eligible && lexical.effective_profile != production_profile {
+            promotion_blockers.push("lexical_profile_promotion_required".to_string());
+        } else if !lexical.promotion_eligible && lexical.effective_profile == production_profile {
+            promotion_blockers.push("lexical_profile_heldout_rejected".to_string());
+            promotion_blockers.extend(lexical.blockers.iter().cloned());
+            promotion_blockers.push("fresh_production_v1_model_evaluation_required".to_string());
+        }
+    }
+    let promotion_eligible = candidate_promotion_eligible && promotion_blockers.is_empty();
+    if !promotion_eligible && promotion_blockers.is_empty() {
+        promotion_blockers.push("no_passing_candidate".to_string());
+    }
+    let evaluation_state = if promotion_eligible {
+        "promotion_eligible"
+    } else if promotion_blockers
+        .iter()
+        .any(|blocker| blocker == "fresh_production_v1_model_evaluation_required")
+    {
+        "blocked_fresh_production_v1_model_evaluation_required"
+    } else if promotion_blockers
+        .iter()
+        .any(|blocker| blocker == "lexical_profile_promotion_required")
+    {
+        "blocked_lexical_profile_promotion_required"
+    } else {
+        "completed_not_eligible"
+    }
+    .to_string();
+    GlobalEvaluationDecision {
+        promotion_eligible,
+        evaluation_state,
+        promotion_blockers,
+    }
+}
+
+pub(super) fn global_evaluation_for_test(
+    candidate_promotion_eligible: bool,
+    _context_blocked_candidate_exists: bool,
+    frozen_dev_selection: &str,
+    effective_profile: &str,
+    lexical_promotion_eligible: bool,
+    lexical_blockers: &[&str],
+) -> Value {
+    let lexical_blockers = lexical_blockers
+        .iter()
+        .map(|blocker| (*blocker).to_string())
+        .collect::<Vec<_>>();
+    serde_json::to_value(finalize_global_evaluation(
+        candidate_promotion_eligible,
+        Vec::new(),
+        LexicalGlobalSignal {
+            frozen_dev_selection: FrozenLexicalProfileName::parse(frozen_dev_selection)
+                .expect("test frozen profile is valid"),
+            effective_profile: FrozenLexicalProfileName::parse(effective_profile)
+                .expect("test effective profile is valid"),
+            promotion_eligible: lexical_promotion_eligible,
+            blockers: &lexical_blockers,
+        },
+    ))
+    .expect("global evaluation decision serializes")
 }
 
 #[derive(Debug, Serialize)]
@@ -2912,42 +3003,29 @@ pub(super) fn run(
 
     let selected_light_candidate = select_candidate(&candidates, true);
     let selected_quality_candidate = select_candidate(&candidates, false);
-    let promotion_eligible =
+    let candidate_promotion_eligible =
         selected_light_candidate.is_some() || selected_quality_candidate.is_some();
-    let context_blocked = candidates.iter().any(|candidate| {
-        candidate
-            .context_contract
-            .as_ref()
-            .is_some_and(|evidence| !evidence.passed)
-    });
-    let lexical_profile_promotion_required =
-        model_candidate_requires_lexical_promotion(frozen_lexical_profile.selected_profile);
     let mut promotion_blockers = host_protocol_failures.clone();
     if !judgment_pool_verified {
         promotion_blockers.push("pooled_judgment_coverage_required".to_string());
     }
-    if context_blocked {
-        promotion_blockers.push("context_contract_failed".to_string());
-    }
-    if lexical_profile_promotion_required {
-        promotion_blockers.push("lexical_profile_promotion_required".to_string());
-    }
     if !redaction.passed {
         promotion_blockers.push("raw_query_or_body_logged".to_string());
     }
-    if !promotion_eligible && promotion_blockers.is_empty() {
-        promotion_blockers.push("no_passing_candidate".to_string());
-    }
-    let evaluation_state = if promotion_eligible {
-        "promotion_eligible"
-    } else if lexical_profile_promotion_required {
-        "blocked_lexical_profile_promotion_required"
-    } else if context_blocked {
-        "blocked_context_contract"
-    } else {
-        "completed_not_eligible"
-    }
-    .to_string();
+    let GlobalEvaluationDecision {
+        promotion_eligible,
+        evaluation_state,
+        promotion_blockers,
+    } = finalize_global_evaluation(
+        candidate_promotion_eligible,
+        promotion_blockers,
+        LexicalGlobalSignal {
+            frozen_dev_selection: lexical_profile_heldout.frozen_dev_selection,
+            effective_profile: lexical_profile_heldout.effective_profile,
+            promotion_eligible: lexical_profile_heldout.promotion_eligible,
+            blockers: &lexical_profile_heldout.blockers,
+        },
+    );
     frozen_guard.revalidate_before_final_report(root, &binary)?;
     let mut report = FullReport {
         schema_version: "qgh.live_model_eval_report.v1",

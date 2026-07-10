@@ -799,7 +799,7 @@ fn heldout_confirmation_allows_the_frozen_metadata_selection_only_when_clean() {
         "quality_gate_failures": [],
     });
     let metadata_boost_v1 = json!({
-        "weighted_ndcg_at_10": 0.50,
+        "weighted_ndcg_at_10": 0.51,
         "exact_top_1": 1.0,
         "hard_filter_violations": 0,
         "get_round_trip": 1.0,
@@ -823,6 +823,82 @@ fn heldout_confirmation_allows_the_frozen_metadata_selection_only_when_clean() {
             "effective_profile": "metadata_boost_v1",
             "promotion_eligible": true,
             "blockers": [],
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn heldout_confirmation_rejects_equal_weighted_ndcg_as_not_strictly_improved() {
+    let metrics = json!({
+        "weighted_ndcg_at_10": 0.50,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.50, 0.50, 0.50, 0.50],
+        "quality_gate_failures": [],
+    });
+
+    assert_eq!(
+        live_model_eval_runtime::lexical_profile_heldout_confirmation_for_test(
+            "frozen-config-sha256",
+            "dev-report-sha256",
+            "metadata_boost_v1",
+            metrics.clone(),
+            metrics,
+        ),
+        json!({
+            "frozen_config_sha256": "frozen-config-sha256",
+            "dev_report_sha256": "dev-report-sha256",
+            "frozen_dev_selection": "metadata_boost_v1",
+            "effective_profile": "production_v1",
+            "promotion_eligible": false,
+            "blockers": ["heldout_weighted_ndcg_not_strictly_improved"],
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn global_state_uses_heldout_v1_fallback_instead_of_the_rejected_dev_selection() {
+    assert_eq!(
+        live_model_eval_runtime::global_evaluation_for_test(
+            false,
+            false,
+            "metadata_boost_v1",
+            "production_v1",
+            false,
+            &["heldout_weighted_ndcg_not_strictly_improved"],
+        ),
+        json!({
+            "promotion_eligible": false,
+            "evaluation_state": "blocked_fresh_production_v1_model_evaluation_required",
+            "promotion_blockers": [
+                "lexical_profile_heldout_rejected",
+                "heldout_weighted_ndcg_not_strictly_improved",
+                "fresh_production_v1_model_evaluation_required",
+            ],
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn context_failure_is_candidate_local_when_another_candidate_is_eligible() {
+    assert_eq!(
+        live_model_eval_runtime::global_evaluation_for_test(
+            true,
+            true,
+            "production_v1",
+            "production_v1",
+            false,
+            &["dev_selection_is_production_v1"],
+        ),
+        json!({
+            "promotion_eligible": true,
+            "evaluation_state": "promotion_eligible",
+            "promotion_blockers": [],
         })
     );
 }
