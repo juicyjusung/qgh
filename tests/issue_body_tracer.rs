@@ -1,7 +1,9 @@
 use chrono::{Duration, SecondsFormat, Utc};
+#[cfg(feature = "vector-search")]
+use qgh::embedding::LOCAL_MODEL_REVISION;
 use qgh::embedding::{
     EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_HF_MODEL_REVISION,
-    DEFAULT_QUERY_PREFIX, LOCAL_MODEL_REVISION,
+    DEFAULT_QUERY_PREFIX,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -10,6 +12,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(feature = "vector-search")]
+use std::os::raw::{c_char, c_int};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -2377,6 +2381,120 @@ fn status_embedding_coverage_reports_fingerprint_mismatch() {
         status_json["data"]["embedding"]["fingerprint"]["matches_config"],
         false
     );
+}
+
+#[cfg(feature = "vector-search")]
+#[test]
+fn corrupt_embedding_fingerprint_degrades_status_and_query_without_breaking_get() {
+    let fixture = TestFixture::new("embedding-corrupt-fingerprint");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let source_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    fixture.write_default_embedding_config(&server.base_url);
+    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
+    let chunk_id = fixture.insert_chunk_for_source(source_id, "corrupt fingerprint chunk");
+    fixture.insert_matching_active_embedding_fingerprint();
+    fixture.insert_embedding_metadata_for_chunk(chunk_id);
+    fixture.corrupt_active_embedding_fingerprint_json();
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["embedding"]["state"], "corrupt");
+    assert_eq!(
+        warning_codes(&status_json),
+        vec!["embedding.artifact_corrupt"]
+    );
+    assert_eq!(
+        json_object_keys(&status_json["warnings"][0]),
+        BTreeSet::from([
+            "code".to_string(),
+            "message".to_string(),
+            "severity".to_string(),
+        ])
+    );
+
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    assert_eq!(query_json["data"]["results"][0]["ranking"]["kind"], "bm25");
+    assert_eq!(
+        warning_codes(&query_json),
+        vec!["embedding.artifact_corrupt"]
+    );
+    assert_eq!(
+        json_object_keys(&query_json["warnings"][0]),
+        BTreeSet::from([
+            "code".to_string(),
+            "message".to_string(),
+            "severity".to_string(),
+        ])
+    );
+
+    let get = fixture.qgh(["get", source_id, "--json"]);
+    assert_success(&get);
+    assert_eq!(stdout_json(&get)["data"]["source"]["source_id"], source_id);
+}
+
+#[cfg(feature = "vector-search")]
+#[test]
+fn unreadable_vector_table_degrades_status_and_query_without_breaking_get() {
+    for (scenario, create_mismatched_table) in [("missing", false), ("mismatched", true)] {
+        let fixture = TestFixture::new(&format!("embedding-vector-table-{scenario}"));
+        let server = FakeGitHub::start(issue_payload_with_pr());
+        fixture.write_config(&server.base_url);
+        assert_success(&fixture.qgh(["sync", "--json"]));
+
+        let source_id = "qgh://github.com/issue/I_kwDOISSUE1";
+        fixture.write_default_embedding_config(&server.base_url);
+        assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
+        let chunk_id = fixture.insert_chunk_for_source(source_id, "vector readiness chunk");
+        fixture.insert_matching_active_embedding_fingerprint();
+        fixture.insert_embedding_metadata_for_chunk(chunk_id);
+        if create_mismatched_table {
+            fixture.create_mismatched_vector_table();
+        }
+
+        let status = fixture.qgh(["status", "--json"]);
+        assert_success(&status);
+        let status_json = stdout_json(&status);
+        assert_eq!(
+            status_json["data"]["embedding"]["state"], "corrupt",
+            "scenario={scenario}: {status_json}"
+        );
+        assert_eq!(
+            warning_codes(&status_json),
+            vec!["embedding.artifact_corrupt"],
+            "scenario={scenario}: {status_json}"
+        );
+        assert_eq!(
+            json_object_keys(&status_json["warnings"][0]),
+            BTreeSet::from([
+                "code".to_string(),
+                "message".to_string(),
+                "severity".to_string(),
+            ])
+        );
+
+        let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+        assert_success(&query);
+        let query_json = stdout_json(&query);
+        assert_eq!(
+            query_json["data"]["results"][0]["ranking"]["kind"], "bm25",
+            "scenario={scenario}: {query_json}"
+        );
+        assert_eq!(
+            warning_codes(&query_json),
+            vec!["embedding.artifact_corrupt"],
+            "scenario={scenario}: {query_json}"
+        );
+
+        let get = fixture.qgh(["get", source_id, "--json"]);
+        assert_success(&get);
+        assert_eq!(stdout_json(&get)["data"]["source"]["source_id"], source_id);
+    }
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -6523,9 +6641,51 @@ limit = 10
         );
     }
 
-    fn insert_embedding_for_chunk(&self, chunk_id: i64) {
+    fn corrupt_active_embedding_fingerprint_json(&self) {
         let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
         let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE embedding_fingerprints
+             SET fingerprint_json = '{not-json'
+             WHERE active = 1",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn create_mismatched_vector_table(&self) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE chunk_embedding_vectors (embedding \"float[2]\")",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "vector-search")]
+    fn insert_embedding_for_chunk(&self, chunk_id: i64) {
+        self.insert_embedding_record_for_chunk(chunk_id, true);
+    }
+
+    #[cfg(feature = "vector-search")]
+    fn insert_embedding_metadata_for_chunk(&self, chunk_id: i64) {
+        self.insert_embedding_record_for_chunk(chunk_id, false);
+    }
+
+    #[cfg(feature = "vector-search")]
+    fn insert_embedding_record_for_chunk(&self, chunk_id: i64, include_vector: bool) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        if include_vector {
+            register_test_sqlite_vec(&conn);
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_embedding_vectors
+                 USING vec0(embedding float[3])",
+                [],
+            )
+            .unwrap();
+        }
         let fingerprint_id: i64 = conn
             .query_row(
                 "SELECT id FROM embedding_fingerprints WHERE active = 1",
@@ -6540,6 +6700,17 @@ limit = 10
             (chunk_id, fingerprint_id),
         )
         .unwrap();
+        if include_vector {
+            let vector_blob = [0.1_f32, 0.2, 0.3]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>();
+            conn.execute(
+                "INSERT INTO chunk_embedding_vectors(rowid, embedding) VALUES (?1, ?2)",
+                rusqlite::params![chunk_id, vector_blob],
+            )
+            .unwrap();
+        }
     }
 
     fn insert_active_embedding_fingerprint_with_revision(
@@ -6738,6 +6909,23 @@ limit = 10
         )
         .unwrap();
     }
+}
+
+#[cfg(feature = "vector-search")]
+fn register_test_sqlite_vec(conn: &rusqlite::Connection) {
+    type SqliteVecEntryPoint = unsafe extern "C" fn(
+        db: *mut rusqlite::ffi::sqlite3,
+        pz_err_msg: *mut *mut c_char,
+        p_api: *const rusqlite::ffi::sqlite3_api_routines,
+    ) -> c_int;
+
+    let entry_point = unsafe {
+        std::mem::transmute::<unsafe extern "C" fn(), SqliteVecEntryPoint>(
+            sqlite_vec::sqlite3_vec_init,
+        )
+    };
+    let rc = unsafe { entry_point(conn.handle(), std::ptr::null_mut(), std::ptr::null()) };
+    assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
 }
 
 impl Drop for TestFixture {

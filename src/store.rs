@@ -19,6 +19,8 @@ use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
 
 const CHUNK_EMBEDDING_VECTORS_TABLE: &str = "chunk_embedding_vectors";
+const CHUNK_EMBEDDING_VECTOR_ROWIDS_TABLE: &str = "chunk_embedding_vectors_rowids";
+const CHUNK_EMBEDDING_VECTOR_CHUNKS_TABLE: &str = "chunk_embedding_vectors_vector_chunks00";
 
 pub struct Store {
     conn: Connection,
@@ -946,6 +948,53 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(QghError::from)
+    }
+
+    pub fn vector_index_ready_for_fingerprint(
+        &self,
+        fingerprint: &EmbeddingFingerprint,
+        expected_rows: i64,
+    ) -> Result<bool, QghError> {
+        if expected_rows == 0 {
+            return Ok(true);
+        }
+        if vector_table_dimension(&self.conn)? != Some(fingerprint.dimension) {
+            return Ok(false);
+        }
+        if !table_exists(&self.conn, CHUNK_EMBEDDING_VECTOR_ROWIDS_TABLE)?
+            || !table_exists(&self.conn, CHUNK_EMBEDDING_VECTOR_CHUNKS_TABLE)?
+        {
+            return Ok(false);
+        }
+
+        let fingerprint_hash = fingerprint.hash();
+        let indexed_rows = self.conn.query_row(
+            &format!(
+                "SELECT count(*)
+                 FROM chunk_embeddings ce
+                 JOIN embedding_fingerprints ef ON ef.id = ce.fingerprint_id
+                 JOIN chunks c ON c.id = ce.chunk_id
+                 JOIN source_entities se ON se.source_id = c.source_id
+                 LEFT JOIN issue_metadata im ON im.source_id = c.source_id
+                 LEFT JOIN comment_metadata cm ON cm.source_id = c.source_id
+                 JOIN {CHUNK_EMBEDDING_VECTOR_ROWIDS_TABLE} vr ON vr.rowid = ce.chunk_id
+                 WHERE ef.fingerprint_hash = ?1
+                   AND se.lifecycle_state = 'active'
+                   AND c.source_version_id = coalesce(im.latest_version_id, cm.latest_version_id)"
+            ),
+            params![fingerprint_hash],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if indexed_rows != expected_rows {
+            return Ok(false);
+        }
+
+        let vector_chunks = self.conn.query_row(
+            &format!("SELECT count(*) FROM {CHUNK_EMBEDDING_VECTOR_CHUNKS_TABLE}"),
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(vector_chunks > 0)
     }
 
     pub fn ensure_vector_storage_for_fingerprint(

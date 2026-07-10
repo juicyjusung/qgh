@@ -1038,7 +1038,13 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         status_embedding["properties"]["state"]["enum"],
-        json!(["missing", "partial", "complete", "fingerprint_mismatch"])
+        json!([
+            "missing",
+            "partial",
+            "complete",
+            "fingerprint_mismatch",
+            "corrupt"
+        ])
     );
     assert_eq!(
         status_embedding["properties"]["coverage"]["$ref"],

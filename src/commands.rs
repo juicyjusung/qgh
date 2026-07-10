@@ -2619,6 +2619,7 @@ fn hybrid_vector_hits(
 struct EmbeddingCoverageState {
     active_fingerprint: Option<EmbeddingFingerprint>,
     active_matches_config: bool,
+    artifact_corrupt: bool,
     total_chunks: i64,
     completed_chunks: i64,
     missing_chunks: i64,
@@ -2627,6 +2628,9 @@ struct EmbeddingCoverageState {
 
 impl EmbeddingCoverageState {
     fn state(&self) -> &'static str {
+        if self.artifact_corrupt {
+            return "corrupt";
+        }
         match (
             &self.active_fingerprint,
             self.active_matches_config,
@@ -2640,7 +2644,8 @@ impl EmbeddingCoverageState {
     }
 
     fn hybrid_ready(&self) -> bool {
-        self.active_fingerprint.is_some()
+        !self.artifact_corrupt
+            && self.active_fingerprint.is_some()
             && self.active_matches_config
             && self.total_chunks > 0
             && self.missing_chunks == 0
@@ -2655,16 +2660,45 @@ fn embedding_coverage_state(
         return Ok(None);
     };
     let expectation = embedding_fingerprint_expectation(embedding);
-    let total_chunks = store.active_embedding_chunk_count()?;
-    let active_fingerprint = store.active_embedding_fingerprint()?;
+    let total_chunks = match store.active_embedding_chunk_count() {
+        Ok(total_chunks) => total_chunks,
+        Err(_) => return Ok(Some(corrupt_embedding_coverage(None, false, 0))),
+    };
+    let active_fingerprint = match store.active_embedding_fingerprint() {
+        Ok(active_fingerprint) => active_fingerprint,
+        Err(_) => return Ok(Some(corrupt_embedding_coverage(None, false, total_chunks))),
+    };
     let active_matches_config = active_fingerprint
         .as_ref()
         .is_some_and(|fingerprint| fingerprint.matches_expectation(&expectation));
-    let active_embedding_count = active_fingerprint
-        .as_ref()
-        .map(|fingerprint| store.current_chunk_embedding_count_for_fingerprint(fingerprint))
-        .transpose()?
-        .unwrap_or(0);
+    let active_embedding_count = match active_fingerprint.as_ref() {
+        Some(fingerprint) => match store.current_chunk_embedding_count_for_fingerprint(fingerprint)
+        {
+            Ok(count) => count,
+            Err(_) => {
+                return Ok(Some(corrupt_embedding_coverage(
+                    active_fingerprint,
+                    active_matches_config,
+                    total_chunks,
+                )));
+            }
+        },
+        None => 0,
+    };
+    if let Some(fingerprint) = active_fingerprint.as_ref() {
+        if active_embedding_count > 0
+            && !matches!(
+                store.vector_index_ready_for_fingerprint(fingerprint, active_embedding_count),
+                Ok(true)
+            )
+        {
+            return Ok(Some(corrupt_embedding_coverage(
+                active_fingerprint,
+                active_matches_config,
+                total_chunks,
+            )));
+        }
+    }
     let completed_chunks = if active_matches_config {
         active_embedding_count
     } else {
@@ -2680,11 +2714,28 @@ fn embedding_coverage_state(
     Ok(Some(EmbeddingCoverageState {
         active_fingerprint,
         active_matches_config,
+        artifact_corrupt: false,
         total_chunks,
         completed_chunks,
         missing_chunks,
         mismatched_chunks,
     }))
+}
+
+fn corrupt_embedding_coverage(
+    active_fingerprint: Option<EmbeddingFingerprint>,
+    active_matches_config: bool,
+    total_chunks: i64,
+) -> EmbeddingCoverageState {
+    EmbeddingCoverageState {
+        active_fingerprint,
+        active_matches_config,
+        artifact_corrupt: true,
+        total_chunks,
+        completed_chunks: 0,
+        missing_chunks: total_chunks,
+        mismatched_chunks: 0,
+    }
 }
 
 fn embedding_warning(code: &'static str, message: &'static str) -> Value {
@@ -2852,6 +2903,10 @@ fn embedding_warnings(profile: &Profile, store: &Store) -> Result<Vec<Value>, Qg
             "severity": "warn_strong",
             "message": "Stored embeddings were created with a different embedding fingerprint and will not be used for vector search. BM25 results are still returned."
         })]),
+        "corrupt" => Ok(vec![embedding_warning(
+            "embedding.artifact_corrupt",
+            "Stored embedding artifacts are corrupt or incomplete. Hybrid retrieval is disabled and BM25 results are still returned.",
+        )]),
         "complete" => Ok(Vec::new()),
         _ => unreachable!("embedding coverage state is closed"),
     }
