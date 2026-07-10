@@ -244,6 +244,8 @@ pub struct Store {
     index_build_tokens: BTreeMap<i64, String>,
     #[cfg(test)]
     purge_failure_stage: Option<PurgeFailureStage>,
+    #[cfg(test)]
+    purge_queue_failure_after_first: bool,
 }
 
 impl Store {
@@ -317,6 +319,8 @@ impl Store {
             index_build_tokens: BTreeMap::new(),
             #[cfg(test)]
             purge_failure_stage: None,
+            #[cfg(test)]
+            purge_queue_failure_after_first: false,
         };
         store.migrate()?;
         store.enforce_pending_purge_guards()?;
@@ -340,8 +344,8 @@ impl Store {
         target: PurgeTarget,
         trigger: PurgeTrigger,
     ) -> Result<PurgeOutcome, QghError> {
-        validate_purge_target(&target)?;
-        if self.purge_is_noop(&target)? {
+        let queued = self.queue_purges(&[(target.clone(), trigger)])?;
+        if queued == 0 {
             return Ok(PurgeOutcome {
                 target,
                 purged_sources: 0,
@@ -350,8 +354,235 @@ impl Store {
                 sensitive_wal_truncated: false,
             });
         }
-        self.content_write_epoch = self.mark_purge_pending(&target, trigger)?;
         self.finish_pending_purge(target, trigger)
+    }
+
+    /// Atomically persists a batch of remotely confirmed lifecycle triggers as
+    /// pending before any destructive purge stage begins. All actionable
+    /// targets share one write-epoch bump and one publication invalidation.
+    /// Identical duplicates are collapsed; conflicting triggers for the same
+    /// target fail before mutation. The returned count excludes completed true
+    /// no-ops.
+    pub fn queue_purges(
+        &mut self,
+        requests: &[(PurgeTarget, PurgeTrigger)],
+    ) -> Result<usize, QghError> {
+        let mut deduplicated = BTreeMap::new();
+        for (target, trigger) in requests {
+            validate_purge_target(target)?;
+            let (kind, value) = target.kind_and_value();
+            let key = (kind.to_string(), value);
+            if let Some((_, existing_trigger)) = deduplicated.get(&key) {
+                if existing_trigger != trigger {
+                    return Err(conflicting_purge_trigger_error(
+                        target.kind(),
+                        *existing_trigger,
+                        *trigger,
+                    ));
+                }
+                continue;
+            }
+            deduplicated.insert(key, (target.clone(), *trigger));
+        }
+        if deduplicated.is_empty() {
+            return Ok(0);
+        }
+
+        #[cfg(test)]
+        let fail_after_first = std::mem::take(&mut self.purge_queue_failure_after_first);
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|_| purge_error())?;
+        let result = (|| -> Result<(usize, i64), QghError> {
+            let mut actionable = Vec::new();
+            for ((kind, value), (target, trigger)) in deduplicated {
+                if self.purge_is_noop(&target).map_err(|_| purge_error())? {
+                    continue;
+                }
+                let pending_trigger = self
+                    .conn
+                    .query_row(
+                        "SELECT trigger FROM purge_requests
+                         WHERE target_kind = ?1 AND target_value = ?2
+                           AND purge_pending = 1",
+                        params![kind, value],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|_| purge_error())?;
+                if let Some(pending_trigger) = pending_trigger {
+                    if pending_trigger != trigger.as_str() {
+                        let existing = PurgeTrigger::from_stored(&pending_trigger)
+                            .map_err(|_| purge_error())?;
+                        return Err(conflicting_purge_trigger_error(
+                            target.kind(),
+                            existing,
+                            trigger,
+                        ));
+                    }
+                }
+                actionable.push((kind, value, target, trigger));
+            }
+            if actionable.is_empty() {
+                return Ok((0, read_content_write_epoch(&self.conn)?));
+            }
+
+            self.conn
+                .execute(
+                    "UPDATE profile_meta
+                     SET value = CAST(value AS INTEGER) + 1
+                     WHERE key = 'content_write_epoch'",
+                    [],
+                )
+                .map_err(|_| purge_error())?;
+            let content_write_epoch =
+                read_content_write_epoch(&self.conn).map_err(|_| purge_error())?;
+            mark_successor_repair_required(&self.conn, content_write_epoch)
+                .map_err(|_| purge_error())?;
+            let now = now_rfc3339();
+            for (kind, value, target, trigger) in &actionable {
+                self.conn
+                    .execute(
+                        "INSERT INTO purge_requests
+                            (target_kind, target_value, trigger, purge_pending,
+                             current_stage, failure_stage, completion_ready, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, 1, 'secure_delete', NULL, 0, ?4, ?4)
+                         ON CONFLICT(target_kind, target_value) DO UPDATE SET
+                            trigger = excluded.trigger,
+                            purge_pending = 1,
+                            current_stage = 'secure_delete',
+                            failure_stage = NULL,
+                            completion_ready = 0,
+                            updated_at = excluded.updated_at",
+                        params![kind, value, trigger.as_str(), now],
+                    )
+                    .map_err(|_| purge_error())?;
+                capture_purge_target_sources(&self.conn, target, kind, value)
+                    .map_err(|_| purge_error())?;
+                #[cfg(test)]
+                if fail_after_first {
+                    return Err(purge_error());
+                }
+            }
+            self.conn
+                .execute(
+                    "UPDATE source_entities SET lifecycle_state = 'purge_pending'
+                     WHERE lifecycle_state = 'active'
+                       AND EXISTS (
+                           SELECT 1
+                           FROM purge_target_sources pts
+                           JOIN purge_requests pr
+                             ON pr.target_kind = pts.target_kind
+                            AND pr.target_value = pts.target_value
+                           WHERE pr.purge_pending = 1
+                             AND pts.source_id = source_entities.source_id
+                       )",
+                    [],
+                )
+                .map_err(|_| purge_error())?;
+            self.conn
+                .execute(
+                    "UPDATE source_versions SET lifecycle_state = 'purge_pending'
+                     WHERE lifecycle_state = 'active'
+                       AND source_id IN (
+                           SELECT source_id FROM source_entities
+                           WHERE lifecycle_state = 'purge_pending'
+                       )",
+                    [],
+                )
+                .map_err(|_| purge_error())?;
+            invalidate_publications_for_pending_purge(&self.conn).map_err(|_| purge_error())?;
+            Ok((actionable.len(), content_write_epoch))
+        })();
+
+        match result {
+            Ok((queued, content_write_epoch)) => {
+                if self.conn.execute_batch("COMMIT").is_err() {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(purge_error());
+                }
+                self.content_write_epoch = content_write_epoch;
+                Ok(queued)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                if error.code == "purge.conflicting_triggers" {
+                    Err(error)
+                } else {
+                    Err(purge_error())
+                }
+            }
+        }
+    }
+
+    /// Returns whether a lifecycle purge invalidated the published lexical
+    /// snapshot and still requires a successfully activated successor. This is
+    /// durable and intentionally independent from both purge-pending state and
+    /// the presence of active sources.
+    pub fn successor_repair_required(&self) -> Result<bool, QghError> {
+        read_successor_repair_required(&self.conn)
+    }
+
+    /// Persists a content-free successful sync-run identity for the current
+    /// post-purge write epoch. Callers must publish the successor using the
+    /// returned identity; an older remote sync run is not authoritative for the
+    /// post-purge source snapshot. Repeated calls in the same epoch are
+    /// idempotent. Fresh profiles and already repaired profiles return `None`.
+    pub fn record_purge_successor_snapshot(&mut self) -> Result<Option<String>, QghError> {
+        let expected_epoch = self.content_write_epoch;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !read_successor_repair_required(&tx)? {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let pending_count: i64 = tx.query_row(
+            "SELECT count(*) FROM purge_requests WHERE purge_pending = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if pending_count != 0 {
+            return Err(QghError::new(
+                "purge.successor_snapshot_pending",
+                "A successor snapshot cannot be recorded until every pending purge completes.",
+                6,
+            ));
+        }
+        let current_epoch = read_content_write_epoch(&tx)?;
+        if current_epoch != expected_epoch {
+            return Err(write_fence_error());
+        }
+        let existing = tx
+            .query_row(
+                "SELECT id FROM sync_runs
+                 WHERE snapshot_kind = 'purge_successor'
+                   AND content_write_epoch = ?1
+                   AND completed_successfully = 1
+                 ORDER BY rowid DESC LIMIT 1",
+                params![current_epoch],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(sync_run_id) = existing {
+            tx.commit()?;
+            return Ok(Some(sync_run_id));
+        }
+
+        let sync_run_id = format!("sync-purge-successor-{}", now_run_id_suffix());
+        let now = now_rfc3339();
+        tx.execute(
+            "INSERT INTO sync_runs
+                (id, started_at, completed_at, completed_successfully,
+                 fetched_issue_count, upserted_issue_count,
+                 fetched_comment_count, upserted_comment_count,
+                 skipped_pull_request_count, snapshot_kind, content_write_epoch)
+             VALUES (?1, ?2, ?2, 1, 0, 0, 0, 0, 0, 'purge_successor', ?3)",
+            params![sync_run_id, now, current_epoch],
+        )?;
+        tx.commit()?;
+        Ok(Some(sync_run_id))
     }
 
     fn purge_is_noop(&self, target: &PurgeTarget) -> Result<bool, QghError> {
@@ -700,6 +931,11 @@ impl Store {
         self.purge_failure_stage = Some(stage);
     }
 
+    #[cfg(test)]
+    fn fail_next_purge_queue_after_first(&mut self) {
+        self.purge_queue_failure_after_first = true;
+    }
+
     fn should_fail_purge_stage(&mut self, stage: PurgeFailureStage) -> bool {
         #[cfg(test)]
         {
@@ -711,89 +947,6 @@ impl Store {
         #[cfg(not(test))]
         let _ = stage;
         false
-    }
-
-    fn mark_purge_pending(
-        &mut self,
-        target: &PurgeTarget,
-        trigger: PurgeTrigger,
-    ) -> Result<i64, QghError> {
-        let (kind, value) = target.kind_and_value();
-        let now = now_rfc3339();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "UPDATE profile_meta
-             SET value = CAST(value AS INTEGER) + 1
-             WHERE key = 'content_write_epoch'",
-            [],
-        )?;
-        let content_write_epoch = read_content_write_epoch(&tx)?;
-        tx.execute(
-            "INSERT INTO purge_requests
-                (target_kind, target_value, trigger, purge_pending,
-                 current_stage, failure_stage, completion_ready, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 1, 'secure_delete', NULL, 0, ?4, ?4)
-             ON CONFLICT(target_kind, target_value) DO UPDATE SET
-                trigger = excluded.trigger,
-                purge_pending = 1,
-                current_stage = 'secure_delete',
-                failure_stage = NULL,
-                completion_ready = 0,
-                updated_at = excluded.updated_at",
-            params![kind, value, trigger.as_str(), now],
-        )?;
-        match target {
-            PurgeTarget::Source { .. } => {
-                tx.execute(
-                    "INSERT OR IGNORE INTO purge_target_sources
-                        (target_kind, target_value, source_id)
-                     SELECT ?1, ?2, source_id FROM source_entities WHERE source_id = ?2",
-                    params![kind, value],
-                )?;
-            }
-            PurgeTarget::Issue { repo, issue_number } => {
-                for table in ["issue_metadata", "comment_metadata"] {
-                    tx.execute(
-                        &format!(
-                            "INSERT OR IGNORE INTO purge_target_sources
-                                (target_kind, target_value, source_id)
-                             SELECT ?1, ?2, source_id FROM {table}
-                             WHERE repo = ?3 AND issue_number = ?4"
-                        ),
-                        params![kind, value, repo, issue_number],
-                    )?;
-                }
-            }
-            PurgeTarget::Repository { repo } => {
-                tx.execute(
-                    "INSERT OR IGNORE INTO purge_target_sources
-                        (target_kind, target_value, source_id)
-                     SELECT ?1, ?2, source_id FROM source_entities WHERE repo = ?3",
-                    params![kind, value, repo],
-                )?;
-            }
-        }
-        tx.execute(
-            "UPDATE source_entities SET lifecycle_state = 'purge_pending'
-             WHERE source_id IN (
-                 SELECT source_id FROM purge_target_sources
-                 WHERE target_kind = ?1 AND target_value = ?2
-             ) AND lifecycle_state = 'active'",
-            params![kind, value],
-        )?;
-        tx.execute(
-            "UPDATE source_versions SET lifecycle_state = 'purge_pending'
-             WHERE source_id IN (
-                 SELECT source_id FROM purge_target_sources
-                 WHERE target_kind = ?1 AND target_value = ?2
-             ) AND lifecycle_state = 'active'",
-            params![kind, value],
-        )?;
-        invalidate_publications_for_pending_purge(&tx)?;
-        tx.commit()?;
-        Ok(content_write_epoch)
     }
 
     fn enforce_pending_purge_guards(&mut self) -> Result<(), QghError> {
@@ -1766,10 +1919,6 @@ impl Store {
     ) -> Result<TargetedSyncSummary, QghError> {
         let existing_comments =
             self.active_comment_versions_for_issue(&issue.repo, issue.number)?;
-        let incoming_source_ids = comments
-            .iter()
-            .map(|comment| comment.source_id.clone())
-            .collect::<BTreeSet<_>>();
         let added_comments = comments
             .iter()
             .filter(|comment| !existing_comments.contains_key(&comment.source_id))
@@ -1782,18 +1931,8 @@ impl Store {
                     .is_some_and(|body_hash| body_hash != &comment.body_hash)
             })
             .count();
-        let deleted_source_ids = existing_comments
-            .keys()
-            .filter(|source_id| !incoming_source_ids.contains(*source_id))
-            .cloned()
-            .collect::<Vec<_>>();
 
         let summary = self.upsert_sources(std::slice::from_ref(issue), comments, 0, &[])?;
-        let mut deleted_comments = 0;
-        for source_id in deleted_source_ids {
-            self.tombstone_source(&source_id, "deleted")?;
-            deleted_comments += 1;
-        }
 
         Ok(TargetedSyncSummary {
             sync_run_id: summary.sync_run_id,
@@ -1803,9 +1942,9 @@ impl Store {
             upserted_comments: comments.len(),
             added_comments,
             updated_comments,
-            deleted_comments,
+            deleted_comments: 0,
             tombstoned_issues: 0,
-            tombstoned_comments: deleted_comments,
+            tombstoned_comments: 0,
         })
     }
 
@@ -3100,11 +3239,31 @@ impl Store {
     /// visible while its purge is pending and disappears atomically with purge
     /// completion, so callers can safely drive retry/backfill decisions.
     pub fn known_repositories(&self) -> Result<Vec<String>, QghError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT repo FROM repositories ORDER BY repo")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
+        let mut repositories = BTreeSet::new();
+        for query in [
+            "SELECT repo FROM repositories",
+            "SELECT DISTINCT repo FROM source_entities WHERE lifecycle_state != 'tombstoned'",
+            "SELECT repo FROM repository_sync_state",
+        ] {
+            let mut stmt = self.conn.prepare(query)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            repositories.extend(
+                rows.into_iter()
+                    .filter(|repo| valid_repository_identity(repo)),
+            );
+        }
+        let mut cursor_stmt = self.conn.prepare("SELECT endpoint FROM sync_cursors")?;
+        let cursor_endpoints = cursor_stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for endpoint in cursor_endpoints {
+            if let Some(repo) = repository_from_cursor_endpoint(&endpoint) {
+                repositories.insert(repo.to_string());
+            }
+        }
+        Ok(repositories.into_iter().collect())
     }
 
     pub fn cursor_views(&self) -> Result<Vec<CursorView>, QghError> {
@@ -3204,6 +3363,11 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Err(error) = ensure_content_write_allowed(&tx, expected_epoch) {
+            drop(tx);
+            self.cleanup_owned_index_generation(generation)?;
+            return Err(error);
+        }
+        if let Err(error) = validate_tantivy_generation_artifact(&expected_path, source_count) {
             drop(tx);
             self.cleanup_owned_index_generation(generation)?;
             return Err(error);
@@ -3318,6 +3482,7 @@ impl Store {
                 "SELECT completed_at
                  FROM sync_runs
                  WHERE completed_successfully = 1
+                   AND snapshot_kind = 'remote_sync'
                  ORDER BY completed_at DESC
                  LIMIT 1",
                 [],
@@ -3459,6 +3624,7 @@ impl Store {
                 "SELECT completed_at
                  FROM sync_runs
                  WHERE completed_successfully = 1
+                   AND snapshot_kind = 'remote_sync'
                  ORDER BY completed_at DESC
                  LIMIT 1",
                 [],
@@ -3532,6 +3698,7 @@ impl Store {
             .query_row(
                 "SELECT id FROM sync_runs
                  WHERE completed_successfully = 1
+                   AND snapshot_kind = 'remote_sync'
                  ORDER BY completed_at DESC, id DESC LIMIT 1",
                 [],
                 |row| row.get(0),
@@ -3543,7 +3710,9 @@ impl Store {
     pub fn latest_sync_run_id(&self) -> Result<Option<String>, QghError> {
         self.conn
             .query_row(
-                "SELECT id FROM sync_runs ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                "SELECT id FROM sync_runs
+                 WHERE snapshot_kind = 'remote_sync'
+                 ORDER BY started_at DESC, rowid DESC LIMIT 1",
                 [],
                 |row| row.get(0),
             )
@@ -4035,7 +4204,11 @@ impl Store {
         embedding_generation_id: Option<i64>,
         expected_publication_id: Option<i64>,
     ) -> Result<i64, QghError> {
+        self.validate_index_root_confinement()?;
         let expected_epoch = self.content_write_epoch;
+        let expected_generation_path = self
+            .index_root
+            .join(format!("generation-{tantivy_generation}"));
         let owner_token = self.index_build_tokens.get(&tantivy_generation).cloned();
         let tx = self
             .conn
@@ -4102,12 +4275,20 @@ impl Store {
         }
         let index_state = tx
             .query_row(
-                "SELECT write_epoch, active FROM index_generations WHERE generation = ?1",
+                "SELECT write_epoch, active, path, source_count
+                 FROM index_generations WHERE generation = ?1",
                 params![tantivy_generation],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((index_epoch, index_active)) = index_state else {
+        let Some((index_epoch, index_active, index_path, source_count)) = index_state else {
             drop(tx);
             self.cleanup_owned_index_generation(tantivy_generation)?;
             return Err(QghError::validation(
@@ -4119,6 +4300,18 @@ impl Store {
             drop(tx);
             self.cleanup_owned_index_generation(tantivy_generation)?;
             return Err(write_fence_error());
+        }
+        let artifact_ready = Path::new(&index_path) == expected_generation_path
+            && usize::try_from(source_count)
+                .ok()
+                .is_some_and(|source_count| {
+                    validate_tantivy_generation_artifact(&expected_generation_path, source_count)
+                        .is_ok()
+                });
+        if !artifact_ready {
+            drop(tx);
+            self.cleanup_owned_index_generation(tantivy_generation)?;
+            return Err(tantivy_artifact_not_ready_error());
         }
         let lease_matches = if let Some(owner_token) = owner_token.as_deref() {
             tx.query_row(
@@ -4136,6 +4329,28 @@ impl Store {
             drop(tx);
             self.cleanup_owned_index_generation(tantivy_generation)?;
             return Err(write_fence_error());
+        }
+        let successor_repair_required = read_successor_repair_required(&tx)?;
+        if successor_repair_required {
+            let authoritative_snapshot = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sync_runs
+                     WHERE id = ?1
+                       AND completed_successfully = 1
+                       AND snapshot_kind = 'purge_successor'
+                       AND content_write_epoch = ?2
+                 )",
+                params![source_snapshot_sync_run_id, expected_epoch],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !authoritative_snapshot {
+                drop(tx);
+                self.cleanup_owned_index_generation(tantivy_generation)?;
+                return Err(QghError::validation(
+                    "publication.successor_snapshot_required",
+                    "A post-purge publication requires the persisted successor snapshot for the current write epoch.",
+                ));
+            }
         }
         let now = now_rfc3339();
         let (manifest, chunker, context, dimension) = embedding_metadata
@@ -4211,6 +4426,9 @@ impl Store {
                  WHERE generation = ?1 AND owner_token = ?2",
                 params![tantivy_generation, owner_token],
             )?;
+        }
+        if successor_repair_required {
+            clear_successor_repair_required(&tx)?;
         }
         tx.commit()?;
         self.index_build_tokens.remove(&tantivy_generation);
@@ -4635,7 +4853,9 @@ impl Store {
                 upserted_issue_count INTEGER NOT NULL,
                 fetched_comment_count INTEGER NOT NULL DEFAULT 0,
                 upserted_comment_count INTEGER NOT NULL DEFAULT 0,
-                skipped_pull_request_count INTEGER NOT NULL
+                skipped_pull_request_count INTEGER NOT NULL,
+                snapshot_kind TEXT NOT NULL DEFAULT 'remote_sync',
+                content_write_epoch INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS sync_cursors (
@@ -4901,6 +5121,13 @@ impl Store {
         )?;
         ensure_column(
             &self.conn,
+            "sync_runs",
+            "snapshot_kind",
+            "TEXT NOT NULL DEFAULT 'remote_sync'",
+        )?;
+        ensure_column(&self.conn, "sync_runs", "content_write_epoch", "INTEGER")?;
+        ensure_column(
+            &self.conn,
             "index_generations",
             "write_epoch",
             "INTEGER NOT NULL DEFAULT 0",
@@ -4931,11 +5158,40 @@ impl Store {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         self.conn.execute(
+            "INSERT INTO profile_meta (key, value)
+             SELECT 'successor_repair_required',
+                    CASE
+                        WHEN EXISTS(
+                            SELECT 1 FROM purge_requests WHERE purge_pending = 1
+                        ) OR (
+                            EXISTS(
+                                SELECT 1 FROM purge_requests
+                                WHERE purge_pending = 0 AND completion_ready = 1
+                            ) AND NOT EXISTS(
+                                SELECT 1 FROM retrieval_publication_pointer WHERE id = 1
+                            )
+                        ) THEN '1'
+                        ELSE '0'
+                    END
+             ON CONFLICT(key) DO NOTHING",
+            [],
+        )?;
+        if read_successor_repair_required(&self.conn)? {
+            let epoch = read_content_write_epoch(&self.conn)?;
+            mark_successor_repair_required(&self.conn, epoch)?;
+        }
+        self.conn.execute(
             "INSERT OR IGNORE INTO repository_sync_state (repo, last_successful_sync_at)
-             SELECT DISTINCT repo, (SELECT max(completed_at) FROM sync_runs)
+             SELECT DISTINCT repo, (
+                 SELECT max(completed_at) FROM sync_runs
+                 WHERE snapshot_kind = 'remote_sync'
+             )
              FROM source_entities
              WHERE lifecycle_state = 'active'
-               AND (SELECT max(completed_at) FROM sync_runs) IS NOT NULL",
+               AND (
+                   SELECT max(completed_at) FROM sync_runs
+                   WHERE snapshot_kind = 'remote_sync'
+               ) IS NOT NULL",
             [],
         )?;
         // Remap legacy lifecycle/reconcile tombstone reasons to the unified
@@ -5048,6 +5304,10 @@ impl Store {
                     [],
                 )
                 .map_err(|_| purge_error())?;
+            let content_write_epoch =
+                read_content_write_epoch(&self.conn).map_err(|_| purge_error())?;
+            mark_successor_repair_required(&self.conn, content_write_epoch)
+                .map_err(|_| purge_error())?;
             invalidate_publications_for_pending_purge(&self.conn).map_err(|_| purge_error())?;
         }
         Ok(inserted)
@@ -5061,6 +5321,62 @@ impl Drop for Store {
             let _ = self.cleanup_owned_index_generation(generation);
         }
     }
+}
+
+fn capture_purge_target_sources(
+    conn: &Connection,
+    target: &PurgeTarget,
+    kind: &str,
+    value: &str,
+) -> Result<(), QghError> {
+    match target {
+        PurgeTarget::Source { .. } => {
+            conn.execute(
+                "INSERT OR IGNORE INTO purge_target_sources
+                    (target_kind, target_value, source_id)
+                 SELECT ?1, ?2, source_id FROM source_entities WHERE source_id = ?2",
+                params![kind, value],
+            )?;
+        }
+        PurgeTarget::Issue { repo, issue_number } => {
+            for table in ["issue_metadata", "comment_metadata"] {
+                conn.execute(
+                    &format!(
+                        "INSERT OR IGNORE INTO purge_target_sources
+                            (target_kind, target_value, source_id)
+                         SELECT ?1, ?2, source_id FROM {table}
+                         WHERE repo = ?3 AND issue_number = ?4"
+                    ),
+                    params![kind, value, repo, issue_number],
+                )?;
+            }
+        }
+        PurgeTarget::Repository { repo } => {
+            conn.execute(
+                "INSERT OR IGNORE INTO purge_target_sources
+                    (target_kind, target_value, source_id)
+                 SELECT ?1, ?2, source_id FROM source_entities WHERE repo = ?3",
+                params![kind, value, repo],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn conflicting_purge_trigger_error(
+    target_kind: &str,
+    existing: PurgeTrigger,
+    conflicting: PurgeTrigger,
+) -> QghError {
+    QghError::validation(
+        "purge.conflicting_triggers",
+        "A purge target cannot be queued with conflicting confirmed triggers.",
+    )
+    .with_details(serde_json::json!({
+        "target_kind": target_kind,
+        "existing_trigger": existing.as_str(),
+        "conflicting_trigger": conflicting.as_str()
+    }))
 }
 
 fn validate_purge_target(target: &PurgeTarget) -> Result<(), QghError> {
@@ -5122,6 +5438,46 @@ fn valid_repository_identity(repo: &str) -> bool {
             && !repo.chars().any(char::is_whitespace)
             && !repo.chars().any(char::is_control)
     })
+}
+
+fn repository_from_cursor_endpoint(endpoint: &str) -> Option<&str> {
+    for prefix in ["issues:", "history:", "repo-comments:"] {
+        if let Some(repo) = endpoint.strip_prefix(prefix) {
+            return valid_repository_identity(repo).then_some(repo);
+        }
+    }
+    let target = endpoint.strip_prefix("comments:")?;
+    let (repo, issue_number) = target.rsplit_once('#')?;
+    let issue_number = issue_number.parse::<i64>().ok()?;
+    (issue_number > 0 && valid_repository_identity(repo)).then_some(repo)
+}
+
+fn validate_tantivy_generation_artifact(
+    generation_path: &Path,
+    expected_source_count: usize,
+) -> Result<(), QghError> {
+    let metadata =
+        fs::symlink_metadata(generation_path).map_err(|_| tantivy_artifact_not_ready_error())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(tantivy_artifact_not_ready_error());
+    }
+    let index = tantivy::Index::open_in_dir(generation_path)
+        .map_err(|_| tantivy_artifact_not_ready_error())?;
+    let reader = index
+        .reader()
+        .map_err(|_| tantivy_artifact_not_ready_error())?;
+    let observed_source_count = reader.searcher().num_docs() as usize;
+    if observed_source_count != expected_source_count {
+        return Err(tantivy_artifact_not_ready_error());
+    }
+    Ok(())
+}
+
+fn tantivy_artifact_not_ready_error() -> QghError {
+    QghError::validation(
+        "publication.tantivy_artifact_not_ready",
+        "The reserved Tantivy generation is missing or does not match its persisted source count.",
+    )
 }
 
 fn purge_error() -> QghError {
@@ -5587,6 +5943,60 @@ fn read_content_write_epoch(conn: &Connection) -> Result<i64, QghError> {
     .map_err(QghError::from)
 }
 
+fn read_successor_repair_required(conn: &Connection) -> Result<bool, QghError> {
+    let value = conn
+        .query_row(
+            "SELECT value FROM profile_meta WHERE key = 'successor_repair_required'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    match value.as_deref() {
+        Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        _ => Err(QghError::new(
+            "purge.successor_repair_state_invalid",
+            "The durable successor repair state is missing or invalid.",
+            6,
+        )),
+    }
+}
+
+fn mark_successor_repair_required(
+    conn: &Connection,
+    content_write_epoch: i64,
+) -> Result<(), QghError> {
+    for (key, value) in [
+        ("successor_repair_required", "1".to_string()),
+        (
+            "successor_repair_requested_epoch",
+            content_write_epoch.to_string(),
+        ),
+        ("successor_repair_reason", "purge".to_string()),
+    ] {
+        conn.execute(
+            "INSERT INTO profile_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+    }
+    Ok(())
+}
+
+fn clear_successor_repair_required(conn: &Connection) -> Result<(), QghError> {
+    conn.execute(
+        "UPDATE profile_meta SET value = '0'
+         WHERE key = 'successor_repair_required'",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM profile_meta
+         WHERE key IN ('successor_repair_requested_epoch', 'successor_repair_reason')",
+        [],
+    )?;
+    Ok(())
+}
+
 fn ensure_content_write_allowed(conn: &Connection, expected_epoch: i64) -> Result<(), QghError> {
     let current_epoch = read_content_write_epoch(conn)?;
     let pending_count: i64 = conn.query_row(
@@ -5828,6 +6238,803 @@ mod tests {
         assert_eq!(PurgeFailureStage::WalCheckpoint.as_str(), "wal_checkpoint");
     }
 
+    #[test]
+    fn fresh_empty_profile_does_not_require_successor_repair_and_migrates_missing_marker() {
+        let paths = temp_profile_paths("successor-repair-fresh-empty");
+        let mut store = Store::open(&paths).unwrap();
+        assert!(!store.successor_repair_required().unwrap());
+        assert!(store.record_purge_successor_snapshot().unwrap().is_none());
+        assert!(store.latest_successful_sync_run_id().unwrap().is_none());
+        store
+            .conn
+            .execute(
+                "DELETE FROM profile_meta WHERE key = 'successor_repair_required'",
+                [],
+            )
+            .unwrap();
+        drop(store);
+
+        let mut reopened = Store::open(&paths).unwrap();
+        assert!(!reopened.successor_repair_required().unwrap());
+        assert!(reopened
+            .record_purge_successor_snapshot()
+            .unwrap()
+            .is_none());
+        assert!(reopened.latest_successful_sync_run_id().unwrap().is_none());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn empty_purge_requires_durable_successor_until_successful_activation() {
+        let paths = temp_profile_paths("successor-repair-empty-purge");
+        let mut store = Store::open(&paths).unwrap();
+        let target = PurgeTarget::Repository {
+            repo: "owner/empty".to_string(),
+        };
+
+        store
+            .purge(target.clone(), PurgeTrigger::AllowlistRemoval)
+            .unwrap();
+        assert!(store.successor_repair_required().unwrap());
+        drop(store);
+
+        let mut reopened = Store::open(&paths).unwrap();
+        assert!(reopened.successor_repair_required().unwrap());
+        let snapshot = reopened
+            .record_purge_successor_snapshot()
+            .unwrap()
+            .expect("post-purge snapshot");
+        assert_eq!(
+            reopened.record_purge_successor_snapshot().unwrap(),
+            Some(snapshot.clone())
+        );
+        let persisted: (String, i64, i64) = reopened
+            .conn
+            .query_row(
+                "SELECT snapshot_kind, content_write_epoch, completed_successfully
+                 FROM sync_runs WHERE id = ?1",
+                params![snapshot],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted.0, "purge_successor");
+        assert_eq!(persisted.1, reopened.content_write_epoch);
+        assert_eq!(persisted.2, 1);
+
+        let (reserved_only, _) = reopened
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        let error = reopened
+            .activate_retrieval_publication(&snapshot, reserved_only, None, None)
+            .unwrap_err();
+        assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
+        assert!(reopened.successor_repair_required().unwrap());
+
+        let (deleted_generation, _) = reopened
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        let deleted_path =
+            crate::index::rebuild(&paths.index_root, deleted_generation, &[]).unwrap();
+        fs::remove_dir_all(deleted_path).unwrap();
+        let error = reopened
+            .activate_retrieval_publication(&snapshot, deleted_generation, None, None)
+            .unwrap_err();
+        assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
+        assert!(reopened.successor_repair_required().unwrap());
+
+        let (generation, _) = reopened
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, generation, &[]).unwrap();
+        reopened
+            .activate_retrieval_publication(&snapshot, generation, None, None)
+            .unwrap();
+        assert!(!reopened.successor_repair_required().unwrap());
+
+        assert_eq!(
+            reopened
+                .queue_purges(&[(target, PurgeTrigger::AllowlistRemoval)])
+                .unwrap(),
+            0
+        );
+        assert!(!reopened.successor_repair_required().unwrap());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_successor_rejects_pending_old_and_stale_epoch_snapshots() {
+        let paths = temp_profile_paths("successor-repair-snapshot-fences");
+        let mut store = Store::open(&paths).unwrap();
+        let old_sync_run_id = "sync-old-remote";
+        store
+            .upsert_sources_for_run(old_sync_run_id, &[], &[], 0, &[])
+            .unwrap();
+        store.mark_sync_run_completed(old_sync_run_id).unwrap();
+        let first_target = PurgeTarget::Repository {
+            repo: "owner/first-empty".to_string(),
+        };
+        store
+            .queue_purges(&[(first_target, PurgeTrigger::AllowlistRemoval)])
+            .unwrap();
+
+        let pending = store.record_purge_successor_snapshot().unwrap_err();
+        assert_eq!(pending.code, "purge.successor_snapshot_pending");
+        store.retry_pending_purges().unwrap();
+        let first_snapshot = store
+            .record_purge_successor_snapshot()
+            .unwrap()
+            .expect("first lifecycle snapshot");
+        assert_ne!(first_snapshot, old_sync_run_id);
+
+        let (old_generation, _) = store
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, old_generation, &[]).unwrap();
+        let old_error = store
+            .activate_retrieval_publication(old_sync_run_id, old_generation, None, None)
+            .unwrap_err();
+        assert_eq!(old_error.code, "publication.successor_snapshot_required");
+        assert!(store.successor_repair_required().unwrap());
+
+        store
+            .purge(
+                PurgeTarget::Repository {
+                    repo: "owner/second-empty".to_string(),
+                },
+                PurgeTrigger::AllowlistRemoval,
+            )
+            .unwrap();
+        let (stale_generation, _) = store
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, stale_generation, &[]).unwrap();
+        let stale_error = store
+            .activate_retrieval_publication(&first_snapshot, stale_generation, None, None)
+            .unwrap_err();
+        assert_eq!(stale_error.code, "publication.successor_snapshot_required");
+        assert!(store.successor_repair_required().unwrap());
+
+        let current_snapshot = store
+            .record_purge_successor_snapshot()
+            .unwrap()
+            .expect("current lifecycle snapshot");
+        assert_ne!(current_snapshot, first_snapshot);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_successor_snapshot_does_not_advance_remote_freshness() {
+        let paths = temp_profile_paths("successor-repair-remote-freshness");
+        let mut store = Store::open(&paths).unwrap();
+        let remote_sync_run_id = "sync-remote-freshness";
+        let repo = "owner/retained";
+        let cursor = CursorUpdate {
+            endpoint: format!("issues:{repo}"),
+            cursor: Some("cursor-safe".to_string()),
+            etag: None,
+            not_modified: false,
+        };
+        store
+            .upsert_sources_for_run(
+                remote_sync_run_id,
+                &[test_issue(
+                    "qgh://github.com/issue/I_REMOTE_FRESHNESS",
+                    repo,
+                    "retained",
+                )],
+                &[],
+                0,
+                &[cursor],
+            )
+            .unwrap();
+        store.mark_sync_run_completed(remote_sync_run_id).unwrap();
+        let remote_completed_at = "2026-01-01T00:00:00Z".to_string();
+        store
+            .conn
+            .execute(
+                "UPDATE sync_runs SET started_at = ?1, completed_at = ?1 WHERE id = ?2",
+                params![remote_completed_at, remote_sync_run_id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE repository_sync_state SET last_successful_sync_at = ?1
+                 WHERE repo = ?2",
+                params![remote_completed_at, repo],
+            )
+            .unwrap();
+
+        store
+            .purge(
+                PurgeTarget::Repository {
+                    repo: "owner/empty".to_string(),
+                },
+                PurgeTrigger::AllowlistRemoval,
+            )
+            .unwrap();
+        let successor = store
+            .record_purge_successor_snapshot()
+            .unwrap()
+            .expect("lifecycle snapshot");
+
+        assert_ne!(successor, remote_sync_run_id);
+        assert_eq!(
+            store.latest_successful_sync_run_id().unwrap().as_deref(),
+            Some(remote_sync_run_id)
+        );
+        assert_eq!(
+            store.latest_sync_run_id().unwrap().as_deref(),
+            Some(remote_sync_run_id)
+        );
+        assert_eq!(
+            store.status().unwrap().last_sync_at,
+            Some(remote_completed_at.clone())
+        );
+        assert_eq!(
+            store
+                .oldest_successful_sync_at_for_repos(&[repo.to_string()])
+                .unwrap(),
+            Some(remote_completed_at.clone())
+        );
+        let backoff = store
+            .record_backoff_state("rate_limit", repo, 60, None)
+            .unwrap();
+        assert_eq!(
+            backoff.last_successful_sync,
+            Some(remote_completed_at.clone())
+        );
+        let repo_sync_at: String = store
+            .conn
+            .query_row(
+                "SELECT last_successful_sync_at FROM repository_sync_state WHERE repo = ?1",
+                params![repo],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repo_sync_at, remote_completed_at);
+
+        store
+            .conn
+            .execute(
+                "DELETE FROM repository_sync_state WHERE repo = ?1",
+                params![repo],
+            )
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(&paths).unwrap();
+        let migrated_repo_sync_at: String = reopened
+            .conn
+            .query_row(
+                "SELECT last_successful_sync_at FROM repository_sync_state WHERE repo = ?1",
+                params![repo],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_repo_sync_at, remote_completed_at);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_queue_marks_every_target_pending_atomically_before_finish() {
+        let paths = temp_profile_paths("purge-queue-atomic-batch");
+        let mut store = Store::open(&paths).unwrap();
+        let first_id = "qgh://github.com/issue/I_QUEUE_ATOMIC_FIRST";
+        let second_id = "qgh://github.com/issue/I_QUEUE_ATOMIC_SECOND";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-queue-atomic",
+                &[
+                    test_issue(first_id, "owner/first", "queue-first-sensitive"),
+                    test_issue(second_id, "owner/second", "queue-second-sensitive"),
+                ],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 2)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication("sync-purge-queue-atomic", generation, None, None)
+            .unwrap();
+        let epoch_before = read_content_write_epoch(&store.conn).unwrap();
+
+        let queued = store
+            .queue_purges(&[
+                (
+                    PurgeTarget::Source {
+                        source_id: first_id.to_string(),
+                    },
+                    PurgeTrigger::ConfirmedDelete,
+                ),
+                (
+                    PurgeTarget::Repository {
+                        repo: "owner/second".to_string(),
+                    },
+                    PurgeTrigger::PermissionLoss,
+                ),
+            ])
+            .unwrap();
+
+        assert_eq!(queued, 2);
+        assert!(store.successor_repair_required().unwrap());
+        assert_eq!(
+            read_content_write_epoch(&store.conn).unwrap(),
+            epoch_before + 1
+        );
+        assert_eq!(store.pending_purges().unwrap().len(), 2);
+        assert!(store.active_retrieval_publication().unwrap().is_none());
+        for source_id in [first_id, second_id] {
+            let state: String = store
+                .conn
+                .query_row(
+                    "SELECT lifecycle_state FROM source_entities WHERE source_id = ?1",
+                    params![source_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "purge_pending");
+            let body_count: i64 = store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM issue_metadata WHERE source_id = ?1",
+                    params![source_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(body_count, 1, "queue must not destroy content");
+        }
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_queue_keeps_global_read_fence_after_partial_finish_failure() {
+        let paths = temp_profile_paths("purge-queue-partial-finish");
+        let mut store = Store::open(&paths).unwrap();
+        let first_id = "qgh://github.com/issue/I_QUEUE_PARTIAL_FIRST";
+        let second_id = "qgh://github.com/issue/I_QUEUE_PARTIAL_SECOND";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-queue-partial",
+                &[
+                    test_issue(first_id, "owner/first", "partial-first"),
+                    test_issue(second_id, "owner/second", "partial-second"),
+                ],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let first = PurgeTarget::Source {
+            source_id: first_id.to_string(),
+        };
+        let second = PurgeTarget::Source {
+            source_id: second_id.to_string(),
+        };
+        store
+            .queue_purges(&[
+                (first.clone(), PurgeTrigger::ConfirmedDelete),
+                (second.clone(), PurgeTrigger::ConfirmedDelete),
+            ])
+            .unwrap();
+
+        store
+            .finish_pending_purge(first, PurgeTrigger::ConfirmedDelete)
+            .unwrap();
+        store.fail_next_purge_at(PurgeFailureStage::Storage);
+        store
+            .finish_pending_purge(second.clone(), PurgeTrigger::ConfirmedDelete)
+            .unwrap_err();
+
+        assert_eq!(store.pending_purges().unwrap().len(), 1);
+        assert_eq!(store.pending_purges().unwrap()[0].target, second);
+        let error = store.begin_read_snapshot().unwrap_err();
+        assert_eq!(error.code, "purge.read_fenced");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_queue_transaction_failure_rolls_back_every_target_content_free() {
+        let paths = temp_profile_paths("purge-queue-rollback");
+        let mut store = Store::open(&paths).unwrap();
+        let first_id = "qgh://github.com/issue/I_QUEUE_ROLLBACK_FIRST";
+        let second_id = "qgh://github.com/issue/I_QUEUE_ROLLBACK_SECOND";
+        let sensitive_marker = "SENSITIVE_QUEUE_ROLLBACK_MARKER";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-queue-rollback",
+                &[
+                    test_issue(first_id, "owner/first", sensitive_marker),
+                    test_issue(second_id, "owner/second", sensitive_marker),
+                ],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 2)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        let publication = store
+            .activate_retrieval_publication("sync-purge-queue-rollback", generation, None, None)
+            .unwrap();
+        let epoch_before = read_content_write_epoch(&store.conn).unwrap();
+        store.fail_next_purge_queue_after_first();
+
+        let error = store
+            .queue_purges(&[
+                (
+                    PurgeTarget::Source {
+                        source_id: first_id.to_string(),
+                    },
+                    PurgeTrigger::ConfirmedDelete,
+                ),
+                (
+                    PurgeTarget::Source {
+                        source_id: second_id.to_string(),
+                    },
+                    PurgeTrigger::ConfirmedDelete,
+                ),
+            ])
+            .unwrap_err();
+
+        assert_eq!(error.code, "purge.failed");
+        let rendered = serde_json::to_string(&error).unwrap();
+        assert!(!rendered.contains(sensitive_marker));
+        assert!(!rendered.contains(first_id));
+        assert!(!rendered.contains(second_id));
+        assert!(store.pending_purges().unwrap().is_empty());
+        assert!(!store.successor_repair_required().unwrap());
+        assert_eq!(read_content_write_epoch(&store.conn).unwrap(), epoch_before);
+        assert_eq!(
+            store
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            publication
+        );
+        for source_id in [first_id, second_id] {
+            let state: String = store
+                .conn
+                .query_row(
+                    "SELECT lifecycle_state FROM source_entities WHERE source_id = ?1",
+                    params![source_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "active");
+        }
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_queue_deduplicates_identical_targets_with_one_epoch_bump() {
+        let paths = temp_profile_paths("purge-queue-deduplicate");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_QUEUE_DEDUPLICATE";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-queue-deduplicate",
+                &[test_issue(source_id, "owner/repo", "deduplicate")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let target = PurgeTarget::Source {
+            source_id: source_id.to_string(),
+        };
+        let epoch_before = read_content_write_epoch(&store.conn).unwrap();
+
+        let queued = store
+            .queue_purges(&[
+                (target.clone(), PurgeTrigger::ConfirmedDelete),
+                (target, PurgeTrigger::ConfirmedDelete),
+            ])
+            .unwrap();
+
+        assert_eq!(queued, 1);
+        assert_eq!(store.pending_purges().unwrap().len(), 1);
+        assert_eq!(
+            read_content_write_epoch(&store.conn).unwrap(),
+            epoch_before + 1
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_queue_rejects_conflicting_triggers_without_mutation() {
+        let paths = temp_profile_paths("purge-queue-conflicting-trigger");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_QUEUE_CONFLICT";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-queue-conflict",
+                &[test_issue(source_id, "owner/repo", "conflict")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        let publication = store
+            .activate_retrieval_publication("sync-purge-queue-conflict", generation, None, None)
+            .unwrap();
+        let epoch_before = read_content_write_epoch(&store.conn).unwrap();
+        let target = PurgeTarget::Source {
+            source_id: source_id.to_string(),
+        };
+
+        let error = store
+            .queue_purges(&[
+                (target.clone(), PurgeTrigger::ConfirmedDelete),
+                (target, PurgeTrigger::PermissionLoss),
+            ])
+            .unwrap_err();
+
+        assert_eq!(error.code, "purge.conflicting_triggers");
+        assert!(store.pending_purges().unwrap().is_empty());
+        assert!(!store.successor_repair_required().unwrap());
+        assert_eq!(read_content_write_epoch(&store.conn).unwrap(), epoch_before);
+        assert_eq!(
+            store
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            publication
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn completed_purge_queue_batch_is_noop_for_epoch_and_publication() {
+        let paths = temp_profile_paths("purge-queue-completed-noop");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_QUEUE_COMPLETED_NOOP";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-queue-completed",
+                &[test_issue(source_id, "owner/repo", "completed")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let target = PurgeTarget::Source {
+            source_id: source_id.to_string(),
+        };
+        store
+            .purge(target.clone(), PurgeTrigger::ConfirmedDelete)
+            .unwrap();
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        let snapshot = store
+            .record_purge_successor_snapshot()
+            .unwrap()
+            .expect("completed purge successor snapshot");
+        let publication = store
+            .activate_retrieval_publication(&snapshot, generation, None, None)
+            .unwrap();
+        let epoch_before = read_content_write_epoch(&store.conn).unwrap();
+
+        let queued = store
+            .queue_purges(&[(target, PurgeTrigger::ConfirmedDelete)])
+            .unwrap();
+
+        assert_eq!(queued, 0);
+        assert!(store.pending_purges().unwrap().is_empty());
+        assert!(!store.successor_repair_required().unwrap());
+        assert_eq!(read_content_write_epoch(&store.conn).unwrap(), epoch_before);
+        assert_eq!(
+            store
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            publication
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn targeted_refresh_upsert_never_tombstones_missing_comments_by_itself() {
+        let paths = temp_profile_paths("targeted-refresh-no-destructive-fallback");
+        let mut store = Store::open(&paths).unwrap();
+        let issue_id = "qgh://github.com/issue/I_TARGET_REFRESH_SAFE";
+        let retained_id = "qgh://github.com/issue-comment/IC_TARGET_REFRESH_RETAINED";
+        let missing_id = "qgh://github.com/issue-comment/IC_TARGET_REFRESH_MISSING";
+        let added_id = "qgh://github.com/issue-comment/IC_TARGET_REFRESH_ADDED";
+        let issue = test_issue(issue_id, "owner/repo", "issue-body");
+        store
+            .upsert_sources_for_run(
+                "sync-targeted-refresh-initial",
+                std::slice::from_ref(&issue),
+                &[
+                    test_comment(retained_id, issue_id, "owner/repo", "retained-old"),
+                    test_comment(missing_id, issue_id, "owner/repo", "missing-stays"),
+                ],
+                0,
+                &[],
+            )
+            .unwrap();
+
+        let summary = store
+            .upsert_target_issue_refresh(
+                &issue,
+                &[
+                    test_comment(retained_id, issue_id, "owner/repo", "retained-new"),
+                    test_comment(added_id, issue_id, "owner/repo", "added-new"),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(summary.added_comments, 1);
+        assert_eq!(summary.updated_comments, 1);
+        assert_eq!(summary.deleted_comments, 0);
+        assert_eq!(summary.tombstoned_comments, 0);
+        assert!(store.get_tombstone(missing_id).unwrap().is_none());
+        assert_eq!(
+            store.get_comment(missing_id).unwrap().unwrap().body,
+            "Comment missing-stays"
+        );
+        assert_eq!(
+            store.get_comment(retained_id).unwrap().unwrap().body,
+            "Comment retained-new"
+        );
+        assert_eq!(
+            store.get_comment(added_id).unwrap().unwrap().body,
+            "Comment added-new"
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn known_repositories_includes_cursor_and_sync_only_state_for_repository_purge() {
+        let paths = temp_profile_paths("known-repositories-owned-state-union");
+        let mut store = Store::open(&paths).unwrap();
+        let target_repo = "owner/empty";
+        let retained_repo = "owner/retained";
+        for repo in [target_repo, retained_repo] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO repository_sync_state (repo, last_successful_sync_at)
+                     VALUES (?1, ?2)",
+                    params![repo, now_rfc3339()],
+                )
+                .unwrap();
+        }
+        for endpoint in [
+            "issues:owner/empty",
+            "history:owner/empty",
+            "repo-comments:owner/empty",
+            "comments:owner/empty#47",
+            "issues:owner/retained",
+            "comments:not-a-repo",
+            "comments:owner/invalid#zero",
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO sync_cursors (endpoint, cursor, etag)
+                     VALUES (?1, NULL, NULL)",
+                    params![endpoint],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.known_repositories().unwrap(),
+            vec![target_repo.to_string(), retained_repo.to_string()]
+        );
+
+        store
+            .purge(
+                PurgeTarget::Repository {
+                    repo: target_repo.to_string(),
+                },
+                PurgeTrigger::AllowlistRemoval,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.known_repositories().unwrap(),
+            vec![retained_repo.to_string()]
+        );
+        let target_sync_state: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM repository_sync_state WHERE repo = ?1",
+                params![target_repo],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_sync_state, 0);
+        let target_cursors: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sync_cursors WHERE endpoint LIKE '%owner/empty%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_cursors, 0);
+        let retained_sync_state: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM repository_sync_state WHERE repo = ?1",
+                params![retained_repo],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_sync_state, 1);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn known_repositories_excludes_completed_repo_tombstone_identities() {
+        let paths = temp_profile_paths("known-repositories-ignore-completed-tombstones");
+        let mut store = Store::open(&paths).unwrap();
+        let repo = "owner/completed";
+        let source_id = "qgh://github.com/issue/I_KNOWN_COMPLETED_TOMBSTONE";
+        store
+            .upsert_sources_for_run(
+                "sync-known-completed-tombstone",
+                &[test_issue(source_id, repo, "completed-sensitive")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+
+        store
+            .purge(
+                PurgeTarget::Repository {
+                    repo: repo.to_string(),
+                },
+                PurgeTrigger::AllowlistRemoval,
+            )
+            .unwrap();
+
+        let retained_identity: (String, String) = store
+            .conn
+            .query_row(
+                "SELECT repo, lifecycle_state FROM source_entities WHERE source_id = ?1",
+                params![source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            retained_identity,
+            (repo.to_string(), "tombstoned".to_string())
+        );
+        assert!(store.known_repositories().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
     #[cfg(feature = "vector-search")]
     #[test]
     fn legacy_tombstone_is_queued_on_reopen_then_retry_purges_residual_state() {
@@ -5851,7 +7058,7 @@ mod tests {
         let (tantivy_generation, generation_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
-        fs::create_dir_all(&generation_path).unwrap();
+        rebuild_reserved_generation(&store, &paths, tantivy_generation);
         fs::write(generation_path.join("segment"), marker).unwrap();
         store
             .activate_retrieval_publication(
@@ -6366,11 +7573,12 @@ mod tests {
                 &[],
             )
             .unwrap();
-        store
+        let (generation, _) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
         store
-            .activate_retrieval_publication("sync-purge-atomic-publication", 1, None, None)
+            .activate_retrieval_publication("sync-purge-atomic-publication", generation, None, None)
             .unwrap();
         store
             .conn
@@ -6609,11 +7817,15 @@ mod tests {
         assert_eq!(stale_error.code, "purge.write_fenced");
         assert!(!generation_path.exists());
         purger.retry_pending_purges().unwrap();
+        let successor_snapshot = purger
+            .record_purge_successor_snapshot()
+            .unwrap()
+            .expect("purge successor snapshot");
         let (successor_generation, successor_path) = purger
             .reserve_index_generation(&paths.index_root, 0)
             .unwrap();
         assert!(successor_generation > generation);
-        fs::create_dir_all(&successor_path).unwrap();
+        rebuild_reserved_generation(&purger, &paths, successor_generation);
         fs::write(successor_path.join("segment"), "fresh-successor").unwrap();
 
         let repeated_stale_error = builder
@@ -6623,12 +7835,7 @@ mod tests {
         assert_eq!(repeated_stale_error.code, "purge.write_fenced");
         assert!(successor_path.join("segment").exists());
         purger
-            .activate_retrieval_publication(
-                "sync-purge-live-index-lease-successor",
-                successor_generation,
-                None,
-                None,
-            )
+            .activate_retrieval_publication(&successor_snapshot, successor_generation, None, None)
             .unwrap();
 
         let _ = fs::remove_dir_all(paths.profile_dir);
@@ -7444,13 +8651,14 @@ mod tests {
             "manifest-purge-first",
             &[target_chunk, other_chunk],
         );
-        store
+        let (first_tantivy_generation, _) = store
             .reserve_index_generation(&paths.index_root, 2)
             .unwrap();
+        rebuild_reserved_generation(&store, &paths, first_tantivy_generation);
         let first_publication = store
             .activate_retrieval_publication(
                 "sync-purge-generation",
-                1,
+                first_tantivy_generation,
                 Some(first_generation),
                 None,
             )
@@ -7460,13 +8668,14 @@ mod tests {
             "manifest-purge-second",
             &[target_chunk, other_chunk],
         );
-        store
+        let (second_tantivy_generation, _) = store
             .reserve_index_generation(&paths.index_root, 2)
             .unwrap();
+        rebuild_reserved_generation(&store, &paths, second_tantivy_generation);
         store
             .activate_retrieval_publication(
                 "sync-purge-generation",
-                2,
+                second_tantivy_generation,
                 Some(second_generation),
                 Some(first_publication),
             )
@@ -7541,14 +8750,14 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let (_, first_path) = store
+        let (first_generation, first_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
-        let (_, second_path) = store
+        let (second_generation, second_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
-        fs::create_dir_all(&first_path).unwrap();
-        fs::create_dir_all(&second_path).unwrap();
+        rebuild_reserved_generation(&store, &paths, first_generation);
+        rebuild_reserved_generation(&store, &paths, second_generation);
         fs::create_dir_all(&paths.index_active).unwrap();
         let backup_path = paths.index_root.join("user-backup-1");
         fs::create_dir_all(&backup_path).unwrap();
@@ -7560,10 +8769,15 @@ mod tests {
         fs::write(backup_path.join("keep"), "user-owned-backup").unwrap();
         fs::write(&model_artifact, "model-artifact").unwrap();
         let first_publication = store
-            .activate_retrieval_publication("sync-purge-tantivy", 1, None, None)
+            .activate_retrieval_publication("sync-purge-tantivy", first_generation, None, None)
             .unwrap();
         store
-            .activate_retrieval_publication("sync-purge-tantivy", 2, None, Some(first_publication))
+            .activate_retrieval_publication(
+                "sync-purge-tantivy",
+                second_generation,
+                None,
+                Some(first_publication),
+            )
             .unwrap();
 
         let outcome = store
@@ -7611,7 +8825,7 @@ mod tests {
         let (generation, generation_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
-        fs::create_dir_all(&generation_path).unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
         fs::write(generation_path.join("segment"), marker).unwrap();
         store
             .activate_retrieval_publication(
@@ -8344,8 +9558,13 @@ mod tests {
         let (generation, _) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        let successor_snapshot = store
+            .record_purge_successor_snapshot()
+            .unwrap()
+            .expect("repository purge successor snapshot");
         let publication = store
-            .activate_retrieval_publication("sync-purge-repeat", generation, None, None)
+            .activate_retrieval_publication(&successor_snapshot, generation, None, None)
             .unwrap();
         let epoch_before = read_content_write_epoch(&store.conn).unwrap();
 
@@ -8496,10 +9715,14 @@ mod tests {
         let (generation, generation_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
-        fs::create_dir_all(&generation_path).unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
         fs::write(generation_path.join("segment"), "other-only").unwrap();
+        let successor_snapshot = store
+            .record_purge_successor_snapshot()
+            .unwrap()
+            .expect("source purge successor snapshot");
         let publication = store
-            .activate_retrieval_publication("sync-purge-source-repeat", generation, None, None)
+            .activate_retrieval_publication(&successor_snapshot, generation, None, None)
             .unwrap();
         let epoch_before = read_content_write_epoch(&store.conn).unwrap();
 
@@ -8622,7 +9845,7 @@ mod tests {
         let (generation, generation_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
-        fs::create_dir_all(&generation_path).unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
         fs::write(generation_path.join("segment"), "other-index-content").unwrap();
         store
             .activate_retrieval_publication("sync-purge-absent-issue-index", generation, None, None)
@@ -8687,10 +9910,14 @@ mod tests {
         let (generation, generation_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
-        fs::create_dir_all(&generation_path).unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
         fs::write(generation_path.join("segment"), "other-issue-only").unwrap();
+        let successor_snapshot = store
+            .record_purge_successor_snapshot()
+            .unwrap()
+            .expect("issue purge successor snapshot");
         let publication = store
-            .activate_retrieval_publication("sync-purge-issue-repeat", generation, None, None)
+            .activate_retrieval_publication(&successor_snapshot, generation, None, None)
             .unwrap();
         let epoch_before = read_content_write_epoch(&store.conn).unwrap();
 
@@ -8744,6 +9971,26 @@ mod tests {
     fn reserve_index_generation_allocates_distinct_inactive_rows() {
         let paths = temp_profile_paths("index-generation-reservation");
         let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run(
+                "sync-index-generation-reservation",
+                &[
+                    test_issue(
+                        "qgh://github.com/issue/I_INDEX_RESERVATION_FIRST",
+                        "owner/repo",
+                        "first",
+                    ),
+                    test_issue(
+                        "qgh://github.com/issue/I_INDEX_RESERVATION_SECOND",
+                        "owner/repo",
+                        "second",
+                    ),
+                ],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
 
         let (first_generation, first_path) = store
             .reserve_index_generation(&paths.index_root, 2)
@@ -8756,6 +10003,8 @@ mod tests {
         assert_eq!(second_generation, 2);
         assert_ne!(first_path, second_path);
         assert_eq!(store.status().unwrap().active_generation, 0);
+        rebuild_reserved_generation(&store, &paths, first_generation);
+        rebuild_reserved_generation(&store, &paths, second_generation);
 
         store
             .mark_index_published(first_generation, &first_path.to_string_lossy(), 2)
@@ -8806,7 +10055,7 @@ mod tests {
         let (first_generation, first_path) = store
             .reserve_index_generation(&paths.index_root, 2)
             .unwrap();
-        fs::create_dir_all(&first_path).unwrap();
+        rebuild_reserved_generation(&store, &paths, first_generation);
         store
             .activate_retrieval_publication(
                 "sync-generation-never-reused",
@@ -9435,11 +10684,17 @@ mod tests {
         store
             .validate_embedding_generation(second_generation)
             .unwrap();
-        store
+        let (tantivy_generation, _) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
+        rebuild_reserved_generation(&store, &paths, tantivy_generation);
         let publication = store
-            .activate_retrieval_publication("generation-sync", 1, Some(second_generation), None)
+            .activate_retrieval_publication(
+                "generation-sync",
+                tantivy_generation,
+                Some(second_generation),
+                None,
+            )
             .unwrap();
         let publication_view = store.active_retrieval_publication().unwrap().unwrap();
         assert_eq!(publication_view.publication_id, publication);
@@ -9508,29 +10763,36 @@ mod tests {
     fn retrieval_publication_cas_keeps_bm25_embedding_null_and_rolls_back_conflicts() {
         let paths = temp_profile_paths("publication-cas");
         let mut store = Store::open(&paths).unwrap();
-        store
+        let (first_generation, _) = store
             .reserve_index_generation(&paths.index_root, 0)
             .unwrap();
+        rebuild_reserved_generation(&store, &paths, first_generation);
         let first = store
-            .activate_retrieval_publication("sync-one", 1, None, None)
+            .activate_retrieval_publication("sync-one", first_generation, None, None)
             .unwrap();
         let active = store.active_retrieval_publication().unwrap().unwrap();
         assert_eq!(active.publication_id, first);
         assert_eq!(active.embedding_generation_id, None);
-        assert_eq!(active.tantivy_generation, 1);
-        store
+        assert_eq!(active.tantivy_generation, first_generation);
+        let (second_generation, _) = store
             .reserve_index_generation(&paths.index_root, 0)
             .unwrap();
+        rebuild_reserved_generation(&store, &paths, second_generation);
         let second = store
-            .activate_retrieval_publication("sync-two", 2, None, Some(first))
+            .activate_retrieval_publication("sync-two", second_generation, None, Some(first))
             .unwrap();
         assert_ne!(first, second);
-        store
+        let (third_generation, _) = store
             .reserve_index_generation(&paths.index_root, 0)
             .unwrap();
-        let conflict = store.activate_retrieval_publication("sync-three", 3, None, Some(first));
+        rebuild_reserved_generation(&store, &paths, third_generation);
+        let conflict =
+            store.activate_retrieval_publication("sync-three", third_generation, None, Some(first));
         assert_eq!(conflict.unwrap_err().code, "publication.cas_conflict");
-        assert_eq!(store.active_index_generation().unwrap(), Some(2));
+        assert_eq!(
+            store.active_index_generation().unwrap(),
+            Some(second_generation)
+        );
         assert_eq!(
             store
                 .active_retrieval_publication()
@@ -9816,6 +11078,24 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    fn rebuild_reserved_generation(
+        store: &Store,
+        paths: &ProfilePaths,
+        generation: i64,
+    ) -> PathBuf {
+        let expected_source_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT source_count FROM index_generations WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let sources = store.active_index_sources().unwrap();
+        assert_eq!(sources.len(), expected_source_count as usize);
+        crate::index::rebuild(&paths.index_root, generation, &sources).unwrap()
     }
 
     fn temp_profile_paths(name: &str) -> ProfilePaths {
