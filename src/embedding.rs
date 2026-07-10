@@ -8,6 +8,11 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
+pub use crate::context::{
+    prepare_embedding_input, EmbeddingSourceContext, PreparedEmbeddingInput,
+    METADATA_CONTEXT_TEMPLATE_VERSION,
+};
+
 pub type EmbeddingVector = Vec<f32>;
 
 pub const DEFAULT_HF_MODEL_ID: &str = "Snowflake/snowflake-arctic-embed-l-v2.0";
@@ -40,9 +45,6 @@ pub const MODEL_MANIFEST_SCHEMA_VERSION: &str = "qgh.model_manifest.v1";
 pub const CHUNKER_VERSION: &str = "qgh.chunker.v2";
 pub const SOURCE_SCHEMA_VERSION: &str = "qgh.source_schema.v1";
 pub const LOCAL_MODEL_REVISION: &str = "local_path";
-/// Exact metadata-context template persisted with an embedding generation.
-pub const METADATA_CONTEXT_TEMPLATE_VERSION: &str = "qgh.context.v1";
-
 const MODULES_FILE: &str = "modules.json";
 const DEFAULT_POOLING_CONFIG_FILE: &str = "1_Pooling/config.json";
 const TOKENIZER_FILES: [&str; 4] = [
@@ -56,70 +58,6 @@ const TOKENIZER_FILES: [&str; 4] = [
 pub struct TokenSpan {
     pub start: usize,
     pub end: usize,
-}
-
-/// Immutable source metadata allowed in contextual document embeddings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EmbeddingSourceContext<'a> {
-    Issue {
-        repository: &'a str,
-        issue_number: i64,
-        title: &'a str,
-    },
-    Comment {
-        repository: &'a str,
-        parent_issue_number: i64,
-        parent_issue_title: &'a str,
-    },
-}
-
-/// Contextual text used only for embedding input and its generation hash.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedEmbeddingInput {
-    text: String,
-}
-
-impl PreparedEmbeddingInput {
-    pub fn context_template_version(&self) -> &'static str {
-        METADATA_CONTEXT_TEMPLATE_VERSION
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.text
-    }
-
-    pub fn context_hash(&self, model_manifest_hash: &str, chunker_fingerprint: &str) -> String {
-        crate::store::embedding_context_hash(
-            model_manifest_hash,
-            chunker_fingerprint,
-            self.context_template_version(),
-            self.as_str(),
-        )
-    }
-}
-
-/// Build the deterministic prefix without changing the authoritative chunk.
-pub fn prepare_embedding_input(
-    context: EmbeddingSourceContext<'_>,
-    chunk: &str,
-) -> PreparedEmbeddingInput {
-    let prefix = match context {
-        EmbeddingSourceContext::Issue {
-            repository,
-            issue_number,
-            title,
-        } => format!("Repository: {repository}\nIssue #{issue_number}: {title}"),
-        EmbeddingSourceContext::Comment {
-            repository,
-            parent_issue_number,
-            parent_issue_title,
-        } => format!(
-            "Repository: {repository}\nComment on issue #{parent_issue_number}: {parent_issue_title}"
-        ),
-    };
-    PreparedEmbeddingInput {
-        text: format!("{prefix}\n\n{chunk}"),
-    }
 }
 
 pub trait EmbeddingProvider: Send + Sync {
@@ -532,10 +470,10 @@ impl ModelManifestV1 {
                 "Prepared model dimensions and max_length are invalid.",
             ));
         }
-        if self.context_template_version.is_empty() {
+        if self.context_template_version != METADATA_CONTEXT_TEMPLATE_VERSION {
             return Err(EmbeddingProviderError::structured(
-                "embedding.manifest_contract_invalid",
-                "Prepared model context_template_version must not be empty.",
+                "embedding.manifest_context_template_unsupported",
+                "Prepared model context_template_version is unsupported.",
             ));
         }
         if self.quantization == QuantizationKind::Dynamic {
@@ -722,7 +660,7 @@ impl PreparedModelStore {
                 output_dimension: contract.output_dimension,
                 max_length: contract.max_length,
                 quantization: required_legacy_quantization(options)?,
-                context_template_version: "qgh.context.none.v1".to_string(),
+                context_template_version: METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
             };
             return self.materialize(options, manifest, runtime_artifact_sources(&snapshot)?);
         }
@@ -1022,7 +960,7 @@ impl PreparedModelStore {
             output_dimension: contract.output_dimension,
             max_length: contract.max_length,
             quantization: required_legacy_quantization(options)?,
-            context_template_version: "qgh.context.none.v1".to_string(),
+            context_template_version: METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
         };
         self.materialize(options, manifest, runtime_artifact_sources(&snapshot)?)
     }
@@ -1089,7 +1027,7 @@ impl PreparedModelStore {
             output_dimension: preset.output_dimension,
             max_length: preset.max_length,
             quantization: preset.quantization,
-            context_template_version: "qgh.context.none.v1".to_string(),
+            context_template_version: METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
         };
         let mut sources = runtime_artifact_sources(&snapshot)?;
         if let Some((relative_path, initializer_name)) = preset.external_initializer {
@@ -2655,7 +2593,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(
             first.context_hash("manifest-hash", "chunker-fingerprint"),
-            crate::store::embedding_context_hash(
+            crate::context::embedding_context_hash(
                 "manifest-hash",
                 "chunker-fingerprint",
                 METADATA_CONTEXT_TEMPLATE_VERSION,
@@ -2800,6 +2738,19 @@ mod tests {
         manifest.quantization = QuantizationKind::Dynamic;
         let error = manifest.validate_contract().unwrap_err();
         assert_eq!(error.code(), "embedding.dynamic_quantization_unsupported");
+    }
+
+    #[test]
+    fn manifest_rejects_non_production_context_template() {
+        let mut manifest = fixture_manifest(Vec::new());
+        manifest.context_template_version = "qgh.context.none.v1".to_string();
+
+        let error = manifest.validate_contract().unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            "embedding.manifest_context_template_unsupported"
+        );
     }
 
     #[test]
@@ -3200,7 +3151,7 @@ mod tests {
             output_dimension: 4,
             max_length: 32,
             quantization: QuantizationKind::None,
-            context_template_version: "qgh.context.none.v1".to_string(),
+            context_template_version: METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
         }
     }
 

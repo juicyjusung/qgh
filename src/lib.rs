@@ -3,6 +3,8 @@ pub mod chunking;
 mod cli;
 mod commands;
 mod config;
+#[doc(hidden)]
+pub mod context;
 mod coverage;
 pub mod embedding;
 mod error;

@@ -1780,14 +1780,14 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
     fingerprint_seed: EmbeddingFingerprintSeed,
     _expectation: &EmbeddingFingerprintExpectation,
 ) -> Result<(usize, Option<i64>), QghError> {
-    let chunks = store.active_embedding_chunks()?;
+    let chunks = store.active_contextual_embedding_chunks()?;
     if chunks.is_empty() {
         return Ok((0, None));
     }
 
     let texts = chunks
         .iter()
-        .map(|chunk| chunk.body.as_str())
+        .map(|chunk| chunk.prepared_input.as_str())
         .collect::<Vec<_>>();
     let vectors = provider.embed_documents(&texts).map_err(embedding_error)?;
     if vectors.len() != chunks.len() {
@@ -1810,12 +1810,12 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
         )
     })?;
     let model_manifest_hash = fingerprint.hash();
-    let context_template_version = "qgh.context.v1".to_string();
+    let context_template_version = crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string();
     let spec = crate::store::EmbeddingGenerationSpec {
         model_manifest_hash: model_manifest_hash.clone(),
         chunker_fingerprint: chunks
             .first()
-            .map(|chunk| chunk.chunker_fingerprint.clone())
+            .map(|chunk| chunk.chunk.chunker_fingerprint.clone())
             .unwrap_or_else(|| "none".to_string()),
         context_template_version: context_template_version.clone(),
         output_dimension: dimension,
@@ -1830,17 +1830,14 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
             .iter()
             .map(|(chunk, vector)| {
                 Ok(crate::store::EmbeddingGenerationChunk {
-                    chunk_id: chunk.chunk_id,
-                    source_version_id: chunk.source_version_id,
+                    chunk_id: chunk.chunk.chunk_id,
+                    source_version_id: chunk.chunk.source_version_id,
                     source_version_hash: store
-                        .source_version_hash(chunk.source_version_id)?
+                        .source_version_hash(chunk.chunk.source_version_id)?
                         .ok_or_else(|| QghError::storage("Missing source version hash."))?,
-                    context_hash: crate::store::embedding_context_hash(
-                        &model_manifest_hash,
-                        &chunk.chunker_fingerprint,
-                        &context_template_version,
-                        &chunk.body,
-                    ),
+                    context_hash: chunk
+                        .prepared_input
+                        .context_hash(&model_manifest_hash, &chunk.chunk.chunker_fingerprint),
                     vector: (*vector).clone(),
                 })
             })
@@ -2353,7 +2350,7 @@ fn refresh_chunk_embeddings(
     provider: &dyn EmbeddingProvider,
     fingerprint_seed: EmbeddingFingerprintSeed,
 ) -> Result<Value, QghError> {
-    let chunks = store.active_embedding_chunks()?;
+    let chunks = store.active_contextual_embedding_chunks()?;
     if chunks.is_empty() {
         return Err(QghError::validation(
             "embedding.no_chunks",
@@ -2364,7 +2361,7 @@ fn refresh_chunk_embeddings(
 
     let texts = chunks
         .iter()
-        .map(|chunk| chunk.body.as_str())
+        .map(|chunk| chunk.prepared_input.as_str())
         .collect::<Vec<_>>();
     let vectors = provider.embed_documents(&texts).map_err(embedding_error)?;
     if vectors.len() != chunks.len() {
@@ -2397,12 +2394,12 @@ fn refresh_chunk_embeddings(
             .with_hint("Run qgh sync successfully before qgh embed --force.")
         })?;
     let model_manifest_hash = fingerprint.hash();
-    let context_template_version = "qgh.context.v1".to_string();
+    let context_template_version = crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string();
     let spec = crate::store::EmbeddingGenerationSpec {
         model_manifest_hash: model_manifest_hash.clone(),
         chunker_fingerprint: chunks
             .first()
-            .map(|chunk| chunk.chunker_fingerprint.clone())
+            .map(|chunk| chunk.chunk.chunker_fingerprint.clone())
             .unwrap_or_else(|| "none".to_string()),
         context_template_version: context_template_version.clone(),
         output_dimension: dimension,
@@ -2416,17 +2413,14 @@ fn refresh_chunk_embeddings(
             .iter()
             .map(|(chunk, vector)| {
                 Ok(crate::store::EmbeddingGenerationChunk {
-                    chunk_id: chunk.chunk_id,
-                    source_version_id: chunk.source_version_id,
+                    chunk_id: chunk.chunk.chunk_id,
+                    source_version_id: chunk.chunk.source_version_id,
                     source_version_hash: store
-                        .source_version_hash(chunk.source_version_id)?
+                        .source_version_hash(chunk.chunk.source_version_id)?
                         .ok_or_else(|| QghError::storage("Missing source version hash."))?,
-                    context_hash: crate::store::embedding_context_hash(
-                        &model_manifest_hash,
-                        &chunk.chunker_fingerprint,
-                        &context_template_version,
-                        &chunk.body,
-                    ),
+                    context_hash: chunk
+                        .prepared_input
+                        .context_hash(&model_manifest_hash, &chunk.chunk.chunker_fingerprint),
                     vector: vector.clone(),
                 })
             })
@@ -5285,13 +5279,37 @@ mod tests {
     #[cfg(feature = "vector-search")]
     use crate::embedding::PoolingKind;
     #[cfg(feature = "vector-search")]
-    use crate::model::{IssueRecord, VectorSearchFilters};
+    use crate::model::{CommentRecord, IssueRecord, VectorSearchFilters};
     use crate::paths::ProfilePaths;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(feature = "vector-search")]
     struct MockEmbeddingProvider;
+
+    #[cfg(feature = "vector-search")]
+    #[derive(Default)]
+    struct RecordingEmbeddingProvider {
+        documents: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[cfg(feature = "vector-search")]
+    impl EmbeddingProvider for RecordingEmbeddingProvider {
+        fn embed_documents(
+            &self,
+            texts: &[&str],
+        ) -> Result<Vec<EmbeddingVector>, EmbeddingProviderError> {
+            self.documents
+                .lock()
+                .unwrap()
+                .extend(texts.iter().map(|text| (*text).to_string()));
+            Ok(texts.iter().map(|_| vec![1.0, 2.0, 3.0]).collect())
+        }
+
+        fn embed_query(&self, _text: &str) -> Result<EmbeddingVector, EmbeddingProviderError> {
+            Ok(vec![1.0, 2.0, 3.0])
+        }
+    }
 
     #[test]
     fn repository_purge_subsumes_only_same_repo_targets() {
@@ -5429,6 +5447,158 @@ mod tests {
         fn embed_query(&self, _text: &str) -> Result<EmbeddingVector, EmbeddingProviderError> {
             Ok(vec![0.0, 1.0, 2.0])
         }
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn sync_embedding_provider_receives_production_issue_context() {
+        let paths = temp_profile_paths("sync-embedding-context");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let issue = vector_issue("I_CONTEXT_SYNC", "owner/repo", 47, "open", "alice", &[]);
+        let source_id = issue.source_id.clone();
+        store
+            .upsert_sources_for_run("sync-context", &[issue], &[], 0, &[])
+            .unwrap();
+        store.mark_sync_run_completed("sync-context").unwrap();
+        let source_version_id = store.latest_source_version_id(&source_id).unwrap().unwrap();
+        store
+            .replace_chunks_for_source_version(
+                &source_id,
+                source_version_id,
+                &[test_chunk("unchanged authoritative chunk".to_string())],
+            )
+            .unwrap();
+        let provider = RecordingEmbeddingProvider::default();
+        let seed = EmbeddingFingerprintSeed {
+            provider: "local".to_string(),
+            model_id: "fixture/model".to_string(),
+            model_revision: "fixture-sha".to_string(),
+            pooling: PoolingKind::Cls,
+            query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
+        };
+        let expectation = EmbeddingFingerprintExpectation {
+            provider: "local".to_string(),
+            model_id: Some("fixture/model".to_string()),
+            model_revision: Some("fixture-sha".to_string()),
+            pooling: Some(PoolingKind::Cls),
+            query_prefix: Some(crate::embedding::DEFAULT_QUERY_PREFIX.to_string()),
+        };
+
+        refresh_incremental_chunk_embeddings_with_provider(
+            &mut store,
+            &provider,
+            seed,
+            &expectation,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *provider.documents.lock().unwrap(),
+            vec!["Repository: github.com/owner/repo\nIssue #47: Vector smoke I_CONTEXT_SYNC\n\nunchanged authoritative chunk"]
+        );
+        assert_eq!(
+            store.active_embedding_chunks().unwrap()[0].body,
+            "unchanged authoritative chunk"
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn force_embedding_provider_and_persisted_hash_share_production_comment_context() {
+        let paths = temp_profile_paths("force-embedding-comment-context");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let issue = vector_issue("I_CONTEXT_FORCE", "owner/repo", 48, "open", "alice", &[]);
+        let comment = CommentRecord {
+            source_id: "qgh://github.com/issue-comment/IC_CONTEXT_FORCE".to_string(),
+            host: "github.com".to_string(),
+            repo: "owner/repo".to_string(),
+            node_id: "IC_CONTEXT_FORCE".to_string(),
+            github_id: 4801,
+            body: "authoritative comment body".to_string(),
+            author: Some("bob".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            canonical_url: "https://github.com/owner/repo/issues/48#issuecomment-4801".to_string(),
+            body_hash: "comment-body-hash-context-force".to_string(),
+            indexed_at: "2026-01-02T00:00:01Z".to_string(),
+            parent_issue_source_id: issue.source_id.clone(),
+            parent_issue_number: issue.number,
+            parent_issue_title: issue.title.clone(),
+            parent_issue_canonical_url: issue.canonical_url.clone(),
+        };
+        store
+            .upsert_sources_for_run(
+                "sync-force-context",
+                &[issue],
+                std::slice::from_ref(&comment),
+                0,
+                &[],
+            )
+            .unwrap();
+        store.mark_sync_run_completed("sync-force-context").unwrap();
+        let source_version_id = store
+            .latest_source_version_id(&comment.source_id)
+            .unwrap()
+            .unwrap();
+        store
+            .replace_chunks_for_source_version(
+                &comment.source_id,
+                source_version_id,
+                &[test_chunk("unchanged comment chunk".to_string())],
+            )
+            .unwrap();
+        let provider = RecordingEmbeddingProvider::default();
+        let seed = EmbeddingFingerprintSeed {
+            provider: "local".to_string(),
+            model_id: "fixture/model".to_string(),
+            model_revision: "fixture-sha".to_string(),
+            pooling: PoolingKind::Cls,
+            query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
+        };
+
+        refresh_chunk_embeddings(&mut store, "work", &provider, seed).unwrap();
+
+        let expected_input = "Repository: github.com/owner/repo\nComment on issue #48: Vector smoke I_CONTEXT_FORCE\n\nunchanged comment chunk";
+        assert_eq!(
+            *provider.documents.lock().unwrap(),
+            vec![expected_input.to_string()]
+        );
+        assert_eq!(
+            store.active_embedding_chunks().unwrap()[0].body,
+            "unchanged comment chunk"
+        );
+        let connection = rusqlite::Connection::open(&paths.db_path).unwrap();
+        let (stored_hash, manifest_hash, chunker_fingerprint, template_version): (
+            String,
+            String,
+            String,
+            String,
+        ) = connection
+            .query_row(
+                "SELECT egc.context_hash, eg.model_manifest_hash,
+                        eg.chunker_fingerprint, eg.context_template_version
+                 FROM embedding_generation_chunks egc
+                 JOIN embedding_generations eg ON eg.id = egc.generation_id
+                 ORDER BY eg.id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_hash,
+            crate::context::embedding_context_hash(
+                &manifest_hash,
+                &chunker_fingerprint,
+                &template_version,
+                expected_input,
+            )
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
     #[test]

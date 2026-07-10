@@ -1,4 +1,5 @@
 use crate::chunking::MarkdownChunk;
+use crate::context::{prepare_embedding_input, EmbeddingSourceContext, PreparedEmbeddingInput};
 use crate::embedding::{EmbeddingFingerprint, EmbeddingVector};
 use crate::error::QghError;
 use crate::model::{
@@ -217,25 +218,10 @@ pub struct ReadSnapshotFence {
     content_write_epoch: i64,
 }
 
-pub fn embedding_context_hash(
-    model_manifest_hash: &str,
-    chunker_fingerprint: &str,
-    context_template_version: &str,
-    embedding_input: &str,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(model_manifest_hash.as_bytes());
-    hasher.update([0]);
-    hasher.update(chunker_fingerprint.as_bytes());
-    hasher.update([0]);
-    hasher.update(context_template_version.as_bytes());
-    hasher.update([0]);
-    hasher.update(embedding_input.as_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextualEmbeddingChunk {
+    pub chunk: StoredChunk,
+    pub prepared_input: PreparedEmbeddingInput,
 }
 
 pub struct Store {
@@ -1811,6 +1797,13 @@ impl Store {
 
         for issue in issues {
             let repo = canonical_repository_identity(&tx, &issue.repo)?;
+            let previous_title = tx
+                .query_row(
+                    "SELECT title FROM issue_metadata WHERE source_id = ?1",
+                    params![issue.source_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
             tx.execute(
                 "INSERT INTO source_entities
                     (source_id, entity_type, host, repo, node_id, github_id, lifecycle_state, created_at, updated_at, last_seen_at)
@@ -1899,6 +1892,36 @@ impl Store {
                  VALUES (?1, 'upsert', ?2, NULL)",
                 params![issue.source_id, now],
             )?;
+            if previous_title.as_deref() != Some(issue.title.as_str()) {
+                let comment_source_ids = {
+                    let mut stmt = tx.prepare(
+                        "SELECT source_id FROM comment_metadata
+                         WHERE parent_issue_source_id = ?1
+                           AND parent_issue_title != ?2",
+                    )?;
+                    let rows = stmt.query_map(params![issue.source_id, issue.title], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                if !comment_source_ids.is_empty() {
+                    tx.execute(
+                        "UPDATE comment_metadata
+                         SET parent_issue_title = ?2
+                         WHERE parent_issue_source_id = ?1
+                           AND parent_issue_title != ?2",
+                        params![issue.source_id, issue.title],
+                    )?;
+                    for source_id in comment_source_ids {
+                        tx.execute(
+                            "INSERT INTO index_tasks
+                                (source_id, task_type, created_at, completed_at)
+                             VALUES (?1, 'upsert', ?2, NULL)",
+                            params![source_id, now],
+                        )?;
+                    }
+                }
+            }
             apply_pending_purge_guard(&tx, &issue.source_id, &repo, issue.number)?;
         }
 
@@ -2441,6 +2464,35 @@ impl Store {
         )?;
         let rows = stmt.query_map([], stored_chunk_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
+    }
+
+    pub fn active_contextual_embedding_chunks(
+        &self,
+    ) -> Result<Vec<ContextualEmbeddingChunk>, QghError> {
+        if !embedding_schema_exists(&self.conn)? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.source_id, c.source_version_id, c.body, c.chunk_index,
+                    c.token_start, c.token_end, c.byte_start, c.byte_end,
+                    c.chunker_version, c.chunker_fingerprint, c.heading_path_json,
+                    se.entity_type, se.host, se.repo,
+                    coalesce(im.issue_number, cm.issue_number),
+                    im.title, cm.parent_issue_title
+             FROM chunks c
+             JOIN source_entities se ON se.source_id = c.source_id
+             LEFT JOIN issue_metadata im ON im.source_id = c.source_id
+             LEFT JOIN comment_metadata cm ON cm.source_id = c.source_id
+             WHERE se.lifecycle_state = 'active'
+               AND c.source_version_id = coalesce(im.latest_version_id, cm.latest_version_id)
+             ORDER BY c.id",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut chunks = Vec::new();
+        while let Some(row) = rows.next()? {
+            chunks.push(contextual_embedding_chunk_from_row(row)?);
+        }
+        Ok(chunks)
     }
 
     pub fn active_embedding_chunk_count(&self) -> Result<i64, QghError> {
@@ -4180,10 +4232,13 @@ impl Store {
         let mut stmt = tx.prepare(
             "SELECT gc.vector_blob, gc.vector_checksum, gc.vector_dimension,
                     gc.source_version_id, gc.source_version_hash, gc.context_hash,
-                    sv.body_hash, coalesce(im.latest_version_id, cm.latest_version_id), c.body
+                    sv.body_hash, coalesce(im.latest_version_id, cm.latest_version_id), c.body,
+                    se.entity_type, se.host, se.repo,
+                    im.issue_number, cm.issue_number, im.title, cm.parent_issue_title
              FROM embedding_generation_chunks gc
              JOIN source_versions sv ON sv.id = gc.source_version_id
              JOIN chunks c ON c.id = gc.chunk_id
+             JOIN source_entities se ON se.source_id = c.source_id
              LEFT JOIN issue_metadata im ON im.source_id = sv.source_id
              LEFT JOIN comment_metadata cm ON cm.source_id = sv.source_id
              WHERE gc.generation_id = ?1",
@@ -4199,6 +4254,13 @@ impl Store {
                 row.get::<_, String>(6)?,
                 row.get::<_, Option<i64>>(7)?,
                 row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, Option<i64>>(12)?,
+                row.get::<_, Option<i64>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
             ))
         })?;
         let mut invalid = false;
@@ -4214,20 +4276,54 @@ impl Store {
                 context_hash,
                 body_hash,
                 latest_version_id,
-                embedding_input,
+                chunk_body,
+                entity_type,
+                host,
+                repo,
+                issue_number,
+                parent_issue_number,
+                issue_title,
+                parent_issue_title,
             ) = row?;
+            let repository = format!("{host}/{repo}");
+            let prepared_input =
+                match entity_type.as_str() {
+                    "issue" => issue_number
+                        .zip(issue_title.as_deref())
+                        .map(|(number, title)| {
+                            prepare_embedding_input(
+                                EmbeddingSourceContext::Issue {
+                                    repository: &repository,
+                                    issue_number: number,
+                                    title,
+                                },
+                                &chunk_body,
+                            )
+                        }),
+                    "issue_comment" => parent_issue_number.zip(parent_issue_title.as_deref()).map(
+                        |(number, title)| {
+                            prepare_embedding_input(
+                                EmbeddingSourceContext::Comment {
+                                    repository: &repository,
+                                    parent_issue_number: number,
+                                    parent_issue_title: title,
+                                },
+                                &chunk_body,
+                            )
+                        },
+                    ),
+                    _ => None,
+                };
             if stored_dimension != dimension
                 || decode_embedding_blob(&bytes, dimension).is_err()
                 || embedding_blob_checksum(&bytes) != checksum
                 || source_hash != body_hash
                 || latest_version_id != Some(source_version_id)
-                || context_hash
-                    != embedding_context_hash(
-                        &model_manifest_hash,
-                        &chunker_fingerprint,
-                        &context_template_version,
-                        &embedding_input,
-                    )
+                || prepared_input.as_ref().is_none_or(|prepared| {
+                    context_hash
+                        != prepared.context_hash(&model_manifest_hash, &chunker_fingerprint)
+                        || prepared.context_template_version() != context_template_version
+                })
             {
                 invalid = true;
                 break;
@@ -6332,6 +6428,45 @@ fn stored_chunk_from_row(row: &rusqlite::Row<'_>) -> Result<StoredChunk, rusqlit
     })
 }
 
+fn contextual_embedding_chunk_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<ContextualEmbeddingChunk, QghError> {
+    let chunk = stored_chunk_from_row(row)?;
+    let entity_type: String = row.get(12)?;
+    let host: String = row.get(13)?;
+    let repo: String = row.get(14)?;
+    let issue_number: i64 = row.get(15)?;
+    let issue_title: Option<String> = row.get(16)?;
+    let parent_issue_title: Option<String> = row.get(17)?;
+    let repository = format!("{host}/{repo}");
+    let context = match entity_type.as_str() {
+        "issue" => EmbeddingSourceContext::Issue {
+            repository: &repository,
+            issue_number,
+            title: issue_title.as_deref().ok_or_else(|| {
+                QghError::storage("Active issue embedding metadata is incomplete.")
+            })?,
+        },
+        "issue_comment" => EmbeddingSourceContext::Comment {
+            repository: &repository,
+            parent_issue_number: issue_number,
+            parent_issue_title: parent_issue_title.as_deref().ok_or_else(|| {
+                QghError::storage("Active comment embedding metadata is incomplete.")
+            })?,
+        },
+        _ => {
+            return Err(QghError::storage(
+                "Active embedding source has an unsupported entity type.",
+            ));
+        }
+    };
+    let prepared_input = prepare_embedding_input(context, &chunk.body);
+    Ok(ContextualEmbeddingChunk {
+        chunk,
+        prepared_input,
+    })
+}
+
 fn stored_issue_from_row(row: &rusqlite::Row<'_>) -> Result<StoredIssue, rusqlite::Error> {
     let labels_json: String = row.get(6)?;
     let labels = serde_json::from_str(&labels_json).unwrap_or_default();
@@ -8364,7 +8499,8 @@ mod tests {
             .begin_embedding_generation(&EmbeddingGenerationSpec {
                 model_manifest_hash: "manifest-stale-builder".to_string(),
                 chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
-                context_template_version: "context-v1".to_string(),
+                context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
+                    .to_string(),
                 output_dimension: 2,
                 source_sync_run_id: "sync-stale-embedding-builder".to_string(),
                 source_snapshot_hash: "snapshot-stale-builder".to_string(),
@@ -8436,7 +8572,8 @@ mod tests {
             .begin_embedding_generation(&EmbeddingGenerationSpec {
                 model_manifest_hash: manifest.to_string(),
                 chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
-                context_template_version: "context-v1".to_string(),
+                context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
+                    .to_string(),
                 output_dimension: 2,
                 source_sync_run_id: "sync-stale-embedding-validation".to_string(),
                 source_snapshot_hash: "snapshot-stale-validation".to_string(),
@@ -8450,11 +8587,11 @@ mod tests {
                     chunk_id,
                     source_version_id,
                     source_version_hash,
-                    context_hash: embedding_context_hash(
+                    context_hash: production_context_hash_for_chunk(
+                        &builder,
                         manifest,
                         crate::chunking::CHUNKER_FINGERPRINT,
-                        "context-v1",
-                        "validate retained chunk",
+                        chunk_id,
                     ),
                     vector: vec![1.0, 2.0],
                 }],
@@ -10897,7 +11034,7 @@ mod tests {
         let spec = EmbeddingGenerationSpec {
             model_manifest_hash: "manifest-a".to_string(),
             chunker_fingerprint: "chunker-a".to_string(),
-            context_template_version: "context-v1".to_string(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
             output_dimension: 2,
             source_sync_run_id: "generation-sync".to_string(),
             source_snapshot_hash: "snapshot-a".to_string(),
@@ -10911,11 +11048,11 @@ mod tests {
                     chunk_id,
                     source_version_id,
                     source_version_hash: "body-hash-generation-sync".to_string(),
-                    context_hash: embedding_context_hash(
+                    context_hash: production_context_hash_for_chunk(
+                        &store,
                         "manifest-a",
                         "chunker-a",
-                        "context-v1",
-                        "alpha beta",
+                        chunk_id,
                     ),
                     vector: vec![1.0, 2.0],
                 }],
@@ -10976,11 +11113,11 @@ mod tests {
                     chunk_id,
                     source_version_id,
                     source_version_hash: "body-hash-generation-sync".to_string(),
-                    context_hash: embedding_context_hash(
+                    context_hash: production_context_hash_for_chunk(
+                        &store,
                         "manifest-b",
                         "chunker-a",
-                        "context-v1",
-                        "alpha beta",
+                        chunk_id,
                     ),
                     vector: vec![1.0, 2.0, 3.0],
                 }],
@@ -11046,11 +11183,11 @@ mod tests {
                     chunk_id,
                     source_version_id,
                     source_version_hash: "body-hash-generation-sync".to_string(),
-                    context_hash: embedding_context_hash(
+                    context_hash: production_context_hash_for_chunk(
+                        &store,
                         "manifest-missing",
                         "chunker-a",
-                        "context-v1",
-                        "alpha beta",
+                        chunk_id,
                     ),
                     vector: vec![1.0, 2.0, 3.0],
                 }],
@@ -11135,7 +11272,8 @@ mod tests {
             .begin_embedding_generation(&EmbeddingGenerationSpec {
                 model_manifest_hash: "manifest-bad".to_string(),
                 chunker_fingerprint: "chunker-bad".to_string(),
-                context_template_version: "context-v1".to_string(),
+                context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
+                    .to_string(),
                 output_dimension: 2,
                 source_sync_run_id: "generation-bad-sync".to_string(),
                 source_snapshot_hash: "snapshot-bad".to_string(),
@@ -11149,11 +11287,11 @@ mod tests {
                     chunk_id,
                     source_version_id,
                     source_version_hash: "body-hash-generation-bad".to_string(),
-                    context_hash: embedding_context_hash(
+                    context_hash: production_context_hash_for_chunk(
+                        &store,
                         "manifest-bad",
                         "chunker-bad",
-                        "context-v1",
-                        "alpha beta",
+                        chunk_id,
                     ),
                     vector: vec![1.0, 2.0],
                 }],
@@ -11193,7 +11331,8 @@ mod tests {
             .begin_embedding_generation(&EmbeddingGenerationSpec {
                 model_manifest_hash: "manifest-retention".to_string(),
                 chunker_fingerprint: "chunker-retention".to_string(),
-                context_template_version: "context-v1".to_string(),
+                context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
+                    .to_string(),
                 output_dimension: 2,
                 source_sync_run_id: "sync-retention".to_string(),
                 source_snapshot_hash: "snapshot-retention".to_string(),
@@ -11211,6 +11350,107 @@ mod tests {
             1
         );
         assert!(store.embedding_generation_state(generation_id).is_err());
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn parent_issue_title_only_upsert_invalidates_comment_context_without_new_body_version() {
+        let paths = temp_profile_paths("parent-title-context-invalidation");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let issue_id = "qgh://github.com/issue/I_PARENT_CONTEXT";
+        let comment_id = "qgh://github.com/issue-comment/IC_PARENT_CONTEXT";
+        let issue = test_issue(issue_id, "owner/repo", "original");
+        let mut comment = test_comment(comment_id, issue_id, "owner/repo", "comment");
+        comment.parent_issue_title = issue.title.clone();
+        store
+            .upsert_sources_for_run(
+                "sync-parent-context-original",
+                std::slice::from_ref(&issue),
+                std::slice::from_ref(&comment),
+                0,
+                &[],
+            )
+            .unwrap();
+        let comment_version_id = store.latest_source_version_id(comment_id).unwrap().unwrap();
+        let chunk_id = store
+            .replace_chunks_for_source_version(
+                comment_id,
+                comment_version_id,
+                &[test_chunk("unchanged comment chunk")],
+            )
+            .unwrap()[0]
+            .chunk_id;
+        let before = store
+            .active_contextual_embedding_chunks()
+            .unwrap()
+            .remove(0);
+        let model_manifest_hash = "manifest-parent-context";
+        let generation_id = store
+            .begin_embedding_generation(&EmbeddingGenerationSpec {
+                model_manifest_hash: model_manifest_hash.to_string(),
+                chunker_fingerprint: before.chunk.chunker_fingerprint.clone(),
+                context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
+                    .to_string(),
+                output_dimension: 2,
+                source_sync_run_id: "sync-parent-context-original".to_string(),
+                source_snapshot_hash: "snapshot-parent-context-original".to_string(),
+                total_chunks: 1,
+            })
+            .unwrap();
+        store
+            .stage_embedding_generation_batch(
+                generation_id,
+                &[EmbeddingGenerationChunk {
+                    chunk_id,
+                    source_version_id: comment_version_id,
+                    source_version_hash: comment.body_hash.clone(),
+                    context_hash: before
+                        .prepared_input
+                        .context_hash(model_manifest_hash, &before.chunk.chunker_fingerprint),
+                    vector: vec![1.0, 2.0],
+                }],
+            )
+            .unwrap();
+        let dirty_comment_tasks_before: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM index_tasks WHERE source_id = ?1 AND completed_at IS NULL",
+                params![comment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let mut renamed_issue = issue.clone();
+        renamed_issue.title = "Renamed parent title".to_string();
+        renamed_issue.updated_at = "2026-01-03T00:00:00Z".to_string();
+        renamed_issue.indexed_at = "2026-01-03T00:00:01Z".to_string();
+        store
+            .upsert_sources_for_run("sync-parent-context-renamed", &[renamed_issue], &[], 0, &[])
+            .unwrap();
+
+        let stored_comment = store.get_comment(comment_id).unwrap().unwrap();
+        assert_eq!(stored_comment.parent_issue.title, "Renamed parent title");
+        assert_eq!(stored_comment.body, comment.body);
+        assert_eq!(
+            store.latest_source_version_id(comment_id).unwrap(),
+            Some(comment_version_id)
+        );
+        let dirty_comment_tasks_after: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM index_tasks WHERE source_id = ?1 AND completed_at IS NULL",
+                params![comment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dirty_comment_tasks_after, dirty_comment_tasks_before + 1);
+        let error = store
+            .validate_embedding_generation(generation_id)
+            .unwrap_err();
+        assert_eq!(error.code, "embedding.generation_validation_failed");
+
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
@@ -11289,11 +11529,28 @@ mod tests {
     }
 
     #[cfg(feature = "vector-search")]
+    fn production_context_hash_for_chunk(
+        store: &Store,
+        model_manifest_hash: &str,
+        chunker_fingerprint: &str,
+        chunk_id: i64,
+    ) -> String {
+        store
+            .active_contextual_embedding_chunks()
+            .unwrap()
+            .into_iter()
+            .find(|chunk| chunk.chunk.chunk_id == chunk_id)
+            .unwrap()
+            .prepared_input
+            .context_hash(model_manifest_hash, chunker_fingerprint)
+    }
+
+    #[cfg(feature = "vector-search")]
     fn stage_test_generation(store: &mut Store, manifest: &str, chunk_ids: &[i64]) -> i64 {
         let spec = EmbeddingGenerationSpec {
             model_manifest_hash: manifest.to_string(),
             chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
-            context_template_version: "context-v1".to_string(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
             output_dimension: 2,
             source_sync_run_id: "sync-purge-generation".to_string(),
             source_snapshot_hash: format!("snapshot-{manifest}"),
@@ -11303,12 +11560,12 @@ mod tests {
         let chunks = chunk_ids
             .iter()
             .map(|chunk_id| {
-                let (source_version_id, body): (i64, String) = store
+                let source_version_id: i64 = store
                     .conn
                     .query_row(
-                        "SELECT source_version_id, body FROM chunks WHERE id = ?1",
+                        "SELECT source_version_id FROM chunks WHERE id = ?1",
                         params![chunk_id],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
+                        |row| row.get(0),
                     )
                     .unwrap();
                 let source_version_hash = store
@@ -11319,11 +11576,11 @@ mod tests {
                     chunk_id: *chunk_id,
                     source_version_id,
                     source_version_hash,
-                    context_hash: embedding_context_hash(
+                    context_hash: production_context_hash_for_chunk(
+                        store,
                         manifest,
                         crate::chunking::CHUNKER_FINGERPRINT,
-                        "context-v1",
-                        &body,
+                        *chunk_id,
                     ),
                     vector: vec![1.0 + *chunk_id as f32, 2.0],
                 }

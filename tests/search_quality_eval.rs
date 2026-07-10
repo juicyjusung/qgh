@@ -1,5 +1,6 @@
 #![cfg(feature = "vector-search")]
 
+use qgh::context::{prepare_embedding_input, EmbeddingSourceContext};
 use qgh::embedding::{
     EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_HF_MODEL_REVISION,
     DEFAULT_QUERY_PREFIX,
@@ -1227,14 +1228,46 @@ fn eval_query_vectors_json<'a>(
 fn eval_document_vectors_json(source_vectors: &BTreeMap<&'static str, Vec<f32>>) -> String {
     let document_vectors = source_vectors
         .iter()
-        .map(|(source_id, vector)| {
-            (
-                format!("eval embedding chunk for {source_id}"),
-                vector.clone(),
-            )
-        })
+        .map(|(source_id, vector)| (eval_embedding_input_for_source(source_id), vector.clone()))
         .collect::<BTreeMap<_, _>>();
     serde_json::to_string(&document_vectors).unwrap()
+}
+
+fn eval_embedding_input_for_source(source_id: &str) -> String {
+    let repository = "github.com/owner/repo";
+    for issue in eval_issues() {
+        let issue_source_id = format!("qgh://github.com/issue/{}", issue.node_id);
+        if issue_source_id == source_id {
+            let chunk = format!("eval embedding chunk for {source_id}");
+            return prepare_embedding_input(
+                EmbeddingSourceContext::Issue {
+                    repository,
+                    issue_number: issue.number,
+                    title: issue.title,
+                },
+                &chunk,
+            )
+            .as_str()
+            .to_string();
+        }
+        for comment in issue.comments {
+            let comment_source_id = format!("qgh://github.com/issue-comment/{}", comment.node_id);
+            if comment_source_id == source_id {
+                let chunk = format!("eval embedding chunk for {source_id}");
+                return prepare_embedding_input(
+                    EmbeddingSourceContext::Comment {
+                        repository,
+                        parent_issue_number: issue.number,
+                        parent_issue_title: issue.title,
+                    },
+                    &chunk,
+                )
+                .as_str()
+                .to_string();
+            }
+        }
+    }
+    panic!("missing eval source metadata for contextual embedding input");
 }
 
 fn eval_base_query_vectors() -> BTreeMap<&'static str, Vec<f32>> {

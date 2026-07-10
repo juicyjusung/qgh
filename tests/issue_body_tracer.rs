@@ -6701,7 +6701,7 @@ query_prefix = "query: "
             output_dimension: 3,
             max_length: 32,
             quantization: QuantizationKind::None,
-            context_template_version: "qgh.context.none.v1".to_string(),
+            context_template_version: qgh::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
         };
         let manifest_hash = manifest.hash();
         let manifest_path = root.join("manifest.json");

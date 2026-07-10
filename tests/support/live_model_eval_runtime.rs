@@ -6,6 +6,10 @@ use percent_encoding::percent_decode_str;
 use qgh::chunking::{
     chunk_markdown_with_config, ChunkerConfig, CHUNKER_FINGERPRINT, CHUNKER_VERSION,
 };
+use qgh::context::{
+    embedding_context_hash, prepare_embedding_input, EmbeddingSourceContext,
+    METADATA_CONTEXT_TEMPLATE_VERSION,
+};
 use qgh::embedding::{
     EmbeddingTokenizer, FastembedProviderOptions, FastembedTokenizer, ModelManifestV1, PoolingKind,
     PreparedModelStore, QuantizationKind,
@@ -1027,11 +1031,31 @@ fn context_input(
     title: &str,
     chunk: &str,
 ) -> String {
+    let Ok(issue_number) = i64::try_from(issue_number) else {
+        return String::new();
+    };
+    let repository = format!("{host}/{repo}");
     match entity_type {
-        "issue" => format!("Repository: {host}/{repo}\nIssue #{issue_number}: {title}\n\n{chunk}"),
-        "issue_comment" => format!(
-            "Repository: {host}/{repo}\nComment on issue #{issue_number}: {title}\n\n{chunk}"
-        ),
+        "issue" => prepare_embedding_input(
+            EmbeddingSourceContext::Issue {
+                repository: &repository,
+                issue_number,
+                title,
+            },
+            chunk,
+        )
+        .as_str()
+        .to_string(),
+        "issue_comment" => prepare_embedding_input(
+            EmbeddingSourceContext::Comment {
+                repository: &repository,
+                parent_issue_number: issue_number,
+                parent_issue_title: title,
+            },
+            chunk,
+        )
+        .as_str()
+        .to_string(),
         _ => String::new(),
     }
 }
@@ -1094,19 +1118,22 @@ fn probe_context_contract(
         comment_rows_checked += usize::from(entity_type == "issue_comment");
         let embedding_input =
             context_input(&entity_type, &host, &repo, issue_number, &title, &chunk);
-        let expected_context_hash = digest_hex(&format!(
-            "{model_manifest_hash}\0{chunker_fingerprint}\0{generation_template_version}\0{embedding_input}"
-        ));
+        let expected_context_hash = embedding_context_hash(
+            &model_manifest_hash,
+            &chunker_fingerprint,
+            &generation_template_version,
+            &embedding_input,
+        );
         context_hash_mismatches +=
             usize::from(embedding_input.is_empty() || stored_context_hash != expected_context_hash);
     }
-    let passed = manifest_template_version == "qgh.context.v1"
-        && generation_template_version == "qgh.context.v1"
+    let passed = manifest_template_version == METADATA_CONTEXT_TEMPLATE_VERSION
+        && generation_template_version == METADATA_CONTEXT_TEMPLATE_VERSION
         && issue_rows_checked > 0
         && comment_rows_checked > 0
         && context_hash_mismatches == 0;
     Ok(ContextContractEvidence {
-        required_template_version: "qgh.context.v1",
+        required_template_version: METADATA_CONTEXT_TEMPLATE_VERSION,
         manifest_template_version: manifest_template_version.to_string(),
         generation_template_version,
         issue_rows_checked,
@@ -1379,9 +1406,19 @@ pub(super) fn run_hard_filter_contract_probe(
 }
 
 fn hard_filter_document_vectors_json(sources: &[CorpusRecord]) -> Result<String, DynError> {
+    let issue_titles = sources
+        .iter()
+        .filter(|source| source.entity_type == "issue")
+        .map(|source| {
+            (
+                (source.repo.as_str(), source.issue_number),
+                source.title.as_str(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let document_vectors = sources
         .iter()
-        .map(|source| {
+        .map(|source| -> Result<(String, Vec<f32>), DynError> {
             let vector = match source.source_id.as_str() {
                 "qgh://github.com/issue/I_FILTER_TARGET" => vec![0.8_f32, 0.2, 0.0, 0.0],
                 "qgh://github.com/issue/I_FILTER_OTHER_ISSUE" => {
@@ -1389,9 +1426,33 @@ fn hard_filter_document_vectors_json(sources: &[CorpusRecord]) -> Result<String,
                 }
                 _ => vec![1.0_f32, 0.0, 0.0, 0.0],
             };
-            (hard_filter_chunk_body(&source.source_id), vector)
+            let repository = format!("github.com/{}", source.repo);
+            let issue_number = i64::try_from(source.issue_number)?;
+            let chunk = hard_filter_chunk_body(&source.source_id);
+            let context = match source.entity_type.as_str() {
+                "issue" => EmbeddingSourceContext::Issue {
+                    repository: &repository,
+                    issue_number,
+                    title: &source.title,
+                },
+                "issue_comment" => EmbeddingSourceContext::Comment {
+                    repository: &repository,
+                    parent_issue_number: issue_number,
+                    parent_issue_title: issue_titles
+                        .get(&(source.repo.as_str(), source.issue_number))
+                        .copied()
+                        .ok_or("hard-filter comment parent title missing")?,
+                },
+                _ => return Err("hard-filter source entity type unsupported".into()),
+            };
+            Ok((
+                prepare_embedding_input(context, &chunk)
+                    .as_str()
+                    .to_string(),
+                vector,
+            ))
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect::<Result<BTreeMap<_, _>, DynError>>()?;
     Ok(serde_json::to_string(&document_vectors)?)
 }
 
