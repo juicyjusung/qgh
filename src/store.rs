@@ -8638,17 +8638,26 @@ fn upsert_source_version(
     indexed_at: &str,
     sync_run_id: &str,
 ) -> Result<i64, rusqlite::Error> {
-    if let Some(version_id) = tx
+    if let Some((version_id, stored_github_updated_at, stored_lifecycle_state)) = tx
         .query_row(
-            "SELECT id FROM source_versions
+            "SELECT id, github_updated_at, lifecycle_state FROM source_versions
              WHERE source_id = ?1 AND body_hash = ?2
              ORDER BY id DESC
              LIMIT 1",
             params![source_id, body_hash],
-            |row| row.get::<_, i64>(0),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()?
     {
+        if stored_github_updated_at == github_updated_at && stored_lifecycle_state == "active" {
+            return Ok(version_id);
+        }
         tx.execute(
             "UPDATE source_versions
              SET github_updated_at = ?1,
@@ -16561,6 +16570,223 @@ mod tests {
             1
         );
         assert!(store.embedding_generation_state(generation_id).is_err());
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn exact_authoritative_noop_preserves_issue_and_comment_version_provenance() {
+        let paths = temp_profile_paths("exact-authoritative-version-provenance");
+        let mut store = Store::open(&paths).unwrap();
+        let issue_id = "qgh://github.com/issue/I_EXACT_VERSION_PROVENANCE";
+        let comment_id = "qgh://github.com/issue-comment/IC_EXACT_VERSION_PROVENANCE";
+        let issue = test_issue(issue_id, "owner/repo", "exact-version-provenance");
+        let comment = test_comment(
+            comment_id,
+            issue_id,
+            "owner/repo",
+            "exact-version-provenance",
+        );
+        store
+            .upsert_sources_for_run(
+                "sync-exact-version-first",
+                std::slice::from_ref(&issue),
+                std::slice::from_ref(&comment),
+                0,
+                &[],
+            )
+            .unwrap();
+        let provenance = |store: &Store, source_id: &str| {
+            store
+                .conn
+                .query_row(
+                    "SELECT id, github_updated_at, indexed_at, sync_run_id, lifecycle_state
+                     FROM source_versions WHERE source_id = ?1",
+                    params![source_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let issue_before = provenance(&store, issue_id);
+        let comment_before = provenance(&store, comment_id);
+        let epoch_before = read_source_snapshot_epoch(&store.conn).unwrap();
+        let mut repeated_issue = issue.clone();
+        repeated_issue.indexed_at = "2026-01-03T00:00:01Z".to_string();
+        let mut repeated_comment = comment.clone();
+        repeated_comment.indexed_at = "2026-01-03T00:00:02Z".to_string();
+
+        store
+            .upsert_sources_for_run(
+                "sync-exact-version-second",
+                &[repeated_issue],
+                &[repeated_comment],
+                0,
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(provenance(&store, issue_id), issue_before);
+        assert_eq!(provenance(&store, comment_id), comment_before);
+        assert_eq!(
+            read_source_snapshot_epoch(&store.conn).unwrap(),
+            epoch_before
+        );
+        for source_id in [issue_id, comment_id] {
+            let version_count: i64 = store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM source_versions WHERE source_id = ?1",
+                    params![source_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(version_count, 1);
+        }
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn authoritative_source_changes_still_update_provenance_and_reactivate() {
+        let paths = temp_profile_paths("authoritative-source-change-provenance");
+        let mut store = Store::open(&paths).unwrap();
+        let issue_id = "qgh://github.com/issue/I_CHANGED_VERSION_PROVENANCE";
+        let comment_id = "qgh://github.com/issue-comment/IC_CHANGED_VERSION_PROVENANCE";
+        let mut issue = test_issue(issue_id, "owner/repo", "changed-version-provenance");
+        let mut comment = test_comment(
+            comment_id,
+            issue_id,
+            "owner/repo",
+            "changed-version-provenance",
+        );
+        store
+            .upsert_sources_for_run(
+                "sync-changed-version-first",
+                std::slice::from_ref(&issue),
+                std::slice::from_ref(&comment),
+                0,
+                &[],
+            )
+            .unwrap();
+
+        let epoch_before_timestamp = read_source_snapshot_epoch(&store.conn).unwrap();
+        issue.updated_at = "2026-01-03T00:00:00Z".to_string();
+        issue.indexed_at = "2026-01-03T00:00:01Z".to_string();
+        comment.updated_at = "2026-01-03T00:00:00Z".to_string();
+        comment.indexed_at = "2026-01-03T00:00:02Z".to_string();
+        store
+            .upsert_sources_for_run(
+                "sync-changed-version-timestamp",
+                std::slice::from_ref(&issue),
+                std::slice::from_ref(&comment),
+                0,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            read_source_snapshot_epoch(&store.conn).unwrap(),
+            epoch_before_timestamp + 1
+        );
+        for (source_id, indexed_at) in [
+            (issue_id, "2026-01-03T00:00:01Z"),
+            (comment_id, "2026-01-03T00:00:02Z"),
+        ] {
+            let provenance: (String, String, String) = store
+                .conn
+                .query_row(
+                    "SELECT github_updated_at, indexed_at, sync_run_id
+                     FROM source_versions WHERE source_id = ?1",
+                    params![source_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                provenance,
+                (
+                    "2026-01-03T00:00:00Z".to_string(),
+                    indexed_at.to_string(),
+                    "sync-changed-version-timestamp".to_string()
+                )
+            );
+        }
+
+        let epoch_before_metadata = read_source_snapshot_epoch(&store.conn).unwrap();
+        issue.title = "Changed metadata title".to_string();
+        comment.parent_issue_title = issue.title.clone();
+        store
+            .upsert_sources_for_run(
+                "sync-changed-version-metadata",
+                std::slice::from_ref(&issue),
+                std::slice::from_ref(&comment),
+                0,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            read_source_snapshot_epoch(&store.conn).unwrap(),
+            epoch_before_metadata + 1
+        );
+        assert_eq!(
+            store.get_issue(issue_id).unwrap().unwrap().title,
+            "Changed metadata title"
+        );
+        assert_eq!(
+            store
+                .get_comment(comment_id)
+                .unwrap()
+                .unwrap()
+                .parent_issue
+                .title,
+            "Changed metadata title"
+        );
+
+        store.tombstone_source(issue_id, "deleted").unwrap();
+        let epoch_before_reactivation = read_source_snapshot_epoch(&store.conn).unwrap();
+        store
+            .upsert_sources_for_run(
+                "sync-changed-version-reactivation",
+                std::slice::from_ref(&issue),
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            read_source_snapshot_epoch(&store.conn).unwrap(),
+            epoch_before_reactivation + 1
+        );
+        assert!(store.get_issue(issue_id).unwrap().is_some());
+        assert!(store.get_tombstone(issue_id).unwrap().is_none());
+
+        let epoch_before_edit = read_source_snapshot_epoch(&store.conn).unwrap();
+        comment.body = "Edited authoritative comment body".to_string();
+        comment.body_hash = "edited-authoritative-comment-hash".to_string();
+        comment.updated_at = "2026-01-04T00:00:00Z".to_string();
+        comment.indexed_at = "2026-01-04T00:00:01Z".to_string();
+        store
+            .upsert_sources_for_run("sync-changed-version-edit", &[], &[comment], 0, &[])
+            .unwrap();
+        assert_eq!(
+            read_source_snapshot_epoch(&store.conn).unwrap(),
+            epoch_before_edit + 1
+        );
+        let comment_version_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM source_versions WHERE source_id = ?1",
+                params![comment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(comment_version_count, 2);
+
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
