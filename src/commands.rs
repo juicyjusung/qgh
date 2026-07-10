@@ -1952,8 +1952,8 @@ fn embedding_tokenizer(
         EmbeddingProviderKind::Local => {
             let options = embedding.fastembed_options();
             let prepared_store = default_prepared_model_store().map_err(embedding_error)?;
-            let snapshot = prepared_store.acquire(&options).map_err(embedding_error)?;
-            FastembedTokenizer::from_prepared_snapshot(&snapshot)
+            prepared_store
+                .acquire_tokenizer(&options)
                 .map(|tokenizer| Box::new(tokenizer) as Box<dyn EmbeddingTokenizer>)
                 .map_err(embedding_error)
         }
@@ -5601,6 +5601,146 @@ fn lexical_evidence(
 mod tests {
     use super::*;
     use crate::model::{IssueRecord, SourceVersionView};
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn tokenizer_only_acquisition_reads_no_model_or_external_bytes() {
+        use crate::embedding::{
+            reset_tokenizer_only_artifact_bytes, tokenizer_only_artifact_bytes, ArtifactRole,
+            ModelArtifactV1, ModelProviderKind, NormalizationKind, QuantizationKind, TokenizerKind,
+            MODEL_MANIFEST_SCHEMA_VERSION,
+        };
+        use sha2::{Digest, Sha256};
+        use tokenizers::models::wordlevel::WordLevel;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "qgh-tokenizer-only-acquisition-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let tokenizer = tokenizers::Tokenizer::new(WordLevel::default())
+            .to_string(false)
+            .unwrap()
+            .into_bytes();
+        let declarations = [
+            (
+                ArtifactRole::OnnxModel,
+                "model.onnx",
+                b"model-must-not-be-read".as_slice(),
+                None,
+            ),
+            (
+                ArtifactRole::OnnxExternalData,
+                "weights.bin",
+                b"external-must-not-be-read".as_slice(),
+                Some("weights.bin"),
+            ),
+            (
+                ArtifactRole::Tokenizer,
+                "tokenizer.json",
+                tokenizer.as_slice(),
+                None,
+            ),
+            (ArtifactRole::Config, "config.json", b"{}".as_slice(), None),
+            (
+                ArtifactRole::SpecialTokensMap,
+                "special_tokens_map.json",
+                b"{}".as_slice(),
+                None,
+            ),
+            (
+                ArtifactRole::TokenizerConfig,
+                "tokenizer_config.json",
+                b"{}".as_slice(),
+                None,
+            ),
+        ];
+        let artifacts = declarations
+            .iter()
+            .map(|(role, path, bytes, initializer)| {
+                if !matches!(
+                    role,
+                    ArtifactRole::OnnxModel | ArtifactRole::OnnxExternalData
+                ) {
+                    std::fs::write(root.join(path), bytes).unwrap();
+                }
+                ModelArtifactV1 {
+                    role: *role,
+                    relative_path: path.to_string(),
+                    sha256: Sha256::digest(bytes)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                    byte_size: bytes.len() as u64,
+                    external_initializer_name: initializer.map(ToString::to_string),
+                }
+            })
+            .collect();
+        let manifest = ModelManifestV1 {
+            schema_version: MODEL_MANIFEST_SCHEMA_VERSION.to_string(),
+            preset_id: None,
+            provider: ModelProviderKind::Fastembed,
+            model_source: ModelSourceV1::Local {
+                declared_id: "tokenizer-only-fixture".to_string(),
+            },
+            artifacts,
+            tokenizer: TokenizerKind::HfTokenizerJson,
+            query_prefix: Some(String::new()),
+            document_prefix: Some(String::new()),
+            pooling: crate::embedding::PoolingKind::Cls,
+            normalization: NormalizationKind::L2,
+            native_dimension: 4,
+            output_dimension: 4,
+            max_length: 32,
+            quantization: QuantizationKind::None,
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+        };
+        let manifest_path = root.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let embedding = EmbeddingConfig {
+            provider: EmbeddingProviderKind::Local,
+            manifest_path: Some(manifest_path),
+            model: None,
+            model_path: None,
+            file: None,
+            pooling: None,
+            query_prefix: None,
+            quantization: None,
+            token_source: None,
+        };
+
+        reset_tokenizer_only_artifact_bytes();
+        embedding_tokenizer(&embedding)
+            .expect("tokenizer-only acquisition must ignore model files");
+        let bytes = tokenizer_only_artifact_bytes();
+
+        assert!(bytes
+            .get(&ArtifactRole::Tokenizer)
+            .is_some_and(|bytes| *bytes > 0));
+        for role in [
+            ArtifactRole::Config,
+            ArtifactRole::SpecialTokensMap,
+            ArtifactRole::TokenizerConfig,
+        ] {
+            assert_eq!(bytes.get(&role).copied(), Some(2));
+        }
+        assert_eq!(bytes.get(&ArtifactRole::OnnxModel).copied().unwrap_or(0), 0);
+        assert_eq!(
+            bytes
+                .get(&ArtifactRole::OnnxExternalData)
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+    }
 
     #[cfg(feature = "fastembed-provider")]
     #[test]
