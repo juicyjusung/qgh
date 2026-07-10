@@ -634,16 +634,21 @@ pub async fn fetch_backfill_issues(
     progress: Option<&dyn ProgressReporter>,
     commit_page: &mut dyn FnMut(FetchPage) -> Result<(), QghError>,
 ) -> Result<BackfillOutcome, QghError> {
-    let outcome = fetch_backfill_issues_classified(
-        profile,
-        token,
-        cursors,
-        max_pages,
-        max_duration_seconds,
-        progress,
-        commit_page,
+    legacy_backfill_outcome(
+        fetch_backfill_issues_classified(
+            profile,
+            token,
+            cursors,
+            max_pages,
+            max_duration_seconds,
+            progress,
+            commit_page,
+        )
+        .await?,
     )
-    .await?;
+}
+
+fn legacy_backfill_outcome(outcome: BackfillOutcome) -> Result<BackfillOutcome, QghError> {
     match outcome.interruption.as_ref() {
         None => Ok(outcome),
         Some(LifecycleInterruption::AuthenticationFailed) => Err(authentication_failure()),
@@ -947,9 +952,15 @@ fn legacy_target_issue_outcome(
         ClassifiedTargetIssueFetchOutcome::Fetched(fetched) => {
             TargetIssueFetchOutcome::Fetched(fetched)
         }
-        ClassifiedTargetIssueFetchOutcome::Confirmed { lifecycle, .. } => {
-            TargetIssueFetchOutcome::Unavailable(lifecycle)
-        }
+        ClassifiedTargetIssueFetchOutcome::Confirmed {
+            state: ConfirmedRemoteState::SourceDeleted | ConfirmedRemoteState::SourceTransferred,
+            lifecycle,
+            ..
+        } => TargetIssueFetchOutcome::Unavailable(lifecycle),
+        ClassifiedTargetIssueFetchOutcome::Confirmed {
+            state: ConfirmedRemoteState::RepositoryPermissionLoss,
+            ..
+        } => return Err(repository_permission_loss_requires_typed_handling()),
         ClassifiedTargetIssueFetchOutcome::Backoff(plan) => TargetIssueFetchOutcome::Backoff(plan),
         ClassifiedTargetIssueFetchOutcome::AuthenticationFailed => {
             return Err(authentication_failure());
@@ -1338,9 +1349,17 @@ pub async fn check_source_lifecycle(
 fn legacy_lifecycle_check(check: ClassifiedLifecycleCheck) -> Result<LifecycleCheck, QghError> {
     match check {
         ClassifiedLifecycleCheck::Active => Ok(LifecycleCheck::Active),
-        ClassifiedLifecycleCheck::Confirmed { state, .. } => Ok(LifecycleCheck::Unavailable {
+        ClassifiedLifecycleCheck::Confirmed {
+            state:
+                state @ (ConfirmedRemoteState::SourceDeleted | ConfirmedRemoteState::SourceTransferred),
+            ..
+        } => Ok(LifecycleCheck::Unavailable {
             reason: state.reason().to_string(),
         }),
+        ClassifiedLifecycleCheck::Confirmed {
+            state: ConfirmedRemoteState::RepositoryPermissionLoss,
+            ..
+        } => Err(repository_permission_loss_requires_typed_handling()),
         ClassifiedLifecycleCheck::AuthenticationFailed => Err(authentication_failure()),
         ClassifiedLifecycleCheck::Backoff(_) => Err(github_unavailable()),
         ClassifiedLifecycleCheck::Transient(_) => Err(github_unavailable()),
@@ -2314,6 +2333,15 @@ fn github_unavailable() -> QghError {
         .with_hint("Retry later; local content was not removed.")
 }
 
+fn repository_permission_loss_requires_typed_handling() -> QghError {
+    QghError::new(
+        "github.repository_permission_loss_requires_typed_handling",
+        "Confirmed repository permission loss requires repository-level purge handling.",
+        3,
+    )
+    .with_hint("Retry through a command that applies confirmed repository purge evidence.")
+}
+
 fn github_get(client: &reqwest::Client, url: &str, token: &str) -> reqwest::RequestBuilder {
     client
         .get(url)
@@ -2967,18 +2995,85 @@ mod permission_classification_tests {
         assert!(matches!(lifecycle, LifecycleCheck::Unavailable { .. }));
 
         let target = legacy_target_issue_outcome(ClassifiedTargetIssueFetchOutcome::Confirmed {
-            state: ConfirmedRemoteState::RepositoryPermissionLoss,
+            state: ConfirmedRemoteState::SourceDeleted,
             repo: "owner/repo".to_string(),
             issue_number: 42,
             lifecycle: TargetIssueLifecycle {
-                status: "permission_loss".to_string(),
-                reason: Some("permission_loss".to_string()),
+                status: "deleted".to_string(),
+                reason: Some("deleted".to_string()),
                 http_status: Some(404),
                 alias_chain: Vec::new(),
             },
         })
         .unwrap();
         assert!(matches!(target, TargetIssueFetchOutcome::Unavailable(_)));
+
+        let Err(lifecycle_error) = legacy_lifecycle_check(ClassifiedLifecycleCheck::Confirmed {
+            state: ConfirmedRemoteState::RepositoryPermissionLoss,
+            http_status: 404,
+        }) else {
+            panic!("repository loss must require typed handling");
+        };
+        assert_eq!(
+            lifecycle_error.code,
+            "github.repository_permission_loss_requires_typed_handling"
+        );
+
+        let Err(target_error) =
+            legacy_target_issue_outcome(ClassifiedTargetIssueFetchOutcome::Confirmed {
+                state: ConfirmedRemoteState::RepositoryPermissionLoss,
+                repo: "owner/repo".to_string(),
+                issue_number: 42,
+                lifecycle: TargetIssueLifecycle {
+                    status: "permission_loss".to_string(),
+                    reason: Some("permission_loss".to_string()),
+                    http_status: Some(404),
+                    alias_chain: Vec::new(),
+                },
+            })
+        else {
+            panic!("repository loss must not become source unavailable");
+        };
+        assert_eq!(
+            target_error.code,
+            "github.repository_permission_loss_requires_typed_handling"
+        );
+    }
+
+    #[test]
+    fn full_and_backfill_legacy_wrappers_preserve_confirmed_repo_evidence() {
+        let confirmed = ConfirmedRepositoryPermissionLoss {
+            repo: "owner/repo".to_string(),
+            http_status: 404,
+        };
+        let fetched = legacy_fetch_outcome(ClassifiedFetchOutcome::Fetched(FetchResult {
+            issues: 0,
+            comments: 0,
+            skipped_pull_requests: 0,
+            confirmed_permission_lost_repos: vec![confirmed.clone()],
+            confirmed_source_deletions: Vec::new(),
+        }))
+        .unwrap();
+        let FetchOutcome::Fetched(fetched) = fetched else {
+            panic!("confirmed evidence must remain a fetched payload");
+        };
+        assert_eq!(
+            fetched.confirmed_permission_lost_repos,
+            vec![confirmed.clone()]
+        );
+
+        let backfill = legacy_backfill_outcome(BackfillOutcome {
+            issues: 0,
+            comments: 0,
+            skipped_pull_requests: 0,
+            confirmed_permission_lost_repos: vec![confirmed.clone()],
+            confirmed_source_deletions: Vec::new(),
+            all_reached_end: false,
+            backoff: None,
+            interruption: None,
+        })
+        .unwrap();
+        assert_eq!(backfill.confirmed_permission_lost_repos, vec![confirmed]);
     }
 
     #[tokio::test]
