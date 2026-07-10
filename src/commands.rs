@@ -3216,12 +3216,12 @@ pub fn query(
     let repo_policy = discover_repo_policy()?;
     let filters = QueryFilters::from_args(&args, &profile, repo_policy.as_ref(), repo_scope)?;
     let limit = effective_limit(&args, repo_policy.as_ref())?;
-    let mut store = Store::open(&profile.paths)?;
+    let store = Store::open_for_read(&profile.paths)?;
     let allowed_repository_keys = configured_repository_identity_keys(&profile);
     store.validate_profile_read_allowlist(&allowed_repository_keys)?;
     let mut vector_open_warnings = Vec::new();
     let vector_enabled = if profile.embedding.is_some() {
-        match store.enable_vector() {
+        match store.enable_vector_for_read() {
             Ok(()) => true,
             Err(_) => {
                 vector_open_warnings.push(embedding_warning(
@@ -4673,7 +4673,11 @@ pub async fn get(
     verify_lifecycle: bool,
 ) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
-    let mut store = Store::open(&profile.paths)?;
+    let mut store = if verify_lifecycle {
+        Store::open(&profile.paths)?
+    } else {
+        Store::open_for_read(&profile.paths)?
+    };
     let allowed_repository_keys = configured_repository_identity_keys(&profile);
     store.validate_profile_read_allowlist(&allowed_repository_keys)?;
     let lifecycle_check = if verify_lifecycle {
@@ -4723,7 +4727,11 @@ pub async fn get_cli(
     }
 
     let profile = load_profile(profile_id)?;
-    let mut store = Store::open(&profile.paths)?;
+    let mut store = if verify_lifecycle {
+        Store::open(&profile.paths)?
+    } else {
+        Store::open_for_read(&profile.paths)?
+    };
     let allowed_repository_keys = configured_repository_identity_keys(&profile);
     store.validate_profile_read_allowlist(&allowed_repository_keys)?;
     let mut lifecycle_checks = Vec::with_capacity(source_ids.len());
@@ -4930,7 +4938,7 @@ pub fn status(
 ) -> Result<LocalReadOutcome, QghError> {
     let profile = load_profile(profile_id)?;
     let repo_policy = discover_repo_policy()?;
-    let store = Store::open(&profile.paths)?;
+    let store = Store::open_for_read(&profile.paths)?;
     let status = store.status()?;
     let purge = purge_report(&store)?;
     let coverage = coverage::evaluate(&store.coverage_snapshot()?, false);
@@ -5054,7 +5062,7 @@ pub fn status(
 
 pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
-    let store = Store::open(&profile.paths)?;
+    let store = Store::open_for_read(&profile.paths)?;
     let status = store.status()?;
     let purge = purge_report(&store)?;
     let purge_ok = purge["pending_count"].as_u64() == Some(0)

@@ -14,7 +14,8 @@ use crate::paths::{ensure_private_dir, set_private_file};
 use crate::time::{now_rfc3339, now_run_id_suffix};
 use rusqlite::types::Value;
 use rusqlite::{
-    params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
+    params, params_from_iter, Connection, OpenFlags, OptionalExtension, Transaction,
+    TransactionBehavior,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -402,7 +403,38 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "secure_delete", "ON")?;
-        let mut store = Self {
+        let mut store = Self::from_connection(conn, paths);
+        store.migrate()?;
+        store.detach_unbound_tantivy_publication()?;
+        store.detach_legacy_embedding_publication_identity()?;
+        store.enforce_pending_purge_guards()?;
+        store.content_write_epoch = read_content_write_epoch(&store.conn)?;
+        Ok(store)
+    }
+
+    /// Opens an initialized store without applying migrations or operational
+    /// repairs. Existing stores are opened with SQLite read-only flags so
+    /// query/get/status/doctor cannot detach publications, advance purge
+    /// guards, or otherwise turn observation into recovery work. A missing
+    /// database is bootstrapped once through the normal writer path, then
+    /// reopened read-only.
+    pub fn open_for_read(paths: &ProfilePaths) -> Result<Self, QghError> {
+        if !paths.db_path.exists() {
+            drop(Self::open(paths)?);
+        }
+        let conn = Connection::open_with_flags(
+            &paths.db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let mut store = Self::from_connection(conn, paths);
+        store.validate_read_schema()?;
+        store.content_write_epoch = read_content_write_epoch(&store.conn)?;
+        Ok(store)
+    }
+
+    fn from_connection(conn: Connection, paths: &ProfilePaths) -> Self {
+        Self {
             conn,
             profile_dir: paths.profile_dir.clone(),
             index_root: paths.index_root.clone(),
@@ -418,13 +450,24 @@ impl Store {
             cleanup_fail_after_first_generation_delete: false,
             #[cfg(test)]
             activation_failure: None,
-        };
-        store.migrate()?;
-        store.detach_unbound_tantivy_publication()?;
-        store.detach_legacy_embedding_publication_identity()?;
-        store.enforce_pending_purge_guards()?;
-        store.content_write_epoch = read_content_write_epoch(&store.conn)?;
-        Ok(store)
+        }
+    }
+
+    fn validate_read_schema(&self) -> Result<(), QghError> {
+        let schema_version = self
+            .conn
+            .query_row(
+                "SELECT value FROM profile_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if schema_version.as_deref() != Some("qgh.db.v1") {
+            return Err(QghError::storage(
+                "The local store schema is not initialized for read-only retrieval. Run `qgh sync` to migrate it.",
+            ));
+        }
+        Ok(())
     }
 
     /// Detaches an active publication whose Tantivy artifact does not carry the
@@ -644,6 +687,11 @@ impl Store {
     pub fn enable_vector(&mut self) -> Result<(), QghError> {
         register_sqlite_vec_extension(&self.conn)?;
         self.migrate_vector_schema()
+    }
+
+    #[cfg(feature = "vector-search")]
+    pub fn enable_vector_for_read(&self) -> Result<(), QghError> {
+        register_sqlite_vec_extension(&self.conn)
     }
 
     /// Durably marks `target` pending before attempting destructive work. A
@@ -2097,6 +2145,14 @@ impl Store {
 
     #[cfg(not(feature = "vector-search"))]
     pub fn enable_vector(&mut self) -> Result<(), QghError> {
+        Err(QghError::validation(
+            "embedding.vector_capability_unavailable",
+            "This qgh binary was built without the vector-search feature.",
+        ))
+    }
+
+    #[cfg(not(feature = "vector-search"))]
+    pub fn enable_vector_for_read(&self) -> Result<(), QghError> {
         Err(QghError::validation(
             "embedding.vector_capability_unavailable",
             "This qgh binary was built without the vector-search feature.",

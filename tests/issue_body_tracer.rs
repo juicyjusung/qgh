@@ -466,6 +466,58 @@ fn doctor_reports_missing_tantivy_without_mutating_publication_pointer() {
 }
 
 #[test]
+fn status_and_doctor_report_storage_repair_candidates_without_mutation() {
+    let fixture = TestFixture::new("report-only-storage-diagnostics");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let source_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    fixture.seed_open_repair_candidates(source_id, true);
+    let before = fixture.open_repair_state(source_id);
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    assert_eq!(stdout_json(&status)["data"]["purge"]["pending_count"], 1);
+    assert_eq!(fixture.open_repair_state(source_id), before);
+
+    let doctor = fixture.qgh(["doctor", "--json"]);
+    assert_success(&doctor);
+    let doctor_json = stdout_json(&doctor);
+    let checks = doctor_json["data"]["checks"].as_array().unwrap();
+    assert!(checks
+        .iter()
+        .any(|check| check["name"] == "tantivy" && check["ok"] == false));
+    assert!(checks
+        .iter()
+        .any(|check| check["name"] == "purge" && check["ok"] == false));
+    assert_eq!(fixture.open_repair_state(source_id), before);
+}
+
+#[test]
+fn query_and_default_get_do_not_repair_invalid_publication_on_open() {
+    let fixture = TestFixture::new("read-only-storage-open");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let source_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    fixture.seed_open_repair_candidates(source_id, false);
+    let before = fixture.open_repair_state(source_id);
+
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_eq!(query.status.code(), Some(6));
+    assert_eq!(
+        stdout_json(&query)["error"]["code"],
+        "publication.source_inventory_mismatch"
+    );
+    assert_eq!(fixture.open_repair_state(source_id), before);
+
+    let get = fixture.qgh(["get", source_id, "--json"]);
+    assert_success(&get);
+    assert_eq!(stdout_json(&get)["data"]["source"]["source_id"], source_id);
+    assert_eq!(fixture.open_repair_state(source_id), before);
+}
+
+#[test]
 fn sync_sends_github_rest_headers_required_by_real_api() {
     let fixture = TestFixture::new("github-required-headers");
     let server = HeaderCheckingFakeGitHub::start();
@@ -3011,7 +3063,7 @@ fn status_embedding_coverage_counts_completed_and_missing_chunks() {
         ),
     );
     assert!(!fixture.qgh(["embed", "--force", "--json"]).status.success());
-    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
+    fixture.initialize_embedding_schema_for_test();
     let issue_chunk = fixture.insert_chunk_for_source(
         "qgh://github.com/issue/I_kwDOISSUE1",
         "issue embedding chunk",
@@ -3096,7 +3148,7 @@ fn status_embedding_coverage_reports_fingerprint_mismatch() {
         ),
     );
     assert!(!fixture.qgh(["embed", "--force", "--json"]).status.success());
-    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
+    fixture.initialize_embedding_schema_for_test();
     let chunk_id = fixture.insert_chunk_for_source(
         "qgh://github.com/issue/I_kwDOISSUE1",
         "stale embedding chunk",
@@ -3143,7 +3195,7 @@ fn corrupt_embedding_fingerprint_degrades_status_and_query_without_breaking_get(
 
     let source_id = "qgh://github.com/issue/I_kwDOISSUE1";
     fixture.write_default_embedding_config(&server.base_url);
-    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
+    fixture.initialize_embedding_schema_for_test();
     let chunk_id = fixture.insert_chunk_for_source(source_id, "corrupt fingerprint chunk");
     fixture.insert_matching_active_embedding_fingerprint();
     fixture.insert_embedding_metadata_for_chunk(chunk_id);
@@ -3199,7 +3251,7 @@ fn unreadable_vector_table_degrades_status_and_query_without_breaking_get() {
 
         let source_id = "qgh://github.com/issue/I_kwDOISSUE1";
         fixture.write_default_embedding_config(&server.base_url);
-        assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
+        fixture.initialize_embedding_schema_for_test();
         let chunk_id = fixture.insert_chunk_for_source(source_id, "vector readiness chunk");
         fixture.insert_matching_active_embedding_fingerprint();
         fixture.insert_embedding_metadata_for_chunk(chunk_id);
@@ -3489,7 +3541,7 @@ query_prefix = "query: "
 "#,
     );
     assert_success(&fixture.qgh(["status", "--json"]));
-    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
+    fixture.initialize_embedding_schema_for_test();
     fixture.insert_active_embedding_fingerprint("Example/old-model");
 
     let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
@@ -3533,7 +3585,7 @@ pooling = "cls"
 query_prefix = "query: "
 "#,
     );
-    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
+    fixture.initialize_embedding_schema_for_test();
     fixture.insert_active_embedding_fingerprint_with_revision(DEFAULT_HF_MODEL_ID, "old-main-sha");
 
     let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
@@ -3565,7 +3617,7 @@ fn partial_embedding_coverage_warns_and_falls_back_to_bm25_results() {
     assert_eq!(bm25_json["warnings"], json!([]));
 
     fixture.write_default_embedding_config(&server.base_url);
-    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
+    fixture.initialize_embedding_schema_for_test();
     let issue_chunk = fixture.insert_chunk_for_source(
         "qgh://github.com/issue/I_kwDOISSUE1",
         "issue embedding chunk",
@@ -3626,7 +3678,7 @@ quantization = "none"
 "#
         ),
     );
-    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
+    fixture.initialize_embedding_schema_for_test();
     let chunk_id = fixture.insert_chunk_for_source(source_id, "issue embedding chunk");
     fixture.insert_active_embedding_fingerprint_with_revision(
         &format!("model_path:{model_path}"),
@@ -3826,7 +3878,7 @@ fn cached_prepared_manifest_query_is_offline_and_falls_back_to_bm25() {
         "prepared model acquisition during a fresh sync must not contact GitHub"
     );
 
-    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
+    fixture.initialize_embedding_schema_for_test();
     let chunk_id = fixture.insert_chunk_for_source(
         "qgh://github.com/issue/I_kwDOISSUE1",
         "prepared manifest runtime fixture",
@@ -7745,6 +7797,16 @@ limit = 10
         cmd.output().unwrap()
     }
 
+    #[cfg(feature = "vector-search")]
+    fn initialize_embedding_schema_for_test(&self) {
+        let output = self.qgh_with_document_vectors(["embed", "--force", "--json"], &json!({}));
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(
+            stdout_json(&output)["error"]["code"],
+            "embedding.test_vectors_empty"
+        );
+    }
+
     fn qgh_in<const N: usize>(&self, cwd: &Path, args: [&str; N]) -> Output {
         let mut cmd = self.base_command();
         cmd.current_dir(cwd).args(["--profile", "work"]).args(args);
@@ -8302,6 +8364,87 @@ limit = 10
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    fn seed_open_repair_candidates(&self, source_id: &str, pending_purge: bool) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE version = ?1",
+            ["qgh.tantivy.commit_inventory.v1"],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE index_generations
+             SET source_inventory_hash = ?1
+             WHERE active = 1",
+            ["0000000000000000000000000000000000000000000000000000000000000000"],
+        )
+        .unwrap();
+        if pending_purge {
+            conn.execute(
+                "INSERT INTO purge_requests
+                    (target_kind, target_value, trigger, purge_pending,
+                     current_stage, failure_stage, completion_ready, created_at, updated_at)
+                 VALUES ('source', ?1, 'confirmed_delete', 1,
+                         'secure_delete', NULL, 0,
+                         '2026-01-04T00:00:00Z', '2026-01-04T00:00:00Z')",
+                [source_id],
+            )
+            .unwrap();
+        }
+    }
+
+    fn open_repair_state(&self, source_id: &str) -> Value {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let (
+            pointer_count,
+            pointer_id,
+            active_publications,
+            active_generations,
+            inventory_migration,
+            guarded_sources,
+            lifecycle_state,
+            content_write_epoch,
+        ): (i64, i64, i64, i64, i64, i64, String, String) = conn
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM retrieval_publication_pointer),
+                    coalesce((SELECT max(publication_id)
+                              FROM retrieval_publication_pointer), 0),
+                    (SELECT count(*) FROM retrieval_publications WHERE active = 1),
+                    (SELECT count(*) FROM index_generations WHERE active = 1),
+                    (SELECT count(*) FROM schema_migrations WHERE version =
+                        'qgh.tantivy.commit_inventory.v1'),
+                    (SELECT count(*) FROM purge_target_sources WHERE source_id = ?1),
+                    (SELECT lifecycle_state FROM source_entities WHERE source_id = ?1),
+                    (SELECT value FROM profile_meta WHERE key = 'content_write_epoch')",
+                [source_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        json!({
+            "pointer_count": pointer_count,
+            "pointer_id": pointer_id,
+            "active_publications": active_publications,
+            "active_generations": active_generations,
+            "inventory_migration": inventory_migration,
+            "guarded_sources": guarded_sources,
+            "lifecycle_state": lifecycle_state,
+            "content_write_epoch": content_write_epoch
+        })
     }
 
     fn remove_active_tantivy_generation(&self) {
