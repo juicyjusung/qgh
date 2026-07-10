@@ -5498,7 +5498,9 @@ mod tests {
             vec!["Repository: github.com/owner/repo\nIssue #47: Vector smoke I_CONTEXT_SYNC\n\nunchanged authoritative chunk"]
         );
         assert_eq!(
-            store.active_embedding_chunks().unwrap()[0].body,
+            store.active_contextual_embedding_chunks().unwrap()[0]
+                .chunk
+                .body,
             "unchanged authoritative chunk"
         );
 
@@ -5568,7 +5570,9 @@ mod tests {
             vec![expected_input.to_string()]
         );
         assert_eq!(
-            store.active_embedding_chunks().unwrap()[0].body,
+            store.active_contextual_embedding_chunks().unwrap()[0]
+                .chunk
+                .body,
             "unchanged comment chunk"
         );
         let connection = rusqlite::Connection::open(&paths.db_path).unwrap();

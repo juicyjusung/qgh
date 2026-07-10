@@ -2446,26 +2446,6 @@ impl Store {
         Ok(deleted)
     }
 
-    pub fn active_embedding_chunks(&self) -> Result<Vec<StoredChunk>, QghError> {
-        if !embedding_schema_exists(&self.conn)? {
-            return Ok(Vec::new());
-        }
-        let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.source_id, c.source_version_id, c.body, c.chunk_index,
-                     c.token_start, c.token_end, c.byte_start, c.byte_end,
-                     c.chunker_version, c.chunker_fingerprint, c.heading_path_json
-             FROM chunks c
-             JOIN source_entities se ON se.source_id = c.source_id
-             LEFT JOIN issue_metadata im ON im.source_id = c.source_id
-             LEFT JOIN comment_metadata cm ON cm.source_id = c.source_id
-             WHERE se.lifecycle_state = 'active'
-               AND c.source_version_id = coalesce(im.latest_version_id, cm.latest_version_id)
-             ORDER BY c.id",
-        )?;
-        let rows = stmt.query_map([], stored_chunk_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
-    }
-
     pub fn active_contextual_embedding_chunks(
         &self,
     ) -> Result<Vec<ContextualEmbeddingChunk>, QghError> {
