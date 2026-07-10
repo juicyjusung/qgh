@@ -1,11 +1,18 @@
 use chrono::{Duration, SecondsFormat, Utc};
 #[cfg(feature = "vector-search")]
 use qgh::embedding::LOCAL_MODEL_REVISION;
+#[cfg(feature = "fastembed-provider")]
+use qgh::embedding::{
+    ArtifactRole, ModelArtifactV1, ModelManifestV1, ModelProviderKind, ModelSourceV1,
+    NormalizationKind, QuantizationKind, TokenizerKind, MODEL_MANIFEST_SCHEMA_VERSION,
+};
 use qgh::embedding::{
     EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_HF_MODEL_REVISION,
     DEFAULT_QUERY_PREFIX,
 };
 use serde_json::{json, Value};
+#[cfg(feature = "fastembed-provider")]
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 #[cfg(feature = "fastembed-provider")]
 use std::collections::HashMap;
@@ -2231,7 +2238,7 @@ fn embedding_status_uses_only_config_and_local_store_snapshot() {
         r#"
 provider = "local"
 model_path = "/definitely/not/a/model"
-file = "onnx/model_quantized.onnx"
+file = "onnx/model.onnx"
 pooling = "cls"
 query_prefix = "query: "
 "#,
@@ -2509,7 +2516,7 @@ fn embedding_enabled_sync_persists_tokenizer_backed_chunks() {
             r#"
 provider = "local"
 model_path = "{}"
-file = "onnx/model_quantized.onnx"
+file = "onnx/model.onnx"
 pooling = "cls"
 query_prefix = "query: "
 "#,
@@ -2545,7 +2552,7 @@ fn embedding_sync_backfills_locally_skips_unchanged_sources_and_cleans_tombstone
             r#"
 provider = "local"
 model_path = "{}"
-file = "onnx/model_quantized.onnx"
+file = "onnx/model.onnx"
 pooling = "cls"
 query_prefix = "query: "
 "#,
@@ -2613,7 +2620,7 @@ fn embedding_sync_skips_when_body_hash_matches_despite_new_github_timestamp() {
             r#"
 provider = "local"
 model_path = "{}"
-file = "onnx/model_quantized.onnx"
+file = "onnx/model.onnx"
 pooling = "cls"
 query_prefix = "query: "
 "#,
@@ -2966,6 +2973,51 @@ query_prefix = "query: "
     assert_eq!(
         stdout_json(&status)["data"]["embedding"]["state"],
         "complete"
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn cached_prepared_manifest_query_is_offline_and_falls_back_to_bm25() {
+    let fixture = TestFixture::new("prepared-manifest-offline-query");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let bm25 = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&bm25);
+    let bm25_results = stdout_json(&bm25)["data"]["results"].clone();
+    let request_count = server.request_count();
+    let (manifest_path, manifest_hash) = fixture.write_prepared_embedding_manifest();
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        &format!(
+            "provider = \"local\"\nmanifest_path = \"{}\"",
+            manifest_path.display()
+        ),
+    );
+
+    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
+    let chunk_id = fixture.insert_chunk_for_source(
+        "qgh://github.com/issue/I_kwDOISSUE1",
+        "prepared manifest chunk",
+    );
+    fixture
+        .insert_active_embedding_fingerprint_with_revision("local:offline-fixture", &manifest_hash);
+    fixture.insert_embedding_for_chunk(chunk_id);
+
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    assert_eq!(
+        warning_codes(&query_json),
+        vec!["embedding.runtime_unavailable"]
+    );
+    assert_eq!(query_json["data"]["results"], bm25_results);
+    assert_eq!(
+        server.request_count(),
+        request_count,
+        "query must not contact GitHub or a model host"
     );
 }
 
@@ -5939,7 +5991,7 @@ query_prefix = "query: "
 
         let model_dir = self.data_home.join("embedding-model");
         fs::create_dir_all(model_dir.join("onnx")).unwrap();
-        fs::write(model_dir.join("onnx/model_quantized.onnx"), b"not-used").unwrap();
+        fs::write(model_dir.join("onnx/model.onnx"), b"not-used").unwrap();
 
         let mut vocab = HashMap::new();
         vocab.insert("[UNK]".to_string(), 0);
@@ -5953,8 +6005,82 @@ query_prefix = "query: "
         tokenizer
             .save(model_dir.join("tokenizer.json"), false)
             .unwrap();
+        fs::write(
+            model_dir.join("config.json"),
+            r#"{"hidden_size":4,"max_position_embeddings":32}"#,
+        )
+        .unwrap();
+        fs::write(model_dir.join("special_tokens_map.json"), "{}").unwrap();
+        fs::write(
+            model_dir.join("tokenizer_config.json"),
+            r#"{"model_max_length":32}"#,
+        )
+        .unwrap();
+        fs::write(
+            model_dir.join("modules.json"),
+            r#"[
+                {"type":"sentence_transformers.models.Normalize"},
+                {"prompts":{"query":"query: ","document":""}}
+            ]"#,
+        )
+        .unwrap();
 
         model_dir
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn write_prepared_embedding_manifest(&self) -> (PathBuf, String) {
+        let root = self.write_local_embedding_tokenizer_model();
+        let declarations = [
+            (ArtifactRole::OnnxModel, "onnx/model.onnx"),
+            (ArtifactRole::Tokenizer, "tokenizer.json"),
+            (ArtifactRole::Config, "config.json"),
+            (ArtifactRole::SpecialTokensMap, "special_tokens_map.json"),
+            (ArtifactRole::TokenizerConfig, "tokenizer_config.json"),
+        ];
+        let artifacts = declarations
+            .into_iter()
+            .map(|(role, relative_path)| {
+                let bytes = fs::read(root.join(relative_path)).unwrap();
+                ModelArtifactV1 {
+                    role,
+                    relative_path: relative_path.to_string(),
+                    sha256: Sha256::digest(&bytes)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                    byte_size: bytes.len() as u64,
+                    external_initializer_name: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let manifest = ModelManifestV1 {
+            schema_version: MODEL_MANIFEST_SCHEMA_VERSION.to_string(),
+            preset_id: None,
+            provider: ModelProviderKind::Fastembed,
+            model_source: ModelSourceV1::Local {
+                declared_id: "offline-fixture".to_string(),
+            },
+            artifacts,
+            tokenizer: TokenizerKind::HfTokenizerJson,
+            query_prefix: Some(DEFAULT_QUERY_PREFIX.to_string()),
+            document_prefix: Some(String::new()),
+            pooling: PoolingKind::Cls,
+            normalization: NormalizationKind::L2,
+            native_dimension: 3,
+            output_dimension: 3,
+            max_length: 32,
+            quantization: QuantizationKind::None,
+            context_template_version: "qgh.context.none.v1".to_string(),
+        };
+        let manifest_hash = manifest.hash();
+        let manifest_path = root.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        (manifest_path, manifest_hash)
     }
 
     fn write_config_repo_listing_comments(&self, api_base_url: &str) {

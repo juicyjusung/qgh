@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 pub type EmbeddingVector = Vec<f32>;
@@ -23,8 +23,18 @@ pub const DEFAULT_HF_MODEL_REVISION: &str = "ac6544c8a46e00af67e330e85a9028c66b8
 // a full corpus needs tens of GB. fp32 embeds with a small bounded batch.
 pub const DEFAULT_HF_MODEL_FILE: &str = "onnx/model.onnx";
 pub const DEFAULT_QUERY_PREFIX: &str = "query: ";
+pub const BUILTIN_PRESET_IDS: [&str; 4] = [
+    "arctic-m-v2-fp32",
+    "granite-97m-multilingual-r2-int8-static",
+    "granite-311m-multilingual-r2-int8-static",
+    "arctic-l-v2-fp32",
+];
+const ARCTIC_M_V2_REVISION: &str = "95c2741480856aa9666782eb4afe11959938017f";
+const GRANITE_97M_R2_REVISION: &str = "835ad14087e140460703cf0fae09f97d469d65c2";
+const GRANITE_311M_R2_REVISION: &str = "44399559930365213510b1ee2eb15ded83374f0e";
 pub const HUGGINGFACE_ENDPOINT: &str = "https://huggingface.co";
 pub const EMBEDDING_FINGERPRINT_SCHEMA_VERSION: &str = "qgh.embedding_fingerprint.v1";
+pub const MODEL_MANIFEST_SCHEMA_VERSION: &str = "qgh.model_manifest.v1";
 // v2: chunks slice the tokenizer's canonical (normalized) text instead of
 // the raw source body, so v1 chunk bodies and embeddings are not comparable.
 pub const CHUNKER_VERSION: &str = "qgh.chunker.v2";
@@ -46,7 +56,7 @@ pub struct TokenSpan {
     pub end: usize,
 }
 
-pub trait EmbeddingProvider {
+pub trait EmbeddingProvider: Send + Sync {
     fn embed_documents(
         &self,
         texts: &[&str],
@@ -54,7 +64,7 @@ pub trait EmbeddingProvider {
     fn embed_query(&self, text: &str) -> Result<EmbeddingVector, EmbeddingProviderError>;
 }
 
-pub trait EmbeddingEngine {
+pub trait EmbeddingEngine: Send + Sync {
     fn embed_texts(&self, texts: &[String])
         -> Result<Vec<EmbeddingVector>, EmbeddingProviderError>;
 }
@@ -66,7 +76,7 @@ pub struct TokenizedText {
     pub spans: Vec<TokenSpan>,
 }
 
-pub trait EmbeddingTokenizer {
+pub trait EmbeddingTokenizer: Send + Sync {
     fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError>;
 
     /// Tokenize and return the canonical text the spans are valid against.
@@ -88,6 +98,10 @@ pub trait EmbeddingTokenizer {
 pub struct LocalEmbeddingProvider<E> {
     engine: E,
     query_prefix: String,
+    document_prefix: String,
+    normalization: NormalizationKind,
+    native_dimension: Option<usize>,
+    output_dimension: Option<usize>,
     dimension: Mutex<Option<usize>>,
 }
 
@@ -96,8 +110,28 @@ impl<E> LocalEmbeddingProvider<E> {
         Self {
             engine,
             query_prefix: query_prefix.into(),
+            document_prefix: String::new(),
+            normalization: NormalizationKind::None,
+            native_dimension: None,
+            output_dimension: None,
             dimension: Mutex::new(None),
         }
+    }
+
+    pub fn with_contract(
+        engine: E,
+        contract: EmbeddingRuntimeContract,
+    ) -> Result<Self, EmbeddingProviderError> {
+        contract.validate()?;
+        Ok(Self {
+            engine,
+            query_prefix: contract.query_prefix.unwrap_or_default(),
+            document_prefix: contract.document_prefix.unwrap_or_default(),
+            normalization: contract.normalization,
+            native_dimension: Some(contract.native_dimension),
+            output_dimension: Some(contract.output_dimension),
+            dimension: Mutex::new(None),
+        })
     }
 
     pub fn dimension(&self) -> Option<usize> {
@@ -109,6 +143,72 @@ impl<E> LocalEmbeddingProvider<E> {
     }
 }
 
+pub fn validate_batch_comparability(
+    provider: &dyn EmbeddingProvider,
+    text: &str,
+) -> Result<(), EmbeddingProviderError> {
+    let single = provider
+        .embed_documents(&[text])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.empty_result",
+                "Embedding engine returned no smoke vector.",
+            )
+        })?;
+    let middle_batch = provider.embed_documents(&["qgh smoke left", text, "qgh smoke right"])?;
+    let front_batch = provider.embed_documents(&[text, "qgh smoke tail"])?;
+    let comparisons = [
+        middle_batch.get(1).ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.empty_result",
+                "Embedding engine returned an incomplete smoke batch.",
+            )
+        })?,
+        front_batch.first().ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.empty_result",
+                "Embedding engine returned an incomplete smoke batch.",
+            )
+        })?,
+    ];
+    for comparison in comparisons {
+        let cosine = cosine_similarity(&single, comparison)?;
+        if cosine < 0.99999 {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.batch_incomparable",
+                "Embedding artifact produced batch-dependent vectors.",
+            )
+            .with_details(json!({ "minimum_cosine": 0.99999, "actual_cosine": cosine })));
+        }
+    }
+    Ok(())
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> Result<f32, EmbeddingProviderError> {
+    if left.is_empty() || left.len() != right.len() {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.batch_incomparable",
+            "Embedding smoke vectors have incompatible dimensions.",
+        ));
+    }
+    let dot = left
+        .iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum::<f32>();
+    let left_norm = left.iter().map(|value| value * value).sum::<f32>().sqrt();
+    let right_norm = right.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if left_norm <= f32::EPSILON || right_norm <= f32::EPSILON {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.batch_incomparable",
+            "Embedding smoke vector has zero norm.",
+        ));
+    }
+    Ok(dot / (left_norm * right_norm))
+}
+
 impl<E: EmbeddingEngine> EmbeddingProvider for LocalEmbeddingProvider<E> {
     fn embed_documents(
         &self,
@@ -116,16 +216,16 @@ impl<E: EmbeddingEngine> EmbeddingProvider for LocalEmbeddingProvider<E> {
     ) -> Result<Vec<EmbeddingVector>, EmbeddingProviderError> {
         let prepared = texts
             .iter()
-            .map(|text| (*text).to_string())
+            .map(|text| format!("{}{}", self.document_prefix, text))
             .collect::<Vec<_>>();
-        let vectors = self.engine.embed_texts(&prepared)?;
+        let vectors = self.process_vectors(self.engine.embed_texts(&prepared)?)?;
         self.record_dimension(&vectors)?;
         Ok(vectors)
     }
 
     fn embed_query(&self, text: &str) -> Result<EmbeddingVector, EmbeddingProviderError> {
         let prepared = vec![format!("{}{}", self.query_prefix, text)];
-        let mut vectors = self.engine.embed_texts(&prepared)?;
+        let mut vectors = self.process_vectors(self.engine.embed_texts(&prepared)?)?;
         self.record_dimension(&vectors)?;
         vectors.pop().ok_or_else(|| {
             EmbeddingProviderError::structured(
@@ -137,6 +237,42 @@ impl<E: EmbeddingEngine> EmbeddingProvider for LocalEmbeddingProvider<E> {
 }
 
 impl<E> LocalEmbeddingProvider<E> {
+    fn process_vectors(
+        &self,
+        mut vectors: Vec<EmbeddingVector>,
+    ) -> Result<Vec<EmbeddingVector>, EmbeddingProviderError> {
+        for vector in &mut vectors {
+            if let Some(native_dimension) = self.native_dimension {
+                if vector.len() != native_dimension {
+                    return Err(EmbeddingProviderError::structured(
+                        "embedding.native_dimension_mismatch",
+                        "Embedding engine output does not match the manifest native dimension.",
+                    )
+                    .with_details(json!({
+                        "expected_dimension": native_dimension,
+                        "actual_dimension": vector.len()
+                    })));
+                }
+            }
+            if let Some(output_dimension) = self.output_dimension {
+                vector.truncate(output_dimension);
+            }
+            if self.normalization == NormalizationKind::L2 {
+                let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+                if !norm.is_finite() || norm <= f32::EPSILON {
+                    return Err(EmbeddingProviderError::structured(
+                        "embedding.normalization_failed",
+                        "Embedding vector cannot be L2 normalized.",
+                    ));
+                }
+                for value in vector {
+                    *value /= norm;
+                }
+            }
+        }
+        Ok(vectors)
+    }
+
     fn record_dimension(&self, vectors: &[EmbeddingVector]) -> Result<(), EmbeddingProviderError> {
         for vector in vectors {
             if vector.is_empty() {
@@ -174,6 +310,921 @@ pub enum PoolingKind {
     Mean,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizationKind {
+    None,
+    L2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantizationKind {
+    None,
+    Static,
+    Dynamic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelProviderKind {
+    Fastembed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenizerKind {
+    HfTokenizerJson,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactRole {
+    OnnxModel,
+    OnnxExternalData,
+    Tokenizer,
+    Config,
+    SpecialTokensMap,
+    TokenizerConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelSourceV1 {
+    Hf {
+        model_id: String,
+        resolved_revision: String,
+    },
+    Local {
+        declared_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelArtifactV1 {
+    pub role: ArtifactRole,
+    pub relative_path: String,
+    pub sha256: String,
+    pub byte_size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_initializer_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelManifestV1 {
+    pub schema_version: String,
+    pub preset_id: Option<String>,
+    pub provider: ModelProviderKind,
+    pub model_source: ModelSourceV1,
+    pub artifacts: Vec<ModelArtifactV1>,
+    pub tokenizer: TokenizerKind,
+    pub query_prefix: Option<String>,
+    pub document_prefix: Option<String>,
+    pub pooling: PoolingKind,
+    pub normalization: NormalizationKind,
+    pub native_dimension: usize,
+    pub output_dimension: usize,
+    pub max_length: usize,
+    pub quantization: QuantizationKind,
+    pub context_template_version: String,
+}
+
+impl ModelManifestV1 {
+    pub fn from_json_slice(bytes: &[u8]) -> Result<Self, EmbeddingProviderError> {
+        let value: Value = serde_json::from_slice(bytes).map_err(manifest_parse_error)?;
+        let object = value.as_object().ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.manifest_invalid",
+                "Prepared model manifest must be a JSON object.",
+            )
+        })?;
+        for field in [
+            "schema_version",
+            "preset_id",
+            "provider",
+            "model_source",
+            "artifacts",
+            "tokenizer",
+            "query_prefix",
+            "document_prefix",
+            "pooling",
+            "normalization",
+            "native_dimension",
+            "output_dimension",
+            "max_length",
+            "quantization",
+            "context_template_version",
+        ] {
+            if !object.contains_key(field) {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.manifest_invalid",
+                    "Prepared model manifest is missing a required field.",
+                )
+                .with_details(json!({ "field": field })));
+            }
+        }
+        let manifest: Self = serde_json::from_value(value).map_err(manifest_parse_error)?;
+        manifest.validate_contract()?;
+        Ok(manifest)
+    }
+
+    pub fn validate_contract(&self) -> Result<(), EmbeddingProviderError> {
+        if self.schema_version != MODEL_MANIFEST_SCHEMA_VERSION {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.manifest_schema_unsupported",
+                "Prepared model manifest schema_version is unsupported.",
+            ));
+        }
+        if let ModelSourceV1::Hf {
+            model_id,
+            resolved_revision,
+        } = &self.model_source
+        {
+            if model_id.is_empty() || !is_commit_sha(resolved_revision) {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.manifest_revision_invalid",
+                    "Hugging Face prepared models require an immutable 40-character commit SHA.",
+                ));
+            }
+        }
+        if self.native_dimension == 0
+            || self.output_dimension == 0
+            || self.output_dimension > self.native_dimension
+            || self.max_length == 0
+        {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.manifest_contract_invalid",
+                "Prepared model dimensions and max_length are invalid.",
+            ));
+        }
+        if self.context_template_version.is_empty() {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.manifest_contract_invalid",
+                "Prepared model context_template_version must not be empty.",
+            ));
+        }
+        if self.quantization == QuantizationKind::Dynamic {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.dynamic_quantization_unsupported",
+                "Dynamic quantization is not supported for persistent embedding generations.",
+            ));
+        }
+        let graph_count = self
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.role == ArtifactRole::OnnxModel)
+            .count();
+        if graph_count != 1 {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.manifest_artifacts_invalid",
+                "Prepared model manifest must declare exactly one ONNX graph.",
+            ));
+        }
+        for required_role in [
+            ArtifactRole::Tokenizer,
+            ArtifactRole::Config,
+            ArtifactRole::SpecialTokensMap,
+            ArtifactRole::TokenizerConfig,
+        ] {
+            if self
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.role == required_role)
+                .count()
+                != 1
+            {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.manifest_artifacts_invalid",
+                    "Prepared model manifest must declare each tokenizer runtime artifact exactly once.",
+                ));
+            }
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        for artifact in &self.artifacts {
+            if !paths.insert(&artifact.relative_path)
+                || !is_sha256(&artifact.sha256)
+                || artifact.byte_size == 0
+                || (artifact.role == ArtifactRole::OnnxExternalData)
+                    != artifact.external_initializer_name.is_some()
+            {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.manifest_artifacts_invalid",
+                    "Prepared model artifact declarations are invalid.",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn hash(&self) -> String {
+        let encoded = serde_json::to_vec(self).expect("validated model manifest serializes");
+        hex_digest(&Sha256::digest(encoded))
+    }
+
+    pub fn runtime_contract(&self) -> EmbeddingRuntimeContract {
+        EmbeddingRuntimeContract {
+            query_prefix: self.query_prefix.clone(),
+            document_prefix: self.document_prefix.clone(),
+            normalization: self.normalization,
+            native_dimension: self.native_dimension,
+            output_dimension: self.output_dimension,
+        }
+    }
+}
+
+fn manifest_parse_error(error: serde_json::Error) -> EmbeddingProviderError {
+    EmbeddingProviderError::structured(
+        "embedding.manifest_invalid",
+        "Prepared model manifest is not valid strict JSON.",
+    )
+    .with_details(json!({ "error": error.to_string() }))
+}
+
+fn is_commit_sha(value: &str) -> bool {
+    value.len() == 40 && value.chars().all(|character| character.is_ascii_hexdigit())
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingRuntimeContract {
+    pub query_prefix: Option<String>,
+    pub document_prefix: Option<String>,
+    pub normalization: NormalizationKind,
+    pub native_dimension: usize,
+    pub output_dimension: usize,
+}
+
+impl EmbeddingRuntimeContract {
+    fn validate(&self) -> Result<(), EmbeddingProviderError> {
+        if self.native_dimension == 0
+            || self.output_dimension == 0
+            || self.output_dimension > self.native_dimension
+        {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.manifest_contract_invalid",
+                "Embedding runtime dimensions are invalid.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedModelSnapshot {
+    pub manifest: ModelManifestV1,
+    pub root: PathBuf,
+    paths: BTreeMap<ArtifactRole, Vec<PathBuf>>,
+}
+
+impl PreparedModelSnapshot {
+    pub fn path_for_role(&self, role: ArtifactRole) -> Option<&Path> {
+        self.paths
+            .get(&role)
+            .and_then(|paths| paths.first())
+            .map(PathBuf::as_path)
+    }
+
+    pub fn paths_for_role(&self, role: ArtifactRole) -> impl Iterator<Item = &Path> {
+        self.paths
+            .get(&role)
+            .into_iter()
+            .flatten()
+            .map(PathBuf::as_path)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedModelStore {
+    root: PathBuf,
+}
+
+impl PreparedModelStore {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn acquire(
+        &self,
+        options: &FastembedProviderOptions,
+    ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
+        if let Some(manifest_path) = &options.manifest_path {
+            return self.load_manifest(manifest_path);
+        }
+        if let Some(model_path) = &options.model_path {
+            let snapshot = resolve_model_path_snapshot(
+                model_path,
+                ManualModelBehavior {
+                    file: options.file.clone(),
+                    pooling: options.pooling,
+                    query_prefix: options.query_prefix.clone(),
+                },
+            )?;
+            let contract = infer_legacy_runtime_contract(&snapshot)?;
+            let manifest = ModelManifestV1 {
+                schema_version: MODEL_MANIFEST_SCHEMA_VERSION.to_string(),
+                preset_id: None,
+                provider: ModelProviderKind::Fastembed,
+                model_source: ModelSourceV1::Local {
+                    declared_id: model_path.to_string_lossy().into_owned(),
+                },
+                artifacts: Vec::new(),
+                tokenizer: TokenizerKind::HfTokenizerJson,
+                query_prefix: Some(snapshot.query_prefix.clone()),
+                document_prefix: contract.document_prefix,
+                pooling: snapshot.pooling,
+                normalization: contract.normalization,
+                native_dimension: contract.native_dimension,
+                output_dimension: contract.output_dimension,
+                max_length: contract.max_length,
+                quantization: quantization_for_file(&snapshot.model_file),
+                context_template_version: "qgh.context.none.v1".to_string(),
+            };
+            return self.materialize(options, manifest, runtime_artifact_sources(&snapshot)?);
+        }
+        #[cfg(feature = "fastembed-provider")]
+        {
+            self.acquire_hf(options)
+        }
+        #[cfg(not(feature = "fastembed-provider"))]
+        {
+            Err(EmbeddingProviderError::structured(
+                "embedding.provider_unavailable",
+                "This qgh binary was built without Hugging Face model acquisition support.",
+            ))
+        }
+    }
+
+    pub fn load(
+        &self,
+        options: &FastembedProviderOptions,
+    ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
+        if let Some(manifest_path) = &options.manifest_path {
+            return self.load_manifest(manifest_path);
+        }
+        let bytes = fs::read(self.alias_path(options)).map_err(|error| {
+            EmbeddingProviderError::structured(
+                "embedding.prepared_snapshot_missing",
+                "No prepared local model snapshot is available.",
+            )
+            .with_details(json!({ "error": error.to_string() }))
+        })?;
+        let alias: PreparedModelAliasV1 = serde_json::from_slice(&bytes).map_err(|error| {
+            EmbeddingProviderError::structured(
+                "embedding.prepared_alias_invalid",
+                "Prepared model alias is invalid.",
+            )
+            .with_details(json!({ "error": error.to_string() }))
+        })?;
+        if alias.schema_version != PREPARED_MODEL_ALIAS_SCHEMA_VERSION
+            || !is_sha256(&alias.manifest_hash)
+        {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.prepared_alias_invalid",
+                "Prepared model alias has an unsupported schema or invalid hash.",
+            ));
+        }
+        let manifest_path = self
+            .root
+            .join("snapshots")
+            .join(&alias.manifest_hash)
+            .join("manifest.json");
+        let snapshot = self.load_manifest(&manifest_path)?;
+        if snapshot.manifest.hash() != alias.manifest_hash {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.prepared_alias_mismatch",
+                "Prepared model alias does not match the snapshot manifest.",
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    pub fn load_manifest(
+        &self,
+        manifest_path: &Path,
+    ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
+        let metadata = fs::symlink_metadata(manifest_path).map_err(|error| {
+            EmbeddingProviderError::structured(
+                "embedding.prepared_manifest_missing",
+                "Prepared model manifest is unavailable.",
+            )
+            .with_details(json!({ "error": error.to_string() }))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.prepared_manifest_invalid",
+                "Prepared model manifest must be a regular file.",
+            ));
+        }
+        let root = manifest_path.parent().ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.prepared_manifest_invalid",
+                "Prepared model manifest must have a parent directory.",
+            )
+        })?;
+        let canonical_root = fs::canonicalize(root)?;
+        let manifest = ModelManifestV1::from_json_slice(&fs::read(manifest_path)?)?;
+        let mut paths = BTreeMap::<ArtifactRole, Vec<PathBuf>>::new();
+        for artifact in &manifest.artifacts {
+            let relative = confined_relative_path(&artifact.relative_path)?;
+            let path = canonical_root.join(relative);
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                EmbeddingProviderError::structured(
+                    "embedding.artifact_missing",
+                    "Prepared model artifact is missing.",
+                )
+                .with_details(json!({
+                    "path": artifact.relative_path,
+                    "error": error.to_string()
+                }))
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.artifact_symlink_forbidden",
+                    "Prepared model artifacts must not be symbolic links.",
+                ));
+            }
+            if !metadata.is_file() {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.artifact_not_regular_file",
+                    "Prepared model artifacts must be regular files.",
+                ));
+            }
+            let canonical_path = fs::canonicalize(&path)?;
+            if !canonical_path.starts_with(&canonical_root) {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.artifact_path_escape",
+                    "Prepared model artifact escapes the manifest root.",
+                ));
+            }
+            if metadata.len() != artifact.byte_size {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.artifact_size_mismatch",
+                    "Prepared model artifact size does not match the manifest.",
+                ));
+            }
+            let bytes = fs::read(&canonical_path)?;
+            if hex_digest(&Sha256::digest(bytes)) != artifact.sha256 {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.artifact_checksum_mismatch",
+                    "Prepared model artifact checksum does not match the manifest.",
+                ));
+            }
+            paths.entry(artifact.role).or_default().push(canonical_path);
+        }
+        Ok(PreparedModelSnapshot {
+            manifest,
+            root: canonical_root,
+            paths,
+        })
+    }
+
+    fn alias_path(&self, options: &FastembedProviderOptions) -> PathBuf {
+        self.root
+            .join("requests")
+            .join(format!("{}.json", prepared_request_key(options)))
+    }
+
+    fn materialize(
+        &self,
+        options: &FastembedProviderOptions,
+        mut manifest: ModelManifestV1,
+        sources: Vec<RuntimeArtifactSource>,
+    ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
+        fs::create_dir_all(self.root.join("snapshots"))?;
+        fs::create_dir_all(self.root.join("requests"))?;
+        let staging = self.root.join(format!(
+            ".staging-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&staging)?;
+        let result = (|| {
+            let mut artifacts = Vec::with_capacity(sources.len());
+            for source in sources {
+                let relative_path = confined_relative_path(&source.relative_path)?;
+                let metadata = fs::symlink_metadata(&source.source_path)?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(EmbeddingProviderError::structured(
+                        "embedding.acquisition_artifact_invalid",
+                        "Model acquisition source must be a regular non-symlink file.",
+                    ));
+                }
+                let bytes = fs::read(&source.source_path)?;
+                let destination = staging.join(relative_path);
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(destination, &bytes)?;
+                artifacts.push(ModelArtifactV1 {
+                    role: source.role,
+                    relative_path: source.relative_path,
+                    sha256: hex_digest(&Sha256::digest(&bytes)),
+                    byte_size: bytes.len() as u64,
+                    external_initializer_name: source.external_initializer_name,
+                });
+            }
+            manifest.artifacts = artifacts;
+            manifest.validate_contract()?;
+            let manifest_hash = manifest.hash();
+            fs::write(
+                staging.join("manifest.json"),
+                serde_json::to_vec_pretty(&manifest).expect("model manifest serializes"),
+            )?;
+            let snapshot_root = self.root.join("snapshots").join(&manifest_hash);
+            if snapshot_root.exists() {
+                fs::remove_dir_all(&staging)?;
+            } else {
+                fs::rename(&staging, &snapshot_root)?;
+            }
+            let alias = PreparedModelAliasV1 {
+                schema_version: PREPARED_MODEL_ALIAS_SCHEMA_VERSION.to_string(),
+                manifest_hash,
+            };
+            let alias_path = self.alias_path(options);
+            let alias_staging = alias_path.with_extension(format!("tmp-{}", std::process::id()));
+            fs::write(
+                &alias_staging,
+                serde_json::to_vec_pretty(&alias).expect("prepared alias serializes"),
+            )?;
+            fs::rename(alias_staging, alias_path)?;
+            self.load(options)
+        })();
+        if staging.exists() {
+            let _ = fs::remove_dir_all(staging);
+        }
+        result
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn acquire_hf(
+        &self,
+        options: &FastembedProviderOptions,
+    ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
+        let configured_model = options.model.as_deref();
+        let explicit_preset = configured_model.and_then(builtin_preset);
+        let default_preset = configured_model
+            .is_none()
+            .then(|| builtin_preset("arctic-l-v2-fp32").expect("default preset is registered"));
+        if let Some(preset) = explicit_preset.or(default_preset) {
+            return self.acquire_builtin_preset(options, preset);
+        }
+
+        let reference = hf_model_reference(configured_model)?;
+        if let Some(preset) = preset_for_compatible_legacy_hf(&reference, options) {
+            return self.acquire_builtin_preset(options, preset);
+        }
+        let cache_dir = options
+            .cache_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(default_hf_cache_dir)?;
+        let mut repo = HfHubModelRepository::new(
+            &reference.model_id,
+            &reference.revision,
+            cache_dir,
+            options.token_source_env.clone(),
+        )?;
+        let mut snapshot = resolve_hf_model_snapshot(
+            &reference.model_id,
+            ManualModelBehavior {
+                file: options.file.clone(),
+                pooling: options.pooling,
+                query_prefix: options.query_prefix.clone(),
+            },
+            &mut repo,
+        )?;
+        if snapshot.path_for(MODULES_FILE).is_none() {
+            snapshot
+                .paths
+                .insert(MODULES_FILE.to_string(), repo.get(MODULES_FILE)?);
+        }
+        let contract = infer_legacy_runtime_contract(&snapshot)?;
+        let manifest = ModelManifestV1 {
+            schema_version: MODEL_MANIFEST_SCHEMA_VERSION.to_string(),
+            preset_id: None,
+            provider: ModelProviderKind::Fastembed,
+            model_source: ModelSourceV1::Hf {
+                model_id: reference.model_id,
+                resolved_revision: snapshot.model_revision.clone(),
+            },
+            artifacts: Vec::new(),
+            tokenizer: TokenizerKind::HfTokenizerJson,
+            query_prefix: Some(snapshot.query_prefix.clone()),
+            document_prefix: contract.document_prefix,
+            pooling: snapshot.pooling,
+            normalization: contract.normalization,
+            native_dimension: contract.native_dimension,
+            output_dimension: contract.output_dimension,
+            max_length: contract.max_length,
+            quantization: quantization_for_file(&snapshot.model_file),
+            context_template_version: "qgh.context.none.v1".to_string(),
+        };
+        self.materialize(options, manifest, runtime_artifact_sources(&snapshot)?)
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn acquire_builtin_preset(
+        &self,
+        options: &FastembedProviderOptions,
+        preset: BuiltinPresetSpec,
+    ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
+        let cache_dir = options
+            .cache_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(default_hf_cache_dir)?;
+        let mut repo = HfHubModelRepository::new(
+            preset.model_id,
+            preset.revision,
+            cache_dir,
+            options.token_source_env.clone(),
+        )?;
+        let resolved_revision = repo.revision()?.ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.manifest_revision_invalid",
+                "Preset acquisition did not resolve an immutable revision.",
+            )
+        })?;
+        if resolved_revision != preset.revision {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.preset_revision_mismatch",
+                "Preset repository did not resolve to its pinned commit.",
+            ));
+        }
+        let mut paths = BTreeMap::new();
+        for file in required_runtime_files(preset.model_file) {
+            paths.insert(file.to_string(), repo.get(file)?);
+        }
+        if let Some((relative_path, _)) = preset.external_initializer {
+            paths.insert(relative_path.to_string(), repo.get(relative_path)?);
+        }
+        let snapshot = ResolvedModelSnapshot {
+            model_id: Some(preset.model_id.to_string()),
+            model_revision: resolved_revision.clone(),
+            model_file: preset.model_file.to_string(),
+            query_prefix: preset.query_prefix.unwrap_or_default().to_string(),
+            pooling: preset.pooling,
+            paths,
+        };
+        let manifest = ModelManifestV1 {
+            schema_version: MODEL_MANIFEST_SCHEMA_VERSION.to_string(),
+            preset_id: Some(preset.id.to_string()),
+            provider: ModelProviderKind::Fastembed,
+            model_source: ModelSourceV1::Hf {
+                model_id: preset.model_id.to_string(),
+                resolved_revision,
+            },
+            artifacts: Vec::new(),
+            tokenizer: TokenizerKind::HfTokenizerJson,
+            query_prefix: preset.query_prefix.map(ToString::to_string),
+            document_prefix: preset.document_prefix.map(ToString::to_string),
+            pooling: preset.pooling,
+            normalization: preset.normalization,
+            native_dimension: preset.native_dimension,
+            output_dimension: preset.output_dimension,
+            max_length: preset.max_length,
+            quantization: preset.quantization,
+            context_template_version: "qgh.context.none.v1".to_string(),
+        };
+        let mut sources = runtime_artifact_sources(&snapshot)?;
+        if let Some((relative_path, initializer_name)) = preset.external_initializer {
+            if let Some(source) = sources
+                .iter_mut()
+                .find(|source| source.relative_path == relative_path)
+            {
+                source.external_initializer_name = Some(initializer_name.to_string());
+            }
+        }
+        self.materialize(options, manifest, sources)
+    }
+}
+
+const PREPARED_MODEL_ALIAS_SCHEMA_VERSION: &str = "qgh.prepared_model_alias.v1";
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedModelAliasV1 {
+    schema_version: String,
+    manifest_hash: String,
+}
+
+struct RuntimeArtifactSource {
+    role: ArtifactRole,
+    relative_path: String,
+    source_path: PathBuf,
+    external_initializer_name: Option<String>,
+}
+
+struct LegacyRuntimeContract {
+    document_prefix: Option<String>,
+    normalization: NormalizationKind,
+    native_dimension: usize,
+    output_dimension: usize,
+    max_length: usize,
+}
+
+fn infer_legacy_runtime_contract(
+    snapshot: &ResolvedModelSnapshot,
+) -> Result<LegacyRuntimeContract, EmbeddingProviderError> {
+    let config = read_json_file(
+        required_path_from_resolved(snapshot, "config.json")?,
+        "config.json",
+    )?;
+    let tokenizer_config = read_json_file(
+        required_path_from_resolved(snapshot, "tokenizer_config.json")?,
+        "tokenizer_config.json",
+    )?;
+    let modules_path = snapshot.path_for(MODULES_FILE).ok_or_else(|| {
+        legacy_manifest_ambiguous(
+            "Legacy model configuration cannot express document prefix and normalization.",
+        )
+    })?;
+    let modules = read_json_file(modules_path, MODULES_FILE)?;
+    let native_dimension = config
+        .get("hidden_size")
+        .or_else(|| config.get("dim"))
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| legacy_manifest_ambiguous("Legacy model native dimension is ambiguous."))?;
+    let max_length = tokenizer_config
+        .get("model_max_length")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0 && *value < 1_000_000)
+        .or_else(|| {
+            config
+                .get("max_position_embeddings")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0)
+        })
+        .ok_or_else(|| legacy_manifest_ambiguous("Legacy model max length is ambiguous."))?;
+    if !contains_module_type(&modules, "Normalize") {
+        return Err(legacy_manifest_ambiguous(
+            "Legacy model normalization is ambiguous.",
+        ));
+    }
+    let document_prefix = find_prompt(&modules, "document")
+        .map(Some)
+        .ok_or_else(|| legacy_manifest_ambiguous("Legacy document prefix is ambiguous."))?;
+    Ok(LegacyRuntimeContract {
+        document_prefix,
+        normalization: NormalizationKind::L2,
+        native_dimension,
+        output_dimension: native_dimension,
+        max_length,
+    })
+}
+
+fn legacy_manifest_ambiguous(message: &str) -> EmbeddingProviderError {
+    EmbeddingProviderError::structured("embedding.legacy_manifest_ambiguous", message)
+        .with_hint("Use embedding.manifest_path with an explicit ModelManifestV1.")
+}
+
+fn contains_module_type(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::Object(object) => {
+            object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|module_type| module_type.contains(needle))
+                || object
+                    .values()
+                    .any(|value| contains_module_type(value, needle))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|value| contains_module_type(value, needle)),
+        _ => false,
+    }
+}
+
+fn find_prompt(value: &Value, name: &str) -> Option<String> {
+    match value {
+        Value::Object(object) => {
+            if let Some(prompt) = object
+                .get("prompts")
+                .and_then(|prompts| prompts.get(name))
+                .and_then(Value::as_str)
+            {
+                return Some(prompt.to_string());
+            }
+            object.values().find_map(|value| find_prompt(value, name))
+        }
+        Value::Array(values) => values.iter().find_map(|value| find_prompt(value, name)),
+        _ => None,
+    }
+}
+
+fn quantization_for_file(file: &str) -> QuantizationKind {
+    let lower = file.to_ascii_lowercase();
+    if lower.contains("quint8") || lower.contains("qint8") || lower.contains("static") {
+        QuantizationKind::Static
+    } else if lower.contains("quantized") || lower.contains("dynamic") {
+        QuantizationKind::Dynamic
+    } else {
+        QuantizationKind::None
+    }
+}
+
+fn runtime_artifact_sources(
+    snapshot: &ResolvedModelSnapshot,
+) -> Result<Vec<RuntimeArtifactSource>, EmbeddingProviderError> {
+    let mut sources = Vec::new();
+    for (role, relative_path) in [
+        (ArtifactRole::OnnxModel, snapshot.model_file.as_str()),
+        (ArtifactRole::Tokenizer, "tokenizer.json"),
+        (ArtifactRole::Config, "config.json"),
+        (ArtifactRole::SpecialTokensMap, "special_tokens_map.json"),
+        (ArtifactRole::TokenizerConfig, "tokenizer_config.json"),
+    ] {
+        sources.push(RuntimeArtifactSource {
+            role,
+            relative_path: relative_path.to_string(),
+            source_path: required_path_from_resolved(snapshot, relative_path)?.to_path_buf(),
+            external_initializer_name: None,
+        });
+    }
+    for (relative_path, source_path) in &snapshot.paths {
+        if relative_path.ends_with("_data") {
+            let initializer_name = Path::new(relative_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    EmbeddingProviderError::structured(
+                        "embedding.external_initializer_invalid",
+                        "External initializer path is invalid.",
+                    )
+                })?;
+            sources.push(RuntimeArtifactSource {
+                role: ArtifactRole::OnnxExternalData,
+                relative_path: relative_path.clone(),
+                source_path: source_path.clone(),
+                external_initializer_name: Some(initializer_name.to_string()),
+            });
+        }
+    }
+    Ok(sources)
+}
+
+fn required_path_from_resolved<'a>(
+    snapshot: &'a ResolvedModelSnapshot,
+    file: &str,
+) -> Result<&'a Path, EmbeddingProviderError> {
+    snapshot.path_for(file).ok_or_else(|| {
+        EmbeddingProviderError::structured(
+            "embedding.model_file_missing",
+            "Resolved model snapshot is missing a required runtime file.",
+        )
+        .with_details(json!({ "file": file }))
+    })
+}
+
+fn prepared_request_key(options: &FastembedProviderOptions) -> String {
+    let identity = format!(
+        "manifest={:?}\nmodel={:?}\nmodel_path={:?}\nfile={:?}\npooling={:?}\nquery_prefix={:?}",
+        options.manifest_path,
+        options.model,
+        options.model_path,
+        options.file,
+        options.pooling,
+        options.query_prefix
+    );
+    hex_digest(&Sha256::digest(identity.as_bytes()))
+}
+
+fn confined_relative_path(value: &str) -> Result<&Path, EmbeddingProviderError> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.artifact_path_invalid",
+            "Prepared model artifact path must stay below the manifest root.",
+        ));
+    }
+    Ok(path)
+}
+
 impl PoolingKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -185,6 +1236,7 @@ impl PoolingKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FastembedProviderOptions {
+    pub manifest_path: Option<PathBuf>,
     pub model: Option<String>,
     pub model_path: Option<PathBuf>,
     pub file: Option<String>,
@@ -197,6 +1249,7 @@ pub struct FastembedProviderOptions {
 impl Default for FastembedProviderOptions {
     fn default() -> Self {
         Self {
+            manifest_path: None,
             model: Some(format!("hf:{DEFAULT_HF_MODEL_ID}")),
             model_path: None,
             file: None,
@@ -206,6 +1259,125 @@ impl Default for FastembedProviderOptions {
             cache_dir: None,
         }
     }
+}
+
+pub fn is_builtin_preset_id(value: &str) -> bool {
+    BUILTIN_PRESET_IDS.contains(&value)
+}
+
+pub fn builtin_preset_hf_reference(value: &str) -> Option<HfModelReference> {
+    builtin_preset(value).map(|preset| HfModelReference {
+        model_id: preset.model_id.to_string(),
+        revision: preset.revision.to_string(),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BuiltinPresetSpec {
+    id: &'static str,
+    model_id: &'static str,
+    revision: &'static str,
+    model_file: &'static str,
+    external_initializer: Option<(&'static str, &'static str)>,
+    pooling: PoolingKind,
+    query_prefix: Option<&'static str>,
+    document_prefix: Option<&'static str>,
+    normalization: NormalizationKind,
+    native_dimension: usize,
+    output_dimension: usize,
+    max_length: usize,
+    quantization: QuantizationKind,
+}
+
+fn builtin_preset(id: &str) -> Option<BuiltinPresetSpec> {
+    match id {
+        "arctic-m-v2-fp32" => Some(BuiltinPresetSpec {
+            id: "arctic-m-v2-fp32",
+            model_id: "Snowflake/snowflake-arctic-embed-m-v2.0",
+            revision: ARCTIC_M_V2_REVISION,
+            model_file: "onnx/model.onnx",
+            external_initializer: None,
+            pooling: PoolingKind::Cls,
+            query_prefix: Some(DEFAULT_QUERY_PREFIX),
+            document_prefix: Some(""),
+            normalization: NormalizationKind::L2,
+            native_dimension: 768,
+            output_dimension: 768,
+            max_length: 8192,
+            quantization: QuantizationKind::None,
+        }),
+        "granite-97m-multilingual-r2-int8-static" => Some(BuiltinPresetSpec {
+            id: "granite-97m-multilingual-r2-int8-static",
+            model_id: "ibm-granite/granite-embedding-97m-multilingual-r2",
+            revision: GRANITE_97M_R2_REVISION,
+            model_file: "onnx/model_quint8_avx2.onnx",
+            external_initializer: None,
+            pooling: PoolingKind::Cls,
+            query_prefix: Some(""),
+            document_prefix: Some(""),
+            normalization: NormalizationKind::L2,
+            native_dimension: 384,
+            output_dimension: 384,
+            max_length: 32_768,
+            quantization: QuantizationKind::Static,
+        }),
+        "granite-311m-multilingual-r2-int8-static" => Some(BuiltinPresetSpec {
+            id: "granite-311m-multilingual-r2-int8-static",
+            model_id: "ibm-granite/granite-embedding-311m-multilingual-r2",
+            revision: GRANITE_311M_R2_REVISION,
+            model_file: "onnx/model_quint8_avx2.onnx",
+            external_initializer: None,
+            pooling: PoolingKind::Cls,
+            query_prefix: Some(""),
+            document_prefix: Some(""),
+            normalization: NormalizationKind::L2,
+            native_dimension: 768,
+            output_dimension: 768,
+            max_length: 32_768,
+            quantization: QuantizationKind::Static,
+        }),
+        "arctic-l-v2-fp32" => Some(BuiltinPresetSpec {
+            id: "arctic-l-v2-fp32",
+            model_id: DEFAULT_HF_MODEL_ID,
+            revision: DEFAULT_HF_MODEL_REVISION,
+            model_file: DEFAULT_HF_MODEL_FILE,
+            external_initializer: Some(("onnx/model.onnx_data", "model.onnx_data")),
+            pooling: PoolingKind::Cls,
+            query_prefix: Some(DEFAULT_QUERY_PREFIX),
+            document_prefix: Some(""),
+            normalization: NormalizationKind::L2,
+            native_dimension: 1024,
+            output_dimension: 1024,
+            max_length: 8192,
+            quantization: QuantizationKind::None,
+        }),
+        _ => None,
+    }
+}
+
+fn preset_for_compatible_legacy_hf(
+    reference: &HfModelReference,
+    options: &FastembedProviderOptions,
+) -> Option<BuiltinPresetSpec> {
+    BUILTIN_PRESET_IDS
+        .iter()
+        .filter_map(|id| builtin_preset(id))
+        .find(|preset| {
+            preset.model_id == reference.model_id
+                && preset.revision == reference.revision
+                && options
+                    .file
+                    .as_deref()
+                    .is_none_or(|file| file == preset.model_file)
+                && options
+                    .pooling
+                    .is_none_or(|pooling| pooling == preset.pooling)
+                && options.query_prefix.as_deref().is_none_or(|prefix| {
+                    preset
+                        .query_prefix
+                        .is_some_and(|expected| prefix == expected)
+                })
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,9 +1395,17 @@ pub fn default_hf_model_reference() -> HfModelReference {
 
 pub fn parse_hf_model_reference(model: &str) -> Option<HfModelReference> {
     let reference = model.strip_prefix("hf:")?;
-    let (model_id, revision) = reference
-        .rsplit_once('@')
-        .unwrap_or((reference, DEFAULT_HF_MODEL_REVISION));
+    let (model_id, explicit_revision) = match reference.rsplit_once('@') {
+        Some((model_id, revision)) => (model_id, Some(revision)),
+        None => (reference, None),
+    };
+    let revision = explicit_revision.unwrap_or_else(|| {
+        if model_id == DEFAULT_HF_MODEL_ID {
+            DEFAULT_HF_MODEL_REVISION
+        } else {
+            "main"
+        }
+    });
     if model_id.is_empty() || revision.is_empty() {
         return None;
     }
@@ -422,6 +1602,17 @@ pub fn default_hf_cache_dir() -> Result<PathBuf, EmbeddingProviderError> {
     Ok(cache_home.join("qgh").join("hf"))
 }
 
+pub fn default_prepared_model_store() -> Result<PreparedModelStore, EmbeddingProviderError> {
+    let hf_cache = default_hf_cache_dir()?;
+    let qgh_cache = hf_cache.parent().ok_or_else(|| {
+        EmbeddingProviderError::structured(
+            "embedding.cache_unavailable",
+            "Could not resolve the qgh model cache directory.",
+        )
+    })?;
+    Ok(PreparedModelStore::new(qgh_cache.join("prepared-models")))
+}
+
 pub trait ModelRepository {
     fn get(&mut self, file: &str) -> Result<PathBuf, EmbeddingProviderError>;
     fn list_files(&mut self) -> Result<Vec<String>, EmbeddingProviderError>;
@@ -605,7 +1796,98 @@ pub struct FastembedTokenizer {
 }
 
 #[cfg(feature = "fastembed-provider")]
+fn fastembed_user_defined_model(
+    snapshot: &PreparedModelSnapshot,
+) -> Result<fastembed::UserDefinedEmbeddingModel, EmbeddingProviderError> {
+    use fastembed::{QuantizationMode, TokenizerFiles, UserDefinedEmbeddingModel};
+
+    let tokenizer_files = TokenizerFiles {
+        tokenizer_file: fs::read(required_prepared_path(snapshot, ArtifactRole::Tokenizer)?)?,
+        config_file: fs::read(required_prepared_path(snapshot, ArtifactRole::Config)?)?,
+        special_tokens_map_file: fs::read(required_prepared_path(
+            snapshot,
+            ArtifactRole::SpecialTokensMap,
+        )?)?,
+        tokenizer_config_file: fs::read(required_prepared_path(
+            snapshot,
+            ArtifactRole::TokenizerConfig,
+        )?)?,
+    };
+    let mut model = UserDefinedEmbeddingModel::new(
+        fs::read(required_prepared_path(snapshot, ArtifactRole::OnnxModel)?)?,
+        tokenizer_files,
+    )
+    .with_pooling(match snapshot.manifest.pooling {
+        PoolingKind::Cls => fastembed::Pooling::Cls,
+        PoolingKind::Mean => fastembed::Pooling::Mean,
+    })
+    .with_quantization(match snapshot.manifest.quantization {
+        QuantizationKind::None => QuantizationMode::None,
+        QuantizationKind::Static => QuantizationMode::Static,
+        QuantizationKind::Dynamic => {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.dynamic_quantization_unsupported",
+                "Dynamic quantization is not supported for persistent embedding generations.",
+            ));
+        }
+    });
+    for artifact in snapshot
+        .manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.role == ArtifactRole::OnnxExternalData)
+    {
+        let initializer_name = artifact.external_initializer_name.clone().ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.external_initializer_invalid",
+                "External initializer is missing its graph file name.",
+            )
+        })?;
+        model = model.with_external_initializer(
+            initializer_name,
+            fs::read(snapshot.root.join(&artifact.relative_path))?,
+        );
+    }
+    Ok(model)
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn required_prepared_path(
+    snapshot: &PreparedModelSnapshot,
+    role: ArtifactRole,
+) -> Result<&Path, EmbeddingProviderError> {
+    snapshot.path_for_role(role).ok_or_else(|| {
+        EmbeddingProviderError::structured(
+            "embedding.model_file_missing",
+            "Prepared model snapshot is missing a required runtime artifact.",
+        )
+        .with_details(json!({ "role": role }))
+    })
+}
+
+#[cfg(feature = "fastembed-provider")]
 impl FastembedEngine {
+    pub fn from_prepared_snapshot(
+        snapshot: &PreparedModelSnapshot,
+    ) -> Result<Self, EmbeddingProviderError> {
+        use fastembed::{InitOptionsUserDefined, TextEmbedding};
+
+        let model = TextEmbedding::try_new_from_user_defined(
+            fastembed_user_defined_model(snapshot)?,
+            InitOptionsUserDefined::new().with_max_length(snapshot.manifest.max_length),
+        )
+        .map_err(|error| {
+            EmbeddingProviderError::structured(
+                "embedding.fastembed_init_failed",
+                "Failed to initialize fastembed prepared model.",
+            )
+            .with_details(json!({ "error": error.to_string() }))
+        })?;
+        Ok(Self {
+            model: Mutex::new(model),
+        })
+    }
+
     pub fn from_snapshot(snapshot: &ResolvedModelSnapshot) -> Result<Self, EmbeddingProviderError> {
         use fastembed::{
             InitOptionsUserDefined, QuantizationMode, TextEmbedding, TokenizerFiles,
@@ -672,6 +1954,23 @@ impl EmbeddingEngine for FastembedEngine {
 
 #[cfg(feature = "fastembed-provider")]
 impl FastembedTokenizer {
+    pub fn from_prepared_snapshot(
+        snapshot: &PreparedModelSnapshot,
+    ) -> Result<Self, EmbeddingProviderError> {
+        let tokenizer_path = required_prepared_path(snapshot, ArtifactRole::Tokenizer)?;
+        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|error| {
+            EmbeddingProviderError::structured(
+                "embedding.tokenizer_init_failed",
+                "Failed to initialize prepared embedding tokenizer.",
+            )
+            .with_details(json!({
+                "file": tokenizer_path.display().to_string(),
+                "error": error.to_string()
+            }))
+        })?;
+        Ok(Self { tokenizer })
+    }
+
     pub fn from_snapshot(snapshot: &ResolvedModelSnapshot) -> Result<Self, EmbeddingProviderError> {
         let tokenizer_path = required_path(snapshot, "tokenizer.json")?;
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|error| {
@@ -1163,7 +2462,7 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingEngine {
-        calls: RefCell<Vec<Vec<String>>>,
+        calls: Mutex<Vec<Vec<String>>>,
     }
 
     impl EmbeddingEngine for RecordingEngine {
@@ -1171,7 +2470,7 @@ mod tests {
             &self,
             texts: &[String],
         ) -> Result<Vec<EmbeddingVector>, EmbeddingProviderError> {
-            self.calls.borrow_mut().push(texts.to_vec());
+            self.calls.lock().unwrap().push(texts.to_vec());
             Ok(texts.iter().map(|_| vec![1.0, 2.0, 3.0]).collect())
         }
     }
@@ -1227,9 +2526,334 @@ mod tests {
         assert_eq!(documents.len(), 2);
         assert_eq!(provider.dimension(), Some(3));
 
-        let calls = provider.engine.calls.borrow();
+        let calls = provider.engine.calls.lock().unwrap();
         assert_eq!(calls[0], vec!["query: rate limit"]);
         assert_eq!(calls[1], vec!["query: already document", "plain"]);
+    }
+
+    #[test]
+    fn strict_manifest_rejects_unknown_fields_and_dynamic_quantization() {
+        let mut manifest = fixture_manifest(Vec::new());
+        let mut json = serde_json::to_value(&manifest).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .insert("guessed_behavior".to_string(), json!(true));
+
+        let error =
+            ModelManifestV1::from_json_slice(&serde_json::to_vec(&json).unwrap()).unwrap_err();
+        assert_eq!(error.code(), "embedding.manifest_invalid");
+
+        manifest.quantization = QuantizationKind::Dynamic;
+        let error = manifest.validate_contract().unwrap_err();
+        assert_eq!(error.code(), "embedding.dynamic_quantization_unsupported");
+    }
+
+    #[test]
+    fn prepared_store_rejects_escape_symlink_and_artifact_integrity_mismatch() {
+        let root = temp_dir("qgh-prepared-store");
+        let snapshot_root = root.join("snapshot");
+        fs::create_dir_all(&snapshot_root).unwrap();
+        let graph = snapshot_root.join("model.onnx");
+        fs::write(&graph, b"onnx-bytes").unwrap();
+        let artifact = fixture_artifact(ArtifactRole::OnnxModel, "model.onnx", b"onnx-bytes", None);
+        let mut artifacts = vec![artifact.clone()];
+        for (role, file) in [
+            (ArtifactRole::Tokenizer, "tokenizer.json"),
+            (ArtifactRole::Config, "config.json"),
+            (ArtifactRole::SpecialTokensMap, "special_tokens_map.json"),
+            (ArtifactRole::TokenizerConfig, "tokenizer_config.json"),
+        ] {
+            fs::write(snapshot_root.join(file), b"{}").unwrap();
+            artifacts.push(fixture_artifact(role, file, b"{}", None));
+        }
+        let manifest_path = snapshot_root.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&fixture_manifest(artifacts.clone())).unwrap(),
+        )
+        .unwrap();
+
+        let store = PreparedModelStore::new(root.join("store"));
+        let snapshot = store.load_manifest(&manifest_path).unwrap();
+        let canonical_graph = fs::canonicalize(&graph).unwrap();
+        assert_eq!(
+            snapshot.path_for_role(ArtifactRole::OnnxModel),
+            Some(canonical_graph.as_path())
+        );
+
+        let mut escaped = fixture_manifest(artifacts.clone());
+        escaped.artifacts[0] = ModelArtifactV1 {
+            relative_path: "../model.onnx".to_string(),
+            ..artifact.clone()
+        };
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&escaped).unwrap()).unwrap();
+        let error = store.load_manifest(&manifest_path).unwrap_err();
+        assert_eq!(error.code(), "embedding.artifact_path_invalid");
+
+        escaped.artifacts[0].relative_path = "model.onnx".to_string();
+        escaped.artifacts[0].sha256 = "0".repeat(64);
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&escaped).unwrap()).unwrap();
+        let error = store.load_manifest(&manifest_path).unwrap_err();
+        assert_eq!(error.code(), "embedding.artifact_checksum_mismatch");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let outside = root.join("outside.onnx");
+            fs::write(&outside, b"onnx-bytes").unwrap();
+            fs::remove_file(&graph).unwrap();
+            symlink(&outside, &graph).unwrap();
+            let manifest = fixture_manifest(artifacts);
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+            let error = store.load_manifest(&manifest_path).unwrap_err();
+            assert_eq!(error.code(), "embedding.artifact_symlink_forbidden");
+        }
+    }
+
+    #[test]
+    fn manifest_runtime_applies_document_query_prefix_mrl_and_l2_normalization() {
+        struct ContractEngine {
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+
+        impl EmbeddingEngine for ContractEngine {
+            fn embed_texts(
+                &self,
+                texts: &[String],
+            ) -> Result<Vec<EmbeddingVector>, EmbeddingProviderError> {
+                self.calls.lock().unwrap().push(texts.to_vec());
+                Ok(texts.iter().map(|_| vec![3.0, 4.0, 12.0, 0.0]).collect())
+            }
+        }
+
+        let provider = LocalEmbeddingProvider::with_contract(
+            ContractEngine {
+                calls: Mutex::new(Vec::new()),
+            },
+            EmbeddingRuntimeContract {
+                query_prefix: Some("q: ".to_string()),
+                document_prefix: Some("d: ".to_string()),
+                normalization: NormalizationKind::L2,
+                native_dimension: 4,
+                output_dimension: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(provider.embed_query("needle").unwrap(), vec![0.6, 0.8]);
+        assert_eq!(
+            provider.embed_documents(&["haystack"]).unwrap(),
+            vec![vec![0.6, 0.8]]
+        );
+        let calls = provider.engine.calls.lock().unwrap();
+        assert_eq!(calls[0], vec!["q: needle"]);
+        assert_eq!(calls[1], vec!["d: haystack"]);
+    }
+
+    #[test]
+    fn custom_hf_without_revision_uses_default_branch_not_snowflake_revision() {
+        let reference = parse_hf_model_reference("hf:Example/custom-model").unwrap();
+
+        assert_eq!(reference.model_id, "Example/custom-model");
+        assert_eq!(reference.revision, "main");
+        assert_ne!(reference.revision, DEFAULT_HF_MODEL_REVISION);
+    }
+
+    #[test]
+    fn builtin_preset_registry_is_closed_and_commit_pinned() {
+        assert_eq!(BUILTIN_PRESET_IDS.len(), 4);
+        for preset_id in BUILTIN_PRESET_IDS {
+            let preset = builtin_preset(preset_id).unwrap();
+            assert_eq!(preset.id, preset_id);
+            assert!(is_commit_sha(preset.revision));
+            assert_ne!(preset.quantization, QuantizationKind::Dynamic);
+        }
+        assert!(builtin_preset("jina-v5").is_none());
+        assert_eq!(
+            builtin_preset("granite-97m-multilingual-r2-int8-static")
+                .unwrap()
+                .quantization,
+            QuantizationKind::Static
+        );
+    }
+
+    #[test]
+    fn acquire_local_legacy_creates_snapshot_that_loads_after_source_is_removed() {
+        let source = temp_dir("qgh-legacy-local-source");
+        fs::write(source.join("model.onnx"), b"onnx").unwrap();
+        fs::write(source.join("tokenizer.json"), b"{}").unwrap();
+        fs::write(
+            source.join("config.json"),
+            br#"{"hidden_size":4,"max_position_embeddings":32}"#,
+        )
+        .unwrap();
+        fs::write(source.join("special_tokens_map.json"), b"{}").unwrap();
+        fs::write(
+            source.join("tokenizer_config.json"),
+            br#"{"model_max_length":32}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("modules.json"),
+            br#"[
+                {"type":"sentence_transformers.models.Normalize"},
+                {"prompts":{"query":"","document":""}}
+            ]"#,
+        )
+        .unwrap();
+
+        let store = PreparedModelStore::new(temp_dir("qgh-prepared-model-store"));
+        let options = FastembedProviderOptions {
+            manifest_path: None,
+            model: None,
+            model_path: Some(source.clone()),
+            file: Some("model.onnx".to_string()),
+            pooling: Some(PoolingKind::Cls),
+            query_prefix: Some(String::new()),
+            token_source_env: None,
+            cache_dir: None,
+        };
+
+        let acquired = store.acquire(&options).unwrap();
+        assert_ne!(acquired.root, fs::canonicalize(&source).unwrap());
+        assert_eq!(acquired.manifest.native_dimension, 4);
+        fs::remove_dir_all(source).unwrap();
+
+        let loaded = store.load(&options).unwrap();
+        assert_eq!(loaded.manifest.hash(), acquired.manifest.hash());
+        assert!(loaded
+            .path_for_role(ArtifactRole::OnnxModel)
+            .unwrap()
+            .is_file());
+    }
+
+    #[test]
+    fn batch_comparability_rejects_position_dependent_vectors() {
+        struct PositionDependentEngine;
+
+        impl EmbeddingEngine for PositionDependentEngine {
+            fn embed_texts(
+                &self,
+                texts: &[String],
+            ) -> Result<Vec<EmbeddingVector>, EmbeddingProviderError> {
+                Ok(texts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| vec![1.0, index as f32 + 1.0])
+                    .collect())
+            }
+        }
+
+        let provider = LocalEmbeddingProvider::new(PositionDependentEngine, "");
+        let error = validate_batch_comparability(&provider, "same text").unwrap_err();
+
+        assert_eq!(error.code(), "embedding.batch_incomparable");
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn prepared_fastembed_model_includes_declared_external_initializer() {
+        let root = temp_dir("qgh-external-initializer");
+        let files = [
+            (
+                ArtifactRole::OnnxModel,
+                "model.onnx",
+                b"graph".as_slice(),
+                None,
+            ),
+            (
+                ArtifactRole::OnnxExternalData,
+                "weights.bin",
+                b"weights".as_slice(),
+                Some("weights.bin"),
+            ),
+            (
+                ArtifactRole::Tokenizer,
+                "tokenizer.json",
+                b"{}".as_slice(),
+                None,
+            ),
+            (ArtifactRole::Config, "config.json", b"{}".as_slice(), None),
+            (
+                ArtifactRole::SpecialTokensMap,
+                "special_tokens_map.json",
+                b"{}".as_slice(),
+                None,
+            ),
+            (
+                ArtifactRole::TokenizerConfig,
+                "tokenizer_config.json",
+                b"{}".as_slice(),
+                None,
+            ),
+        ];
+        let mut artifacts = Vec::new();
+        for (role, relative_path, bytes, initializer_name) in files {
+            fs::write(root.join(relative_path), bytes).unwrap();
+            artifacts.push(fixture_artifact(
+                role,
+                relative_path,
+                bytes,
+                initializer_name,
+            ));
+        }
+        let manifest_path = root.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&fixture_manifest(artifacts)).unwrap(),
+        )
+        .unwrap();
+        let snapshot = PreparedModelStore::new(root.join("unused"))
+            .load_manifest(&manifest_path)
+            .unwrap();
+
+        let model = fastembed_user_defined_model(&snapshot).unwrap();
+
+        assert_eq!(model.external_initializers.len(), 1);
+        assert_eq!(model.external_initializers[0].file_name, "weights.bin");
+        assert_eq!(model.external_initializers[0].buffer, b"weights");
+    }
+
+    fn fixture_manifest(artifacts: Vec<ModelArtifactV1>) -> ModelManifestV1 {
+        ModelManifestV1 {
+            schema_version: MODEL_MANIFEST_SCHEMA_VERSION.to_string(),
+            preset_id: None,
+            provider: ModelProviderKind::Fastembed,
+            model_source: ModelSourceV1::Local {
+                declared_id: "fixture".to_string(),
+            },
+            artifacts,
+            tokenizer: TokenizerKind::HfTokenizerJson,
+            query_prefix: Some(String::new()),
+            document_prefix: Some(String::new()),
+            pooling: PoolingKind::Cls,
+            normalization: NormalizationKind::L2,
+            native_dimension: 4,
+            output_dimension: 4,
+            max_length: 32,
+            quantization: QuantizationKind::None,
+            context_template_version: "qgh.context.none.v1".to_string(),
+        }
+    }
+
+    fn fixture_artifact(
+        role: ArtifactRole,
+        relative_path: &str,
+        bytes: &[u8],
+        external_initializer_name: Option<&str>,
+    ) -> ModelArtifactV1 {
+        ModelArtifactV1 {
+            role,
+            relative_path: relative_path.to_string(),
+            sha256: hex_digest(&Sha256::digest(bytes)),
+            byte_size: bytes.len() as u64,
+            external_initializer_name: external_initializer_name.map(ToString::to_string),
+        }
     }
 
     #[test]
