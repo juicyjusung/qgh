@@ -28,6 +28,7 @@ const CHUNK_EMBEDDING_VECTORS_TABLE: &str = "chunk_embedding_vectors";
 const CHUNK_EMBEDDING_VECTOR_CHUNKS_META_TABLE: &str = "chunk_embedding_vectors_chunks";
 const CHUNK_EMBEDDING_VECTOR_ROWIDS_TABLE: &str = "chunk_embedding_vectors_rowids";
 const CHUNK_EMBEDDING_VECTOR_CHUNKS_TABLE: &str = "chunk_embedding_vectors_vector_chunks00";
+const TANTIVY_COMMIT_INVENTORY_MIGRATION: &str = "qgh.tantivy.commit_inventory.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingGenerationSpec {
@@ -294,6 +295,8 @@ pub struct Store {
     cleanup_promote_generation_after_scan: Option<i64>,
     #[cfg(test)]
     cleanup_fail_after_first_generation_delete: bool,
+    #[cfg(test)]
+    activation_failure: Option<QghError>,
 }
 
 impl Store {
@@ -373,6 +376,8 @@ impl Store {
             cleanup_promote_generation_after_scan: None,
             #[cfg(test)]
             cleanup_fail_after_first_generation_delete: false,
+            #[cfg(test)]
+            activation_failure: None,
         };
         store.migrate()?;
         store.detach_unbound_tantivy_publication()?;
@@ -387,9 +392,19 @@ impl Store {
     /// payload stay intact for rollback/repair, but query cannot trust them.
     fn detach_unbound_tantivy_publication(&mut self) -> Result<(), QghError> {
         type ActiveArtifact = (i64, i64, String, i64, Option<String>, Option<i64>);
-
-        let active_artifact = self
+        let tx = self
             .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let migration_complete = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+            params![TANTIVY_COMMIT_INVENTORY_MIGRATION],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if migration_complete {
+            tx.commit()?;
+            return Ok(());
+        }
+        let active_artifact = tx
             .query_row(
                 "SELECT rp.publication_id, ig.generation, ig.path, ig.source_count,
                         ig.source_inventory_hash, rp.embedding_generation_id
@@ -419,40 +434,42 @@ impl Store {
             embedding_generation_id,
         )): Option<ActiveArtifact> = active_artifact
         else {
-            return Ok(());
+            return finish_schema_migration(tx, TANTIVY_COMMIT_INVENTORY_MIGRATION);
         };
         let expected_path = self.index_root.join(format!("generation-{generation}"));
-        let artifact_bound = Path::new(&stored_path) == expected_path
-            && usize::try_from(source_count)
-                .ok()
-                .is_some_and(|source_count| {
-                    source_inventory_hash
-                        .as_deref()
-                        .is_some_and(|inventory_hash| {
-                            validate_tantivy_generation_artifact(
-                                &expected_path,
-                                source_count,
-                                inventory_hash,
-                            )
-                            .is_ok()
-                        })
-                });
-        if artifact_bound {
-            return Ok(());
+        if Path::new(&stored_path) != expected_path {
+            return finish_schema_migration(tx, TANTIVY_COMMIT_INVENTORY_MIGRATION);
+        }
+        let Some(source_count) = usize::try_from(source_count).ok() else {
+            return finish_schema_migration(tx, TANTIVY_COMMIT_INVENTORY_MIGRATION);
+        };
+        let Some(source_inventory_hash) = source_inventory_hash.as_deref() else {
+            return finish_schema_migration(tx, TANTIVY_COMMIT_INVENTORY_MIGRATION);
+        };
+        match validate_tantivy_generation_artifact(
+            &expected_path,
+            source_count,
+            source_inventory_hash,
+        ) {
+            Ok(()) => return finish_schema_migration(tx, TANTIVY_COMMIT_INVENTORY_MIGRATION),
+            // Legacy generations that predate the builder commit payload (or
+            // carry a different payload) are detached once during open-time
+            // migration. Operational filesystem loss/corruption is only
+            // reported by the read-only resolver below.
+            Err(error) if error.code == "publication.source_inventory_mismatch" => {}
+            Err(_) => {
+                return finish_schema_migration(tx, TANTIVY_COMMIT_INVENTORY_MIGRATION);
+            }
         }
 
-        let embedding_table_exists = table_exists(&self.conn, "embedding_generations")?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_table_exists = table_exists(&tx, "embedding_generations")?;
         let detached = tx.execute(
             "DELETE FROM retrieval_publication_pointer
              WHERE id = 1 AND publication_id = ?1",
             params![publication_id],
         )?;
         if detached == 0 {
-            tx.commit()?;
-            return Ok(());
+            return finish_schema_migration(tx, TANTIVY_COMMIT_INVENTORY_MIGRATION);
         }
         tx.execute(
             "UPDATE retrieval_publications SET active = 0 WHERE publication_id = ?1",
@@ -471,8 +488,7 @@ impl Store {
                 )?;
             }
         }
-        tx.commit()?;
-        Ok(())
+        finish_schema_migration(tx, TANTIVY_COMMIT_INVENTORY_MIGRATION)
     }
 
     /// Replaces an active legacy vector publication whose embedding identity
@@ -3916,6 +3932,16 @@ impl Store {
             self.cleanup_owned_index_generation(generation)?;
             return Err(source_inventory_mismatch_error());
         };
+        if let Err(error) = validate_managed_tantivy_generation_path(
+            &self.profile_dir,
+            &self.index_root,
+            generation,
+            Path::new(path),
+        ) {
+            drop(tx);
+            self.cleanup_owned_index_generation(generation)?;
+            return Err(error);
+        }
         if let Err(error) = validate_tantivy_generation_artifact(
             &expected_path,
             source_count,
@@ -5160,6 +5186,11 @@ impl Store {
             .map_err(QghError::from)
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_retrieval_publication_activation(&mut self, error: QghError) {
+        self.activation_failure = Some(error);
+    }
+
     pub fn activate_retrieval_publication(
         &mut self,
         source_snapshot_sync_run_id: &str,
@@ -5167,6 +5198,10 @@ impl Store {
         embedding_generation_id: Option<i64>,
         expected_publication_id: Option<i64>,
     ) -> Result<i64, QghError> {
+        #[cfg(test)]
+        if let Some(error) = self.activation_failure.take() {
+            return Err(error);
+        }
         self.validate_index_root_confinement()?;
         let expected_epoch = self.content_write_epoch;
         let expected_generation_path = self
@@ -5432,6 +5467,16 @@ impl Store {
             self.cleanup_owned_index_generation(tantivy_generation)?;
             return Err(tantivy_artifact_not_ready_error());
         };
+        if let Err(error) = validate_managed_tantivy_generation_path(
+            &self.profile_dir,
+            &self.index_root,
+            tantivy_generation,
+            Path::new(&index_path),
+        ) {
+            drop(tx);
+            self.cleanup_owned_index_generation(tantivy_generation)?;
+            return Err(error);
+        }
         if let Err(error) = validate_tantivy_generation_artifact(
             &expected_generation_path,
             source_count,
@@ -5603,6 +5648,103 @@ impl Store {
             )
             .optional()
             .map_err(QghError::from)
+    }
+
+    /// Resolves the only Tantivy artifact that retrieval may use. `None` is a
+    /// valid state only for a never-published profile with no active sources.
+    /// The resolver is read-only: invalid publication state is reported and is
+    /// never repaired or detached here.
+    pub fn resolve_active_tantivy_artifact(&self) -> Result<Option<PathBuf>, QghError> {
+        let publication = self.active_retrieval_publication()?;
+        let (pointer_count, active_publication_count, active_generation_count) =
+            self.conn.query_row(
+                "SELECT
+                     (SELECT count(*) FROM retrieval_publication_pointer),
+                     (SELECT count(*) FROM retrieval_publications WHERE active = 1),
+                     (SELECT count(*) FROM index_generations WHERE active = 1)",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )?;
+        let expected_active_count = if publication.is_some() { 1 } else { 0 };
+        if pointer_count != expected_active_count
+            || active_publication_count != expected_active_count
+            || active_generation_count != expected_active_count
+        {
+            return Err(tantivy_artifact_not_ready_error());
+        }
+        self.validate_query_publication_snapshot(publication.as_ref())?;
+        let Some(publication) = publication else {
+            return Ok(None);
+        };
+
+        let generation = self
+            .conn
+            .query_row(
+                "SELECT generation.path, generation.source_count,
+                        generation.source_inventory_hash, generation.active,
+                        generation.source_snapshot_sync_run_id,
+                        generation.source_snapshot_epoch, publication.active
+                 FROM index_generations generation
+                 JOIN retrieval_publications publication
+                   ON publication.publication_id = ?1
+                  AND publication.tantivy_generation = generation.generation
+                 WHERE generation.generation = ?2",
+                params![publication.publication_id, publication.tantivy_generation],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, bool>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, bool>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            stored_path,
+            source_count,
+            inventory_hash,
+            generation_active,
+            sync_run_id,
+            epoch,
+            publication_active,
+        )) = generation
+        else {
+            return Err(tantivy_artifact_not_ready_error());
+        };
+        if !publication_active
+            || !generation_active
+            || sync_run_id.as_deref() != Some(publication.source_snapshot_sync_run_id.as_str())
+            || epoch != Some(publication.source_snapshot_epoch)
+        {
+            return Err(tantivy_artifact_not_ready_error());
+        }
+        let expected_path = validate_managed_tantivy_generation_path(
+            &self.profile_dir,
+            &self.index_root,
+            publication.tantivy_generation,
+            Path::new(&stored_path),
+        )?;
+        let Some(source_count) = usize::try_from(source_count).ok() else {
+            return Err(source_inventory_mismatch_error());
+        };
+        let Some(inventory_hash) = inventory_hash
+            .as_deref()
+            .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        else {
+            return Err(source_inventory_mismatch_error());
+        };
+        validate_tantivy_generation_artifact(&expected_path, source_count, inventory_hash)?;
+        Ok(Some(expected_path))
     }
 
     pub fn validate_query_publication_snapshot(
@@ -7099,6 +7241,77 @@ fn repository_from_cursor_endpoint(endpoint: &str) -> Option<&str> {
     (issue_number > 0 && valid_repository_identity(repo)).then_some(repo)
 }
 
+fn validate_managed_tantivy_generation_path(
+    profile_dir: &Path,
+    index_root: &Path,
+    generation: i64,
+    stored_path: &Path,
+) -> Result<PathBuf, QghError> {
+    if generation < 0 || index_root != profile_dir.join("tantivy") {
+        return Err(tantivy_artifact_not_ready_error());
+    }
+    let expected_path = index_root.join(format!("generation-{generation}"));
+    if stored_path != expected_path {
+        return Err(tantivy_artifact_not_ready_error());
+    }
+    let profile_metadata =
+        fs::symlink_metadata(profile_dir).map_err(|_| tantivy_artifact_not_ready_error())?;
+    let root_metadata =
+        fs::symlink_metadata(index_root).map_err(|_| tantivy_artifact_not_ready_error())?;
+    if profile_metadata.file_type().is_symlink()
+        || !profile_metadata.is_dir()
+        || root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+    {
+        return Err(tantivy_artifact_not_ready_error());
+    }
+    let canonical_profile =
+        fs::canonicalize(profile_dir).map_err(|_| tantivy_artifact_not_ready_error())?;
+    let canonical_root =
+        fs::canonicalize(index_root).map_err(|_| tantivy_artifact_not_ready_error())?;
+    if canonical_root != canonical_profile.join("tantivy") {
+        return Err(tantivy_artifact_not_ready_error());
+    }
+    let generation_metadata =
+        fs::symlink_metadata(&expected_path).map_err(|_| tantivy_artifact_not_ready_error())?;
+    if generation_metadata.file_type().is_symlink() || !generation_metadata.is_dir() {
+        return Err(tantivy_artifact_not_ready_error());
+    }
+    let canonical_generation =
+        fs::canonicalize(&expected_path).map_err(|_| tantivy_artifact_not_ready_error())?;
+    if canonical_generation != canonical_root.join(format!("generation-{generation}")) {
+        return Err(tantivy_artifact_not_ready_error());
+    }
+    validate_tantivy_tree_confinement(&expected_path, &canonical_generation)?;
+    Ok(expected_path)
+}
+
+fn validate_tantivy_tree_confinement(
+    directory: &Path,
+    canonical_generation: &Path,
+) -> Result<(), QghError> {
+    for entry in fs::read_dir(directory).map_err(|_| tantivy_artifact_not_ready_error())? {
+        let entry = entry.map_err(|_| tantivy_artifact_not_ready_error())?;
+        let path = entry.path();
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|_| tantivy_artifact_not_ready_error())?;
+        if metadata.file_type().is_symlink() {
+            return Err(tantivy_artifact_not_ready_error());
+        }
+        let canonical_path =
+            fs::canonicalize(&path).map_err(|_| tantivy_artifact_not_ready_error())?;
+        if !canonical_path.starts_with(canonical_generation) {
+            return Err(tantivy_artifact_not_ready_error());
+        }
+        if metadata.is_dir() {
+            validate_tantivy_tree_confinement(&path, canonical_generation)?;
+        } else if !metadata.is_file() {
+            return Err(tantivy_artifact_not_ready_error());
+        }
+    }
+    Ok(())
+}
+
 fn validate_tantivy_generation_artifact(
     generation_path: &Path,
     expected_source_count: usize,
@@ -7279,6 +7492,22 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, QghError> {
         )
         .optional()?
         .is_some())
+}
+
+fn record_schema_migration(conn: &Connection, version: &str) -> Result<(), QghError> {
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at)
+         VALUES (?1, ?2)
+         ON CONFLICT(version) DO NOTHING",
+        params![version, now_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn finish_schema_migration(tx: Transaction<'_>, version: &str) -> Result<(), QghError> {
+    record_schema_migration(&tx, version)?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn generation_vector_table_name(dimension: usize) -> String {
@@ -8460,6 +8689,7 @@ mod tests {
         assert!(!store.successor_repair_required().unwrap());
         assert!(store.capture_retrieval_build_snapshot().unwrap().is_none());
         store.validate_query_publication_snapshot(None).unwrap();
+        assert_eq!(store.resolve_active_tantivy_artifact().unwrap(), None);
         assert!(store.record_purge_successor_snapshot().unwrap().is_none());
         assert!(store.latest_successful_sync_run_id().unwrap().is_none());
         store
@@ -8479,6 +8709,7 @@ mod tests {
             .unwrap()
             .is_none());
         reopened.validate_query_publication_snapshot(None).unwrap();
+        assert_eq!(reopened.resolve_active_tantivy_artifact().unwrap(), None);
         assert!(reopened
             .record_purge_successor_snapshot()
             .unwrap()
@@ -13769,6 +14000,13 @@ mod tests {
             .unwrap();
         writer.commit().unwrap();
         writer.wait_merging_threads().unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM schema_migrations WHERE version = ?1",
+                params![TANTIVY_COMMIT_INVENTORY_MIGRATION],
+            )
+            .unwrap();
         drop(store);
 
         let reopened = Store::open(&paths).unwrap();
@@ -13779,6 +14017,217 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "publication.source_snapshot_incomplete");
         assert!(generation_path.exists());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn open_records_tantivy_inventory_migration_after_valid_artifact_validation() {
+        let paths = temp_profile_paths("publication-valid-artifact-migration");
+        let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run(
+                "sync-valid-artifact-migration",
+                &[test_issue(
+                    "qgh://github.com/issue/I_VALID_ARTIFACT_MIGRATION",
+                    "owner/repo",
+                    "valid-artifact-migration",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-valid-artifact-migration")
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (generation, _) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        let publication_id = store
+            .activate_retrieval_publication(
+                snapshot.identity().sync_run_id(),
+                generation,
+                None,
+                snapshot.expected_publication_id(),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM schema_migrations WHERE version = ?1",
+                params![TANTIVY_COMMIT_INVENTORY_MIGRATION],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(&paths).unwrap();
+        assert_eq!(
+            reopened
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            publication_id
+        );
+        let migration_recorded: bool = reopened
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+                params![TANTIVY_COMMIT_INVENTORY_MIGRATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(migration_recorded);
+
+        let sources = reopened.active_index_sources().unwrap();
+        crate::index::rebuild(&paths.index_root, generation, &sources).unwrap();
+        let index =
+            tantivy::Index::open_in_dir(paths.index_root.join(format!("generation-{generation}")))
+                .unwrap();
+        let mut writer = index
+            .writer::<tantivy::TantivyDocument>(50_000_000)
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        drop(reopened);
+
+        let reopened_after_corruption = Store::open(&paths).unwrap();
+        assert_eq!(
+            reopened_after_corruption
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            publication_id
+        );
+        let error = reopened_after_corruption
+            .resolve_active_tantivy_artifact()
+            .unwrap_err();
+        assert_eq!(error.code, "publication.source_inventory_mismatch");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn open_records_tantivy_inventory_migration_when_artifact_is_missing() {
+        let paths = temp_profile_paths("publication-missing-artifact-migration");
+        let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run(
+                "sync-missing-artifact-migration",
+                &[test_issue(
+                    "qgh://github.com/issue/I_MISSING_ARTIFACT_MIGRATION",
+                    "owner/repo",
+                    "missing-artifact-migration",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-missing-artifact-migration")
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (generation, generation_path) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        let publication_id = store
+            .activate_retrieval_publication(
+                snapshot.identity().sync_run_id(),
+                generation,
+                None,
+                snapshot.expected_publication_id(),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM schema_migrations WHERE version = ?1",
+                params![TANTIVY_COMMIT_INVENTORY_MIGRATION],
+            )
+            .unwrap();
+        fs::remove_dir_all(generation_path).unwrap();
+        drop(store);
+
+        let reopened = Store::open(&paths).unwrap();
+        assert_eq!(
+            reopened
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            publication_id
+        );
+        let migration_recorded: bool = reopened
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+                params![TANTIVY_COMMIT_INVENTORY_MIGRATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(migration_recorded);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn reopen_reports_runtime_tantivy_corruption_without_detaching_pointer() {
+        let paths = temp_profile_paths("publication-runtime-artifact-corruption");
+        let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run(
+                "sync-runtime-artifact-corruption",
+                &[test_issue(
+                    "qgh://github.com/issue/I_RUNTIME_ARTIFACT_CORRUPTION",
+                    "owner/repo",
+                    "runtime-artifact-corruption",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-runtime-artifact-corruption")
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (generation, generation_path) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        let publication_id = store
+            .activate_retrieval_publication(
+                snapshot.identity().sync_run_id(),
+                generation,
+                None,
+                snapshot.expected_publication_id(),
+            )
+            .unwrap();
+        let index = tantivy::Index::open_in_dir(&generation_path).unwrap();
+        let mut writer = index
+            .writer::<tantivy::TantivyDocument>(50_000_000)
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        drop(store);
+
+        let reopened = Store::open(&paths).unwrap();
+        assert_eq!(
+            reopened
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            publication_id
+        );
+        let error = reopened.resolve_active_tantivy_artifact().unwrap_err();
+        assert_eq!(error.code, "publication.source_inventory_mismatch");
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -14033,6 +14482,405 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, "publication.source_inventory_mismatch");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn active_tantivy_resolver_rejects_missing_artifact_without_detaching_pointer() {
+        let paths = temp_profile_paths("publication-missing-active-artifact");
+        let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run(
+                "sync-missing-active-artifact",
+                &[test_issue(
+                    "qgh://github.com/issue/I_MISSING_ACTIVE_ARTIFACT",
+                    "owner/repo",
+                    "missing-active-artifact",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-missing-active-artifact")
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (generation, generation_path) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        let publication_id = store
+            .activate_retrieval_publication(
+                snapshot.identity().sync_run_id(),
+                generation,
+                None,
+                snapshot.expected_publication_id(),
+            )
+            .unwrap();
+        fs::remove_dir_all(generation_path).unwrap();
+
+        let error = store.resolve_active_tantivy_artifact().unwrap_err();
+        assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
+        assert_eq!(
+            store
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            publication_id
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_rejects_symlink_inside_tantivy_generation() {
+        use std::os::unix::fs::symlink;
+
+        let paths = temp_profile_paths("publication-activation-contained-symlink");
+        let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run(
+                "sync-activation-contained-symlink",
+                &[test_issue(
+                    "qgh://github.com/issue/I_ACTIVATION_CONTAINED_SYMLINK",
+                    "owner/repo",
+                    "activation-contained-symlink",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-activation-contained-symlink")
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (generation, generation_path) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        let outside = paths.profile_dir.join("outside-generation");
+        fs::write(&outside, b"outside fixture").unwrap();
+        symlink(&outside, generation_path.join("unexpected-link")).unwrap();
+
+        let error = store
+            .activate_retrieval_publication(
+                snapshot.identity().sync_run_id(),
+                generation,
+                None,
+                snapshot.expected_publication_id(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
+        assert!(store.active_retrieval_publication().unwrap().is_none());
+        assert!(outside.exists());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_index_publish_rejects_symlink_inside_tantivy_generation() {
+        use std::os::unix::fs::symlink;
+
+        let paths = temp_profile_paths("legacy-publish-contained-symlink");
+        let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run(
+                "sync-legacy-publish-contained-symlink",
+                &[test_issue(
+                    "qgh://github.com/issue/I_LEGACY_PUBLISH_CONTAINED_SYMLINK",
+                    "owner/repo",
+                    "legacy-publish-contained-symlink",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-legacy-publish-contained-symlink")
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (generation, generation_path) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        let outside = paths.profile_dir.join("outside-legacy-generation");
+        fs::write(&outside, b"outside fixture").unwrap();
+        symlink(&outside, generation_path.join("unexpected-link")).unwrap();
+
+        let error = store
+            .mark_index_published(generation, &generation_path.to_string_lossy(), 1)
+            .unwrap_err();
+        assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
+        assert_eq!(store.active_index_generation().unwrap(), None);
+        assert!(outside.exists());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn active_tantivy_resolver_rejects_orphan_active_state_for_empty_profile() {
+        let paths = temp_profile_paths("publication-resolver-orphan-active-state");
+        let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run(
+                "sync-resolver-orphan-active-state",
+                &[test_issue(
+                    "qgh://github.com/issue/I_RESOLVER_ORPHAN_ACTIVE_STATE",
+                    "owner/repo",
+                    "resolver-orphan-active-state",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-resolver-orphan-active-state")
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (generation, _) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .activate_retrieval_publication(
+                snapshot.identity().sync_run_id(),
+                generation,
+                None,
+                snapshot.expected_publication_id(),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM retrieval_publication_pointer WHERE id = 1", [])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE source_entities SET lifecycle_state = 'tombstoned'",
+                [],
+            )
+            .unwrap();
+
+        let error = store.resolve_active_tantivy_artifact().unwrap_err();
+        assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn active_tantivy_resolver_rejects_multiple_active_publications() {
+        let paths = temp_profile_paths("publication-resolver-multiple-active-publications");
+        let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run(
+                "sync-resolver-multiple-active-publications",
+                &[test_issue(
+                    "qgh://github.com/issue/I_RESOLVER_MULTIPLE_ACTIVE_PUBLICATIONS",
+                    "owner/repo",
+                    "resolver-multiple-active-publications",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-resolver-multiple-active-publications")
+            .unwrap();
+        let first_snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (first_generation, _) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &first_snapshot)
+            .unwrap();
+        crate::index::rebuild(
+            &paths.index_root,
+            first_generation,
+            first_snapshot.sources(),
+        )
+        .unwrap();
+        let first_publication = store
+            .activate_retrieval_publication(
+                first_snapshot.identity().sync_run_id(),
+                first_generation,
+                None,
+                first_snapshot.expected_publication_id(),
+            )
+            .unwrap();
+        let second_snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (second_generation, _) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &second_snapshot)
+            .unwrap();
+        crate::index::rebuild(
+            &paths.index_root,
+            second_generation,
+            second_snapshot.sources(),
+        )
+        .unwrap();
+        store
+            .activate_retrieval_publication(
+                second_snapshot.identity().sync_run_id(),
+                second_generation,
+                None,
+                second_snapshot.expected_publication_id(),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE retrieval_publications SET active = 1 WHERE publication_id = ?1",
+                params![first_publication],
+            )
+            .unwrap();
+
+        let error = store.resolve_active_tantivy_artifact().unwrap_err();
+        assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn active_tantivy_resolver_does_not_materialize_source_bodies() {
+        let paths = temp_profile_paths("publication-resolver-metadata-only");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_RESOLVER_METADATA_ONLY";
+        store
+            .upsert_sources_for_run(
+                "sync-resolver-metadata-only",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "resolver-metadata-only",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-resolver-metadata-only")
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (generation, expected_path) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .activate_retrieval_publication(
+                snapshot.identity().sync_run_id(),
+                generation,
+                None,
+                snapshot.expected_publication_id(),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE issue_metadata SET body = X'80' WHERE source_id = ?1",
+                params![source_id],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.resolve_active_tantivy_artifact().unwrap(),
+            Some(expected_path)
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn active_tantivy_resolver_rejects_same_count_artifact_inventory_swap() {
+        let paths = temp_profile_paths("publication-resolver-same-count-swap");
+        let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run(
+                "sync-resolver-same-count-swap",
+                &[test_issue(
+                    "qgh://github.com/issue/I_RESOLVER_SAME_COUNT_SWAP",
+                    "owner/repo",
+                    "resolver-same-count-swap",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-resolver-same-count-swap")
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (generation, _) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .activate_retrieval_publication(
+                snapshot.identity().sync_run_id(),
+                generation,
+                None,
+                snapshot.expected_publication_id(),
+            )
+            .unwrap();
+        let mut substituted = snapshot.sources().to_vec();
+        substituted[0].title = "same-count-substitution".to_string();
+        substituted[0].body = "same-count-substitution".to_string();
+        crate::index::rebuild(&paths.index_root, generation, &substituted).unwrap();
+
+        let error = store.resolve_active_tantivy_artifact().unwrap_err();
+        assert_eq!(error.code, "publication.source_inventory_mismatch");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_tantivy_resolver_rejects_symlink_inside_generation() {
+        use std::os::unix::fs::symlink;
+
+        let paths = temp_profile_paths("publication-resolver-contained-symlink");
+        let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run(
+                "sync-resolver-contained-symlink",
+                &[test_issue(
+                    "qgh://github.com/issue/I_RESOLVER_CONTAINED_SYMLINK",
+                    "owner/repo",
+                    "resolver-contained-symlink",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-resolver-contained-symlink")
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (generation, generation_path) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .activate_retrieval_publication(
+                snapshot.identity().sync_run_id(),
+                generation,
+                None,
+                snapshot.expected_publication_id(),
+            )
+            .unwrap();
+        let outside = paths.profile_dir.join("outside-artifact");
+        fs::write(&outside, "content-free-fixture").unwrap();
+        symlink(&outside, generation_path.join("unexpected-link")).unwrap();
+
+        let error = store.resolve_active_tantivy_artifact().unwrap_err();
+        assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }

@@ -209,10 +209,10 @@ fn search_with_filters_profile(
     profile: LexicalRankingProfile,
     limit: usize,
 ) -> Result<Vec<SearchHit>, QghError> {
-    if limit == 0 || filters.source_types.is_empty() {
-        return Ok(Vec::new());
-    }
     if !active_path.exists() {
+        return Err(QghError::index("Tantivy index artifact is missing."));
+    }
+    if limit == 0 || filters.source_types.is_empty() {
         return Ok(Vec::new());
     }
     let index = Index::open_in_dir(active_path).map_err(|e| QghError::index(e.to_string()))?;
@@ -577,6 +577,18 @@ mod tests {
     use super::*;
     use crate::model::IndexSource;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn search_rejects_missing_artifact_instead_of_returning_empty_results() {
+        let index_root = temp_index_root("missing-search-artifact");
+        let missing = index_root.join("generation-1");
+
+        let error = search(&missing, "query-not-logged", 5).unwrap_err();
+        assert_eq!(error.code, "index.failure");
+        assert_eq!(error.message, "Tantivy index artifact is missing.");
+
+        let _ = fs::remove_dir_all(index_root);
+    }
 
     #[test]
     fn rebuild_uses_generation_path_and_warm_bm25_p95_stays_under_500ms() {

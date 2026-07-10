@@ -138,9 +138,8 @@ pub async fn sync(
         if let Some(last_sync_at) = last_sync.as_deref() {
             let snapshot_age_seconds = freshness::snapshot_age_seconds(last_sync_at)?;
             if snapshot_age_seconds <= max_age_seconds {
-                let publication = store.active_retrieval_publication()?;
-                match store.validate_query_publication_snapshot(publication.as_ref()) {
-                    Ok(()) => {
+                match store.resolve_active_tantivy_artifact() {
+                    Ok(_) => {
                         progress.line(format_args!(
                             "qgh sync: skipped, snapshot fresh age={snapshot_age_seconds}s max_age={max_age_seconds}s"
                         ));
@@ -163,6 +162,8 @@ pub async fn sync(
                             "publication.source_snapshot_incomplete"
                                 | "publication.source_snapshot_changed"
                                 | "publication.embedding_snapshot_mismatch"
+                                | "publication.tantivy_artifact_not_ready"
+                                | "publication.source_inventory_mismatch"
                         ) =>
                     {
                         progress.line(format_args!(
@@ -1159,10 +1160,23 @@ fn rebuild_bm25_index(
             }
         }
         Ok(_) => {}
-        Err(_) => warnings.push(embedding_sync_warning(
-            "publication.activation_failed",
-            "Retrieval publication activation failed after BM25 rebuild. The previous publication remains active.",
-        )),
+        Err(error) => {
+            let valid_previous = snapshot.expected_publication_id().is_some_and(|expected| {
+                store
+                    .active_retrieval_publication()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|publication| publication.publication_id == expected)
+                    && matches!(store.resolve_active_tantivy_artifact(), Ok(Some(_)))
+            });
+            if !valid_previous {
+                return Err(error);
+            }
+            warnings.push(embedding_sync_warning(
+                "publication.activation_failed",
+                "Retrieval publication activation failed after BM25 rebuild. The previous publication remains active.",
+            ));
+        }
     }
     let status = store.status()?;
     let active_generation = store
@@ -3171,7 +3185,7 @@ pub fn query(
     let outcome = (|| -> Result<LocalReadOutcome, QghError> {
         let overrides = freshness_overrides(args.max_age.as_deref(), args.require_fresh)?;
         let publication = store.active_retrieval_publication()?;
-        ensure_query_publication_is_safe(&store, publication.as_ref())?;
+        let active_index_path = ensure_query_publication_is_safe(&store)?;
         if let Some(results) = exact_results(&store, &args.query, &filters, &profile.id)? {
             let last_successful_sync_at =
                 query_freshness_sync_time(&store, &profile, &filters, &results)?;
@@ -3222,19 +3236,20 @@ pub fn query(
         } else {
             (None, vector_open_warnings)
         };
-        let active_index_path =
-            publication_index_path(&store, publication.as_ref(), &profile.paths.index_active)?;
         let lexical_limit = if hybrid_vector_hits.is_some() {
             hybrid_candidate_limit(limit)
         } else {
             limit
         };
-        let lexical_hits = index::search_with_filters(
-            &active_index_path,
-            &args.query,
-            &filters.search_filters(),
-            lexical_limit,
-        )?;
+        let lexical_hits = match active_index_path.as_deref() {
+            Some(active_index_path) => index::search_with_filters(
+                active_index_path,
+                &args.query,
+                &filters.search_filters(),
+                lexical_limit,
+            )?,
+            None => Vec::new(),
+        };
         let hits = match hybrid_vector_hits {
             Some(vector_hits) => fuse_hybrid_hits(lexical_hits, vector_hits, limit),
             None => lexical_hits
@@ -4865,9 +4880,7 @@ pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
         && purge["retrieval_blocked"].as_bool() == Some(false);
     let permissions_ok = private_paths_ok(&profile.paths);
     let sqlite_ok = status.active_generation >= 0;
-    let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
-    let tantivy_ok = !active_index_path.exists()
-        || index::search(&active_index_path, "__qgh_doctor_probe__", 1).is_ok();
+    let tantivy_ok = store.resolve_active_tantivy_artifact().is_ok();
     let (github_ok, rate_limit_ok, rate_limit_headers) = match resolve_token(&profile) {
         Ok(token) => doctor_github_probe(&profile, &token).await,
         Err(_) => (false, false, rate_limit_headers_json(None, None)),
@@ -4960,33 +4973,11 @@ fn active_index_path(store: &Store, fallback: &std::path::Path) -> Result<PathBu
         .unwrap_or_else(|| fallback.to_path_buf()))
 }
 
-fn publication_index_path(
-    store: &Store,
-    publication: Option<&RetrievalPublicationView>,
-    fallback: &std::path::Path,
-) -> Result<PathBuf, QghError> {
-    match publication {
-        Some(publication) => store
-            .index_path_for_generation(publication.tantivy_generation)?
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                QghError::validation(
-                    "publication.tantivy_generation_missing",
-                    "The active retrieval publication references a missing Tantivy generation.",
-                )
-            }),
-        None => active_index_path(store, fallback),
-    }
-}
-
-fn ensure_query_publication_is_safe(
-    store: &Store,
-    publication: Option<&RetrievalPublicationView>,
-) -> Result<(), QghError> {
+fn ensure_query_publication_is_safe(store: &Store) -> Result<Option<PathBuf>, QghError> {
     if store.successor_repair_required()? {
         return Err(successor_repair_required_error());
     }
-    store.validate_query_publication_snapshot(publication)
+    store.resolve_active_tantivy_artifact()
 }
 
 fn successor_repair_required_error() -> QghError {
@@ -5342,7 +5333,7 @@ fn lexical_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SourceVersionView;
+    use crate::model::{IssueRecord, SourceVersionView};
 
     fn test_stored_chunk(source_id: &str) -> StoredChunk {
         StoredChunk {
@@ -5365,7 +5356,7 @@ mod tests {
     #[cfg(feature = "vector-search")]
     use crate::embedding::PoolingKind;
     #[cfg(feature = "vector-search")]
-    use crate::model::{CommentRecord, IssueRecord, VectorSearchFilters};
+    use crate::model::{CommentRecord, VectorSearchFilters};
     use crate::paths::ProfilePaths;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5435,6 +5426,106 @@ mod tests {
         fn embed_query(&self, _text: &str) -> Result<EmbeddingVector, EmbeddingProviderError> {
             Ok(vec![1.0, 2.0, 3.0])
         }
+    }
+
+    #[test]
+    fn first_publication_activation_failure_returns_original_error() {
+        let paths = temp_profile_paths("first-publication-activation-failure");
+        let profile = bm25_test_profile(&paths);
+        let mut store = Store::open(&paths).unwrap();
+        seed_bm25_snapshot(
+            &mut store,
+            "sync-first-publication-activation-failure",
+            "I_FIRST_PUBLICATION_ACTIVATION_FAILURE",
+        );
+        store.fail_next_retrieval_publication_activation(QghError::new(
+            "publication.test_activation_failed",
+            "Fixture activation failed.",
+            6,
+        ));
+
+        let error = match rebuild_bm25_index(&profile, &mut store, &StderrSyncProgress::new(false))
+        {
+            Ok(_) => panic!("first activation failure must be fatal"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "publication.test_activation_failed");
+        assert!(store.active_retrieval_publication().unwrap().is_none());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn activation_failure_warns_only_when_exact_previous_publication_is_valid() {
+        let paths = temp_profile_paths("valid-previous-publication-activation-failure");
+        let profile = bm25_test_profile(&paths);
+        let mut store = Store::open(&paths).unwrap();
+        seed_bm25_snapshot(
+            &mut store,
+            "sync-valid-previous-publication",
+            "I_VALID_PREVIOUS_PUBLICATION",
+        );
+        rebuild_bm25_index(&profile, &mut store, &StderrSyncProgress::new(false)).unwrap();
+        let previous_id = store
+            .active_retrieval_publication()
+            .unwrap()
+            .unwrap()
+            .publication_id;
+        store.fail_next_retrieval_publication_activation(QghError::new(
+            "publication.test_activation_failed",
+            "Fixture activation failed.",
+            6,
+        ));
+
+        let outcome =
+            rebuild_bm25_index(&profile, &mut store, &StderrSyncProgress::new(false)).unwrap();
+        assert!(outcome
+            .warnings
+            .iter()
+            .any(|warning| warning["code"] == "publication.activation_failed"));
+        assert_eq!(
+            store
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            previous_id
+        );
+        assert!(matches!(
+            store.resolve_active_tantivy_artifact(),
+            Ok(Some(_))
+        ));
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn activation_failure_is_fatal_when_previous_artifact_is_invalid() {
+        let paths = temp_profile_paths("invalid-previous-publication-activation-failure");
+        let profile = bm25_test_profile(&paths);
+        let mut store = Store::open(&paths).unwrap();
+        seed_bm25_snapshot(
+            &mut store,
+            "sync-invalid-previous-publication",
+            "I_INVALID_PREVIOUS_PUBLICATION",
+        );
+        rebuild_bm25_index(&profile, &mut store, &StderrSyncProgress::new(false)).unwrap();
+        let previous_path = store.resolve_active_tantivy_artifact().unwrap().unwrap();
+        fs::remove_dir_all(previous_path).unwrap();
+        store.fail_next_retrieval_publication_activation(QghError::new(
+            "publication.test_activation_failed",
+            "Fixture activation failed.",
+            6,
+        ));
+
+        let error = match rebuild_bm25_index(&profile, &mut store, &StderrSyncProgress::new(false))
+        {
+            Ok(_) => panic!("invalid previous publication cannot justify fallback success"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "publication.test_activation_failed");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
     #[test]
@@ -6387,6 +6478,68 @@ mod tests {
             cache_dir,
             profile_dir,
         }
+    }
+
+    fn bm25_test_profile(paths: &ProfilePaths) -> Profile {
+        Profile {
+            id: "bm25-test-profile".to_string(),
+            host: "github.com".to_string(),
+            api_base_url: "https://api.github.com".to_string(),
+            web_base_url: "https://github.com".to_string(),
+            repos: vec![crate::config::RepoRef {
+                owner: "owner".to_string(),
+                name: "repo".to_string(),
+            }],
+            embedding: None,
+            reconcile_after_seconds: None,
+            freshness: crate::config::FreshnessSettings {
+                query_max_age_seconds: 1,
+                query_stale_behavior: crate::config::StaleBehavior::Warn,
+                active_issue_max_age_seconds: None,
+            },
+            bootstrap: crate::config::BootstrapSettings {
+                lookback_seconds: 1,
+            },
+            sync_max_age_seconds: None,
+            comments_mode: CommentsMode::PerIssue,
+            comment_parent_resolution_budget: 1,
+            max_in_flight_requests: 1,
+            token_source: TokenSource::GithubCli,
+            paths: paths.clone(),
+        }
+    }
+
+    fn seed_bm25_snapshot(store: &mut Store, sync_run_id: &str, node_id: &str) {
+        store
+            .upsert_sources_for_run(
+                sync_run_id,
+                &[IssueRecord {
+                    source_id: format!("qgh://github.com/issue/{node_id}"),
+                    host: "github.com".to_string(),
+                    repo: "owner/repo".to_string(),
+                    node_id: node_id.to_string(),
+                    github_id: 47,
+                    number: 47,
+                    title: "Fixture publication".to_string(),
+                    body: "Fixture body not emitted by activation errors.".to_string(),
+                    state: "open".to_string(),
+                    labels: Vec::new(),
+                    milestone: None,
+                    assignees: Vec::new(),
+                    author: Some("fixture".to_string()),
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    updated_at: "2026-01-02T00:00:00Z".to_string(),
+                    closed_at: None,
+                    canonical_url: "https://github.com/owner/repo/issues/47".to_string(),
+                    body_hash: "fixture-body-hash".to_string(),
+                    indexed_at: "2026-01-02T00:00:01Z".to_string(),
+                }],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store.mark_sync_run_completed(sync_run_id).unwrap();
     }
 
     #[cfg(feature = "vector-search")]

@@ -340,6 +340,69 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
 }
 
 #[test]
+fn normal_query_fails_closed_when_active_tantivy_artifact_is_missing() {
+    let fixture = TestFixture::new("query-missing-active-tantivy");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.remove_active_tantivy_generation();
+
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert!(!query.status.success());
+    assert_eq!(
+        stdout_json(&query)["error"]["code"],
+        "publication.tantivy_artifact_not_ready"
+    );
+}
+
+#[test]
+fn exact_query_fails_closed_but_get_survives_when_active_tantivy_is_missing() {
+    let fixture = TestFixture::new("exact-query-missing-active-tantivy");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.remove_active_tantivy_generation();
+
+    let exact = fixture.qgh(["query", "https://github.com/owner/repo/issues/42", "--json"]);
+    assert!(!exact.status.success());
+    assert_eq!(
+        stdout_json(&exact)["error"]["code"],
+        "publication.tantivy_artifact_not_ready"
+    );
+
+    let get = fixture.qgh(["get", "qgh://github.com/issue/I_kwDOISSUE1", "--json"]);
+    assert_success(&get);
+    assert_eq!(
+        stdout_json(&get)["data"]["source"]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+}
+
+#[test]
+fn doctor_reports_missing_tantivy_without_mutating_publication_pointer() {
+    let fixture = TestFixture::new("doctor-missing-active-tantivy");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let publication_id = fixture.active_retrieval_publication_id();
+    fixture.remove_active_tantivy_generation();
+
+    let doctor = fixture.qgh(["doctor", "--json"]);
+    assert_success(&doctor);
+    let doctor_json = stdout_json(&doctor);
+    let tantivy = doctor_json["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "tantivy")
+        .unwrap();
+    assert_eq!(tantivy["ok"], false);
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    assert_eq!(fixture.active_retrieval_publication_id(), publication_id);
+}
+
+#[test]
 fn sync_sends_github_rest_headers_required_by_real_api() {
     let fixture = TestFixture::new("github-required-headers");
     let server = HeaderCheckingFakeGitHub::start();
@@ -3689,6 +3752,32 @@ fn sync_if_stale_repairs_detached_pre_epoch_publication_even_when_remote_sync_is
     assert_ne!(successor_publication_id, original_publication_id);
     drop(conn);
 
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&query);
+    assert!(!stdout_json(&query)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn sync_if_stale_repairs_missing_active_tantivy_even_when_remote_sync_is_fresh() {
+    let fixture = TestFixture::new("sync-if-stale-missing-active-tantivy");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let original_publication_id = fixture.active_retrieval_publication_id();
+    fixture.remove_active_tantivy_generation();
+    let requests_before_repair = server.request_count();
+
+    let repaired = fixture.qgh(["sync", "--if-stale", "--max-age", "30m", "--json"]);
+    assert_success(&repaired);
+    assert_eq!(stdout_json(&repaired)["data"]["sync_state"], "ok");
+    assert!(server.request_count() > requests_before_repair);
+    assert_ne!(
+        fixture.active_retrieval_publication_id(),
+        original_publication_id
+    );
     let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
     assert_success(&query);
     assert!(!stdout_json(&query)["data"]["results"]
@@ -7688,6 +7777,37 @@ limit = 10
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    fn active_retrieval_publication_id(&self) -> i64 {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT publication_id FROM retrieval_publication_pointer WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn remove_active_tantivy_generation(&self) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let path: String = conn
+            .query_row(
+                "SELECT generation.path
+                 FROM retrieval_publication_pointer pointer
+                 JOIN retrieval_publications publication
+                   ON publication.publication_id = pointer.publication_id
+                 JOIN index_generations generation
+                   ON generation.generation = publication.tantivy_generation
+                 WHERE pointer.id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        fs::remove_dir_all(path).unwrap();
     }
 
     fn active_retrieval_publication_count(&self) -> i64 {
