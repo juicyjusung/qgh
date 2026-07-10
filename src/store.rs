@@ -1759,6 +1759,17 @@ impl Store {
             .map_err(QghError::from)
     }
 
+    pub fn source_version_hash(&self, source_version_id: i64) -> Result<Option<String>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT body_hash FROM source_versions WHERE id = ?1",
+                params![source_version_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(QghError::from)
+    }
+
     pub fn coverage_snapshot(&self) -> Result<CoverageSnapshot, QghError> {
         let snapshot = self
             .conn
@@ -1816,7 +1827,6 @@ impl Store {
         Ok(())
     }
 
-    #[cfg(feature = "vector-search")]
     pub fn begin_embedding_generation(
         &mut self,
         spec: &EmbeddingGenerationSpec,
@@ -1874,7 +1884,6 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    #[cfg(feature = "vector-search")]
     pub fn stage_embedding_generation_batch(
         &mut self,
         generation_id: i64,
@@ -2003,7 +2012,6 @@ impl Store {
         }
     }
 
-    #[cfg(feature = "vector-search")]
     pub fn embedding_generation_chunk_blob(
         &self,
         generation_id: i64,
@@ -2026,7 +2034,6 @@ impl Store {
             .map_err(QghError::from)
     }
 
-    #[cfg(feature = "vector-search")]
     pub fn validate_embedding_generation(&mut self, generation_id: i64) -> Result<(), QghError> {
         let (state, dimension, total_chunks, completed_chunks): (String, usize, i64, i64) =
             self.conn.query_row(
@@ -2109,7 +2116,6 @@ impl Store {
         Ok(())
     }
 
-    #[cfg(feature = "vector-search")]
     pub fn embedding_generation_state(&self, generation_id: i64) -> Result<String, QghError> {
         self.conn
             .query_row(
@@ -2117,6 +2123,17 @@ impl Store {
                 params![generation_id],
                 |row| row.get(0),
             )
+            .map_err(QghError::from)
+    }
+
+    pub fn latest_embedding_generation_state(&self) -> Result<Option<String>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT state FROM embedding_generations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
             .map_err(QghError::from)
     }
 
@@ -2289,7 +2306,6 @@ impl Store {
             .map_err(QghError::from)
     }
 
-    #[cfg(feature = "vector-search")]
     pub fn cleanup_embedding_generations(
         &mut self,
         stale_building_before: &str,
@@ -2378,7 +2394,6 @@ impl Store {
         Ok(removed)
     }
 
-    #[cfg(feature = "vector-search")]
     fn fail_embedding_generation(
         &mut self,
         generation_id: i64,
@@ -2974,12 +2989,10 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, QghError> {
         .is_some())
 }
 
-#[cfg(feature = "vector-search")]
 fn generation_vector_table_name(dimension: usize) -> String {
     format!("embedding_generation_vectors_d{dimension}")
 }
 
-#[cfg(feature = "vector-search")]
 fn encode_embedding_blob(vector: &[f32]) -> Vec<u8> {
     vector
         .iter()
@@ -2987,7 +3000,6 @@ fn encode_embedding_blob(vector: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-#[cfg(feature = "vector-search")]
 fn decode_embedding_blob(bytes: &[u8], dimension: usize) -> Result<Vec<f32>, QghError> {
     if bytes.len() != dimension.saturating_mul(std::mem::size_of::<f32>()) {
         return Err(QghError::validation(
@@ -3004,7 +3016,6 @@ fn decode_embedding_blob(bytes: &[u8], dimension: usize) -> Result<Vec<f32>, Qgh
         .collect()
 }
 
-#[cfg(feature = "vector-search")]
 fn embedding_blob_checksum(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
