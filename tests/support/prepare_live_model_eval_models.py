@@ -41,12 +41,10 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def download(url: str, destination: Path) -> None:
-    if destination.is_file() and destination.stat().st_size > 0:
-        return
+def download(url: str, destination: Path) -> int:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".partial")
-    subprocess.run(
+    result = subprocess.run(
         [
             "curl",
             "--fail",
@@ -57,11 +55,30 @@ def download(url: str, destination: Path) -> None:
             "qgh-live-model-eval/1",
             "--output",
             str(temporary),
+            "--write-out",
+            "%{size_download}",
             url,
         ],
         check=True,
+        capture_output=True,
+        text=True,
     )
     os.replace(temporary, destination)
+    return int(float(result.stdout.strip()))
+
+
+def snapshot_sha256(root: Path) -> str:
+    files = []
+    for path in sorted(path for path in root.rglob("*") if path.is_file()):
+        files.append(
+            {
+                "relative_path": path.relative_to(root).as_posix(),
+                "byte_size": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    canonical = json.dumps(files, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def main() -> None:
@@ -103,7 +120,15 @@ def main() -> None:
             local_cache=arctic_cache,
         )
     )
-    print(json.dumps({"prepared": summaries}, sort_keys=True))
+    provenance = {
+        "schema_version": "qgh.live_model_preparation.v1",
+        "prepared": summaries,
+    }
+    args.output_root.mkdir(parents=True, exist_ok=True)
+    (args.output_root / "preparation-provenance.json").write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(json.dumps(provenance, sort_keys=True))
 
 
 def prepare_manifest(
@@ -121,16 +146,26 @@ def prepare_manifest(
     local_cache: Path = None,
 ):
     artifacts = []
+    artifact_acquisition = []
     for role, relative_path, initializer in files:
         url = f"https://huggingface.co/{model_id}/resolve/{revision}/{relative_path}"
         destination = root / relative_path
         cached = local_cache / relative_path if local_cache is not None else None
-        if not destination.is_file() or destination.stat().st_size == 0:
+        if destination.is_file() and destination.stat().st_size > 0:
+            source = "existing_snapshot"
+            source_bytes = destination.stat().st_size
+            transfer_bytes = 0
+        else:
             if cached is not None and cached.exists():
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(cached.resolve(), destination)
+                source = "local_cache"
+                source_bytes = cached.stat().st_size
+                transfer_bytes = 0
             else:
-                download(url, destination)
+                transfer_bytes = download(url, destination)
+                source = "curl"
+                source_bytes = destination.stat().st_size
         artifact = {
             "role": role,
             "relative_path": relative_path,
@@ -140,6 +175,14 @@ def prepare_manifest(
         if initializer is not None:
             artifact["external_initializer_name"] = initializer
         artifacts.append(artifact)
+        artifact_acquisition.append(
+            {
+                "relative_path": relative_path,
+                "source": source,
+                "source_bytes": source_bytes,
+                "download_transfer_bytes": transfer_bytes,
+            }
+        )
     manifest = {
         "schema_version": "qgh.model_manifest.v1",
         "preset_id": None,
@@ -171,8 +214,23 @@ def prepare_manifest(
         "resolved_revision": revision,
         "manifest_file": f"{candidate}/manifest.json",
         "manifest_sha256": sha256_file(manifest_path),
+        "prepared_snapshot_sha256": snapshot_sha256(root),
         "snapshot_bytes": sum(artifact["byte_size"] for artifact in artifacts)
         + manifest_path.stat().st_size,
+        "download_transfer_bytes": sum(
+            artifact["download_transfer_bytes"] for artifact in artifact_acquisition
+        ),
+        "cache_source_bytes": sum(
+            artifact["source_bytes"]
+            for artifact in artifact_acquisition
+            if artifact["source"] == "local_cache"
+        ),
+        "existing_snapshot_bytes": sum(
+            artifact["source_bytes"]
+            for artifact in artifact_acquisition
+            if artifact["source"] == "existing_snapshot"
+        ),
+        "artifact_acquisition": artifact_acquisition,
     }
     return summary
 

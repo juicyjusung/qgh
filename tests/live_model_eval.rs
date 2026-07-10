@@ -405,6 +405,94 @@ fn prepared_manifests_target_context_v1() {
     assert!(!MODEL_PREP_SCRIPT.contains("qgh.context.none.v1"));
 }
 
+#[test]
+fn model_preparation_records_download_and_cache_source_bytes() {
+    let root = std::env::temp_dir().join(format!(
+        "qgh-live-model-prepare-contract-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let models_root = root.join("models");
+    for (candidate, paths) in [
+        (
+            "gte-modernbert-base",
+            vec![
+                "onnx/model.onnx",
+                "tokenizer.json",
+                "config.json",
+                "special_tokens_map.json",
+                "tokenizer_config.json",
+            ],
+        ),
+        (
+            "arctic-embed-l-v2.0",
+            vec![
+                "onnx/model.onnx",
+                "onnx/model.onnx_data",
+                "tokenizer.json",
+                "config.json",
+                "special_tokens_map.json",
+                "tokenizer_config.json",
+            ],
+        ),
+    ] {
+        for path in paths {
+            let path = models_root.join(candidate).join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"public-test-artifact").unwrap();
+        }
+    }
+    let output = std::process::Command::new("python3")
+        .args([
+            "tests/support/prepare_live_model_eval_models.py",
+            "--output-root",
+        ])
+        .arg(&models_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stdout["schema_version"], "qgh.live_model_preparation.v1");
+    assert_eq!(stdout["prepared"][0]["download_transfer_bytes"], 0);
+    assert!(
+        stdout["prepared"][0]["existing_snapshot_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        stdout["prepared"][0]["prepared_snapshot_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    let provenance: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(models_root.join("preparation-provenance.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(provenance, stdout);
+    #[cfg(feature = "fastembed-provider")]
+    assert_eq!(
+        live_model_eval_runtime::prepared_model_download_bytes_for_test(
+            &root,
+            "gte-modernbert-base",
+            "Alibaba-NLP/gte-modernbert-base",
+            "e7f32e3c00f91d699e8c43b53106206bcc72bb22",
+        )
+        .expect("Rust verifies Python preparation provenance"),
+        0
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(feature = "fastembed-provider")]
 #[test]
 fn dev_grid_fuses_real_branch_observations_with_deterministic_ties() {
@@ -418,6 +506,100 @@ fn dev_grid_fuses_real_branch_observations_with_deterministic_ties() {
         2,
     );
     assert_eq!(ranked, ["source-b", "source-a", "source-c"]);
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn primary_dev_metrics_use_the_production_query_protocol() {
+    let protocol = live_model_eval_runtime::dev_query_protocol_for_test();
+    assert_eq!(protocol.primary_query_limit, 20);
+    assert_eq!(protocol.primary_candidate_window, 80);
+    assert_eq!(protocol.diagnostic_query_limit, 100);
+    assert!(!protocol.diagnostic_can_select);
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn lexical_profile_remains_typed_and_frozen_until_integrated_lane_d_ab() {
+    assert_eq!(
+        live_model_eval_runtime::lexical_profile_freeze_for_test(),
+        json!({
+            "production_profile": "production_v1",
+            "comparison_candidate": "metadata_boost_v1",
+            "state": "pending_integrated_lane_d_ab",
+            "may_select": false,
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn resource_failure_preserves_heldout_quality_and_numeric_partial_evidence() {
+    let report = live_model_eval_runtime::resource_failure_contract_for_test();
+    assert!(report["held_out_metrics"].is_object());
+    assert_eq!(report["resources"]["complete"], false);
+    assert_eq!(report["resources"]["phase"], "50k_embed");
+    assert_eq!(report["resources"]["measured_50k_chunk_count"], 12_500);
+    assert_eq!(
+        report["blocker"],
+        json!({"code": "eval.resource_failed", "phase": "50k_embed"})
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn backfill_success_requires_complete_generation_mapping_vec0_and_publication_counts() {
+    let path = std::env::temp_dir().join(format!(
+        "qgh-live-model-backfill-contract-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE chunks(id INTEGER PRIMARY KEY);
+             CREATE TABLE embedding_generations(
+               id INTEGER PRIMARY KEY, state TEXT, total_chunks INTEGER, completed_chunks INTEGER
+             );
+             CREATE TABLE embedding_generation_chunks(generation_id INTEGER, chunk_id INTEGER);
+             CREATE TABLE embedding_generation_vector_rows(
+               generation_id INTEGER, vector_table TEXT, vector_rowid INTEGER
+             );
+             CREATE TABLE embedding_generation_vectors_d4(rowid INTEGER PRIMARY KEY);
+             CREATE TABLE retrieval_publications(
+               publication_id INTEGER PRIMARY KEY, embedding_generation_id INTEGER, active INTEGER
+             );
+             CREATE TABLE retrieval_publication_pointer(id INTEGER PRIMARY KEY, publication_id INTEGER);
+             INSERT INTO chunks VALUES (1), (2);
+             INSERT INTO embedding_generations VALUES (7, 'active', 2, 2);
+             INSERT INTO embedding_generation_chunks VALUES (7, 1), (7, 2);
+             INSERT INTO embedding_generation_vector_rows
+               VALUES (7, 'embedding_generation_vectors_d4', 1),
+                      (7, 'embedding_generation_vectors_d4', 2);
+             INSERT INTO embedding_generation_vectors_d4 VALUES (1), (2);
+             INSERT INTO retrieval_publications VALUES (9, 7, 1);
+             INSERT INTO retrieval_publication_pointer VALUES (1, 9);",
+        )
+        .unwrap();
+    drop(connection);
+    let evidence = live_model_eval_runtime::backfill_integrity_for_test(&path, 2)
+        .expect("complete publication");
+    assert_eq!(evidence["generation_total_chunks"], 2);
+    assert_eq!(evidence["vector_mapping_rows"], 2);
+    assert_eq!(evidence["vec0_rows"], 2);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "DELETE FROM embedding_generation_vectors_d4 WHERE rowid = 2",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(live_model_eval_runtime::backfill_integrity_for_test(&path, 2).is_err());
+    std::fs::remove_file(path).unwrap();
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -548,11 +730,183 @@ fn heldout_parse_occurs_after_frozen_config_write() {
     assert!(freeze < heldout_parse);
 }
 
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn frozen_run_identity_covers_complete_snapshots_and_is_revalidated_at_phase_boundaries() {
+    let root = std::env::temp_dir().join(format!(
+        "qgh-live-model-snapshot-contract-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("onnx")).unwrap();
+    std::fs::write(root.join("manifest.json"), b"manifest-v1").unwrap();
+    std::fs::write(root.join("onnx/model.onnx"), b"model-v1").unwrap();
+    let first =
+        live_model_eval_runtime::prepared_snapshot_digest_for_test(&root).expect("snapshot hashes");
+    assert_eq!(first["file_count"], 2);
+    assert_eq!(first["sha256"].as_str().unwrap().len(), 64);
+    std::fs::write(root.join("onnx/model.onnx"), b"model-v2").unwrap();
+    let second = live_model_eval_runtime::prepared_snapshot_digest_for_test(&root)
+        .expect("changed snapshot hashes");
+    assert_ne!(first["sha256"], second["sha256"]);
+    std::fs::remove_dir_all(root).unwrap();
+
+    for field in [
+        "integrated_git_head",
+        "worktree_clean",
+        "release_binary_sha256",
+        "contract_gate_bundle_sha256",
+        "candidate_states",
+        "manifest_hash",
+        "prepared_snapshot_sha256",
+        "artifact_set_sha256",
+    ] {
+        assert!(
+            RUNTIME_SUPPORT.contains(field),
+            "missing frozen field {field}"
+        );
+    }
+    let freeze = RUNTIME_SUPPORT
+        .find("fs::write(root.join(\"frozen-config.json\")")
+        .unwrap();
+    let heldout_revalidation = RUNTIME_SUPPORT
+        .find("frozen_guard.revalidate_before_heldout")
+        .unwrap();
+    let heldout_parse = RUNTIME_SUPPORT
+        .find("parse_jsonl::<QrelRecord>(test_raw)")
+        .unwrap();
+    assert!(freeze < heldout_revalidation && heldout_revalidation < heldout_parse);
+    let resource_revalidation = RUNTIME_SUPPORT
+        .find("frozen_guard.revalidate_before_50k")
+        .unwrap();
+    let backfill = RUNTIME_SUPPORT.find("measure_50k_backfill(").unwrap();
+    assert!(resource_revalidation < backfill);
+}
+
 #[test]
 fn runtime_records_schema_fingerprints_and_derives_redaction_state() {
     assert!(RUNTIME_SUPPORT.contains("database_schema_fingerprint"));
     assert!(RUNTIME_SUPPORT.contains("tantivy_schema_fingerprint"));
     assert!(!RUNTIME_SUPPORT.contains("raw_query_or_body_logged: false"));
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn canonical_gate_bundle_is_strict_and_bound_to_git_binary_and_file_hash() {
+    let root = std::env::temp_dir().join(format!(
+        "qgh-live-model-gate-contract-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let git_sha = "a".repeat(40);
+    let binary_sha = "b".repeat(64);
+    let bundle =
+        live_model_eval_runtime::contract_gate_bundle_json_for_test(&root, &git_sha, &binary_sha)
+            .expect("gate result artifacts");
+    let names = bundle["gates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|gate| gate["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "edit_reconciliation",
+            "delete_and_stale_exclusion",
+            "purge_pending_retry",
+            "parent_context_invalidation",
+            "concurrent_publication_snapshot",
+            "bm25_search_quality",
+            "hard_filter_exclusion",
+        ]
+    );
+    let path = root.join("contract-gate-bundle.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&bundle).unwrap()).unwrap();
+    let frozen_hash = live_model_eval_runtime::verify_contract_gate_bundle_path_for_test(
+        &root,
+        &git_sha,
+        &binary_sha,
+        None,
+    )
+    .expect("valid canonical gate bundle");
+    assert_eq!(frozen_hash.len(), 64);
+
+    std::fs::write(root.join("contract-gates/edit_reconciliation.json"), b"{}").unwrap();
+    assert!(
+        live_model_eval_runtime::verify_contract_gate_bundle_path_for_test(
+            &root,
+            &git_sha,
+            &binary_sha,
+            Some(&frozen_hash),
+        )
+        .is_err()
+    );
+    live_model_eval_runtime::contract_gate_bundle_json_for_test(&root, &git_sha, &binary_sha)
+        .expect("restore gate result artifacts");
+
+    let mut changed = bundle.clone();
+    changed["gates"][0]["result_sha256"] = json!("d".repeat(64));
+    std::fs::write(&path, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+    assert!(
+        live_model_eval_runtime::verify_contract_gate_bundle_path_for_test(
+            &root,
+            &git_sha,
+            &binary_sha,
+            Some(&frozen_hash),
+        )
+        .is_err()
+    );
+
+    let mut unknown = bundle;
+    unknown["unexpected"] = json!(true);
+    std::fs::write(&path, serde_json::to_vec_pretty(&unknown).unwrap()).unwrap();
+    assert!(
+        live_model_eval_runtime::verify_contract_gate_bundle_path_for_test(
+            &root,
+            &git_sha,
+            &binary_sha,
+            None,
+        )
+        .is_err()
+    );
+    assert!(!RUNTIME_SUPPORT.contains("QGH_LIVE_MODEL_EVAL_STALE_GATE_STATUS"));
+    assert!(!RUNTIME_SUPPORT.contains("QGH_LIVE_MODEL_EVAL_FILTER_GATE_STATUS"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn redaction_audit_scans_canonical_gate_artifacts_and_partial_canary_fragments() {
+    let root = std::env::temp_dir().join(format!(
+        "qgh-live-model-redaction-contract-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("nested")).unwrap();
+    let canary = "private-canary-fragment";
+    std::fs::write(root.join("contract-gate-bundle.json"), canary).unwrap();
+    std::fs::write(root.join("nested/eval-write.partial"), canary).unwrap();
+    std::fs::write(root.join("ignored.bin"), canary).unwrap();
+    let evidence = live_model_eval_runtime::redaction_file_scan_for_test(&root, canary)
+        .expect("redaction scan completes");
+    assert_eq!(evidence["artifact_files_checked"], 2);
+    assert_eq!(
+        evidence["violation_artifacts"],
+        json!(["contract-gate-bundle.json", "nested/eval-write.partial"])
+    );
+    assert_eq!(evidence["passed"], false);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(feature = "fastembed-provider")]
