@@ -157,6 +157,8 @@ struct ContextContractEvidence {
 #[derive(Debug)]
 struct ContextContractFailure {
     manifest_hash: String,
+    candidate_database_schema_fingerprint: String,
+    candidate_tantivy_schema_fingerprint: String,
     evidence: ContextContractEvidence,
 }
 
@@ -195,6 +197,8 @@ struct CandidateReport {
     runtime: String,
     status: String,
     manifest_hash: Option<String>,
+    candidate_database_schema_fingerprint: Option<String>,
+    candidate_tantivy_schema_fingerprint: Option<String>,
     context_contract: Option<ContextContractEvidence>,
     dev_metrics: Option<RetrievalMetrics>,
     held_out_metrics: Option<RetrievalMetrics>,
@@ -273,6 +277,8 @@ struct ContextProbeSmokeReport {
     schema_version: &'static str,
     corpus_source_count: usize,
     manifest_hash: String,
+    candidate_database_schema_fingerprint: String,
+    candidate_tantivy_schema_fingerprint: String,
     context_contract: ContextContractEvidence,
     evaluation_state: &'static str,
     raw_query_or_body_logged: bool,
@@ -559,14 +565,229 @@ pub(super) fn hybrid_gate_for_test(expected: usize, observed: usize) -> bool {
 fn weighted_score(values: [f64; 6]) -> f64 {
     0.50 * values[0]
         + 0.20 * values[1]
-        + 0.10 * values[2]
+        + 0.15 * values[2]
         + 0.10 * values[3]
-        + 0.05 * values[4]
-        + 0.05 * values[5]
+        + 0.025 * values[4]
+        + 0.025 * values[5]
 }
 
 pub(super) fn weighted_score_for_test(values: [f64; 6]) -> f64 {
     weighted_score(values)
+}
+
+pub(super) fn run_hard_filter_contract_probe(
+    binary: &Path,
+    corpus_raw: &str,
+) -> Result<(), DynError> {
+    const TARGET_REPO: &str = "juicyjusung/qgh";
+    const COMPETING_REPO: &str = "competing/filter-probe";
+    const TARGET_ISSUE: u64 = 900_001;
+    const SENTINEL: &str = "bounded-adversarial-filter-sentinel";
+
+    let corpus = parse_jsonl::<CorpusRecord>(corpus_raw);
+    let issue_seed = corpus
+        .iter()
+        .find(|source| source.entity_type == "issue")
+        .ok_or("hard-filter issue seed missing")?;
+    let comment_seed = corpus
+        .iter()
+        .find(|source| source.entity_type == "issue_comment")
+        .ok_or("hard-filter comment seed missing")?;
+
+    let issue = |repo: &str, issue_number: u64, node_id: &str| {
+        let mut source = issue_seed.clone();
+        source.source_id = format!("qgh://github.com/issue/{node_id}");
+        source.entity_type = "issue".to_string();
+        source.repo = repo.to_string();
+        source.issue_number = issue_number;
+        source.canonical_url = format!("https://github.com/{repo}/issues/{issue_number}");
+        source.title = SENTINEL.to_string();
+        source.body = SENTINEL.to_string();
+        source.body_sha256 = digest_hex(SENTINEL);
+        source
+    };
+    let mut competing_comment = comment_seed.clone();
+    competing_comment.source_id =
+        "qgh://github.com/issue-comment/IC_FILTER_TARGET_COMMENT".to_string();
+    competing_comment.entity_type = "issue_comment".to_string();
+    competing_comment.repo = TARGET_REPO.to_string();
+    competing_comment.issue_number = TARGET_ISSUE;
+    competing_comment.canonical_url =
+        format!("https://github.com/{TARGET_REPO}/issues/{TARGET_ISSUE}#issuecomment-9900001");
+    competing_comment.title = SENTINEL.to_string();
+    competing_comment.body = SENTINEL.to_string();
+    competing_comment.body_sha256 = digest_hex(SENTINEL);
+
+    let sources = vec![
+        issue(TARGET_REPO, TARGET_ISSUE, "I_FILTER_TARGET"),
+        issue(TARGET_REPO, TARGET_ISSUE + 1, "I_FILTER_WRONG_LABEL"),
+        issue(TARGET_REPO, TARGET_ISSUE + 2, "I_FILTER_WRONG_STATE"),
+        issue(TARGET_REPO, TARGET_ISSUE + 3, "I_FILTER_WRONG_AUTHOR"),
+        issue(TARGET_REPO, TARGET_ISSUE + 4, "I_FILTER_OTHER_ISSUE"),
+        issue(COMPETING_REPO, TARGET_ISSUE, "I_FILTER_OTHER_REPO"),
+        competing_comment,
+    ];
+    let metadata = |state: &str, author: &str, labels: &[&str]| IssueApiMetadata {
+        state: state.to_string(),
+        author: author.to_string(),
+        labels: labels.iter().map(|label| (*label).to_string()).collect(),
+    };
+    let issue_metadata = BTreeMap::from([
+        (
+            "qgh://github.com/issue/I_FILTER_TARGET".to_string(),
+            metadata("open", "target-author", &["target-label"]),
+        ),
+        (
+            "qgh://github.com/issue/I_FILTER_WRONG_LABEL".to_string(),
+            metadata("open", "target-author", &["wrong-label"]),
+        ),
+        (
+            "qgh://github.com/issue/I_FILTER_WRONG_STATE".to_string(),
+            metadata("closed", "target-author", &["target-label"]),
+        ),
+        (
+            "qgh://github.com/issue/I_FILTER_WRONG_AUTHOR".to_string(),
+            metadata("open", "wrong-author", &["target-label"]),
+        ),
+        (
+            "qgh://github.com/issue/I_FILTER_OTHER_ISSUE".to_string(),
+            metadata("open", "target-author", &["target-label"]),
+        ),
+        (
+            "qgh://github.com/issue/I_FILTER_OTHER_REPO".to_string(),
+            metadata("open", "target-author", &["target-label"]),
+        ),
+    ]);
+    let server = PublicSnapshotServer::start_with_issue_metadata(&sources, &issue_metadata)?;
+    let root = PathBuf::from("target/qgh-eval/hard-filter-contract");
+    ensure_target_root(&root)?;
+    let fixture = CliFixture::new(root, binary.to_path_buf(), server.base_url.clone())?;
+    fixture.write_hard_filter_probe_config(TARGET_REPO, COMPETING_REPO)?;
+    fixture.sync()?;
+
+    let connection = Connection::open(fixture.db_path())?;
+    let source_count: usize = connection.query_row(
+        "SELECT COUNT(*) FROM source_entities WHERE lifecycle_state = 'active'",
+        [],
+        |row| row.get(0),
+    )?;
+    if source_count != sources.len() {
+        return Err(format!(
+            "hard-filter probe expected {} competing sources, found {source_count}",
+            sources.len()
+        )
+        .into());
+    }
+    drop(connection);
+
+    assert_hard_filter_results(
+        &fixture,
+        &[
+            "query",
+            SENTINEL,
+            "--repo",
+            TARGET_REPO,
+            "--label",
+            "target-label",
+            "--state",
+            "open",
+            "--author",
+            "target-author",
+            "--limit",
+            "10",
+            "--json",
+        ],
+        &[
+            ("qgh://github.com/issue/I_FILTER_TARGET", TARGET_ISSUE),
+            (
+                "qgh://github.com/issue/I_FILTER_OTHER_ISSUE",
+                TARGET_ISSUE + 4,
+            ),
+        ],
+        TARGET_REPO,
+    )?;
+    assert_hard_filter_results(
+        &fixture,
+        &[
+            "query",
+            SENTINEL,
+            "--repo",
+            TARGET_REPO,
+            "--issue",
+            "900001",
+            "--limit",
+            "10",
+            "--json",
+        ],
+        &[("qgh://github.com/issue/I_FILTER_TARGET", TARGET_ISSUE)],
+        TARGET_REPO,
+    )?;
+    assert_hard_filter_results(
+        &fixture,
+        &[
+            "query",
+            SENTINEL,
+            "--repo",
+            TARGET_REPO,
+            "--label",
+            "target-label",
+            "--state",
+            "open",
+            "--author",
+            "target-author",
+            "--issue",
+            "900001",
+            "--limit",
+            "10",
+            "--json",
+        ],
+        &[("qgh://github.com/issue/I_FILTER_TARGET", TARGET_ISSUE)],
+        TARGET_REPO,
+    )?;
+    Ok(())
+}
+
+fn assert_hard_filter_results(
+    fixture: &CliFixture,
+    arguments: &[&str],
+    expected: &[(&str, u64)],
+    expected_repo: &str,
+) -> Result<(), DynError> {
+    let output = fixture.qgh(arguments)?;
+    let envelope: Value = serde_json::from_slice(&output.stdout)?;
+    let results = envelope["data"]["results"]
+        .as_array()
+        .ok_or("hard-filter result array missing")?;
+    let mut observed = BTreeMap::new();
+    for result in results {
+        let source_id = result["source_id"]
+            .as_str()
+            .ok_or("hard-filter result source_id missing")?;
+        let repo = result["repo"]
+            .as_str()
+            .ok_or("hard-filter result repo missing")?;
+        let entity_type = result["entity_type"]
+            .as_str()
+            .ok_or("hard-filter result entity_type missing")?;
+        let issue_number = result["issue_number"]
+            .as_u64()
+            .ok_or("hard-filter result issue_number missing")?;
+        if repo != expected_repo || entity_type != "issue" {
+            return Err("repo/source-type filter admitted a competing source".into());
+        }
+        observed.insert(source_id.to_string(), issue_number);
+    }
+    let expected = expected
+        .iter()
+        .map(|(source_id, issue_number)| ((*source_id).to_string(), *issue_number))
+        .collect::<BTreeMap<_, _>>();
+    if observed != expected {
+        return Err(format!(
+            "hard-filter result mismatch: observed {observed:?}, expected {expected:?}"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn target_root_allowed(cwd: &Path, root: &Path) -> bool {
@@ -685,6 +906,8 @@ struct PreparedCandidate {
     model_id: String,
     revision: String,
     manifest_hash: String,
+    candidate_database_schema_fingerprint: String,
+    candidate_tantivy_schema_fingerprint: String,
     context_contract: ContextContractEvidence,
     fixture: CliFixture,
     manifest_path: PathBuf,
@@ -1039,6 +1262,8 @@ pub(super) fn run_context_probe_smoke(
     {
         return Err("context smoke embedded no chunks".into());
     }
+    let (candidate_database_schema_fingerprint, candidate_tantivy_schema_fingerprint) =
+        fixture.schema_fingerprints()?;
     let context_contract =
         probe_context_contract(&fixture.db_path(), &manifest.context_template_version)?;
     let redaction = verify_redaction(root, &subset, &[])?;
@@ -1046,6 +1271,8 @@ pub(super) fn run_context_probe_smoke(
         schema_version: "qgh.live_model_eval_context_probe.v1",
         corpus_source_count: subset.len(),
         manifest_hash,
+        candidate_database_schema_fingerprint,
+        candidate_tantivy_schema_fingerprint,
         evaluation_state: if context_contract.passed {
             "context_contract_passed"
         } else {
@@ -1104,6 +1331,10 @@ fn prepare_candidate_dev(
             );
             if let Some(failure) = context_failure {
                 report.manifest_hash = Some(failure.manifest_hash.clone());
+                report.candidate_database_schema_fingerprint =
+                    Some(failure.candidate_database_schema_fingerprint.clone());
+                report.candidate_tantivy_schema_fingerprint =
+                    Some(failure.candidate_tantivy_schema_fingerprint.clone());
                 report.context_contract = Some(failure.evidence.clone());
                 report.status = "blocked_context_contract".to_string();
             }
@@ -1150,11 +1381,15 @@ fn try_prepare_candidate_dev(
         return Err("embedding completed without any chunks".into());
     }
     let db_growth = fixture.db_bytes()?.saturating_sub(db_bytes_before);
+    let (candidate_database_schema_fingerprint, candidate_tantivy_schema_fingerprint) =
+        fixture.schema_fingerprints()?;
     let context_contract =
         probe_context_contract(&fixture.db_path(), &manifest.context_template_version)?;
     if !context_contract.passed {
         return Err(Box::new(ContextContractFailure {
             manifest_hash,
+            candidate_database_schema_fingerprint,
+            candidate_tantivy_schema_fingerprint,
             evidence: context_contract,
         }));
     }
@@ -1183,6 +1418,8 @@ fn try_prepare_candidate_dev(
         model_id: model_id.to_string(),
         revision: revision.to_string(),
         manifest_hash,
+        candidate_database_schema_fingerprint,
+        candidate_tantivy_schema_fingerprint,
         context_contract,
         fixture,
         manifest_path: manifest_path.to_path_buf(),
@@ -1222,6 +1459,12 @@ fn finish_candidate(
                     "completed_not_eligible".to_string()
                 },
                 manifest_hash: Some(prepared.manifest_hash.clone()),
+                candidate_database_schema_fingerprint: Some(
+                    prepared.candidate_database_schema_fingerprint.clone(),
+                ),
+                candidate_tantivy_schema_fingerprint: Some(
+                    prepared.candidate_tantivy_schema_fingerprint.clone(),
+                ),
                 context_contract: Some(prepared.context_contract),
                 dev_metrics: Some(prepared.dev_metrics),
                 held_out_metrics: Some(held_out_metrics),
@@ -1242,6 +1485,12 @@ fn finish_candidate(
             runtime: "qgh release binary / fastembed UserDefinedEmbeddingModel".to_string(),
             status: "blocked_after_dev".to_string(),
             manifest_hash: Some(prepared.manifest_hash),
+            candidate_database_schema_fingerprint: Some(
+                prepared.candidate_database_schema_fingerprint,
+            ),
+            candidate_tantivy_schema_fingerprint: Some(
+                prepared.candidate_tantivy_schema_fingerprint,
+            ),
             context_contract: Some(prepared.context_contract),
             dev_metrics: Some(prepared.dev_metrics),
             held_out_metrics: None,
@@ -1343,6 +1592,8 @@ fn blocked_candidate(
         runtime: "qgh release binary / fastembed UserDefinedEmbeddingModel".to_string(),
         status: "blocked".to_string(),
         manifest_hash: None,
+        candidate_database_schema_fingerprint: None,
+        candidate_tantivy_schema_fingerprint: None,
         context_contract: None,
         dev_metrics: None,
         held_out_metrics: None,
@@ -1399,6 +1650,8 @@ fn dragonkue_blocker(root: &Path) -> CandidateReport {
         runtime: "qgh fastembed UserDefinedEmbeddingModel".to_string(),
         status: "blocked".to_string(),
         manifest_hash: None,
+        candidate_database_schema_fingerprint: None,
+        candidate_tantivy_schema_fingerprint: None,
         context_contract: None,
         dev_metrics: None,
         held_out_metrics: None,
@@ -2205,6 +2458,47 @@ env = "QGH_PUBLIC_FIXTURE_AUTH"
         Ok(())
     }
 
+    fn write_hard_filter_probe_config(
+        &self,
+        target_repo: &str,
+        competing_repo: &str,
+    ) -> Result<(), DynError> {
+        let config = format!(
+            r#"schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "{}"
+web_base_url = "https://github.com"
+repos = ["{target_repo}", "{competing_repo}"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_PUBLIC_FIXTURE_AUTH"
+"#,
+            self.api_base_url
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config)?;
+        let policy = format!(
+            r#"schema_version = "qgh.repo.v1"
+
+[repo]
+github = "{target_repo}"
+
+[defaults]
+scope = "repo"
+state = "all"
+source_types = ["issue"]
+labels = []
+
+[query]
+limit = 10
+"#
+        );
+        fs::write(self.root.join(".qgh.toml"), policy)?;
+        Ok(())
+    }
+
     fn sync(&self) -> Result<(), DynError> {
         let _ = self.qgh(&["sync", "--all", "--json"])?;
         Ok(())
@@ -2501,9 +2795,23 @@ struct PublicSnapshotServer {
     handle: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+struct IssueApiMetadata {
+    state: String,
+    author: String,
+    labels: Vec<String>,
+}
+
 impl PublicSnapshotServer {
     fn start(corpus: &[CorpusRecord]) -> Result<Self, DynError> {
-        let responses = Arc::new(build_api_responses(corpus)?);
+        Self::start_with_issue_metadata(corpus, &BTreeMap::new())
+    }
+
+    fn start_with_issue_metadata(
+        corpus: &[CorpusRecord],
+        issue_metadata: &BTreeMap<String, IssueApiMetadata>,
+    ) -> Result<Self, DynError> {
+        let responses = Arc::new(build_api_responses(corpus, issue_metadata)?);
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let base_url = format!("http://{address}");
@@ -2539,7 +2847,10 @@ impl Drop for PublicSnapshotServer {
     }
 }
 
-fn build_api_responses(corpus: &[CorpusRecord]) -> Result<BTreeMap<String, String>, DynError> {
+fn build_api_responses(
+    corpus: &[CorpusRecord],
+    issue_metadata: &BTreeMap<String, IssueApiMetadata>,
+) -> Result<BTreeMap<String, String>, DynError> {
     let mut responses = BTreeMap::new();
     let mut issues_by_repo = BTreeMap::<&str, Vec<&CorpusRecord>>::new();
     let mut comments_by_thread = BTreeMap::<(&str, u64), Vec<&CorpusRecord>>::new();
@@ -2562,6 +2873,7 @@ fn build_api_responses(corpus: &[CorpusRecord]) -> Result<BTreeMap<String, Strin
                     comments_by_thread
                         .get(&(repo, source.issue_number))
                         .map_or(0, Vec::len),
+                    issue_metadata.get(&source.source_id),
                 )
             })
             .collect::<Result<Vec<_>, DynError>>()?;
@@ -2599,22 +2911,35 @@ fn build_api_responses(corpus: &[CorpusRecord]) -> Result<BTreeMap<String, Strin
     Ok(responses)
 }
 
-fn issue_json(source: &CorpusRecord, comment_count: usize) -> Result<Value, DynError> {
+fn issue_json(
+    source: &CorpusRecord,
+    comment_count: usize,
+    metadata: Option<&IssueApiMetadata>,
+) -> Result<Value, DynError> {
+    let state = metadata.map_or("open", |value| value.state.as_str());
+    let author = metadata.map_or("public-fixture-author", |value| value.author.as_str());
+    let labels = metadata.map_or_else(Vec::new, |value| {
+        value
+            .labels
+            .iter()
+            .map(|name| json!({"name": name}))
+            .collect::<Vec<_>>()
+    });
     Ok(json!({
         "id": synthetic_issue_id(&source.repo, source.issue_number),
         "node_id": decoded_node_id(&source.source_id)?,
         "number": source.issue_number,
         "title": source.title,
         "body": source.body,
-        "state": "open",
+        "state": state,
         "locked": false,
         "comments": comment_count,
         "html_url": source.canonical_url,
         "created_at": source.github_updated_at,
         "updated_at": source.github_updated_at,
         "closed_at": null,
-        "user": {"login": "public-fixture-author"},
-        "labels": [],
+        "user": {"login": author},
+        "labels": labels,
         "milestone": null,
         "assignees": []
     }))
@@ -2891,8 +3216,8 @@ fn hard_filter_contract_gate() -> ExternalContractGate {
         .ok()
         .filter(|value| is_sha256(value));
     ExternalContractGate {
-        name: "same_repo_hard_filter_contract",
-        command: "cargo test --all-features --test search_quality_eval curated_search_quality_eval_gate_passes -- --exact",
+        name: "competing_repo_label_state_author_issue_and_source_type_hard_filter_contract",
+        command: "cargo test --all-features --test live_model_eval production_hard_filter_contract_excludes_competing_sources -- --exact",
         status,
         result_sha256,
     }

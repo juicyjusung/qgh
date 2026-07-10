@@ -4,7 +4,7 @@
 
 The fixture and harness are ready for the integrated live run, but this lane selects no model. Eligibility is derived from recorded context, quality, resource, host, stale, hard-filter, judgment-pool, and redaction evidence; it is not hard-coded.
 
-Prepared manifests now declare `qgh.context.v1`. A small real GTE run over one public issue thread proved that the current branch still hashes raw chunks: all 3 stored generation context hashes disagreed with the deterministic issue/comment metadata inputs, so the probe derived `blocked_context_contract`. Its ignored artifact SHA-256 is `3ea108ab39b494aa3454156a761c764debb6b009c1c00127e073af81315e4880`. The same probe must return zero mismatches after the Lane D context builder is integrated, before held-out or 50,000-chunk evidence can be eligible.
+Prepared manifests now declare `qgh.context.v1`. A small real GTE run over one public issue thread proved that the current branch still hashes raw chunks: all 3 stored generation context hashes disagreed with the deterministic issue/comment metadata inputs, so the probe derived `blocked_context_contract`. The probe also captured the post-embed `d768` candidate database fingerprint `77e5b4fb0f7242357c5b123079c245727dd88a3092aee827c8b2940e293431d4`; its ignored artifact SHA-256 is `ca2874bf433b3e8c24a908a09036d6c5d6241abed0589d2fdd3f2b67a8d4a650`. The same probe must return zero mismatches after the Lane D context builder is integrated, before held-out or 50,000-chunk evidence can be eligible.
 
 The corrected qgh-only runtime smoke executed the release binary through sync, MCP query, and real `get`; it reported `get_round_trip=1.0`, verified stderr/artifact redaction, and captured database and Tantivy schema fingerprints. Artifact SHA-256: `15ae5036085ce34371dfa14a1331cd865b864dcab0ff8cea250a2ab8544ea5b3` under ignored `target/qgh-eval/`.
 
@@ -22,18 +22,20 @@ Held-out counts are English semantic 20, Korean semantic 15, Korean-query-to-Eng
 
 ## Frozen evaluation protocol
 
-All BM25 and candidate dev runs finish before `frozen-config.json` is written. The held-out JSONL is not parsed until after that write. Frozen evidence includes corpus/qrels, database-schema, Tantivy-schema, model-manifest, chunker, context, fusion, and lexical-profile fingerprints.
+All BM25 and candidate dev runs finish before `frozen-config.json` is written. The held-out JSONL is not parsed until after that write. Frozen evidence includes corpus/qrels, BM25 database-schema, Tantivy-schema, model-manifest, chunker, context, fusion, and lexical-profile fingerprints. Each candidate report additionally records its own post-embed database and Tantivy fingerprints so dimension-specific vector tables are part of that model's evidence.
 
 Production fusion is equal RRF with `k=60`. The production query limit is 20 and `HYBRID_OVERFETCH_FACTOR=4`, so the actual candidate window is 80. qgh exposes no runtime seam for either value. A dev-only offline diagnostic attempts `k={20,60,100}` and windows `{40,80,100}` from a separate `limit=100` query. Cells lacking provable lexical/vector branch coverage are incomplete; missing candidates are never zero-filled, and the diagnostic cannot select a deployable configuration.
 
-Reports include nDCG@10, MRR@10, Recall@5/@10/@20, exact top-1, hard-filter violations, real `get` round-trip, duplicate crowding, and negative top-result rate. Every model-scored semantic/comment/long query must expose a real hybrid-ranked result; a BM25 fallback fails the quality gate. The light tier first keeps candidates within 0.02 weighted nDCG@10 of the best passing model, then selects the smallest snapshot. The quality tier keeps candidates within 0.005 weighted nDCG@10 of the best, then uses weighted MRR@10 and finally snapshot size as tie-breakers.
+Reports include nDCG@10, MRR@10, Recall@5/@10/@20, exact top-1, hard-filter violations, real `get` round-trip, duplicate crowding, and negative top-result rate. Weighted quality uses English `.50`, Korean `.20`, Korean-query-to-English-source `.15`, English-query-to-Korean-source `.10`, comment `.025`, and long/context `.025`. Every model-scored semantic/comment/long query must expose a real hybrid-ranked result; a BM25 fallback fails the quality gate. The light tier first keeps candidates within 0.02 weighted nDCG@10 of the best passing model, then selects the smallest snapshot. The quality tier keeps candidates within 0.005 weighted nDCG@10 of the best, then uses weighted MRR@10 and finally snapshot size as tie-breakers.
 
 The live corpus does not inject stale state and its single-repository filters are insufficient as standalone hard-filter evidence. Promotion therefore requires passed result hashes for both external gates:
 
 ```sh
 cargo test --all-features --test issue_body_tracer full_reconciliation_tombstones_deleted_comments_and_updates_status -- --exact
-cargo test --all-features --test search_quality_eval curated_search_quality_eval_gate_passes -- --exact
+cargo test --all-features --test live_model_eval production_hard_filter_contract_excludes_competing_sources -- --exact
 ```
+
+The hard-filter gate syncs seven same-text sources: the target issue, wrong-label, wrong-state, and wrong-author issues, a fully matching different issue, the target issue's comment, and the same issue number in a competing repository. Real qgh queries exercise repository, label, state, author, issue, and issue-only policy filters both in bounded groups and all together; the fully constrained query must return only the target issue.
 
 Normal-run stderr is retained only in memory for comparison against every raw query/body. Generated event/report/frozen artifacts are also scanned. The report derives its redaction status from that audit and blocks promotion on any violation.
 

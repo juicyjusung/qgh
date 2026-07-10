@@ -504,15 +504,31 @@ fn hybrid_gate_requires_every_model_scored_query_to_use_hybrid() {
 fn weighted_quality_uses_the_frozen_class_weights() {
     assert!((live_model_eval_runtime::weighted_score_for_test([1.0; 6]) - 1.0).abs() < 1e-12);
     assert!(
-        (live_model_eval_runtime::weighted_score_for_test([0.0, 0.0, 1.0, 0.0, 0.0, 0.0]) - 0.10)
+        (live_model_eval_runtime::weighted_score_for_test([0.0, 0.0, 1.0, 0.0, 0.0, 0.0]) - 0.15)
             .abs()
             < 1e-12
     );
     assert!(
-        (live_model_eval_runtime::weighted_score_for_test([0.0, 0.0, 0.0, 0.0, 1.0, 1.0]) - 0.10)
+        (live_model_eval_runtime::weighted_score_for_test([0.0, 0.0, 0.0, 0.0, 1.0, 1.0]) - 0.05)
             .abs()
             < 1e-12
     );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn production_hard_filter_contract_excludes_competing_sources() {
+    live_model_eval_runtime::run_hard_filter_contract_probe(
+        std::path::Path::new(env!("CARGO_BIN_EXE_qgh")),
+        CORPUS_JSONL,
+    )
+    .expect("production hard-filter contract probe passes");
+}
+
+#[test]
+fn candidate_reports_capture_post_embed_schema_fingerprints() {
+    assert!(RUNTIME_SUPPORT.contains("candidate_database_schema_fingerprint"));
+    assert!(RUNTIME_SUPPORT.contains("candidate_tantivy_schema_fingerprint"));
 }
 
 #[test]
