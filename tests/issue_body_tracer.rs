@@ -917,6 +917,44 @@ fn sync_purges_repo_removed_from_profile_allowlist_and_preserves_other_repo() {
         .all(|request| !request.contains("/repos/other/repo/")));
 }
 
+#[test]
+fn purge_successor_remains_queryable_when_configured_embedding_refresh_fails() {
+    let fixture = TestFixture::new("purge-successor-embedding-fallback");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    fixture.write_config_with_repos_and_embedding(
+        &server.base_url,
+        &["owner/repo"],
+        r#"
+[embedding]
+provider = "local"
+model_path = "/definitely/not/a/model"
+file = "onnx/model.onnx"
+pooling = "cls"
+query_prefix = "query: "
+quantization = "none"
+"#,
+    );
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+    assert!(warning_codes(&stdout_json(&sync))
+        .iter()
+        .any(|code| code.starts_with("embedding.sync_") && code.ends_with("_failed")));
+
+    let query = fixture.qgh(["query", "shared repo policy tracer", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    let results = query_json["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["repo"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results, ["owner/repo"]);
+}
+
 #[cfg(unix)]
 #[test]
 fn pending_purge_is_retried_by_next_sync_without_touching_user_backup() {
@@ -6062,6 +6100,15 @@ env = "QGH_TEST_TOKEN"
     }
 
     fn write_config_with_repos(&self, api_base_url: &str, repos: &[&str]) {
+        self.write_config_with_repos_and_embedding(api_base_url, repos, "");
+    }
+
+    fn write_config_with_repos_and_embedding(
+        &self,
+        api_base_url: &str,
+        repos: &[&str],
+        embedding: &str,
+    ) {
         let repos = repos
             .iter()
             .map(|repo| format!(r#""{repo}""#))
@@ -6080,6 +6127,8 @@ repos = [{repos}]
 [profiles.work.token_source]
 type = "env"
 env = "QGH_TEST_TOKEN"
+
+{embedding}
 "#
         );
         fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
