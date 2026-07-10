@@ -537,6 +537,16 @@ fn render_status(data: &Value) -> String {
     line(
         &mut out,
         format_args!(
+            "purge: pending {}, successor repair required {}, retrieval blocked {}, stages {}",
+            display_at(data, &["purge", "pending_count"]),
+            display_at(data, &["purge", "successor_repair_required"]),
+            display_at(data, &["purge", "retrieval_blocked"]),
+            join_array(data.pointer("/purge/current_stages"))
+        ),
+    );
+    line(
+        &mut out,
+        format_args!(
             "default sync scope: {}",
             default_sync_scope(resolution.get("effective_repo_scope"))
         ),
@@ -596,6 +606,20 @@ fn render_doctor(data: &Value) -> String {
         format_args!(
             "doctor exposed to MCP: {}",
             display_at(data, &["mcp", "doctor_exposed"])
+        ),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "purge successor repair required: {}",
+            display_at(data, &["purge", "successor_repair_required"])
+        ),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "user-created filesystem backups/snapshots: {}",
+            display_at(data, &["purge", "unmanaged_filesystem_backups"])
         ),
     );
     out
@@ -701,6 +725,7 @@ fn doctor_hint(name: &str) -> &'static str {
         "rate_limit_headers" => "verify GitHub API responses include rate-limit headers",
         "repo_policy" => "update .qgh.toml or the selected profile repo allowlist",
         "profile_resolution" => "pass --profile or adjust profile allowlists",
+        "purge" => "run qgh sync to retry pending qgh-managed cleanup",
         _ => "inspect the corresponding JSON check details with --json",
     }
 }

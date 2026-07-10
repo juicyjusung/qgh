@@ -540,6 +540,23 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "validation.backfill_conflicts",
         "validation.requires_backfill",
         "validation.repo_required",
+        "validation.lifecycle_failed",
+        "github.invalid_issue_json",
+        "github.invalid_comment_json",
+        "github.confirmed_lifecycle_requires_typed_handling",
+        "sync.commit_page_failed",
+        "sync.transfer_cycle",
+        "sync.transfer_chain_too_long",
+        "embedding.source_snapshot_missing",
+        "purge.failed",
+        "purge.retry_failed",
+        "purge.read_fenced",
+        "purge.write_fenced",
+        "purge.successor_blocked",
+        "purge.successor_repair_required",
+        "purge.successor_snapshot_pending",
+        "publication.successor_snapshot_required",
+        "publication.tantivy_artifact_not_ready",
     ] {
         assert!(
             error_codes.contains(&json!(code)),
@@ -904,6 +921,24 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "#/$defs/index"
     );
     assert_eq!(status_schema["properties"]["sync"]["$ref"], "#/$defs/sync");
+    assert_eq!(
+        status_schema["properties"]["purge"]["$ref"],
+        "#/$defs/purge"
+    );
+    let status_purge = &status_schema["$defs"]["purge"];
+    assert_eq!(status_purge["additionalProperties"], false);
+    assert_eq!(
+        status_purge["required"],
+        json!([
+            "pending_count",
+            "successor_repair_required",
+            "retrieval_blocked",
+            "target_kinds",
+            "triggers",
+            "current_stages",
+            "failure_stages"
+        ])
+    );
     assert_eq!(
         status_schema["properties"]["reconciliation"]["$ref"],
         "#/$defs/reconciliation"
@@ -2065,9 +2100,20 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "tantivy",
             "github_auth_reachability",
             "rate_limit_headers",
+            "purge",
             "repo_policy",
             "profile_resolution"
         ])
+    );
+    assert_eq!(
+        doctor_schema["properties"]["purge"]["$ref"],
+        "#/$defs/purge"
+    );
+    let doctor_purge = &doctor_schema["$defs"]["purge"];
+    assert_eq!(doctor_purge["additionalProperties"], false);
+    assert_eq!(
+        doctor_purge["properties"]["unmanaged_filesystem_backups"]["const"],
+        "not_deleted_by_qgh"
     );
     assert_eq!(
         doctor_check["properties"]["headers"]["$ref"],
