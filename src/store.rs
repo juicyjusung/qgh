@@ -1228,6 +1228,102 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
     }
 
+    pub fn generation_vector_search(
+        &self,
+        query_vector: &[f32],
+        filters: &VectorSearchFilters,
+        limit: usize,
+    ) -> Result<Vec<VectorSearchHit>, QghError> {
+        let Some(generation_id) = self
+            .active_retrieval_publication()?
+            .and_then(|publication| publication.embedding_generation_id)
+        else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT gc.vector_blob, gc.vector_dimension, c.id, c.source_id,
+                    c.source_version_id, c.body, c.chunk_index, c.token_start,
+                    c.token_end, c.byte_start, c.byte_end, c.chunker_version,
+                    c.chunker_fingerprint, c.heading_path_json, sv.body_hash
+             FROM embedding_generation_chunks gc
+             JOIN chunks c ON c.id = gc.chunk_id
+             JOIN source_versions sv ON sv.id = c.source_version_id
+             JOIN source_entities se ON se.source_id = c.source_id
+             WHERE gc.generation_id = ?1 AND se.lifecycle_state = 'active'",
+        )?;
+        let mut candidates = Vec::new();
+        for row in stmt.query_map(params![generation_id], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)? as usize,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, String>(14)?,
+            ))
+        })? {
+            let (
+                blob,
+                dimension,
+                chunk_id,
+                source_id,
+                source_version_id,
+                body,
+                chunk_index,
+                token_start,
+                token_end,
+                byte_start,
+                byte_end,
+                chunker_version,
+                chunker_fingerprint,
+                heading_path_json,
+                source_version_hash,
+            ) = row?;
+            let Ok(vector) = decode_embedding_blob(&blob, dimension) else {
+                continue;
+            };
+            if vector.len() != query_vector.len() {
+                continue;
+            }
+            let distance = 1.0 - cosine_similarity(query_vector, &vector);
+            candidates.push(VectorSearchHit {
+                source_id: source_id.clone(),
+                chunk: StoredChunk {
+                    chunk_id,
+                    source_id,
+                    source_version_id,
+                    body,
+                    chunk_index: chunk_index as usize,
+                    token_start: token_start as usize,
+                    token_end: token_end as usize,
+                    byte_start: byte_start as usize,
+                    byte_end: byte_end as usize,
+                    chunker_version,
+                    chunker_fingerprint,
+                    heading_path: serde_json::from_str(&heading_path_json).unwrap_or_default(),
+                },
+                source_version_hash,
+                vector_distance: distance,
+            });
+        }
+        candidates.sort_by(|a, b| a.vector_distance.total_cmp(&b.vector_distance));
+        let mut seen = BTreeSet::new();
+        Ok(candidates
+            .into_iter()
+            .filter(|hit| seen.insert(hit.source_id.clone()))
+            .take(limit)
+            .collect())
+    }
+
     pub fn get_tombstone(&self, source_id: &str) -> Result<Option<TombstoneView>, QghError> {
         self.conn
             .query_row(
@@ -2228,6 +2324,21 @@ impl Store {
             .map_err(QghError::from)
     }
 
+    pub fn active_embedding_generation_coverage(&self) -> Result<Option<(i64, i64)>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT eg.id, count(egc.chunk_id) FROM retrieval_publication_pointer p
+             JOIN retrieval_publications rp ON rp.publication_id = p.publication_id
+             JOIN embedding_generations eg ON eg.id = rp.embedding_generation_id
+             LEFT JOIN embedding_generation_chunks egc ON egc.generation_id = eg.id
+             WHERE p.id = 1 GROUP BY eg.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(QghError::from)
+    }
+
     pub fn activate_retrieval_publication(
         &mut self,
         source_snapshot_sync_run_id: &str,
@@ -3089,6 +3200,20 @@ fn encode_embedding_blob(vector: &[f32]) -> Vec<u8> {
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect()
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let (mut dot, mut na, mut nb) = (0.0, 0.0, 0.0);
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na.sqrt() * nb.sqrt())
+    }
 }
 
 fn decode_embedding_blob(bytes: &[u8], dimension: usize) -> Result<Vec<f32>, QghError> {

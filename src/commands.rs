@@ -2835,7 +2835,7 @@ fn hybrid_vector_hits(
             ));
         }
     };
-    match store.vector_only_search(
+    match store.generation_vector_search(
         &query_vector,
         &filters.vector_search_filters(),
         hybrid_candidate_limit(limit),
@@ -2880,7 +2880,6 @@ impl EmbeddingCoverageState {
 
     fn hybrid_ready(&self) -> bool {
         !self.artifact_corrupt
-            && self.active_fingerprint.is_some()
             && self.active_matches_config
             && self.total_chunks > 0
             && self.missing_chunks == 0
@@ -2894,6 +2893,19 @@ fn embedding_coverage_state(
     let Some(embedding) = profile.embedding.as_ref() else {
         return Ok(None);
     };
+    if let Some((_generation_id, completed_chunks)) =
+        store.active_embedding_generation_coverage()?
+    {
+        return Ok(Some(EmbeddingCoverageState {
+            active_fingerprint: None,
+            active_matches_config: true,
+            artifact_corrupt: false,
+            total_chunks: completed_chunks,
+            completed_chunks,
+            missing_chunks: 0,
+            mismatched_chunks: 0,
+        }));
+    }
     let expectation = embedding_fingerprint_expectation(embedding);
     let total_chunks = match store.active_embedding_chunk_count() {
         Ok(total_chunks) => total_chunks,
