@@ -3373,6 +3373,7 @@ pub fn resolve_fastembed_snapshot(
 struct HfHubModelRepository {
     repo: hf_hub::api::sync::ApiRepo,
     info: Option<hf_hub::api::RepoInfo>,
+    cache_root: PathBuf,
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -3383,6 +3384,8 @@ impl HfHubModelRepository {
         cache_dir: PathBuf,
         token_source_env: Option<String>,
     ) -> Result<Self, EmbeddingProviderError> {
+        fs::create_dir_all(&cache_dir)?;
+        let cache_root = fs::canonicalize(&cache_dir)?;
         let token = token_source_env
             .map(|env| {
                 std::env::var(&env).map_err(|_| {
@@ -3417,6 +3420,7 @@ impl HfHubModelRepository {
                 model_revision.to_string(),
             )),
             info: None,
+            cache_root,
         })
     }
 
@@ -3451,13 +3455,7 @@ impl ModelRepository for HfHubModelRepository {
                 "error": error.to_string()
             }))
         })?;
-        fs::canonicalize(path).map_err(|_| {
-            EmbeddingProviderError::structured(
-                "embedding.hf_cache_invalid",
-                "Downloaded Hugging Face artifact could not be resolved in the local cache.",
-            )
-            .with_details(json!({ "file": file }))
-        })
+        confined_hf_cache_artifact(&self.cache_root, &path, file)
     }
 
     fn list_files(&mut self) -> Result<Vec<String>, EmbeddingProviderError> {
@@ -3477,6 +3475,29 @@ impl ModelRepository for HfHubModelRepository {
         // prefix, and dimension drift behind an unchanged fingerprint.
         Ok(Some(self.info()?.sha.clone()))
     }
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn confined_hf_cache_artifact(
+    cache_root: &Path,
+    path: &Path,
+    file: &str,
+) -> Result<PathBuf, EmbeddingProviderError> {
+    let canonical_path = fs::canonicalize(path).map_err(|_| {
+        EmbeddingProviderError::structured(
+            "embedding.hf_cache_invalid",
+            "Downloaded Hugging Face artifact could not be resolved in the local cache.",
+        )
+        .with_details(json!({ "file": file }))
+    })?;
+    if !canonical_path.starts_with(cache_root) {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.hf_cache_invalid",
+            "Downloaded Hugging Face artifact escapes the configured local cache.",
+        )
+        .with_details(json!({ "file": file })));
+    }
+    Ok(canonical_path)
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -4237,6 +4258,35 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code(), "embedding.tokenizer_artifact_too_large");
+    }
+
+    #[cfg(all(feature = "fastembed-provider", unix))]
+    #[test]
+    fn hf_cache_artifact_canonicalization_rejects_escape_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("qgh-hf-cache-confinement");
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let cache = fs::canonicalize(cache).unwrap();
+        let inside = cache.join("inside.bin");
+        fs::write(&inside, b"inside").unwrap();
+        assert_eq!(
+            confined_hf_cache_artifact(&cache, &inside, "inside.bin").unwrap(),
+            inside
+        );
+
+        let outside = root.join("outside.bin");
+        fs::write(&outside, b"outside").unwrap();
+        let pointer = cache.join("pointer.bin");
+        symlink(&outside, &pointer).unwrap();
+        let error = confined_hf_cache_artifact(&cache, &pointer, "pointer.bin").unwrap_err();
+
+        assert_eq!(error.code(), "embedding.hf_cache_invalid");
+        assert!(!error
+            .details()
+            .to_string()
+            .contains(&root.to_string_lossy()[..]));
     }
 
     #[cfg(feature = "fastembed-provider")]
