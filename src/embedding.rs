@@ -1174,59 +1174,14 @@ impl PreparedModelStore {
         options: &FastembedProviderOptions,
     ) -> Result<PreparedManifestInspection, EmbeddingProviderError> {
         let alias_path = self.alias_path(options);
-        let alias_metadata = fs::symlink_metadata(&alias_path).map_err(|error| {
-            EmbeddingProviderError::structured(
-                "embedding.prepared_snapshot_missing",
-                "No prepared local model snapshot is available.",
-            )
-            .with_details(json!({ "error": error.to_string() }))
-        })?;
-        if alias_metadata.file_type().is_symlink() || !alias_metadata.is_file() {
-            return Err(EmbeddingProviderError::structured(
-                "embedding.prepared_alias_invalid",
-                "Prepared model alias must be a regular non-symlink file.",
-            ));
-        }
-        if alias_metadata.len() > MAX_PREPARED_ALIAS_BYTES {
-            return Err(EmbeddingProviderError::structured(
-                "embedding.prepared_alias_invalid",
-                "Prepared model alias exceeds the supported size.",
-            ));
-        }
-        let requests_root = canonical_store_subdirectory(
-            &self.root,
-            "requests",
-            "embedding.prepared_alias_invalid",
-            "Prepared model request storage is invalid.",
-        )?;
-        if !fs::canonicalize(&alias_path)?.starts_with(&requests_root) {
-            return Err(EmbeddingProviderError::structured(
-                "embedding.prepared_alias_invalid",
-                "Prepared model alias escapes the prepared model store.",
-            ));
-        }
-        let bytes = read_bounded_file(
-            &alias_path,
-            &artifact_file_identity(&alias_metadata),
-            MAX_PREPARED_ALIAS_BYTES,
-            "embedding.prepared_alias_invalid",
-            "Prepared model alias changed or exceeds the supported size.",
-        )?;
-        let alias: PreparedModelAliasV1 = serde_json::from_slice(&bytes).map_err(|error| {
-            EmbeddingProviderError::structured(
-                "embedding.prepared_alias_invalid",
-                "Prepared model alias is invalid.",
-            )
-            .with_details(json!({ "error": error.to_string() }))
-        })?;
-        if alias.schema_version != PREPARED_MODEL_ALIAS_SCHEMA_VERSION
-            || !is_sha256(&alias.manifest_hash)
-        {
-            return Err(EmbeddingProviderError::structured(
-                "embedding.prepared_alias_invalid",
-                "Prepared model alias has an unsupported schema or invalid hash.",
-            ));
-        }
+        let alias = self
+            .read_prepared_alias_record_at(&alias_path)?
+            .ok_or_else(|| {
+                EmbeddingProviderError::structured(
+                    "embedding.prepared_snapshot_missing",
+                    "No prepared local model snapshot is available.",
+                )
+            })?;
         let manifest_path = self
             .root
             .join("snapshots")
@@ -1565,6 +1520,65 @@ impl PreparedModelStore {
             .join(format!("{}.json", prepared_request_key(options)))
     }
 
+    fn read_prepared_alias_record_at(
+        &self,
+        alias_path: &Path,
+    ) -> Result<Option<PreparedModelAliasV1>, EmbeddingProviderError> {
+        let metadata = match fs::symlink_metadata(alias_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.prepared_alias_invalid",
+                    "Prepared model alias could not be inspected.",
+                ));
+            }
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_PREPARED_ALIAS_BYTES
+        {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.prepared_alias_invalid",
+                "Prepared model alias must be a bounded regular non-symlink file.",
+            ));
+        }
+        let requests_root = canonical_store_subdirectory(
+            &self.root,
+            "requests",
+            "embedding.prepared_alias_invalid",
+            "Prepared model request storage is invalid.",
+        )?;
+        if !fs::canonicalize(alias_path)?.starts_with(&requests_root) {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.prepared_alias_invalid",
+                "Prepared model alias escapes its local store.",
+            ));
+        }
+        let bytes = read_bounded_file(
+            alias_path,
+            &artifact_file_identity(&metadata),
+            MAX_PREPARED_ALIAS_BYTES,
+            "embedding.prepared_alias_invalid",
+            "Prepared model alias changed or exceeds the supported size.",
+        )?;
+        let alias: PreparedModelAliasV1 = serde_json::from_slice(&bytes).map_err(|_| {
+            EmbeddingProviderError::structured(
+                "embedding.prepared_alias_invalid",
+                "Prepared model alias is invalid.",
+            )
+        })?;
+        if alias.schema_version != PREPARED_MODEL_ALIAS_SCHEMA_VERSION
+            || !is_sha256(&alias.manifest_hash)
+        {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.prepared_alias_invalid",
+                "Prepared model alias has an invalid contract.",
+            ));
+        }
+        Ok(Some(alias))
+    }
+
     #[cfg(feature = "fastembed-provider")]
     fn acquisition_pin_path(&self, options: &FastembedProviderOptions) -> PathBuf {
         self.root
@@ -1589,6 +1603,12 @@ impl PreparedModelStore {
             "embedding.acquisition_pin_invalid",
             "Prepared model acquisition pin storage is invalid.",
         )
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn sync_requests_root(&self, code: &str, message: &str) -> Result<(), EmbeddingProviderError> {
+        let requests_root = self.ensure_requests_root()?;
+        sync_directory(&requests_root, code, message)
     }
 
     #[cfg(feature = "fastembed-provider")]
@@ -1619,10 +1639,25 @@ impl PreparedModelStore {
     }
 
     #[cfg(feature = "fastembed-provider")]
+    fn with_pin_mutation_lock<T>(
+        &self,
+        options: &FastembedProviderOptions,
+        operation: impl FnOnce() -> Result<T, EmbeddingProviderError>,
+    ) -> Result<T, EmbeddingProviderError> {
+        let lock = self.acquire_pin_mutation_lock(options)?;
+        let result = operation();
+        let release = lock.release();
+        match (result, release) {
+            (_, Err(error)) => Err(error),
+            (result, Ok(())) => result,
+        }
+    }
+
+    #[cfg(feature = "fastembed-provider")]
     fn read_acquisition_pin_record_at(
         &self,
         pin_path: &Path,
-    ) -> Result<Option<PreparedModelAcquisitionPinV1>, EmbeddingProviderError> {
+    ) -> Result<Option<PreparedModelAcquisitionPinV2>, EmbeddingProviderError> {
         let metadata = match fs::symlink_metadata(pin_path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1656,20 +1691,9 @@ impl PreparedModelStore {
             "embedding.acquisition_pin_invalid",
             "Prepared model acquisition pin changed or exceeds the supported size.",
         )?;
-        let pin: PreparedModelAcquisitionPinV1 = serde_json::from_slice(&bytes).map_err(|_| {
-            EmbeddingProviderError::structured(
-                "embedding.acquisition_pin_invalid",
-                "Prepared model acquisition pin is invalid.",
-            )
-        })?;
-        if pin.schema_version != PREPARED_MODEL_ACQUISITION_PIN_SCHEMA_VERSION
-            || !is_commit_sha(&pin.resolved_revision)
-        {
-            return Err(EmbeddingProviderError::structured(
-                "embedding.acquisition_pin_invalid",
-                "Prepared model acquisition pin has an invalid contract.",
-            ));
-        }
+        let pin: PreparedModelAcquisitionPinV2 =
+            serde_json::from_slice(&bytes).map_err(|_| acquisition_pin_invalid())?;
+        pin.validate()?;
         Ok(Some(pin))
     }
 
@@ -1699,38 +1723,64 @@ impl PreparedModelStore {
     fn acquisition_pin_for_manifest(
         &self,
         options: &FastembedProviderOptions,
+        reference: &HfModelReference,
         manifest: &ModelManifestV1,
-    ) -> Result<Option<PreparedModelAcquisitionPinV1>, EmbeddingProviderError> {
+    ) -> Result<PreparedModelAcquisitionPinV2, EmbeddingProviderError> {
         let ModelSourceV1::Hf {
             model_id,
             resolved_revision,
         } = &manifest.model_source
         else {
-            return Ok(None);
+            return Err(acquisition_pin_invalid());
         };
-        Ok(self
+        let pin = self
             .read_acquisition_pin_record_at(&self.acquisition_pin_path(options))?
-            .filter(|pin| pin.model_id == *model_id && pin.resolved_revision == *resolved_revision))
+            .ok_or_else(acquisition_pin_invalid)?;
+        if pin.model_id != reference.model_id
+            || pin.requested_revision != reference.revision
+            || pin.model_id != *model_id
+            || pin.resolved_revision != *resolved_revision
+        {
+            return Err(acquisition_pin_invalid());
+        }
+        Ok(pin)
     }
 
-    #[cfg(feature = "fastembed-provider")]
+    #[cfg(all(feature = "fastembed-provider", test))]
     fn retire_acquisition_pin(
         &self,
         options: &FastembedProviderOptions,
-        expected: &PreparedModelAcquisitionPinV1,
+        expected: &PreparedModelAcquisitionPinV2,
     ) -> Result<(), EmbeddingProviderError> {
-        let _lock = self.acquire_pin_mutation_lock(options)?;
+        self.with_pin_mutation_lock(options, || {
+            self.retire_acquisition_pin_locked(options, expected)
+        })
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn retire_acquisition_pin_locked(
+        &self,
+        options: &FastembedProviderOptions,
+        expected: &PreparedModelAcquisitionPinV2,
+    ) -> Result<(), EmbeddingProviderError> {
         let pin_path = self.acquisition_pin_path(options);
         let current = self.read_acquisition_pin_record_at(&pin_path)?;
-        if current.as_ref() == Some(expected) {
-            fs::remove_file(pin_path).map_err(|_| {
-                EmbeddingProviderError::structured(
-                    "embedding.acquisition_pin_retire_failed",
-                    "Prepared model acquisition pin could not be retired.",
-                )
-            })?;
+        if current.as_ref() != Some(expected) {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.acquisition_pin_mismatch",
+                "Prepared model acquisition pin changed before publication.",
+            ));
         }
-        Ok(())
+        fs::remove_file(pin_path).map_err(|_| {
+            EmbeddingProviderError::structured(
+                "embedding.acquisition_pin_retire_failed",
+                "Prepared model acquisition pin could not be retired.",
+            )
+        })?;
+        self.sync_requests_root(
+            "embedding.acquisition_pin_retire_failed",
+            "Prepared model acquisition pin retirement could not be made durable.",
+        )
     }
 
     #[cfg(feature = "fastembed-provider")]
@@ -1748,48 +1798,64 @@ impl PreparedModelStore {
         }
         self.ensure_requests_root()?;
         let pin_path = self.acquisition_pin_path(options);
-        let pin = PreparedModelAcquisitionPinV1 {
+        let pin = PreparedModelAcquisitionPinV2 {
             schema_version: PREPARED_MODEL_ACQUISITION_PIN_SCHEMA_VERSION.to_string(),
             model_id: reference.model_id.clone(),
             requested_revision: reference.revision.clone(),
             resolved_revision: resolved_revision.clone(),
+            tokenizer_artifacts: None,
         };
-        let _lock = self.acquire_pin_mutation_lock(options)?;
-        if let Some(existing) = self.read_acquisition_pin(options, reference)? {
-            return Ok(existing);
-        }
-        let staging = pin_path.with_extension(format!(
-            "tmp-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        write_new_bytes(
-            &staging,
-            &serde_json::to_vec_pretty(&pin).expect("acquisition pin serializes"),
-        )?;
-        let published = fs::hard_link(&staging, &pin_path);
-        let _ = fs::remove_file(&staging);
-        match published {
-            Ok(()) => Ok(HfModelReference {
-                model_id: reference.model_id.clone(),
-                revision: resolved_revision,
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => self
-                .read_acquisition_pin(options, reference)?
-                .ok_or_else(|| {
-                    EmbeddingProviderError::structured(
-                        "embedding.acquisition_pin_invalid",
-                        "Prepared model acquisition pin disappeared during publication.",
-                    )
-                }),
-            Err(_) => Err(EmbeddingProviderError::structured(
+        self.with_pin_mutation_lock(options, || {
+            if let Some(existing) = self.read_acquisition_pin(options, reference)? {
+                return Ok(existing);
+            }
+            atomic_replace_bytes(
+                &pin_path,
+                &serde_json::to_vec_pretty(&pin).expect("acquisition pin serializes"),
                 "embedding.acquisition_pin_invalid",
                 "Prepared model acquisition pin could not be published.",
-            )),
-        }
+            )?;
+            Ok(HfModelReference {
+                model_id: reference.model_id.clone(),
+                revision: resolved_revision,
+            })
+        })
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn finalize_acquisition_pin(
+        &self,
+        options: &FastembedProviderOptions,
+        reference: &HfModelReference,
+        pinned: &HfModelReference,
+        artifacts: &[PreparedTokenizerArtifactV2],
+    ) -> Result<(), EmbeddingProviderError> {
+        validate_tokenizer_pin_artifacts(artifacts)?;
+        self.with_pin_mutation_lock(options, || {
+            let pin_path = self.acquisition_pin_path(options);
+            let mut current = self
+                .read_acquisition_pin_record_at(&pin_path)?
+                .ok_or_else(acquisition_pin_invalid)?;
+            if current.model_id != reference.model_id
+                || current.requested_revision != reference.revision
+                || current.model_id != pinned.model_id
+                || current.resolved_revision != pinned.revision
+            {
+                return Err(acquisition_pin_invalid());
+            }
+            match &current.tokenizer_artifacts {
+                Some(existing) if existing == artifacts => return Ok(()),
+                Some(_) => return Err(acquisition_artifact_mismatch()),
+                None => {}
+            }
+            current.tokenizer_artifacts = Some(artifacts.to_vec());
+            atomic_replace_bytes(
+                &pin_path,
+                &serde_json::to_vec_pretty(&current).expect("acquisition pin serializes"),
+                "embedding.acquisition_pin_invalid",
+                "Prepared model acquisition pin could not be finalized.",
+            )
+        })
     }
 
     #[cfg(feature = "fastembed-provider")]
@@ -1831,14 +1897,43 @@ impl PreparedModelStore {
     fn materialize(
         &self,
         options: &FastembedProviderOptions,
-        mut manifest: ModelManifestV1,
+        manifest: ModelManifestV1,
         sources: Vec<RuntimeArtifactSource>,
     ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
-        #[cfg(feature = "fastembed-provider")]
-        let acquisition_pin = self.acquisition_pin_for_manifest(options, &manifest)?;
+        let (snapshot_root, alias, _) = self.stage_materialized_snapshot(manifest, sources)?;
+        atomic_replace_bytes(
+            &self.alias_path(options),
+            &serde_json::to_vec_pretty(&alias).expect("prepared alias serializes"),
+            "embedding.prepared_alias_publish_failed",
+            "Prepared model alias could not be published.",
+        )?;
+        self.load_manifest(&snapshot_root.join("manifest.json"))
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn materialize_hf(
+        &self,
+        options: &FastembedProviderOptions,
+        reference: &HfModelReference,
+        manifest: ModelManifestV1,
+        sources: Vec<RuntimeArtifactSource>,
+    ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
+        let expected = self.acquisition_pin_for_manifest(options, reference, &manifest)?;
+        let (snapshot_root, alias, artifacts) =
+            self.stage_materialized_snapshot(manifest, sources)?;
+        let tokenizer_artifacts = tokenizer_pin_artifacts_from_materialized(&artifacts)?;
+        self.commit_hf_alias(options, &expected, &alias, &tokenizer_artifacts)?;
+        self.load_manifest(&snapshot_root.join("manifest.json"))
+    }
+
+    fn stage_materialized_snapshot(
+        &self,
+        mut manifest: ModelManifestV1,
+        sources: Vec<RuntimeArtifactSource>,
+    ) -> Result<(PathBuf, PreparedModelAliasV1, Vec<ModelArtifactV1>), EmbeddingProviderError> {
         fs::create_dir_all(self.root.join("snapshots"))?;
         fs::create_dir_all(self.root.join("requests"))?;
-        canonical_store_subdirectory(
+        let snapshots_root = canonical_store_subdirectory(
             &self.root,
             "snapshots",
             "embedding.acquisition_artifact_invalid",
@@ -1884,7 +1979,7 @@ impl PreparedModelStore {
                 });
             }
             if manifest.artifacts.is_empty() {
-                manifest.artifacts = artifacts;
+                manifest.artifacts = artifacts.clone();
             } else if manifest.artifacts != artifacts {
                 return Err(EmbeddingProviderError::structured(
                     "embedding.acquisition_artifact_mismatch",
@@ -1893,46 +1988,108 @@ impl PreparedModelStore {
             }
             manifest.validate_contract()?;
             let manifest_hash = manifest.hash();
-            fs::write(
-                staging.join("manifest.json"),
-                serde_json::to_vec_pretty(&manifest).expect("model manifest serializes"),
+            write_new_bytes(
+                &staging.join("manifest.json"),
+                &serde_json::to_vec_pretty(&manifest).expect("model manifest serializes"),
             )?;
             let snapshot_root = self.root.join("snapshots").join(&manifest_hash);
             if snapshot_root.exists() {
                 fs::remove_dir_all(&staging)?;
             } else {
                 fs::rename(&staging, &snapshot_root)?;
+                sync_directory(
+                    &snapshots_root,
+                    "embedding.acquisition_artifact_invalid",
+                    "Prepared model snapshot publication could not be made durable.",
+                )?;
             }
             let alias = PreparedModelAliasV1 {
                 schema_version: PREPARED_MODEL_ALIAS_SCHEMA_VERSION.to_string(),
                 manifest_hash,
             };
-            let alias_path = self.alias_path(options);
-            let alias_staging = alias_path.with_extension(format!(
-                "tmp-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            ));
-            write_new_bytes(
-                &alias_staging,
-                &serde_json::to_vec_pretty(&alias).expect("prepared alias serializes"),
-            )?;
-            fs::rename(alias_staging, alias_path)?;
-            self.load(options)
+            Ok((snapshot_root, alias, artifacts))
         })();
-        if staging.exists() {
-            let _ = fs::remove_dir_all(staging);
-        }
-        #[cfg(feature = "fastembed-provider")]
-        if result.is_ok() {
-            if let Some(expected) = acquisition_pin.as_ref() {
-                let _ = self.retire_acquisition_pin(options, expected);
+        match result {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                if staging.exists() {
+                    fs::remove_dir_all(staging).map_err(|_| {
+                        EmbeddingProviderError::structured(
+                            "embedding.acquisition_staging_cleanup_failed",
+                            "Prepared model acquisition staging directory could not be removed.",
+                        )
+                    })?;
+                }
+                Err(error)
             }
         }
-        result
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn commit_hf_alias(
+        &self,
+        options: &FastembedProviderOptions,
+        expected: &PreparedModelAcquisitionPinV2,
+        alias: &PreparedModelAliasV1,
+        tokenizer_artifacts: &[PreparedTokenizerArtifactV2],
+    ) -> Result<(), EmbeddingProviderError> {
+        expected.validate()?;
+        validate_tokenizer_pin_artifacts(tokenizer_artifacts)?;
+        if expected
+            .tokenizer_artifacts
+            .as_ref()
+            .is_some_and(|pinned| pinned != tokenizer_artifacts)
+        {
+            return Err(acquisition_artifact_mismatch());
+        }
+        self.with_pin_mutation_lock(options, || {
+            let pin_path = self.acquisition_pin_path(options);
+            let Some(mut current) = self.read_acquisition_pin_record_at(&pin_path)? else {
+                let existing = self.read_prepared_alias_record_at(&self.alias_path(options))?;
+                if existing.as_ref() == Some(alias) {
+                    return self.sync_requests_root(
+                        "embedding.prepared_alias_publish_failed",
+                        "Prepared model alias publication could not be made durable.",
+                    );
+                }
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.acquisition_pin_mismatch",
+                    "Prepared model acquisition pin is missing before publication.",
+                ));
+            };
+            if &current != expected {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.acquisition_pin_mismatch",
+                    "Prepared model acquisition pin changed before publication.",
+                ));
+            }
+            match &current.tokenizer_artifacts {
+                Some(pinned) if pinned != tokenizer_artifacts => {
+                    return Err(acquisition_artifact_mismatch());
+                }
+                Some(_) => {}
+                None => {
+                    current.tokenizer_artifacts = Some(tokenizer_artifacts.to_vec());
+                    atomic_replace_bytes(
+                        &pin_path,
+                        &serde_json::to_vec_pretty(&current).expect("acquisition pin serializes"),
+                        "embedding.acquisition_pin_invalid",
+                        "Prepared model acquisition pin could not be finalized.",
+                    )?;
+                }
+            }
+            let alias_path = self.alias_path(options);
+            let existing = self.read_prepared_alias_record_at(&alias_path)?;
+            if existing.as_ref() != Some(alias) {
+                atomic_replace_bytes(
+                    &alias_path,
+                    &serde_json::to_vec_pretty(alias).expect("prepared alias serializes"),
+                    "embedding.prepared_alias_publish_failed",
+                    "Prepared model alias could not be published.",
+                )?;
+            }
+            self.retire_acquisition_pin_locked(options, &current)
+        })
     }
 
     #[cfg(feature = "fastembed-provider")]
@@ -1991,7 +2148,9 @@ impl PreparedModelStore {
             options.token_source_env.clone(),
         )?;
         let artifacts = tokenizer_artifact_paths(|file| repo.get(file))?;
-        load_unmanifested_tokenizer(&cache_dir, artifacts)
+        let acquired = load_unmanifested_tokenizer_with_evidence(&cache_dir, artifacts)?;
+        self.finalize_acquisition_pin(options, &reference, &pinned, &acquired.artifacts)?;
+        Ok(acquired.tokenizer)
     }
 
     #[cfg(feature = "fastembed-provider")]
@@ -2079,7 +2238,12 @@ impl PreparedModelStore {
             quantization: required_legacy_quantization(options)?,
             context_template_version: METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
         };
-        self.materialize(options, manifest, runtime_artifact_sources(&snapshot)?)
+        self.materialize_hf(
+            options,
+            &reference,
+            manifest,
+            runtime_artifact_sources(&snapshot)?,
+        )
     }
 
     #[cfg(feature = "fastembed-provider")]
@@ -2155,7 +2319,7 @@ impl PreparedModelStore {
                 source.external_initializer_name = Some(initializer_name.to_string());
             }
         }
-        self.materialize(options, manifest, sources)
+        self.materialize_hf(options, &reference, manifest, sources)
     }
 }
 
@@ -2183,22 +2347,30 @@ fn acquire_local_tokenizer(
 #[cfg(feature = "fastembed-provider")]
 fn tokenizer_artifact_paths(
     mut resolve: impl FnMut(&str) -> Result<PathBuf, EmbeddingProviderError>,
-) -> Result<Vec<(ArtifactRole, PathBuf)>, EmbeddingProviderError> {
+) -> Result<Vec<(ArtifactRole, String, PathBuf)>, EmbeddingProviderError> {
     TOKENIZER_ARTIFACT_ROLES
         .into_iter()
         .zip(TOKENIZER_FILES)
-        .map(|(role, file)| resolve(file).map(|path| (role, path)))
+        .map(|(role, file)| resolve(file).map(|path| (role, file.to_string(), path)))
         .collect()
 }
 
 #[cfg(feature = "fastembed-provider")]
 fn load_unmanifested_tokenizer(
     root: &Path,
-    artifacts: Vec<(ArtifactRole, PathBuf)>,
+    artifacts: Vec<(ArtifactRole, String, PathBuf)>,
 ) -> Result<FastembedTokenizer, EmbeddingProviderError> {
+    Ok(load_unmanifested_tokenizer_with_evidence(root, artifacts)?.tokenizer)
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn load_unmanifested_tokenizer_with_evidence(
+    root: &Path,
+    artifacts: Vec<(ArtifactRole, String, PathBuf)>,
+) -> Result<VerifiedTokenizerAcquisition, EmbeddingProviderError> {
     let canonical_root = fs::canonicalize(root)?;
     let mut inspected = Vec::with_capacity(artifacts.len());
-    for (role, path) in artifacts {
+    for (role, relative_path, path) in artifacts {
         let metadata = fs::symlink_metadata(&path).map_err(|_| {
             EmbeddingProviderError::structured(
                 "embedding.artifact_missing",
@@ -2223,6 +2395,7 @@ fn load_unmanifested_tokenizer(
         }
         inspected.push((
             role,
+            relative_path,
             canonical_path,
             artifact_file_identity(&metadata),
             metadata.len(),
@@ -2231,11 +2404,12 @@ fn load_unmanifested_tokenizer(
     validate_tokenizer_artifact_sizes(
         inspected
             .iter()
-            .map(|(role, _, _, byte_size)| (*role, *byte_size)),
+            .map(|(role, _, _, _, byte_size)| (*role, *byte_size)),
     )?;
 
     let mut tokenizer_bytes = None;
-    for (role, canonical_path, identity, byte_size) in inspected {
+    let mut verified_artifacts = Vec::with_capacity(inspected.len());
+    for (role, relative_path, canonical_path, identity, byte_size) in inspected {
         if role == ArtifactRole::Tokenizer {
             let bytes = read_bounded_file(
                 &canonical_path,
@@ -2244,9 +2418,15 @@ fn load_unmanifested_tokenizer(
                 "embedding.artifact_changed",
                 "Tokenizer artifact changed while it was being verified.",
             )?;
-            let _sha256 = hex_digest(&Sha256::digest(&bytes));
+            let sha256 = hex_digest(&Sha256::digest(&bytes));
             #[cfg(test)]
             record_tokenizer_only_artifact_bytes(role, bytes.len() as u64);
+            verified_artifacts.push(PreparedTokenizerArtifactV2 {
+                role,
+                relative_path,
+                sha256,
+                byte_size: bytes.len() as u64,
+            });
             tokenizer_bytes = Some(bytes);
         } else {
             let mut file = File::open(&canonical_path)?;
@@ -2254,7 +2434,7 @@ fn load_unmanifested_tokenizer(
             if opened_identity != identity {
                 return Err(artifact_changed_error());
             }
-            let (_sha256, actual_size) = stream_sha256(&mut file)?;
+            let (sha256, actual_size) = stream_sha256(&mut file)?;
             if actual_size != byte_size
                 || artifact_file_identity(&file.metadata()?) != opened_identity
             {
@@ -2262,22 +2442,33 @@ fn load_unmanifested_tokenizer(
             }
             #[cfg(test)]
             record_tokenizer_only_artifact_bytes(role, actual_size);
+            verified_artifacts.push(PreparedTokenizerArtifactV2 {
+                role,
+                relative_path,
+                sha256,
+                byte_size: actual_size,
+            });
         }
     }
-    FastembedTokenizer::from_verified_bytes(tokenizer_bytes.ok_or_else(|| {
+    let tokenizer = FastembedTokenizer::from_verified_bytes(tokenizer_bytes.ok_or_else(|| {
         EmbeddingProviderError::structured(
             "embedding.model_file_missing",
             "Tokenizer acquisition is missing its tokenizer artifact.",
         )
         .with_details(json!({ "role": ArtifactRole::Tokenizer }))
-    })?)
+    })?)?;
+    validate_tokenizer_pin_artifacts(&verified_artifacts)?;
+    Ok(VerifiedTokenizerAcquisition {
+        tokenizer,
+        artifacts: verified_artifacts,
+    })
 }
 
 const PREPARED_MODEL_ALIAS_SCHEMA_VERSION: &str = "qgh.prepared_model_alias.v1";
 #[cfg(feature = "fastembed-provider")]
-const PREPARED_MODEL_ACQUISITION_PIN_SCHEMA_VERSION: &str = "qgh.prepared_model_acquisition_pin.v1";
+const PREPARED_MODEL_ACQUISITION_PIN_SCHEMA_VERSION: &str = "qgh.prepared_model_acquisition_pin.v2";
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PreparedModelAliasV1 {
     schema_version: String,
@@ -2287,23 +2478,146 @@ struct PreparedModelAliasV1 {
 #[cfg(feature = "fastembed-provider")]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct PreparedModelAcquisitionPinV1 {
+struct PreparedModelAcquisitionPinV2 {
     schema_version: String,
     model_id: String,
     requested_revision: String,
     resolved_revision: String,
+    tokenizer_artifacts: Option<Vec<PreparedTokenizerArtifactV2>>,
 }
 
 #[cfg(feature = "fastembed-provider")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedTokenizerArtifactV2 {
+    role: ArtifactRole,
+    relative_path: String,
+    sha256: String,
+    byte_size: u64,
+}
+
+#[cfg(feature = "fastembed-provider")]
+struct VerifiedTokenizerAcquisition {
+    tokenizer: FastembedTokenizer,
+    artifacts: Vec<PreparedTokenizerArtifactV2>,
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[derive(Debug)]
 struct AcquisitionPinMutationLock {
     path: PathBuf,
 }
 
 #[cfg(feature = "fastembed-provider")]
-impl Drop for AcquisitionPinMutationLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
+impl AcquisitionPinMutationLock {
+    fn release(self) -> Result<(), EmbeddingProviderError> {
+        let parent = self.path.parent().ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.acquisition_pin_unlock_failed",
+                "Prepared model acquisition pin lock has no parent directory.",
+            )
+        })?;
+        fs::remove_dir(&self.path).map_err(|_| {
+            EmbeddingProviderError::structured(
+                "embedding.acquisition_pin_unlock_failed",
+                "Prepared model acquisition pin lock could not be removed.",
+            )
+        })?;
+        sync_directory(
+            parent,
+            "embedding.acquisition_pin_unlock_failed",
+            "Prepared model acquisition pin lock removal could not be made durable.",
+        )
     }
+}
+
+#[cfg(feature = "fastembed-provider")]
+impl PreparedModelAcquisitionPinV2 {
+    fn validate(&self) -> Result<(), EmbeddingProviderError> {
+        if self.schema_version != PREPARED_MODEL_ACQUISITION_PIN_SCHEMA_VERSION
+            || self.model_id.is_empty()
+            || self.requested_revision.is_empty()
+            || !is_commit_sha(&self.resolved_revision)
+        {
+            return Err(acquisition_pin_invalid());
+        }
+        if let Some(artifacts) = &self.tokenizer_artifacts {
+            validate_tokenizer_pin_artifacts(artifacts)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn validate_tokenizer_pin_artifacts(
+    artifacts: &[PreparedTokenizerArtifactV2],
+) -> Result<(), EmbeddingProviderError> {
+    if artifacts.len() != TOKENIZER_ARTIFACT_ROLES.len() {
+        return Err(acquisition_pin_invalid());
+    }
+    for ((artifact, expected_role), expected_path) in artifacts
+        .iter()
+        .zip(TOKENIZER_ARTIFACT_ROLES)
+        .zip(TOKENIZER_FILES)
+    {
+        if artifact.role != expected_role
+            || artifact.relative_path != expected_path
+            || !is_sha256(&artifact.sha256)
+            || artifact.byte_size > MAX_TOKENIZER_ARTIFACT_BYTES
+        {
+            return Err(acquisition_pin_invalid());
+        }
+    }
+    validate_tokenizer_artifact_sizes(
+        artifacts
+            .iter()
+            .map(|artifact| (artifact.role, artifact.byte_size)),
+    )
+    .map_err(|_| acquisition_pin_invalid())
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn tokenizer_pin_artifacts_from_materialized(
+    artifacts: &[ModelArtifactV1],
+) -> Result<Vec<PreparedTokenizerArtifactV2>, EmbeddingProviderError> {
+    let mut selected = Vec::with_capacity(TOKENIZER_ARTIFACT_ROLES.len());
+    for (expected_role, expected_path) in TOKENIZER_ARTIFACT_ROLES.into_iter().zip(TOKENIZER_FILES)
+    {
+        let mut matching = artifacts
+            .iter()
+            .filter(|artifact| artifact.role == expected_role);
+        let artifact = matching.next().ok_or_else(acquisition_artifact_mismatch)?;
+        if matching.next().is_some()
+            || artifact.relative_path != expected_path
+            || artifact.external_initializer_name.is_some()
+        {
+            return Err(acquisition_artifact_mismatch());
+        }
+        selected.push(PreparedTokenizerArtifactV2 {
+            role: artifact.role,
+            relative_path: artifact.relative_path.clone(),
+            sha256: artifact.sha256.clone(),
+            byte_size: artifact.byte_size,
+        });
+    }
+    validate_tokenizer_pin_artifacts(&selected).map_err(|_| acquisition_artifact_mismatch())?;
+    Ok(selected)
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn acquisition_pin_invalid() -> EmbeddingProviderError {
+    EmbeddingProviderError::structured(
+        "embedding.acquisition_pin_invalid",
+        "Prepared model acquisition pin has an invalid contract.",
+    )
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn acquisition_artifact_mismatch() -> EmbeddingProviderError {
+    EmbeddingProviderError::structured(
+        "embedding.acquisition_artifact_mismatch",
+        "Materialized model artifacts do not match the pinned acquisition.",
+    )
 }
 
 struct RuntimeArtifactSource {
@@ -2766,11 +3080,50 @@ fn write_new_bytes(path: &Path, bytes: &[u8]) -> Result<(), EmbeddingProviderErr
         file.sync_all()?;
         Ok(())
     })();
-    if result.is_err() {
-        drop(file);
-        let _ = fs::remove_file(path);
+    drop(file);
+    if let Err(error) = result {
+        fs::remove_file(path)?;
+        return Err(error);
     }
-    result
+    Ok(())
+}
+
+fn atomic_replace_bytes(
+    destination: &Path,
+    bytes: &[u8],
+    code: &str,
+    message: &str,
+) -> Result<(), EmbeddingProviderError> {
+    let staging = destination.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    write_new_bytes(&staging, bytes)?;
+    if fs::rename(&staging, destination).is_err() {
+        fs::remove_file(&staging).map_err(|_| {
+            EmbeddingProviderError::structured(
+                "embedding.atomic_replace_cleanup_failed",
+                "Prepared model state staging file could not be removed.",
+            )
+        })?;
+        return Err(EmbeddingProviderError::structured(code, message));
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        EmbeddingProviderError::structured(code, "Prepared model state has no parent directory.")
+    })?;
+    sync_directory(parent, code, message)
+}
+
+fn sync_directory(path: &Path, code: &str, message: &str) -> Result<(), EmbeddingProviderError> {
+    let directory =
+        File::open(path).map_err(|_| EmbeddingProviderError::structured(code, message))?;
+    directory
+        .sync_all()
+        .map_err(|_| EmbeddingProviderError::structured(code, message))
 }
 
 fn artifact_changed_error() -> EmbeddingProviderError {
@@ -4692,7 +5045,8 @@ mod tests {
         store
             .publish_acquisition_pin(&options, &reference, "b".repeat(40))
             .unwrap();
-        store.retire_acquisition_pin(&options, &older).unwrap();
+        let error = store.retire_acquisition_pin(&options, &older).unwrap_err();
+        assert_eq!(error.code(), "embedding.acquisition_pin_mismatch");
 
         let resolves = std::cell::Cell::new(0_u32);
         let full = store
@@ -4703,6 +5057,230 @@ mod tests {
             .unwrap();
         assert_eq!(full.revision, "b".repeat(40));
         assert_eq!(resolves.get(), 0);
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn tokenizer_pin_v2_rejects_same_commit_cache_byte_drift() {
+        let root = temp_dir("qgh-hf-tokenizer-pin-byte-drift");
+        let source_root = root.join("source");
+        let manifest_path = write_runtime_payload_fixture(&source_root);
+        let verifier = PreparedModelStore::new(root.join("verifier"));
+        let verified = verifier.load_manifest(&manifest_path).unwrap();
+        let store = PreparedModelStore::new(root.join("prepared"));
+        let options = FastembedProviderOptions {
+            model: Some("hf:example/model@main".to_string()),
+            ..FastembedProviderOptions::default()
+        };
+        let reference = HfModelReference {
+            model_id: "example/model".to_string(),
+            revision: "main".to_string(),
+        };
+        let pinned = store
+            .publish_acquisition_pin(&options, &reference, "a".repeat(40))
+            .unwrap();
+        let tokenizer = load_unmanifested_tokenizer_with_evidence(
+            &source_root,
+            tokenizer_artifact_paths(|file| Ok(source_root.join(file))).unwrap(),
+        )
+        .unwrap();
+        store
+            .finalize_acquisition_pin(&options, &reference, &pinned, &tokenizer.artifacts)
+            .unwrap();
+        let finalized = store
+            .read_acquisition_pin_record_at(&store.acquisition_pin_path(&options))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            finalized.tokenizer_artifacts.as_deref(),
+            Some(tokenizer.artifacts.as_slice())
+        );
+
+        fs::write(source_root.join("config.json"), b"[]").unwrap();
+        let mut manifest = verified.manifest.clone();
+        manifest.model_source = ModelSourceV1::Hf {
+            model_id: reference.model_id.clone(),
+            resolved_revision: pinned.revision.clone(),
+        };
+        manifest.artifacts.clear();
+        let error = store
+            .materialize_hf(
+                &options,
+                &reference,
+                manifest,
+                runtime_artifact_sources_from_prepared(&verified),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code(), "embedding.acquisition_artifact_mismatch");
+        assert!(!store.alias_path(&options).exists());
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn late_a_cannot_replace_alias_authorized_by_newer_b_pin() {
+        use std::sync::{Arc, Barrier};
+
+        let root = temp_dir("qgh-hf-pin-alias-cas");
+        let store = PreparedModelStore::new(root.join("prepared"));
+        let options = FastembedProviderOptions {
+            model: Some("hf:example/model@main".to_string()),
+            ..FastembedProviderOptions::default()
+        };
+        let reference = HfModelReference {
+            model_id: "example/model".to_string(),
+            revision: "main".to_string(),
+        };
+        let evidence_a = fixture_tokenizer_evidence(b"a");
+        let pinned_a = store
+            .publish_acquisition_pin(&options, &reference, "a".repeat(40))
+            .unwrap();
+        store
+            .finalize_acquisition_pin(&options, &reference, &pinned_a, &evidence_a)
+            .unwrap();
+        let expected_a = store
+            .read_acquisition_pin_record_at(&store.acquisition_pin_path(&options))
+            .unwrap()
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let late_store = store.clone();
+        let late_options = options.clone();
+        let late_barrier = Arc::clone(&barrier);
+        let late = std::thread::spawn(move || {
+            late_barrier.wait();
+            late_store.commit_hf_alias(
+                &late_options,
+                &expected_a,
+                &PreparedModelAliasV1 {
+                    schema_version: PREPARED_MODEL_ALIAS_SCHEMA_VERSION.to_string(),
+                    manifest_hash: "1".repeat(64),
+                },
+                &evidence_a,
+            )
+        });
+
+        let current_a = store
+            .read_acquisition_pin_record_at(&store.acquisition_pin_path(&options))
+            .unwrap()
+            .unwrap();
+        store.retire_acquisition_pin(&options, &current_a).unwrap();
+        let evidence_b = fixture_tokenizer_evidence(b"b");
+        let pinned_b = store
+            .publish_acquisition_pin(&options, &reference, "b".repeat(40))
+            .unwrap();
+        store
+            .finalize_acquisition_pin(&options, &reference, &pinned_b, &evidence_b)
+            .unwrap();
+        let expected_b = store
+            .read_acquisition_pin_record_at(&store.acquisition_pin_path(&options))
+            .unwrap()
+            .unwrap();
+
+        barrier.wait();
+        let error = late.join().unwrap().unwrap_err();
+        assert_eq!(error.code(), "embedding.acquisition_pin_mismatch");
+
+        let alias_b = PreparedModelAliasV1 {
+            schema_version: PREPARED_MODEL_ALIAS_SCHEMA_VERSION.to_string(),
+            manifest_hash: "2".repeat(64),
+        };
+        store
+            .commit_hf_alias(&options, &expected_b, &alias_b, &evidence_b)
+            .unwrap();
+        store
+            .commit_hf_alias(&options, &expected_b, &alias_b, &evidence_b)
+            .expect("missing pin is idempotent for the same manifest alias");
+        let conflicting = PreparedModelAliasV1 {
+            schema_version: PREPARED_MODEL_ALIAS_SCHEMA_VERSION.to_string(),
+            manifest_hash: "3".repeat(64),
+        };
+        let error = store
+            .commit_hf_alias(&options, &expected_b, &conflicting, &evidence_b)
+            .unwrap_err();
+        assert_eq!(error.code(), "embedding.acquisition_pin_mismatch");
+        assert_eq!(
+            store
+                .read_prepared_alias_record_at(&store.alias_path(&options))
+                .unwrap(),
+            Some(alias_b)
+        );
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn stale_lock_and_mismatched_or_malformed_pins_fail_closed() {
+        let root = temp_dir("qgh-hf-pin-invalid-state");
+        let store = PreparedModelStore::new(root.join("prepared"));
+        let options = FastembedProviderOptions {
+            model: Some("hf:example/model@main".to_string()),
+            ..FastembedProviderOptions::default()
+        };
+        let reference = HfModelReference {
+            model_id: "example/model".to_string(),
+            revision: "main".to_string(),
+        };
+        store.ensure_requests_root().unwrap();
+        fs::create_dir(store.acquisition_pin_lock_path(&options)).unwrap();
+        let error = store.acquire_pin_mutation_lock(&options).unwrap_err();
+        assert_eq!(error.code(), "embedding.acquisition_pin_busy");
+        fs::remove_dir(store.acquisition_pin_lock_path(&options)).unwrap();
+
+        store
+            .publish_acquisition_pin(&options, &reference, "a".repeat(40))
+            .unwrap();
+        let pin_path = store.acquisition_pin_path(&options);
+        let mut pin: PreparedModelAcquisitionPinV2 =
+            serde_json::from_slice(&fs::read(&pin_path).unwrap()).unwrap();
+        pin.requested_revision = "other".to_string();
+        fs::write(&pin_path, serde_json::to_vec_pretty(&pin).unwrap()).unwrap();
+        let error = store
+            .read_acquisition_pin(&options, &reference)
+            .unwrap_err();
+        assert_eq!(error.code(), "embedding.acquisition_pin_invalid");
+
+        fs::write(&pin_path, b"{not-json").unwrap();
+        let error = store
+            .read_acquisition_pin(&options, &reference)
+            .unwrap_err();
+        assert_eq!(error.code(), "embedding.acquisition_pin_invalid");
+    }
+
+    #[cfg(all(feature = "fastembed-provider", unix))]
+    #[test]
+    fn pin_retire_failure_is_returned_and_keeps_pin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("qgh-hf-pin-retire-failure");
+        let store = PreparedModelStore::new(root.join("prepared"));
+        let options = FastembedProviderOptions {
+            model: Some("hf:example/model@main".to_string()),
+            ..FastembedProviderOptions::default()
+        };
+        let reference = HfModelReference {
+            model_id: "example/model".to_string(),
+            revision: "main".to_string(),
+        };
+        store
+            .publish_acquisition_pin(&options, &reference, "a".repeat(40))
+            .unwrap();
+        let expected = store
+            .read_acquisition_pin_record_at(&store.acquisition_pin_path(&options))
+            .unwrap()
+            .unwrap();
+        let lock = store.acquire_pin_mutation_lock(&options).unwrap();
+        let requests = store.root.join("requests");
+        let original = fs::metadata(&requests).unwrap().permissions();
+        fs::set_permissions(&requests, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let error = store
+            .retire_acquisition_pin_locked(&options, &expected)
+            .unwrap_err();
+
+        fs::set_permissions(&requests, original).unwrap();
+        lock.release().unwrap();
+        assert_eq!(error.code(), "embedding.acquisition_pin_retire_failed");
+        assert!(store.acquisition_pin_path(&options).is_file());
     }
 
     #[cfg(feature = "fastembed-provider")]
@@ -5231,6 +5809,20 @@ mod tests {
             byte_size: bytes.len() as u64,
             external_initializer_name: external_initializer_name.map(ToString::to_string),
         }
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn fixture_tokenizer_evidence(bytes: &[u8]) -> Vec<PreparedTokenizerArtifactV2> {
+        TOKENIZER_ARTIFACT_ROLES
+            .into_iter()
+            .zip(TOKENIZER_FILES)
+            .map(|(role, relative_path)| PreparedTokenizerArtifactV2 {
+                role,
+                relative_path: relative_path.to_string(),
+                sha256: hex_digest(&Sha256::digest(bytes)),
+                byte_size: bytes.len() as u64,
+            })
+            .collect()
     }
 
     #[test]
