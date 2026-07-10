@@ -4,9 +4,13 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
+#[cfg(feature = "fastembed-provider")]
+use sha2::{Digest, Sha256};
 
 const PROFILE_SECRET: &str = "QGH_PROFILE_SECRET_7d0df87c";
 const POLICY_SECRET: &str = "QGH_POLICY_SECRET_418ee7ad";
+#[cfg(feature = "fastembed-provider")]
+const TOKENIZER_PATH_SECRET: &str = "QGH_HOME_PATH_SECRET_a39f4c22";
 
 #[test]
 fn invalid_profile_toml_never_echoes_source_values() {
@@ -89,6 +93,88 @@ fn explicit_manifest_artifact_readiness_does_not_block_status_or_get() {
     assert_eq!(get.status.code(), Some(4));
     let get_json: serde_json::Value = serde_json::from_slice(&get.stdout).unwrap();
     assert_eq!(get_json["error"]["code"], "source.not_found");
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn tokenizer_initialization_errors_never_expose_cache_paths() {
+    let fixture = CliFixture::new(TOKENIZER_PATH_SECRET);
+    let manifest_path = write_invalid_tokenizer_manifest(&fixture.root.join("prepared-model"));
+    fixture.write_config_with_manifest(&manifest_path);
+
+    for json in [true, false] {
+        let output = fixture.embed(json);
+        assert!(!output.status.success());
+        assert_output_redacted(&output, TOKENIZER_PATH_SECRET);
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn write_invalid_tokenizer_manifest(root: &std::path::Path) -> PathBuf {
+    fs::create_dir_all(root).unwrap();
+    let declarations = [
+        ("onnx_model", "model.onnx", b"not-an-onnx".as_slice()),
+        (
+            "tokenizer",
+            "tokenizer.json",
+            b"{invalid-tokenizer".as_slice(),
+        ),
+        ("config", "config.json", b"{}".as_slice()),
+        (
+            "special_tokens_map",
+            "special_tokens_map.json",
+            b"{}".as_slice(),
+        ),
+        (
+            "tokenizer_config",
+            "tokenizer_config.json",
+            b"{}".as_slice(),
+        ),
+    ];
+    let artifacts = declarations
+        .iter()
+        .map(|(role, relative_path, bytes)| {
+            fs::write(root.join(relative_path), bytes).unwrap();
+            json!({
+                "role": role,
+                "relative_path": relative_path,
+                "sha256": hex_sha256(bytes),
+                "byte_size": bytes.len()
+            })
+        })
+        .collect::<Vec<_>>();
+    let manifest = json!({
+        "schema_version": "qgh.model_manifest.v1",
+        "preset_id": null,
+        "provider": "fastembed",
+        "model_source": {"type": "local", "declared_id": "fixture"},
+        "artifacts": artifacts,
+        "tokenizer": "hf_tokenizer_json",
+        "query_prefix": "",
+        "document_prefix": "",
+        "pooling": "cls",
+        "normalization": "l2",
+        "native_dimension": 4,
+        "output_dimension": 4,
+        "max_length": 32,
+        "quantization": "none",
+        "context_template_version": "qgh.context.v1"
+    });
+    let manifest_path = root.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    manifest_path
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn hex_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn explicit_manifest_fixture() -> serde_json::Value {
@@ -226,6 +312,15 @@ env = "QGH_TEST_TOKEN"
             "qgh://github.com/issue/I_missing",
             "--json",
         ]);
+        command.output().unwrap()
+    }
+
+    fn embed(&self, json: bool) -> Output {
+        let mut command = self.base_command();
+        command.args(["--profile", "work", "embed", "--force"]);
+        if json {
+            command.arg("--json");
+        }
         command.output().unwrap()
     }
 

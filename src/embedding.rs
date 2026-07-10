@@ -2483,31 +2483,19 @@ impl FastembedTokenizer {
         snapshot: &PreparedModelSnapshot,
     ) -> Result<Self, EmbeddingProviderError> {
         let tokenizer_path = required_prepared_path(snapshot, ArtifactRole::Tokenizer)?;
-        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|error| {
-            EmbeddingProviderError::structured(
-                "embedding.tokenizer_init_failed",
-                "Failed to initialize prepared embedding tokenizer.",
-            )
-            .with_details(json!({
-                "file": tokenizer_path.display().to_string(),
-                "error": error.to_string()
-            }))
-        })?;
+        let tokenizer = tokenizer_from_local_bytes(
+            tokenizer_path,
+            "Failed to initialize prepared embedding tokenizer.",
+        )?;
         Ok(Self { tokenizer })
     }
 
     pub fn from_snapshot(snapshot: &ResolvedModelSnapshot) -> Result<Self, EmbeddingProviderError> {
         let tokenizer_path = required_path(snapshot, "tokenizer.json")?;
-        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|error| {
-            EmbeddingProviderError::structured(
-                "embedding.tokenizer_init_failed",
-                "Failed to initialize embedding tokenizer.",
-            )
-            .with_details(json!({
-                "file": tokenizer_path.display().to_string(),
-                "error": error.to_string()
-            }))
-        })?;
+        let tokenizer = tokenizer_from_local_bytes(
+            tokenizer_path,
+            "Failed to initialize embedding tokenizer.",
+        )?;
         Ok(Self { tokenizer })
     }
 
@@ -2515,6 +2503,21 @@ impl FastembedTokenizer {
         let snapshot = resolve_fastembed_snapshot(options)?;
         Self::from_snapshot(&snapshot)
     }
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn tokenizer_from_local_bytes(
+    path: &Path,
+    message: &'static str,
+) -> Result<tokenizers::Tokenizer, EmbeddingProviderError> {
+    let bytes = fs::read(path).map_err(|_| {
+        EmbeddingProviderError::structured("embedding.tokenizer_init_failed", message)
+            .with_details(json!({ "role": ArtifactRole::Tokenizer }))
+    })?;
+    tokenizers::Tokenizer::from_bytes(bytes).map_err(|_| {
+        EmbeddingProviderError::structured("embedding.tokenizer_init_failed", message)
+            .with_details(json!({ "role": ArtifactRole::Tokenizer }))
+    })
 }
 
 #[cfg(feature = "fastembed-provider")]
