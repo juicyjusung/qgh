@@ -849,45 +849,18 @@ impl PreparedModelStore {
         self.verify(inspection)
     }
 
+    pub fn validate_manifest_contract(
+        &self,
+        manifest_path: &Path,
+    ) -> Result<(), EmbeddingProviderError> {
+        read_manifest_contract(manifest_path).map(|_| ())
+    }
+
     pub fn inspect_manifest(
         &self,
         manifest_path: &Path,
     ) -> Result<PreparedModelInspection, EmbeddingProviderError> {
-        let metadata = fs::symlink_metadata(manifest_path).map_err(|error| {
-            EmbeddingProviderError::structured(
-                "embedding.prepared_manifest_missing",
-                "Prepared model manifest is unavailable.",
-            )
-            .with_details(json!({ "error": error.to_string() }))
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(EmbeddingProviderError::structured(
-                "embedding.prepared_manifest_invalid",
-                "Prepared model manifest must be a regular file.",
-            ));
-        }
-        if metadata.len() > MAX_MODEL_MANIFEST_BYTES {
-            return Err(EmbeddingProviderError::structured(
-                "embedding.prepared_manifest_invalid",
-                "Prepared model manifest exceeds the supported size.",
-            ));
-        }
-        let root = manifest_path.parent().ok_or_else(|| {
-            EmbeddingProviderError::structured(
-                "embedding.prepared_manifest_invalid",
-                "Prepared model manifest must have a parent directory.",
-            )
-        })?;
-        let canonical_root = fs::canonicalize(root)?;
-        let manifest_bytes = read_bounded_file(
-            manifest_path,
-            &artifact_file_identity(&metadata),
-            MAX_MODEL_MANIFEST_BYTES,
-            "embedding.prepared_manifest_invalid",
-            "Prepared model manifest changed or exceeds the supported size.",
-        )?;
-        let manifest = ModelManifestV1::from_json_slice(&manifest_bytes)?;
-        let manifest_hash = manifest.hash();
+        let (manifest, manifest_hash, canonical_root) = read_manifest_contract(manifest_path)?;
         let mut artifacts = Vec::with_capacity(manifest.artifacts.len());
         for artifact in &manifest.artifacts {
             let relative = confined_relative_path(&artifact.relative_path)?;
@@ -946,7 +919,53 @@ impl PreparedModelStore {
             artifact_stamp,
         })
     }
+}
 
+fn read_manifest_contract(
+    manifest_path: &Path,
+) -> Result<(ModelManifestV1, String, PathBuf), EmbeddingProviderError> {
+    let metadata = fs::symlink_metadata(manifest_path).map_err(|error| {
+        EmbeddingProviderError::structured(
+            "embedding.prepared_manifest_missing",
+            "Prepared model manifest is unavailable.",
+        )
+        .with_details(json!({ "error": error.to_string() }))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.prepared_manifest_invalid",
+            "Prepared model manifest must be a regular file.",
+        ));
+    }
+    if metadata.len() > MAX_MODEL_MANIFEST_BYTES {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.prepared_manifest_invalid",
+            "Prepared model manifest exceeds the supported size.",
+        ));
+    }
+    let root = manifest_path.parent().ok_or_else(|| {
+        EmbeddingProviderError::structured(
+            "embedding.prepared_manifest_invalid",
+            "Prepared model manifest must have a parent directory.",
+        )
+    })?;
+    let canonical_root = fs::canonicalize(root)?;
+    let manifest_bytes = read_bounded_file(
+        manifest_path,
+        &artifact_file_identity(&metadata),
+        MAX_MODEL_MANIFEST_BYTES,
+        "embedding.prepared_manifest_invalid",
+        "Prepared model manifest changed or exceeds the supported size.",
+    )?;
+    let manifest = ModelManifestV1::from_json_slice(&manifest_bytes)?;
+    let manifest_hash = manifest.hash();
+    for artifact in &manifest.artifacts {
+        confined_relative_path(&artifact.relative_path)?;
+    }
+    Ok((manifest, manifest_hash, canonical_root))
+}
+
+impl PreparedModelStore {
     pub fn verify(
         &self,
         inspection: PreparedModelInspection,

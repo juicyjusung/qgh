@@ -1105,7 +1105,7 @@ fn parse_embedding_config(raw: &RawEmbeddingConfig) -> Result<(), QghError> {
             default_prepared_model_store().and_then(|store| store.inspect(&options))
         {
             if let Err(source_error) =
-                PreparedModelStore::new(PathBuf::new()).inspect_manifest(manifest_path)
+                PreparedModelStore::new(PathBuf::new()).validate_manifest_contract(manifest_path)
             {
                 let error = if matches!(
                     prepared_error.code(),
@@ -1292,6 +1292,87 @@ mod tests {
             .unwrap_err()
             .message
             .contains("manifest_path"));
+    }
+
+    #[test]
+    fn explicit_manifest_config_validates_contract_without_requiring_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "qgh-config-manifest-contract-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&explicit_manifest_fixture("model.onnx")).unwrap(),
+        )
+        .unwrap();
+        let config = explicit_manifest_config(manifest_path.clone());
+
+        parse_embedding_config(&config).unwrap();
+
+        fs::write(root.join("model.onnx"), b"x").unwrap();
+        parse_embedding_config(&config).unwrap();
+
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&explicit_manifest_fixture("../model.onnx")).unwrap(),
+        )
+        .unwrap();
+        let error = parse_embedding_config(&config).unwrap_err();
+        assert_eq!(error.code, "embedding.artifact_path_invalid");
+    }
+
+    fn explicit_manifest_config(manifest_path: PathBuf) -> RawEmbeddingConfig {
+        RawEmbeddingConfig {
+            provider: EmbeddingProviderKind::Local,
+            manifest_path: Some(manifest_path),
+            model: None,
+            model_path: None,
+            file: None,
+            pooling: None,
+            query_prefix: None,
+            quantization: None,
+            token_source: None,
+        }
+    }
+
+    fn explicit_manifest_fixture(model_path: &str) -> serde_json::Value {
+        let artifact = |role: &str, relative_path: &str, byte_size: u64| {
+            serde_json::json!({
+                "role": role,
+                "relative_path": relative_path,
+                "sha256": "0".repeat(64),
+                "byte_size": byte_size
+            })
+        };
+        serde_json::json!({
+            "schema_version": "qgh.model_manifest.v1",
+            "preset_id": null,
+            "provider": "fastembed",
+            "model_source": {"type": "local", "declared_id": "fixture"},
+            "artifacts": [
+                artifact("onnx_model", model_path, 8),
+                artifact("tokenizer", "tokenizer.json", 8),
+                artifact("config", "config.json", 8),
+                artifact("special_tokens_map", "special_tokens_map.json", 8),
+                artifact("tokenizer_config", "tokenizer_config.json", 8)
+            ],
+            "tokenizer": "hf_tokenizer_json",
+            "query_prefix": "",
+            "document_prefix": "",
+            "pooling": "cls",
+            "normalization": "l2",
+            "native_dimension": 4,
+            "output_dimension": 4,
+            "max_length": 32,
+            "quantization": "none",
+            "context_template_version": "qgh.context.v1"
+        })
     }
 
     fn raw_profile(host: &str, repos: &[&str]) -> RawProfile {

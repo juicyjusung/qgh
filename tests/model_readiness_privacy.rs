@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::json;
+
 const PROFILE_SECRET: &str = "QGH_PROFILE_SECRET_7d0df87c";
 const POLICY_SECRET: &str = "QGH_POLICY_SECRET_418ee7ad";
 
@@ -55,6 +57,74 @@ github = ["{POLICY_SECRET}"]
     }
 }
 
+#[test]
+fn explicit_manifest_artifact_readiness_does_not_block_status_or_get() {
+    let fixture = CliFixture::new("manifest-artifact-readiness");
+    let model_root = fixture.root.join("prepared-model");
+    fs::create_dir_all(&model_root).unwrap();
+    let manifest_path = model_root.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&explicit_manifest_fixture()).unwrap(),
+    )
+    .unwrap();
+    fixture.write_config_with_manifest(&manifest_path);
+
+    let missing = fixture.status(true);
+    assert!(
+        missing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&missing.stdout)
+    );
+    let missing_json: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(missing_json["data"]["embedding"]["state"], "missing");
+
+    fs::write(model_root.join("model.onnx"), b"x").unwrap();
+    let truncated = fixture.status(true);
+    assert!(truncated.status.success());
+    let truncated_json: serde_json::Value = serde_json::from_slice(&truncated.stdout).unwrap();
+    assert_eq!(truncated_json["data"]["embedding"]["state"], "missing");
+
+    let get = fixture.get_missing_source();
+    assert_eq!(get.status.code(), Some(4));
+    let get_json: serde_json::Value = serde_json::from_slice(&get.stdout).unwrap();
+    assert_eq!(get_json["error"]["code"], "source.not_found");
+}
+
+fn explicit_manifest_fixture() -> serde_json::Value {
+    let artifact = |role: &str, relative_path: &str| {
+        json!({
+            "role": role,
+            "relative_path": relative_path,
+            "sha256": "0".repeat(64),
+            "byte_size": 8
+        })
+    };
+    json!({
+        "schema_version": "qgh.model_manifest.v1",
+        "preset_id": null,
+        "provider": "fastembed",
+        "model_source": {"type": "local", "declared_id": "fixture"},
+        "artifacts": [
+            artifact("onnx_model", "model.onnx"),
+            artifact("tokenizer", "tokenizer.json"),
+            artifact("config", "config.json"),
+            artifact("special_tokens_map", "special_tokens_map.json"),
+            artifact("tokenizer_config", "tokenizer_config.json")
+        ],
+        "tokenizer": "hf_tokenizer_json",
+        "query_prefix": "",
+        "document_prefix": "",
+        "pooling": "cls",
+        "normalization": "l2",
+        "native_dimension": 4,
+        "output_dimension": 4,
+        "max_length": 32,
+        "quantization": "none",
+        "context_template_version": "qgh.context.v1"
+    })
+}
+
 fn assert_output_redacted(output: &Output, marker: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -103,6 +173,28 @@ env = "QGH_TEST_TOKEN"
         );
     }
 
+    fn write_config_with_manifest(&self, manifest_path: &std::path::Path) {
+        self.write_config(&format!(
+            r#"schema_version = "qgh.config.v1"
+
+[embedding]
+provider = "local"
+manifest_path = "{}"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#,
+            manifest_path.display()
+        ));
+    }
+
     fn write_config(&self, text: &str) {
         fs::write(self.config_home.join("qgh/config.toml"), text).unwrap();
     }
@@ -117,6 +209,27 @@ env = "QGH_TEST_TOKEN"
     }
 
     fn status(&self, json: bool) -> Output {
+        let mut command = self.base_command();
+        command.args(["--profile", "work", "status"]);
+        if json {
+            command.arg("--json");
+        }
+        command.output().unwrap()
+    }
+
+    fn get_missing_source(&self) -> Output {
+        let mut command = self.base_command();
+        command.args([
+            "--profile",
+            "work",
+            "get",
+            "qgh://github.com/issue/I_missing",
+            "--json",
+        ]);
+        command.output().unwrap()
+    }
+
+    fn base_command(&self) -> Command {
         let mut command = Command::new(binary());
         command
             .env("XDG_CONFIG_HOME", &self.config_home)
@@ -125,12 +238,8 @@ env = "QGH_TEST_TOKEN"
             .env("QGH_TEST_TOKEN", "fixture-token")
             .env_remove("QGH_PROFILE")
             .env_remove("RUST_LOG")
-            .current_dir(&self.root)
-            .args(["--profile", "work", "status"]);
-        if json {
-            command.arg("--json");
-        }
-        command.output().unwrap()
+            .current_dir(&self.root);
+        command
     }
 }
 
