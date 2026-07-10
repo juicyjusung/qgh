@@ -518,6 +518,29 @@ fn model_preparation_records_download_and_cache_source_bytes() {
     )
     .unwrap();
     assert_eq!(provenance, stdout);
+    assert_eq!(
+        provenance["unavailable"],
+        json!([{
+            "candidate": "dragonkue-ko",
+            "model_id": "dragonkue/snowflake-arctic-embed-l-v2.0-ko",
+            "resolved_revision": "55ec6e9358a56d56af759bc8372e970caf8c305f",
+            "required_artifact": "onnx/model.onnx",
+            "availability": "missing_at_immutable_revision",
+            "checked_at": "2026-07-10T17:45:46Z",
+            "authentication": "none",
+            "evidence": {
+                "revision_http_status": 200,
+                "tree_http_status": 200,
+                "tree_entry_count": 12,
+                "required_artifact_matches": 0,
+                "tree_sha256": "3440d1cf94a3c8664310e4b0b03cb57da5a7e132fea5fa6087618a580aee6219",
+                "path_sha256": "9e4c07c5352f95ac48d195ab5be417240ab20f1f773da95836b5c69ec7337dc0",
+                "resolve_http_status": 404,
+                "resolve_error": "EntryNotFound",
+                "resolve_revision": "55ec6e9358a56d56af759bc8372e970caf8c305f"
+            }
+        }])
+    );
     #[cfg(feature = "fastembed-provider")]
     assert_eq!(
         live_model_eval_runtime::prepared_model_download_bytes_for_test(
@@ -529,6 +552,235 @@ fn model_preparation_records_download_and_cache_source_bytes() {
         .expect("Rust verifies Python preparation provenance"),
         0
     );
+    #[cfg(feature = "fastembed-provider")]
+    {
+        let blocker = live_model_eval_runtime::dragonkue_blocker_for_test(&root)
+            .expect("immutable unavailability evidence produces an offline blocker");
+        assert_eq!(blocker["candidate"], "dragonkue-ko");
+        assert_eq!(blocker["status"], "blocked");
+        assert_eq!(
+            blocker["blocker"],
+            json!({
+                "code": "eval.model_artifact_missing_at_immutable_revision",
+                "phase": "preparation_provenance"
+            })
+        );
+        assert_eq!(blocker["synthetic_substitution"], false);
+
+        let provenance_path = models_root.join("preparation-provenance.json");
+        let mut tampered_unavailable = provenance.clone();
+        tampered_unavailable["unavailable"][0]["evidence"]["tree_sha256"] = json!("0".repeat(64));
+        std::fs::write(
+            &provenance_path,
+            serde_json::to_vec_pretty(&tampered_unavailable).unwrap(),
+        )
+        .unwrap();
+        assert!(live_model_eval_runtime::dragonkue_blocker_for_test(&root).is_err());
+        std::fs::write(
+            &provenance_path,
+            serde_json::to_vec_pretty(&provenance).unwrap(),
+        )
+        .unwrap();
+    }
+    #[cfg(feature = "fastembed-provider")]
+    {
+        let provenance_path = models_root.join("preparation-provenance.json");
+        let original = provenance.clone();
+
+        let mut per_artifact_bytes = original.clone();
+        per_artifact_bytes["prepared"][0]["artifact_acquisition"][0]["source_bytes"] = json!(
+            per_artifact_bytes["prepared"][0]["artifact_acquisition"][0]["source_bytes"]
+                .as_u64()
+                .unwrap()
+                + 1
+        );
+        per_artifact_bytes["prepared"][0]["existing_snapshot_bytes"] = json!(
+            per_artifact_bytes["prepared"][0]["existing_snapshot_bytes"]
+                .as_u64()
+                .unwrap()
+                + 1
+        );
+        std::fs::write(
+            &provenance_path,
+            serde_json::to_vec_pretty(&per_artifact_bytes).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            live_model_eval_runtime::prepared_model_download_bytes_for_test(
+                &root,
+                "gte-modernbert-base",
+                "Alibaba-NLP/gte-modernbert-base",
+                "e7f32e3c00f91d699e8c43b53106206bcc72bb22",
+            )
+            .is_err()
+        );
+
+        let mut transfer_semantics = original.clone();
+        let artifact_size = transfer_semantics["prepared"][0]["artifact_acquisition"][0]
+            ["source_bytes"]
+            .as_u64()
+            .unwrap();
+        transfer_semantics["prepared"][0]["artifact_acquisition"][0]["source"] = json!("curl");
+        transfer_semantics["prepared"][0]["artifact_acquisition"][0]["download_transfer_bytes"] =
+            json!(1);
+        transfer_semantics["prepared"][0]["download_transfer_bytes"] = json!(1);
+        transfer_semantics["prepared"][0]["existing_snapshot_bytes"] = json!(
+            transfer_semantics["prepared"][0]["existing_snapshot_bytes"]
+                .as_u64()
+                .unwrap()
+                - artifact_size
+        );
+        std::fs::write(
+            &provenance_path,
+            serde_json::to_vec_pretty(&transfer_semantics).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            live_model_eval_runtime::prepared_model_download_bytes_for_test(
+                &root,
+                "gte-modernbert-base",
+                "Alibaba-NLP/gte-modernbert-base",
+                "e7f32e3c00f91d699e8c43b53106206bcc72bb22",
+            )
+            .is_err()
+        );
+
+        let mut aggregate = original;
+        aggregate["prepared"][0]["download_transfer_bytes"] = json!(1);
+        std::fs::write(
+            &provenance_path,
+            serde_json::to_vec_pretty(&aggregate).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            live_model_eval_runtime::prepared_model_download_bytes_for_test(
+                &root,
+                "gte-modernbert-base",
+                "Alibaba-NLP/gte-modernbert-base",
+                "e7f32e3c00f91d699e8c43b53106206bcc72bb22",
+            )
+            .is_err()
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn model_preparation_offline_refresh_preserves_valid_acquisition_evidence() {
+    let root = std::env::temp_dir().join(format!(
+        "qgh-live-model-offline-prepare-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let models_root = root.join("models");
+    for (candidate, paths) in [
+        (
+            "gte-modernbert-base",
+            vec![
+                "onnx/model.onnx",
+                "tokenizer.json",
+                "config.json",
+                "special_tokens_map.json",
+                "tokenizer_config.json",
+            ],
+        ),
+        (
+            "arctic-embed-l-v2.0",
+            vec![
+                "onnx/model.onnx",
+                "onnx/model.onnx_data",
+                "tokenizer.json",
+                "config.json",
+                "special_tokens_map.json",
+                "tokenizer_config.json",
+            ],
+        ),
+    ] {
+        for path in paths {
+            let path = models_root.join(candidate).join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"public-offline-artifact").unwrap();
+        }
+    }
+    let run = |offline: bool| {
+        let mut command = std::process::Command::new("python3");
+        command
+            .args([
+                "tests/support/prepare_live_model_eval_models.py",
+                "--output-root",
+            ])
+            .arg(&models_root);
+        if offline {
+            command.arg("--offline");
+        }
+        command.output().unwrap()
+    };
+    assert!(run(false).status.success());
+    let provenance_path = models_root.join("preparation-provenance.json");
+    let mut provenance: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&provenance_path).unwrap()).unwrap();
+    let artifact_size = provenance["prepared"][0]["artifact_acquisition"][0]["source_bytes"]
+        .as_u64()
+        .unwrap();
+    provenance["prepared"][0]["artifact_acquisition"][0]["source"] = json!("curl");
+    provenance["prepared"][0]["artifact_acquisition"][0]["download_transfer_bytes"] =
+        json!(artifact_size);
+    provenance["prepared"][0]["download_transfer_bytes"] = json!(artifact_size);
+    provenance["prepared"][0]["existing_snapshot_bytes"] = json!(
+        provenance["prepared"][0]["existing_snapshot_bytes"]
+            .as_u64()
+            .unwrap()
+            - artifact_size
+    );
+    std::fs::write(
+        &provenance_path,
+        serde_json::to_vec_pretty(&provenance).unwrap(),
+    )
+    .unwrap();
+
+    let offline = run(true);
+    assert!(
+        offline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    let refreshed: serde_json::Value = serde_json::from_slice(&offline.stdout).unwrap();
+    assert_eq!(
+        refreshed["prepared"][0]["artifact_acquisition"][0]["source"],
+        "curl"
+    );
+    assert_eq!(
+        refreshed["prepared"][0]["artifact_acquisition"][0]["download_transfer_bytes"],
+        artifact_size
+    );
+
+    std::fs::write(
+        models_root.join("gte-modernbert-base/onnx/model.onnx"),
+        vec![b'x'; artifact_size as usize],
+    )
+    .unwrap();
+    let changed_snapshot = run(true);
+    assert!(changed_snapshot.status.success());
+    let changed: serde_json::Value = serde_json::from_slice(&changed_snapshot.stdout).unwrap();
+    assert_eq!(
+        changed["prepared"][0]["artifact_acquisition"][0]["source"],
+        "existing_snapshot"
+    );
+    assert_eq!(
+        changed["prepared"][0]["artifact_acquisition"][0]["download_transfer_bytes"],
+        0
+    );
+
+    std::fs::remove_file(models_root.join("gte-modernbert-base/tokenizer_config.json")).unwrap();
+    let missing = run(true);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("offline preparation is missing"));
+    assert!(!models_root
+        .join("gte-modernbert-base/tokenizer_config.json.partial")
+        .exists());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -1125,6 +1377,29 @@ fn failing_resource_child_preserves_sanitized_numeric_evidence() {
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
+fn resource_seed_covers_every_active_latest_source_and_production_embed_is_exact() {
+    let evidence = live_model_eval_runtime::resource_seed_embed_contract_for_test(
+        std::path::Path::new(env!("CARGO_BIN_EXE_qgh")),
+        CORPUS_JSONL,
+    )
+    .expect("50k resource corpus uses the production refresh/embed path");
+    assert_eq!(evidence["seeded_chunks"], 50_000);
+    assert!(evidence["active_latest_versions"].as_u64().unwrap() > 1);
+    assert_eq!(evidence["active_latest_versions_without_chunks"], 0);
+    assert!(
+        evidence["minimum_chunks_per_active_version"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(evidence["invalid_source_local_chunk_indices"], 0);
+    assert_eq!(evidence["refreshed_chunks"], 0);
+    assert_eq!(evidence["embedded_chunks"], 50_000);
+    assert_eq!(evidence["post_embed_chunks"], 50_000);
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
 fn backfill_success_requires_complete_generation_mapping_vec0_and_publication_counts() {
     let path = std::env::temp_dir().join(format!(
         "qgh-live-model-backfill-contract-{}-{}.sqlite3",
@@ -1591,6 +1866,47 @@ fn target_root_rejects_lookalikes_and_parent_traversal() {
     ));
 }
 
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn live_eval_binary_accepts_only_the_canonical_cargo_built_executable() {
+    let root = std::env::temp_dir().join(format!(
+        "qgh-live-binary-provenance-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let cargo_binary = root.join("cargo-qgh");
+    std::fs::write(&cargo_binary, b"cargo-built").unwrap();
+    let copied_override = root.join("copied-qgh");
+    std::fs::copy(&cargo_binary, &copied_override).unwrap();
+
+    assert_eq!(
+        live_model_eval_runtime::resolve_eval_binary_for_test(&cargo_binary, None)
+            .expect("Cargo binary is accepted"),
+        cargo_binary.canonicalize().unwrap()
+    );
+    assert!(live_model_eval_runtime::resolve_eval_binary_for_test(
+        &cargo_binary,
+        Some(&copied_override)
+    )
+    .is_err());
+    assert!(
+        live_model_eval_runtime::resolve_eval_binary_for_test(&root.join("missing"), None).is_err()
+    );
+    assert!(live_model_eval_runtime::resolve_eval_binary_for_test(&root, None).is_err());
+
+    #[cfg(unix)]
+    {
+        let symlink = root.join("symlink-qgh");
+        std::os::unix::fs::symlink(&cargo_binary, &symlink).unwrap();
+        assert!(live_model_eval_runtime::resolve_eval_binary_for_test(&symlink, None).is_err());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(all(feature = "fastembed-provider", unix))]
 #[test]
 fn canonical_eval_root_rejects_an_existing_symlink() {
@@ -1669,9 +1985,143 @@ fn heldout_parse_occurs_after_frozen_config_write() {
         .find("fs::write(root.join(\"frozen-config.json\")")
         .unwrap();
     let heldout_parse = RUNTIME_SUPPORT
-        .find("parse_jsonl::<QrelRecord>(test_raw)")
+        .find("parse_jsonl_checked::<QrelRecord>(test_raw)")
         .unwrap();
     assert!(freeze < heldout_parse);
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn runtime_fixture_preflight_validates_raw_provenance_without_opening_heldout_json() {
+    let evidence = live_model_eval_runtime::fixture_preflight_for_test(
+        CORPUS_JSONL,
+        DEV_QRELS_JSONL,
+        TEST_QRELS_JSONL,
+        PROVENANCE_JSON,
+    )
+    .expect("committed raw fixture provenance passes");
+    assert_eq!(evidence["corpus_source_count"], 154);
+    assert_eq!(evidence["dev_query_count"], 40);
+    assert_eq!(evidence["heldout_raw_record_count"], 80);
+
+    let invalid_heldout = std::iter::repeat_n("{not-json}\n", 80).collect::<String>();
+    let mut raw_only_provenance: serde_json::Value = serde_json::from_str(PROVENANCE_JSON).unwrap();
+    raw_only_provenance["qrels_test_sha256"] = json!(digest_hex(&invalid_heldout));
+    assert!(live_model_eval_runtime::fixture_preflight_for_test(
+        CORPUS_JSONL,
+        DEV_QRELS_JSONL,
+        &invalid_heldout,
+        &serde_json::to_string(&raw_only_provenance).unwrap(),
+    )
+    .is_ok());
+
+    assert!(live_model_eval_runtime::fixture_preflight_for_test(
+        &format!("{CORPUS_JSONL}\n"),
+        DEV_QRELS_JSONL,
+        TEST_QRELS_JSONL,
+        PROVENANCE_JSON,
+    )
+    .is_err());
+    let mut private_provenance: serde_json::Value = serde_json::from_str(PROVENANCE_JSON).unwrap();
+    private_provenance["repositories"][0]["visibility"] = json!("private");
+    assert!(live_model_eval_runtime::fixture_preflight_for_test(
+        CORPUS_JSONL,
+        DEV_QRELS_JSONL,
+        TEST_QRELS_JSONL,
+        &serde_json::to_string(&private_provenance).unwrap(),
+    )
+    .is_err());
+    let mut authenticated_provenance: serde_json::Value =
+        serde_json::from_str(PROVENANCE_JSON).unwrap();
+    authenticated_provenance["acquisition"]["authentication"] = json!("token");
+    assert!(live_model_eval_runtime::fixture_preflight_for_test(
+        CORPUS_JSONL,
+        DEV_QRELS_JSONL,
+        TEST_QRELS_JSONL,
+        &serde_json::to_string(&authenticated_provenance).unwrap(),
+    )
+    .is_err());
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn frozen_heldout_open_validates_classes_gold_adjudication_and_thread_split() {
+    live_model_eval_runtime::heldout_fixture_contract_for_test(
+        CORPUS_JSONL,
+        DEV_QRELS_JSONL,
+        TEST_QRELS_JSONL,
+        PROVENANCE_JSON,
+    )
+    .expect("committed held-out contract passes");
+
+    let tamper_first = |mutate: &dyn Fn(&mut serde_json::Value)| {
+        let mut records = TEST_QRELS_JSONL
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        mutate(&mut records[0]);
+        records
+            .into_iter()
+            .map(|record| serde_json::to_string(&record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let bad_class = tamper_first(&|record| record["class"] = json!("negative"));
+    assert!(live_model_eval_runtime::heldout_fixture_contract_for_test(
+        CORPUS_JSONL,
+        DEV_QRELS_JSONL,
+        &bad_class,
+        PROVENANCE_JSON,
+    )
+    .is_err());
+    let bad_gold = tamper_first(&|record| {
+        record["relevant"][0]["source_id"] = json!("qgh://github.com/issue/I_missing")
+    });
+    assert!(live_model_eval_runtime::heldout_fixture_contract_for_test(
+        CORPUS_JSONL,
+        DEV_QRELS_JSONL,
+        &bad_gold,
+        PROVENANCE_JSON,
+    )
+    .is_err());
+    let one_adjudicator = tamper_first(&|record| record["adjudicators"] = json!(["only-one"]));
+    assert!(live_model_eval_runtime::heldout_fixture_contract_for_test(
+        CORPUS_JSONL,
+        DEV_QRELS_JSONL,
+        &one_adjudicator,
+        PROVENANCE_JSON,
+    )
+    .is_err());
+
+    let dev_source =
+        serde_json::from_str::<serde_json::Value>(DEV_QRELS_JSONL.lines().next().unwrap()).unwrap()
+            ["relevant"][0]["source_id"]
+            .clone();
+    let thread_leak = tamper_first(&|record| {
+        record["relevant"] = json!([{
+            "source_id": dev_source,
+            "grade": 3,
+            "rationale": "valid public source forced across the frozen split"
+        }]);
+        record["filters"] = json!({"repo": "juicyjusung/qgh"});
+    });
+    assert!(live_model_eval_runtime::heldout_fixture_contract_for_test(
+        CORPUS_JSONL,
+        DEV_QRELS_JSONL,
+        &thread_leak,
+        PROVENANCE_JSON,
+    )
+    .is_err());
+
+    let mut bad_adjudication: serde_json::Value = serde_json::from_str(PROVENANCE_JSON).unwrap();
+    bad_adjudication["adjudication"]["method"] = json!("unreviewed");
+    assert!(live_model_eval_runtime::heldout_fixture_contract_for_test(
+        CORPUS_JSONL,
+        DEV_QRELS_JSONL,
+        TEST_QRELS_JSONL,
+        &serde_json::to_string(&bad_adjudication).unwrap(),
+    )
+    .is_err());
 }
 
 #[test]
@@ -1683,7 +2133,7 @@ fn lexical_profile_is_selected_and_report_bound_before_heldout_then_never_resele
         .find("fs::write(root.join(\"frozen-config.json\")")
         .expect("frozen config exists");
     let heldout_parse = RUNTIME_SUPPORT
-        .find("parse_jsonl::<QrelRecord>(test_raw)")
+        .find("parse_jsonl_checked::<QrelRecord>(test_raw)")
         .expect("held-out parse exists");
     assert!(dev_ab < freeze && freeze < heldout_parse);
     assert_eq!(
@@ -1749,7 +2199,7 @@ fn frozen_run_identity_covers_complete_snapshots_and_is_revalidated_at_phase_bou
         .find("frozen_guard.revalidate_before_heldout")
         .unwrap();
     let heldout_parse = RUNTIME_SUPPORT
-        .find("parse_jsonl::<QrelRecord>(test_raw)")
+        .find("parse_jsonl_checked::<QrelRecord>(test_raw)")
         .unwrap();
     assert!(freeze < heldout_revalidation && heldout_revalidation < heldout_parse);
     let resource_revalidation = RUNTIME_SUPPORT
@@ -1768,6 +2218,34 @@ fn frozen_run_identity_covers_complete_snapshots_and_is_revalidated_at_phase_bou
         .unwrap();
     let final_report = RUNTIME_SUPPORT.find("let mut report = FullReport").unwrap();
     assert!(final_revalidation < final_report);
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn live_eval_file_hashing_uses_bounded_streaming_reads() {
+    struct BoundedReader {
+        remaining: usize,
+        maximum_request: usize,
+    }
+
+    impl std::io::Read for BoundedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if buffer.len() > self.maximum_request {
+                return Err(std::io::Error::other("unbounded read request"));
+            }
+            let read = self.remaining.min(buffer.len());
+            buffer[..read].fill(0x5a);
+            self.remaining -= read;
+            Ok(read)
+        }
+    }
+
+    let hash = live_model_eval_runtime::stream_sha256_for_test(BoundedReader {
+        remaining: 3 * 1024 * 1024 + 17,
+        maximum_request: 1024 * 1024,
+    })
+    .expect("hashing stays within the bounded reader contract");
+    assert_eq!(hash.len(), 64);
 }
 
 #[test]

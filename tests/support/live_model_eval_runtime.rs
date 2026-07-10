@@ -10,10 +10,7 @@ use qgh::context::{
     embedding_context_hash, prepare_embedding_input, EmbeddingSourceContext,
     METADATA_CONTEXT_TEMPLATE_VERSION,
 };
-use qgh::embedding::{
-    EmbeddingTokenizer, FastembedProviderOptions, FastembedTokenizer, ModelManifestV1, PoolingKind,
-    PreparedModelStore, QuantizationKind,
-};
+use qgh::embedding::{EmbeddingTokenizer, FastembedTokenizer, ModelManifestV1, PreparedModelStore};
 use qgh::search_eval::{
     production_lexical_profile_for_eval, search_with_lexical_profile_for_eval, EvalLexicalProfile,
     SearchFilters,
@@ -51,6 +48,12 @@ const EFFECTIVE_BATCH_SIZE: usize = 16;
 const REQUIRED_INTRA_OP_THREADS: usize = 4;
 const DRAGONKUE_MODEL_ID: &str = "dragonkue/snowflake-arctic-embed-l-v2.0-ko";
 const DRAGONKUE_REVISION: &str = "55ec6e9358a56d56af759bc8372e970caf8c305f";
+const DRAGONKUE_REQUIRED_ARTIFACT: &str = "onnx/model.onnx";
+const DRAGONKUE_CHECKED_AT: &str = "2026-07-10T17:45:46Z";
+const DRAGONKUE_TREE_SHA256: &str =
+    "3440d1cf94a3c8664310e4b0b03cb57da5a7e132fea5fa6087618a580aee6219";
+const DRAGONKUE_PATH_SHA256: &str =
+    "9e4c07c5352f95ac48d195ab5be417240ab20f1f773da95836b5c69ec7337dc0";
 const TEST_EMBEDDING_QUERY_VECTORS_ENV: &str = "QGH_TEST_EMBEDDING_QUERY_VECTORS";
 const TEST_EMBEDDING_DOCUMENT_VECTORS_ENV: &str = "QGH_TEST_EMBEDDING_DOCUMENT_VECTORS";
 const FILTER_PROBE_TARGET_REPO: &str = "juicyjusung/qgh";
@@ -1344,6 +1347,7 @@ struct FrozenRunGuard {
 struct ModelPreparationProvenance {
     schema_version: String,
     prepared: Vec<PreparedModelProvenance>,
+    unavailable: Vec<UnavailableModelProvenance>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1369,6 +1373,33 @@ struct ArtifactAcquisitionProvenance {
     source: String,
     source_bytes: u64,
     download_transfer_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnavailableModelProvenance {
+    candidate: String,
+    model_id: String,
+    resolved_revision: String,
+    required_artifact: String,
+    availability: String,
+    checked_at: String,
+    authentication: String,
+    evidence: UnavailableModelEvidence,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnavailableModelEvidence {
+    revision_http_status: u16,
+    tree_http_status: u16,
+    tree_entry_count: usize,
+    required_artifact_matches: usize,
+    tree_sha256: String,
+    path_sha256: String,
+    resolve_http_status: u16,
+    resolve_error: String,
+    resolve_revision: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2810,11 +2841,7 @@ fn prepared_model_download_bytes(
     revision: &str,
     manifest_path: &Path,
 ) -> Result<u64, DynError> {
-    let provenance: ModelPreparationProvenance =
-        serde_json::from_slice(&fs::read(model_preparation_provenance_path(root)?)?)?;
-    if provenance.schema_version != "qgh.live_model_preparation.v1" {
-        return Err("model preparation provenance schema is invalid".into());
-    }
+    let provenance = load_model_preparation_provenance(root)?;
     let record = provenance
         .prepared
         .iter()
@@ -2831,11 +2858,11 @@ fn prepared_model_download_bytes(
             .parent()
             .ok_or("prepared candidate manifest parent missing")?,
     )?;
-    let artifact_paths = manifest
+    let manifest_artifacts = manifest
         .artifacts
         .iter()
-        .map(|artifact| artifact.relative_path.as_str())
-        .collect::<BTreeSet<_>>();
+        .map(|artifact| (artifact.relative_path.as_str(), artifact.byte_size))
+        .collect::<BTreeMap<_, _>>();
     let recorded_paths = record
         .artifact_acquisition
         .iter()
@@ -2865,14 +2892,17 @@ fn prepared_model_download_bytes(
         || record.prepared_snapshot_sha256 != snapshot.sha256
         || record.snapshot_bytes != snapshot.bytes
         || record.artifact_acquisition.len() != manifest.artifacts.len()
-        || artifact_paths != recorded_paths
+        || manifest_artifacts.len() != manifest.artifacts.len()
+        || manifest_artifacts.keys().copied().collect::<BTreeSet<_>>() != recorded_paths
         || record.artifact_acquisition.iter().any(|artifact| {
-            artifact.source_bytes == 0
+            manifest_artifacts.get(artifact.relative_path.as_str()) != Some(&artifact.source_bytes)
+                || artifact.source_bytes == 0
                 || !matches!(
                     artifact.source.as_str(),
                     "curl" | "local_cache" | "existing_snapshot"
                 )
-                || (artifact.source == "curl" && artifact.download_transfer_bytes == 0)
+                || (artifact.source == "curl"
+                    && artifact.download_transfer_bytes != artifact.source_bytes)
                 || (artifact.source != "curl" && artifact.download_transfer_bytes != 0)
         })
         || record.download_transfer_bytes != recorded_download
@@ -2882,6 +2912,44 @@ fn prepared_model_download_bytes(
         return Err("model preparation provenance failed verification".into());
     }
     Ok(record.download_transfer_bytes)
+}
+
+fn load_model_preparation_provenance(root: &Path) -> Result<ModelPreparationProvenance, DynError> {
+    let provenance: ModelPreparationProvenance =
+        serde_json::from_slice(&fs::read(model_preparation_provenance_path(root)?)?)?;
+    if provenance.schema_version != "qgh.live_model_preparation.v1" {
+        return Err("model preparation provenance schema is invalid".into());
+    }
+    Ok(provenance)
+}
+
+fn validate_dragonkue_unavailable_provenance(root: &Path) -> Result<(), DynError> {
+    let provenance = load_model_preparation_provenance(root)?;
+    if provenance.unavailable.len() != 1 {
+        return Err("immutable unavailable-candidate provenance is incomplete".into());
+    }
+    let record = &provenance.unavailable[0];
+    let evidence = &record.evidence;
+    if record.candidate != "dragonkue-ko"
+        || record.model_id != DRAGONKUE_MODEL_ID
+        || record.resolved_revision != DRAGONKUE_REVISION
+        || record.required_artifact != DRAGONKUE_REQUIRED_ARTIFACT
+        || record.availability != "missing_at_immutable_revision"
+        || record.checked_at != DRAGONKUE_CHECKED_AT
+        || record.authentication != "none"
+        || evidence.revision_http_status != 200
+        || evidence.tree_http_status != 200
+        || evidence.tree_entry_count != 12
+        || evidence.required_artifact_matches != 0
+        || evidence.tree_sha256 != DRAGONKUE_TREE_SHA256
+        || evidence.path_sha256 != DRAGONKUE_PATH_SHA256
+        || evidence.resolve_http_status != 404
+        || evidence.resolve_error != "EntryNotFound"
+        || evidence.resolve_revision != record.resolved_revision
+    {
+        return Err("immutable unavailable-candidate provenance failed verification".into());
+    }
+    Ok(())
 }
 
 fn model_preparation_provenance_path(root: &Path) -> Result<PathBuf, DynError> {
@@ -3020,6 +3088,248 @@ fn repository_identity(repo_root: &Path) -> Result<(String, bool), DynError> {
     Ok((git_head, status.stdout.is_empty()))
 }
 
+struct FixturePreflight {
+    provenance: FixtureProvenance,
+    corpus: Vec<CorpusRecord>,
+    dev: Vec<QrelRecord>,
+    corpus_sha256: String,
+    qrels_dev_sha256: String,
+    qrels_test_sha256: String,
+    heldout_raw_record_count: usize,
+}
+
+fn parse_jsonl_checked<T: for<'de> Deserialize<'de>>(raw: &str) -> Result<Vec<T>, DynError> {
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).map_err(Into::into))
+        .collect()
+}
+
+fn raw_jsonl_record_count(raw: &str) -> usize {
+    raw.lines().filter(|line| !line.trim().is_empty()).count()
+}
+
+fn validate_runtime_fixture_preflight(
+    corpus_raw: &str,
+    dev_raw: &str,
+    heldout_raw: &str,
+    provenance_raw: &str,
+) -> Result<FixturePreflight, DynError> {
+    let provenance: FixtureProvenance = serde_json::from_str(provenance_raw)?;
+    let corpus_sha256 = digest_hex(corpus_raw);
+    let qrels_dev_sha256 = digest_hex(dev_raw);
+    let qrels_test_sha256 = digest_hex(heldout_raw);
+    let heldout_raw_record_count = raw_jsonl_record_count(heldout_raw);
+    if provenance.schema_version != "qgh.live_model_provenance.v1"
+        || !provenance.snapshot_at.ends_with('Z')
+        || provenance.acquisition.method != "unauthenticated GitHub REST API"
+        || provenance.acquisition.authentication != "none"
+        || provenance.acquisition.raw_response_committed
+        || provenance.corpus_sha256 != corpus_sha256
+        || provenance.qrels_dev_sha256 != qrels_dev_sha256
+        || provenance.qrels_test_sha256 != qrels_test_sha256
+        || provenance.dev_query_count != raw_jsonl_record_count(dev_raw)
+        || provenance.test_query_count != heldout_raw_record_count
+        || provenance.dev_query_count != 40
+        || provenance.test_query_count != 80
+    {
+        return Err("live fixture raw provenance preflight failed".into());
+    }
+
+    let corpus = parse_jsonl_checked::<CorpusRecord>(corpus_raw)?;
+    let dev = parse_jsonl_checked::<QrelRecord>(dev_raw)?;
+    let mut repository_counts = BTreeMap::<String, usize>::new();
+    for source in &corpus {
+        if source.schema_version != "qgh.live_model_corpus.v1"
+            || source.snapshot_at != provenance.snapshot_at
+            || !source.source_id.starts_with("qgh://github.com/")
+            || !matches!(source.entity_type.as_str(), "issue" | "issue_comment")
+            || !source.canonical_url.starts_with("https://github.com/")
+            || source.body_sha256 != digest_hex(&source.body)
+            || source.license.is_empty()
+        {
+            return Err("live fixture public corpus contract failed".into());
+        }
+        *repository_counts.entry(source.repo.clone()).or_default() += 1;
+    }
+    if provenance.repositories.is_empty()
+        || provenance.repositories.len() != repository_counts.len()
+    {
+        return Err("live fixture repository provenance is incomplete".into());
+    }
+    let mut recorded_repositories = BTreeSet::new();
+    for repository in &provenance.repositories {
+        if !recorded_repositories.insert(repository.repo.as_str())
+            || repository.visibility != "public"
+            || repository.license.is_empty()
+            || repository.repo_url != format!("https://github.com/{}", repository.repo)
+            || !repository
+                .issues_api
+                .starts_with("https://api.github.com/repos/")
+            || repository_counts.get(&repository.repo) != Some(&repository.source_count)
+        {
+            return Err("live fixture repository provenance is not public and exact".into());
+        }
+    }
+    validate_qrel_records(&corpus, &dev, "dev")?;
+    Ok(FixturePreflight {
+        provenance,
+        corpus,
+        dev,
+        corpus_sha256,
+        qrels_dev_sha256,
+        qrels_test_sha256,
+        heldout_raw_record_count,
+    })
+}
+
+fn validate_qrel_records(
+    corpus: &[CorpusRecord],
+    records: &[QrelRecord],
+    expected_split: &str,
+) -> Result<BTreeSet<(String, u64)>, DynError> {
+    let sources = corpus
+        .iter()
+        .map(|source| {
+            (
+                source.source_id.as_str(),
+                (
+                    source.repo.as_str(),
+                    source.issue_number,
+                    source.entity_type.as_str(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut query_ids = BTreeSet::new();
+    let mut threads = BTreeSet::new();
+    for qrel in records {
+        if qrel.schema_version != "qgh.live_model_qrel.v1"
+            || qrel.split != expected_split
+            || !query_ids.insert(qrel.query_id.as_str())
+            || qrel.query.trim().is_empty()
+            || qrel.rationale.trim().is_empty()
+            || qrel.labeler.trim().is_empty()
+            || qrel.adjudicators.len() < 2
+            || qrel.ambiguous
+            || qrel.second_adjudication.is_some()
+        {
+            return Err("live fixture qrel record contract failed".into());
+        }
+        if qrel.query_class == QueryClass::Negative {
+            if !qrel.relevant.is_empty() {
+                return Err("negative live qrel contains a gold source".into());
+            }
+            continue;
+        }
+        if qrel.relevant.is_empty() {
+            return Err("non-negative live qrel has no gold source".into());
+        }
+        for relevant in &qrel.relevant {
+            if !(1..=3).contains(&relevant.grade) || relevant.rationale.trim().is_empty() {
+                return Err("live qrel relevance judgment is invalid".into());
+            }
+            let (repo, issue_number, entity_type) = sources
+                .get(relevant.source_id.as_str())
+                .ok_or("live qrel gold source is absent from the public corpus")?;
+            if *repo != qrel.filters.repo
+                || qrel
+                    .filters
+                    .issue_number
+                    .is_some_and(|expected| expected != *issue_number)
+                || qrel
+                    .filters
+                    .source_type
+                    .as_deref()
+                    .is_some_and(|expected| expected != *entity_type)
+            {
+                return Err("live qrel gold source violates its frozen filter".into());
+            }
+            threads.insert(((*repo).to_string(), *issue_number));
+        }
+    }
+    Ok(threads)
+}
+
+fn validate_heldout_fixture_after_freeze(
+    corpus: &[CorpusRecord],
+    dev: &[QrelRecord],
+    heldout: &[QrelRecord],
+    provenance: &FixtureProvenance,
+) -> Result<(), DynError> {
+    if provenance.adjudication.method != "manual source-body review"
+        || provenance.adjudication.ambiguous_candidate_policy != "second adjudication or exclusion"
+        || provenance.adjudication.title_only_paraphrases_allowed
+        || !provenance.judgment_pool.complete
+        || provenance.judgment_pool.multi_source_query_count < 10
+        || !provenance
+            .judgment_pool
+            .method
+            .contains("source-body overlap review")
+    {
+        return Err("live fixture adjudication provenance failed".into());
+    }
+    let expected_counts = BTreeMap::from([
+        (QueryClass::EnglishSemantic, 20),
+        (QueryClass::KoreanSemantic, 15),
+        (QueryClass::KoQueryEnSource, 10),
+        (QueryClass::EnQueryKoSource, 10),
+        (QueryClass::ExactIdentifier, 10),
+        (QueryClass::CommentOnly, 5),
+        (QueryClass::LongContext, 5),
+        (QueryClass::Negative, 5),
+    ]);
+    let actual_counts = heldout.iter().fold(BTreeMap::new(), |mut counts, qrel| {
+        *counts.entry(qrel.query_class).or_insert(0) += 1;
+        counts
+    });
+    if heldout.len() != 80 || actual_counts != expected_counts {
+        return Err("held-out live qrel class balance changed".into());
+    }
+    let dev_threads = validate_qrel_records(corpus, dev, "dev")?;
+    let heldout_threads = validate_qrel_records(corpus, heldout, "test")?;
+    if !dev_threads.is_disjoint(&heldout_threads) {
+        return Err("live qrel issue/comment thread crosses the frozen split".into());
+    }
+    let mut query_ids = BTreeSet::new();
+    if dev
+        .iter()
+        .chain(heldout)
+        .any(|qrel| !query_ids.insert(qrel.query_id.as_str()))
+    {
+        return Err("live qrel query id crosses the frozen split".into());
+    }
+    Ok(())
+}
+
+pub(super) fn fixture_preflight_for_test(
+    corpus_raw: &str,
+    dev_raw: &str,
+    heldout_raw: &str,
+    provenance_raw: &str,
+) -> Result<Value, DynError> {
+    let preflight =
+        validate_runtime_fixture_preflight(corpus_raw, dev_raw, heldout_raw, provenance_raw)?;
+    Ok(json!({
+        "corpus_source_count": preflight.corpus.len(),
+        "dev_query_count": preflight.dev.len(),
+        "heldout_raw_record_count": preflight.heldout_raw_record_count,
+    }))
+}
+
+pub(super) fn heldout_fixture_contract_for_test(
+    corpus_raw: &str,
+    dev_raw: &str,
+    heldout_raw: &str,
+    provenance_raw: &str,
+) -> Result<(), DynError> {
+    let corpus = parse_jsonl_checked::<CorpusRecord>(corpus_raw)?;
+    let dev = parse_jsonl_checked::<QrelRecord>(dev_raw)?;
+    let heldout = parse_jsonl_checked::<QrelRecord>(heldout_raw)?;
+    let provenance = serde_json::from_str::<FixtureProvenance>(provenance_raw)?;
+    validate_heldout_fixture_after_freeze(&corpus, &dev, &heldout, &provenance)
+}
+
 pub(super) fn run(
     root: &Path,
     corpus_raw: &str,
@@ -3037,11 +3347,15 @@ pub(super) fn run(
     ] {
         remove_dir_if_exists(&root.join(stale))?;
     }
-    let corpus = parse_jsonl::<CorpusRecord>(corpus_raw);
-    let dev = parse_jsonl::<QrelRecord>(dev_raw);
-    let corpus_sha256 = digest_hex(corpus_raw);
-    let qrels_dev_sha256 = digest_hex(dev_raw);
-    let provenance: FixtureProvenance = serde_json::from_str(provenance_raw)?;
+    let FixturePreflight {
+        provenance,
+        corpus,
+        dev,
+        corpus_sha256,
+        qrels_dev_sha256,
+        qrels_test_sha256,
+        heldout_raw_record_count: _,
+    } = validate_runtime_fixture_preflight(corpus_raw, dev_raw, test_raw, provenance_raw)?;
     let repo_root = std::env::current_dir()?.canonicalize()?;
     let binary = eval_binary()?;
     let host = host_record(&binary)?;
@@ -3061,6 +3375,7 @@ pub(super) fn run(
         load_contract_gate_bundle(root, &host.git_sha, &host.binary_sha256, None)?;
     let model_preparation_provenance_sha256 =
         file_sha256(&model_preparation_provenance_path(root)?)?;
+    let dragonkue = dragonkue_blocker(root)?;
     let judgment_pool_verified = provenance.judgment_pool.complete
         && provenance.judgment_pool.multi_source_query_count >= 10;
     let server = PublicSnapshotServer::start(&corpus)?;
@@ -3121,7 +3436,6 @@ pub(super) fn run(
             frozen_lexical_profile.selected_profile,
         ));
     }
-    let dragonkue = dragonkue_blocker(root);
     let mut frozen_candidate_states = candidate_states
         .iter()
         .map(|state| frozen_candidate_state(root, state))
@@ -3141,7 +3455,7 @@ pub(super) fn run(
         candidate_states: frozen_candidate_states.clone(),
         corpus_sha256: corpus_sha256.clone(),
         qrels_dev_sha256: qrels_dev_sha256.clone(),
-        qrels_test_sha256: digest_hex(test_raw),
+        qrels_test_sha256,
         chunker_version: CHUNKER_VERSION,
         chunker_fingerprint: CHUNKER_FINGERPRINT,
         context_profile: "qgh.context.v1",
@@ -3186,7 +3500,8 @@ pub(super) fn run(
     };
 
     frozen_guard.revalidate_before_heldout(root, &binary)?;
-    let held_out = parse_jsonl::<QrelRecord>(test_raw);
+    let held_out = parse_jsonl_checked::<QrelRecord>(test_raw)?;
+    validate_heldout_fixture_after_freeze(&corpus, &dev, &held_out, &provenance)?;
     eprintln!("live-eval phase=heldout-open-once status=running");
     let bm25_evidence = run_single_pass(&bm25_fixture, &held_out)?;
     let bm25 = evaluate_rankings(
@@ -3965,35 +4280,17 @@ fn lexical_profile_blocked_candidate(
     report
 }
 
-fn dragonkue_blocker(root: &Path) -> CandidateReport {
-    eprintln!("live-eval candidate=dragonkue-ko phase=manifest-probe status=running");
-    let store = PreparedModelStore::new(root.join("dragonkue-probe/prepared-models"));
-    let options = FastembedProviderOptions {
-        manifest_path: None,
-        model: Some(format!("hf:{DRAGONKUE_MODEL_ID}@{DRAGONKUE_REVISION}")),
-        model_path: None,
-        file: Some("onnx/model.onnx".to_string()),
-        pooling: Some(PoolingKind::Cls),
-        query_prefix: Some("query: ".to_string()),
-        quantization: Some(QuantizationKind::None),
-        token_source_env: None,
-        cache_dir: Some(root.join("dragonkue-probe/hf-cache")),
-    };
-    let blocker = match store.acquire(&options) {
-        Ok(_) => Blocker {
-            code: "eval.unexpected_dragonkue_onnx".to_string(),
-            phase: "candidate_acquisition".to_string(),
-        },
-        Err(error) => Blocker {
-            code: error.code().to_string(),
-            phase: "candidate_acquisition".to_string(),
-        },
+fn dragonkue_blocker(root: &Path) -> Result<CandidateReport, DynError> {
+    validate_dragonkue_unavailable_provenance(root)?;
+    let blocker = Blocker {
+        code: "eval.model_artifact_missing_at_immutable_revision".to_string(),
+        phase: "preparation_provenance".to_string(),
     };
     eprintln!(
         "live-eval candidate=dragonkue-ko status=blocked code={}",
         blocker.code
     );
-    CandidateReport {
+    Ok(CandidateReport {
         candidate: "dragonkue-ko".to_string(),
         model_id: DRAGONKUE_MODEL_ID.to_string(),
         resolved_revision: DRAGONKUE_REVISION.to_string(),
@@ -4011,7 +4308,11 @@ fn dragonkue_blocker(root: &Path) -> CandidateReport {
         quality_resource_gate_failures: vec!["runtime_unavailable".to_string()],
         blocker: Some(blocker),
         synthetic_substitution: false,
-    }
+    })
+}
+
+pub(super) fn dragonkue_blocker_for_test(root: &Path) -> Result<Value, DynError> {
+    Ok(serde_json::to_value(dragonkue_blocker(root)?)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4056,12 +4357,10 @@ fn measure_50k_backfill(
     partial.contextual_chunk_tokens = Some(chunk.contextual_token_count);
     seed_50k_chunks(&fixture.db_path(), &chunk.body, chunk.raw_token_count)
         .map_err(|_| resource_run_failure("50k_seed", &partial))?;
-    let seeded_chunk_count =
-        chunk_count(&fixture.db_path()).map_err(|_| resource_run_failure("50k_seed", &partial))?;
+    let seed_preflight = resource_seed_preflight(&fixture.db_path())
+        .map_err(|_| resource_run_failure("50k_seed", &partial))?;
+    let seeded_chunk_count = seed_preflight.seeded_chunks;
     partial.chunk_count = Some(seeded_chunk_count);
-    if seeded_chunk_count != 50_000 {
-        return Err(resource_run_failure("50k_seed", &partial));
-    }
     let bytes_before = checkpoint_and_storage_bytes(&fixture.db_path())
         .map_err(|_| resource_run_failure("50k_seed", &partial))?;
     let started_at = command_output("date", &["+%Y-%m-%dT%H:%M:%S%z"]);
@@ -4090,11 +4389,14 @@ fn measure_50k_backfill(
     let embedded = envelope["data"]["chunks"]["embedded"]
         .as_u64()
         .unwrap_or_default() as usize;
+    let refreshed = envelope["data"]["chunks"]["refreshed"]
+        .as_u64()
+        .unwrap_or(usize::MAX as u64) as usize;
     partial.chunk_count = Some(embedded);
     if seconds > 0.0 {
         partial.chunks_per_second = Some(embedded as f64 / seconds);
     }
-    if embedded != 50_000 {
+    if refreshed != 0 || embedded != 50_000 {
         return Err(resource_run_failure("50k_embed", &partial));
     }
     let bytes_after = checkpoint_and_storage_bytes(&fixture.db_path())
@@ -4173,16 +4475,30 @@ fn public_900_token_chunk(
 
 fn seed_50k_chunks(db_path: &Path, body: &str, token_count: usize) -> Result<(), DynError> {
     let mut connection = Connection::open(db_path)?;
-    let (source_id, source_version_id): (String, i64) = connection.query_row(
-        "SELECT se.source_id, im.latest_version_id
-         FROM source_entities se
-         JOIN issue_metadata im ON im.source_id = se.source_id
-         WHERE se.lifecycle_state = 'active'
-         ORDER BY se.source_id
-         LIMIT 1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+    let active_versions = {
+        let mut statement = connection.prepare(
+            "SELECT se.source_id, coalesce(im.latest_version_id, cm.latest_version_id)
+             FROM source_entities se
+             LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+             LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+             WHERE se.lifecycle_state = 'active'
+               AND coalesce(im.latest_version_id, cm.latest_version_id) IS NOT NULL
+             ORDER BY se.source_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    if active_versions.is_empty() || active_versions.len() > 50_000 {
+        return Err(
+            "50k resource seed requires between 1 and 50,000 active source versions".into(),
+        );
+    }
+    let chunks_per_source = 50_000 / active_versions.len();
+    let remainder = 50_000 % active_versions.len();
     let transaction = connection.transaction()?;
     transaction.execute("DELETE FROM chunks", [])?;
     {
@@ -4193,26 +4509,213 @@ fn seed_50k_chunks(db_path: &Path, body: &str, token_count: usize) -> Result<(),
                 chunker_version, chunker_fingerprint, heading_path_json
              ) VALUES (?1, ?2, ?3, ?4, 0, ?5, 0, ?6, ?7, ?8, '[]')",
         )?;
-        for chunk_index in 0..50_000_i64 {
-            insert.execute(params![
-                source_id,
-                source_version_id,
-                body,
-                chunk_index,
-                token_count as i64,
-                body.len() as i64,
-                CHUNKER_VERSION,
-                CHUNKER_FINGERPRINT,
-            ])?;
+        for (source_offset, (source_id, source_version_id)) in active_versions.iter().enumerate() {
+            let source_chunk_count = chunks_per_source + usize::from(source_offset < remainder);
+            for chunk_index in 0..source_chunk_count {
+                insert.execute(params![
+                    source_id,
+                    source_version_id,
+                    body,
+                    chunk_index as i64,
+                    token_count as i64,
+                    body.len() as i64,
+                    CHUNKER_VERSION,
+                    CHUNKER_FINGERPRINT,
+                ])?;
+            }
         }
     }
     transaction.commit()?;
     Ok(())
 }
 
-fn chunk_count(db_path: &Path) -> Result<usize, DynError> {
+fn resource_seed_preflight(db_path: &Path) -> Result<ResourceSeedPreflight, DynError> {
     let connection = Connection::open(db_path)?;
-    Ok(connection.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?)
+    let seeded_chunks =
+        connection.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
+    let active_latest_versions = connection.query_row(
+        "SELECT COUNT(*)
+         FROM source_entities se
+         LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+         LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+         WHERE se.lifecycle_state = 'active'
+           AND coalesce(im.latest_version_id, cm.latest_version_id) IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    let active_latest_versions_without_chunks = connection.query_row(
+        "SELECT COUNT(*)
+         FROM source_entities se
+         LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+         LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+         WHERE se.lifecycle_state = 'active'
+           AND coalesce(im.latest_version_id, cm.latest_version_id) IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM chunks c
+               WHERE c.source_id = se.source_id
+                 AND c.source_version_id = coalesce(im.latest_version_id, cm.latest_version_id)
+           )",
+        [],
+        |row| row.get(0),
+    )?;
+    let minimum_chunks_per_active_version = connection.query_row(
+        "SELECT coalesce(MIN(chunk_count), 0)
+         FROM (
+             SELECT COUNT(c.id) AS chunk_count
+             FROM source_entities se
+             LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+             LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+             LEFT JOIN chunks c
+               ON c.source_id = se.source_id
+              AND c.source_version_id = coalesce(im.latest_version_id, cm.latest_version_id)
+             WHERE se.lifecycle_state = 'active'
+               AND coalesce(im.latest_version_id, cm.latest_version_id) IS NOT NULL
+             GROUP BY se.source_id, coalesce(im.latest_version_id, cm.latest_version_id)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let invalid_source_local_chunk_indices = connection.query_row(
+        "SELECT COUNT(*)
+         FROM (
+             SELECT se.source_id, COUNT(c.id) AS chunk_count,
+                    COUNT(DISTINCT c.chunk_index) AS distinct_indices,
+                    MIN(c.chunk_index) AS minimum_index,
+                    MAX(c.chunk_index) AS maximum_index
+             FROM source_entities se
+             LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+             LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+             LEFT JOIN chunks c
+               ON c.source_id = se.source_id
+              AND c.source_version_id = coalesce(im.latest_version_id, cm.latest_version_id)
+             WHERE se.lifecycle_state = 'active'
+               AND coalesce(im.latest_version_id, cm.latest_version_id) IS NOT NULL
+             GROUP BY se.source_id, coalesce(im.latest_version_id, cm.latest_version_id)
+             HAVING chunk_count = 0
+                 OR distinct_indices != chunk_count
+                 OR minimum_index != 0
+                 OR maximum_index != chunk_count - 1
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let evidence = ResourceSeedPreflight {
+        seeded_chunks,
+        active_latest_versions,
+        active_latest_versions_without_chunks,
+        minimum_chunks_per_active_version,
+        invalid_source_local_chunk_indices,
+    };
+    if evidence.seeded_chunks != 50_000
+        || evidence.active_latest_versions == 0
+        || evidence.active_latest_versions_without_chunks != 0
+        || evidence.minimum_chunks_per_active_version == 0
+        || evidence.invalid_source_local_chunk_indices != 0
+    {
+        return Err("50k resource seed preflight failed".into());
+    }
+    Ok(evidence)
+}
+
+fn resource_document_vectors_json(
+    sources: &[CorpusRecord],
+    body: &str,
+) -> Result<String, DynError> {
+    let issue_titles = sources
+        .iter()
+        .filter(|source| source.entity_type == "issue")
+        .map(|source| {
+            (
+                (source.repo.as_str(), source.issue_number),
+                source.title.as_str(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let vectors = sources
+        .iter()
+        .map(|source| -> Result<(String, Vec<f32>), DynError> {
+            let repository = format!("github.com/{}", source.repo);
+            let issue_number = i64::try_from(source.issue_number)?;
+            let context = match source.entity_type.as_str() {
+                "issue" => EmbeddingSourceContext::Issue {
+                    repository: &repository,
+                    issue_number,
+                    title: &source.title,
+                },
+                "issue_comment" => EmbeddingSourceContext::Comment {
+                    repository: &repository,
+                    parent_issue_number: issue_number,
+                    parent_issue_title: issue_titles
+                        .get(&(source.repo.as_str(), source.issue_number))
+                        .copied()
+                        .ok_or("resource fixture comment parent title missing")?,
+                },
+                _ => return Err("resource fixture source type unsupported".into()),
+            };
+            Ok((
+                prepare_embedding_input(context, body).as_str().to_string(),
+                vec![1.0_f32, 0.0, 0.0, 0.0],
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, DynError>>()?;
+    Ok(serde_json::to_string(&vectors)?)
+}
+
+pub(super) fn resource_seed_embed_contract_for_test(
+    binary: &Path,
+    corpus_raw: &str,
+) -> Result<Value, DynError> {
+    let sources = parse_jsonl::<CorpusRecord>(corpus_raw);
+    let server = PublicSnapshotServer::start(&sources)?;
+    let root = std::env::temp_dir().join(format!(
+        "qgh-live-resource-seed-contract-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    let result = (|| -> Result<Value, DynError> {
+        let fixture = CliFixture::new(root.clone(), binary.to_path_buf(), server.base_url.clone())?;
+        fixture.write_config(None)?;
+        fixture.sync()?;
+        fixture.write_test_embedding_config()?;
+        let query_vectors = serde_json::to_string(&BTreeMap::from([(
+            "resource schema initialization",
+            vec![0.0_f32, 1.0, 0.0, 0.0],
+        )]))?;
+        let _ = fixture.qgh_with_test_vectors(
+            &[
+                "query",
+                "resource schema initialization",
+                "--repo",
+                "juicyjusung/qgh",
+                "--json",
+            ],
+            Some(&query_vectors),
+            None,
+        )?;
+        let body = "public deterministic resource measurement chunk";
+        seed_50k_chunks(&fixture.db_path(), body, 1)?;
+        let preflight = resource_seed_preflight(&fixture.db_path())?;
+        let document_vectors = resource_document_vectors_json(&sources, body)?;
+        let output = fixture.qgh_with_test_vectors(
+            &["embed", "--force", "--json"],
+            None,
+            Some(&document_vectors),
+        )?;
+        let envelope: Value = serde_json::from_slice(&output.stdout)?;
+        let post_embed = resource_seed_preflight(&fixture.db_path())?;
+        Ok(json!({
+            "seeded_chunks": preflight.seeded_chunks,
+            "active_latest_versions": preflight.active_latest_versions,
+            "active_latest_versions_without_chunks": preflight.active_latest_versions_without_chunks,
+            "minimum_chunks_per_active_version": preflight.minimum_chunks_per_active_version,
+            "invalid_source_local_chunk_indices": preflight.invalid_source_local_chunk_indices,
+            "refreshed_chunks": envelope["data"]["chunks"]["refreshed"],
+            "embedded_chunks": envelope["data"]["chunks"]["embedded"],
+            "post_embed_chunks": post_embed.seeded_chunks,
+        }))
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
 }
 
 fn verify_backfill_integrity(
@@ -5313,6 +5816,15 @@ struct ResourceChunk {
     contextual_token_count: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct ResourceSeedPreflight {
+    seeded_chunks: usize,
+    active_latest_versions: usize,
+    active_latest_versions_without_chunks: usize,
+    minimum_chunks_per_active_version: usize,
+    invalid_source_local_chunk_indices: usize,
+}
+
 struct CliFixture {
     root: PathBuf,
     config_home: PathBuf,
@@ -5375,6 +5887,30 @@ type = "env"
 env = "QGH_PUBLIC_FIXTURE_AUTH"
 {}"#,
             self.api_base_url, embedding
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config)?;
+        Ok(())
+    }
+
+    fn write_test_embedding_config(&self) -> Result<(), DynError> {
+        let config = format!(
+            r#"schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "{}"
+web_base_url = "https://github.com"
+repos = ["juicyjusung/qgh"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_PUBLIC_FIXTURE_AUTH"
+
+[embedding]
+provider = "local"
+model = "arctic-l-v2-fp32"
+"#,
+            self.api_base_url
         );
         fs::write(self.config_home.join("qgh/config.toml"), config)?;
         Ok(())
@@ -6099,22 +6635,65 @@ fn collect_regular_file_digests(
     Ok(())
 }
 
+fn stream_sha256(mut reader: impl Read) -> Result<String, DynError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub(super) fn stream_sha256_for_test(reader: impl Read) -> Result<String, DynError> {
+    stream_sha256(reader)
+}
+
 fn file_sha256(path: &Path) -> Result<String, DynError> {
-    Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
+    stream_sha256(fs::File::open(path)?)
 }
 
 pub(super) fn prepared_snapshot_digest_for_test(root: &Path) -> Result<Value, DynError> {
     Ok(serde_json::to_value(prepared_snapshot_digest(root)?)?)
 }
 
-fn eval_binary() -> Result<PathBuf, DynError> {
-    let path = std::env::var_os("QGH_LIVE_MODEL_EVAL_BINARY")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target/release/qgh"));
-    if !path.is_file() {
-        return Err(format!("live eval binary is unavailable: {}", path.display()).into());
+fn resolve_eval_binary(
+    cargo_binary: &Path,
+    configured_override: Option<&Path>,
+) -> Result<PathBuf, DynError> {
+    if configured_override.is_some() {
+        return Err("live eval binary overrides are forbidden".into());
     }
-    Ok(path.canonicalize()?)
+    if !cargo_binary.is_absolute() {
+        return Err("Cargo live eval binary path must be absolute".into());
+    }
+    let metadata =
+        fs::symlink_metadata(cargo_binary).map_err(|_| "Cargo live eval binary is unavailable")?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("Cargo live eval binary must be a regular non-symlink file".into());
+    }
+    Ok(cargo_binary.canonicalize()?)
+}
+
+pub(super) fn resolve_eval_binary_for_test(
+    cargo_binary: &Path,
+    configured_override: Option<&Path>,
+) -> Result<PathBuf, DynError> {
+    resolve_eval_binary(cargo_binary, configured_override)
+}
+
+fn eval_binary() -> Result<PathBuf, DynError> {
+    let configured_override = std::env::var_os("QGH_LIVE_MODEL_EVAL_BINARY").map(PathBuf::from);
+    // Cargo builds this executable in the same invocation that builds and runs
+    // this integration-test harness. Rejecting every runtime override prevents
+    // a copied or stale foreign binary from being attributed to the clean HEAD.
+    resolve_eval_binary(
+        Path::new(env!("CARGO_BIN_EXE_qgh")),
+        configured_override.as_deref(),
+    )
 }
 
 fn host_record(binary: &Path) -> Result<HostRecord, DynError> {
