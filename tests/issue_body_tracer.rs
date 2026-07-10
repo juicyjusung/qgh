@@ -4665,6 +4665,10 @@ fn sync_resumes_from_last_committed_issue_page_after_mid_pagination_backoff() {
         partial_status_json["data"]["sync"]["backoff"]["last_successful_sync"],
         Value::Null
     );
+    let partial_run_id =
+        stdout_json(&fixture.qgh(["get", "qgh://github.com/issue/I_PAGE_ONE", "--json"]))["data"]
+            ["source"]["source_version"]["sync_run_id"]
+            .clone();
 
     server.set_mode(PAGINATED_RESUME);
     server.clear_requests();
@@ -4712,7 +4716,7 @@ fn sync_resumes_from_last_committed_issue_page_after_mid_pagination_backoff() {
     assert_success(&resumed_get);
     assert_eq!(
         stdout_json(&duplicate_get)["data"]["source"]["source_version"]["sync_run_id"],
-        resumed_run_id
+        partial_run_id
     );
     assert_eq!(
         stdout_json(&resumed_get)["data"]["source"]["source_version"]["sync_run_id"],
