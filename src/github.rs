@@ -9,7 +9,6 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::header::{HeaderMap, ETAG, IF_NONE_MATCH, LINK, LOCATION, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde::Deserialize;
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration as StdDuration;
@@ -69,6 +68,9 @@ pub struct ClassifiedFetchOutcome {
     /// surfacing the interruption.
     pub result: FetchResult,
     pub interruption: Option<LifecycleInterruption>,
+    /// A stable, content-free operation failure observed after any lifecycle
+    /// evidence above. Callers must persist/queue evidence before surfacing it.
+    pub terminal_error: Option<QghError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +114,7 @@ pub enum ClassifiedTargetIssueTerminal {
     Backoff(BackoffPlan),
     Transient(GitHubTransientKind),
     AmbiguousForbidden,
+    Failed(QghError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +139,7 @@ pub struct ReconciliationResult {
     pub unavailable_sources: Vec<LifecycleFailure>,
     pub confirmed_permission_lost_repos: Vec<ConfirmedRepositoryPermissionLoss>,
     pub interruption: Option<LifecycleInterruption>,
+    pub terminal_error: Option<QghError>,
 }
 
 pub trait ProgressReporter {
@@ -310,6 +314,14 @@ pub async fn fetch_issues(
 }
 
 fn legacy_fetch_outcome(outcome: ClassifiedFetchOutcome) -> Result<FetchOutcome, QghError> {
+    if !outcome.result.confirmed_permission_lost_repos.is_empty()
+        || !outcome.result.confirmed_source_deletions.is_empty()
+    {
+        return Err(confirmed_lifecycle_requires_typed_handling());
+    }
+    if let Some(error) = outcome.terminal_error {
+        return Err(error);
+    }
     Ok(match outcome.interruption {
         None => FetchOutcome::Fetched(outcome.result),
         Some(LifecycleInterruption::Backoff(plan)) => FetchOutcome::Backoff(plan),
@@ -371,6 +383,24 @@ async fn fetch_issues_classified_with_client(
                     confirmed_source_deletions: confirmed_source_deletions.into_values().collect(),
                 },
                 interruption: $interruption,
+                terminal_error: None,
+            })
+        };
+    }
+    macro_rules! fail_fetch {
+        ($error:expr) => {
+            return Ok(ClassifiedFetchOutcome {
+                result: FetchResult {
+                    issues: total_issues,
+                    comments: total_comments,
+                    skipped_pull_requests: total_skipped_pull_requests,
+                    confirmed_permission_lost_repos: confirmed_permission_lost_repos
+                        .into_values()
+                        .collect(),
+                    confirmed_source_deletions: confirmed_source_deletions.into_values().collect(),
+                },
+                interruption: None,
+                terminal_error: Some($error),
             })
         };
     }
@@ -413,7 +443,7 @@ async fn fetch_issues_classified_with_client(
                 finish_fetch!(Some(LifecycleInterruption::Backoff(backoff)));
             }
             if status == StatusCode::NO_CONTENT {
-                commit_page(FetchPage {
+                if let Err(error) = commit_page(FetchPage {
                     issues: Vec::new(),
                     comments: Vec::new(),
                     skipped_pull_requests: 0,
@@ -423,7 +453,9 @@ async fn fetch_issues_classified_with_client(
                         etag: response_etag.clone(),
                         not_modified: false,
                     }],
-                })?;
+                }) {
+                    fail_fetch!(content_free_commit_error(error));
+                }
                 break;
             }
             if status == StatusCode::NOT_MODIFIED {
@@ -433,7 +465,7 @@ async fn fetch_issues_classified_with_client(
                         repo: repo_name.clone(),
                     },
                 );
-                commit_page(FetchPage {
+                if let Err(error) = commit_page(FetchPage {
                     issues: Vec::new(),
                     comments: Vec::new(),
                     skipped_pull_requests: 0,
@@ -443,7 +475,9 @@ async fn fetch_issues_classified_with_client(
                         etag: response_etag.clone(),
                         not_modified: true,
                     }],
-                })?;
+                }) {
+                    fail_fetch!(content_free_commit_error(error));
+                }
                 break;
             }
             if !status.is_success() {
@@ -514,10 +548,10 @@ async fn fetch_issues_classified_with_client(
             if let Some(etag) = header_string(&headers, ETAG) {
                 response_etag = Some(etag);
             }
-            let page: Vec<ApiIssue> = response
-                .json()
-                .await
-                .map_err(|_| QghError::github("GitHub returned invalid issue JSON."))?;
+            let page: Vec<ApiIssue> = match response.json().await {
+                Ok(page) => page,
+                Err(_) => fail_fetch!(invalid_issue_response()),
+            };
             emit(
                 progress,
                 ProgressEvent::IssuePageFetched {
@@ -550,7 +584,7 @@ async fn fetch_issues_classified_with_client(
                         &issue,
                         progress,
                     )
-                    .await?
+                    .await
                     {
                         CommentFetchOutcome::Fetched(fetched_comments) => {
                             repo_comment_count += fetched_comments.len();
@@ -588,6 +622,7 @@ async fn fetch_issues_classified_with_client(
                         CommentFetchOutcome::AmbiguousForbidden => {
                             finish_fetch!(Some(LifecycleInterruption::AmbiguousForbidden));
                         }
+                        CommentFetchOutcome::Failed(error) => fail_fetch!(error),
                     }
                 }
                 page_issues.push(issue);
@@ -612,12 +647,14 @@ async fn fetch_issues_classified_with_client(
                 etag: response_etag.clone(),
                 not_modified: false,
             });
-            commit_page(FetchPage {
+            if let Err(error) = commit_page(FetchPage {
                 issues: page_issues,
                 comments: page_comments,
                 skipped_pull_requests: page_skipped_pull_requests,
                 cursor_updates: page_cursor_updates,
-            })?;
+            }) {
+                fail_fetch!(content_free_commit_error(error));
+            }
             next_url = next_link(&headers);
         }
         if repo_issue_count != last_progress_issue_count || repo_skipped_pull_requests > 0 {
@@ -647,6 +684,7 @@ pub struct BackfillOutcome {
     pub all_reached_end: bool,
     pub backoff: Option<BackoffPlan>,
     pub interruption: Option<LifecycleInterruption>,
+    pub terminal_error: Option<QghError>,
 }
 
 /// Budgeted historical backfill: walk issues older-first from each repo's
@@ -681,6 +719,14 @@ pub async fn fetch_backfill_issues(
 }
 
 fn legacy_backfill_outcome(outcome: BackfillOutcome) -> Result<BackfillOutcome, QghError> {
+    if !outcome.confirmed_permission_lost_repos.is_empty()
+        || !outcome.confirmed_source_deletions.is_empty()
+    {
+        return Err(confirmed_lifecycle_requires_typed_handling());
+    }
+    if let Some(error) = outcome.terminal_error.clone() {
+        return Err(error);
+    }
     match outcome.interruption.as_ref() {
         None => Ok(outcome),
         Some(LifecycleInterruption::AuthenticationFailed) => Err(authentication_failure()),
@@ -716,6 +762,7 @@ pub async fn fetch_backfill_issues_classified(
     let mut pages = 0usize;
     let mut backoff = None;
     let mut interruption = None;
+    let mut terminal_error = None;
     let mut confirmed_permission_lost_repos = BTreeMap::new();
     let mut confirmed_source_deletions = BTreeMap::new();
 
@@ -851,10 +898,14 @@ pub async fn fetch_backfill_issues_classified(
                     | ResponseDisposition::PermissionCandidate { .. } => unreachable!(),
                 }
             }
-            let page: Vec<ApiIssue> = response
-                .json()
-                .await
-                .map_err(|_| QghError::github("GitHub returned invalid issue JSON."))?;
+            let page: Vec<ApiIssue> = match response.json().await {
+                Ok(page) => page,
+                Err(_) => {
+                    terminal_error = Some(invalid_issue_response());
+                    all_reached_end = false;
+                    break 'repos;
+                }
+            };
             pages += 1;
             let indexed_at = now_rfc3339();
             let mut page_issues = Vec::new();
@@ -879,7 +930,7 @@ pub async fn fetch_backfill_issues_classified(
                     &issue,
                     progress,
                 )
-                .await?
+                .await
                 {
                     CommentFetchOutcome::Fetched(fetched_comments) => {
                         total_comments += fetched_comments.len();
@@ -925,6 +976,11 @@ pub async fn fetch_backfill_issues_classified(
                         all_reached_end = false;
                         break 'repos;
                     }
+                    CommentFetchOutcome::Failed(error) => {
+                        terminal_error = Some(error);
+                        all_reached_end = false;
+                        break 'repos;
+                    }
                 }
                 page_issues.push(issue);
                 total_issues += 1;
@@ -935,12 +991,16 @@ pub async fn fetch_backfill_issues_classified(
                 etag: None,
                 not_modified: false,
             });
-            commit_page(FetchPage {
+            if let Err(error) = commit_page(FetchPage {
                 issues: page_issues,
                 comments: page_comments,
                 skipped_pull_requests: page_skipped_pull_requests,
                 cursor_updates: page_cursor_updates,
-            })?;
+            }) {
+                terminal_error = Some(content_free_commit_error(error));
+                all_reached_end = false;
+                break 'repos;
+            }
             if backoff.is_some() {
                 all_reached_end = false;
                 break 'repos;
@@ -958,6 +1018,7 @@ pub async fn fetch_backfill_issues_classified(
         all_reached_end,
         backoff,
         interruption,
+        terminal_error,
     })
 }
 
@@ -980,19 +1041,19 @@ pub async fn fetch_target_issue(
 fn legacy_target_issue_outcome(
     outcome: ClassifiedTargetIssueFetchOutcome,
 ) -> Result<TargetIssueFetchOutcome, QghError> {
+    if !outcome.confirmed_transitions.is_empty()
+        || matches!(
+            outcome.terminal,
+            ClassifiedTargetIssueTerminal::Confirmed { .. }
+        )
+    {
+        return Err(confirmed_lifecycle_requires_typed_handling());
+    }
     Ok(match outcome.terminal {
         ClassifiedTargetIssueTerminal::Fetched(fetched) => {
             TargetIssueFetchOutcome::Fetched(fetched)
         }
-        ClassifiedTargetIssueTerminal::Confirmed {
-            state: ConfirmedRemoteState::SourceDeleted | ConfirmedRemoteState::SourceTransferred,
-            lifecycle,
-            ..
-        } => TargetIssueFetchOutcome::Unavailable(lifecycle),
-        ClassifiedTargetIssueTerminal::Confirmed {
-            state: ConfirmedRemoteState::RepositoryPermissionLoss,
-            ..
-        } => return Err(repository_permission_loss_requires_typed_handling()),
+        ClassifiedTargetIssueTerminal::Confirmed { .. } => unreachable!(),
         ClassifiedTargetIssueTerminal::Backoff(plan) => TargetIssueFetchOutcome::Backoff(plan),
         ClassifiedTargetIssueTerminal::AuthenticationFailed => {
             return Err(authentication_failure());
@@ -1001,6 +1062,7 @@ fn legacy_target_issue_outcome(
         | ClassifiedTargetIssueTerminal::AmbiguousForbidden => {
             return Err(github_unavailable());
         }
+        ClassifiedTargetIssueTerminal::Failed(error) => return Err(error),
     })
 }
 
@@ -1043,32 +1105,20 @@ async fn fetch_target_issue_classified_with_client(
     }
 
     loop {
-        let url = issue_object_url(profile, &current_repo, current_issue_number);
-        if !visited.insert(url.clone()) {
-            return Err(QghError::validation(
-                "sync.transfer_cycle",
-                "Issue transfer alias chain contains a cycle.",
-            )
-            .with_details(json!({
-                "repo": repo.full_name(),
-                "issue_number": issue_number,
-                "alias_chain": alias_chain
-            }))
-            .with_hint("Run targeted refresh for the final issue location after the transfer is corrected upstream."));
+        let identity = (
+            current_repo.full_name().to_ascii_lowercase(),
+            current_issue_number,
+        );
+        if !visited.insert(identity) {
+            finish_target!(ClassifiedTargetIssueTerminal::Failed(transfer_cycle_error()));
         }
         if visited.len() > TRANSFER_FOLLOW_LIMIT {
-            return Err(QghError::validation(
-                "sync.transfer_chain_too_long",
-                "Issue transfer alias chain exceeded the follow limit.",
-            )
-            .with_details(json!({
-                "repo": repo.full_name(),
-                "issue_number": issue_number,
-                "alias_chain": alias_chain,
-                "limit": TRANSFER_FOLLOW_LIMIT
-            }))
-            .with_hint("Run targeted refresh for the final issue location directly."));
+            finish_target!(ClassifiedTargetIssueTerminal::Failed(
+                transfer_chain_too_long_error()
+            ));
         }
+
+        let url = issue_object_url(profile, &current_repo, current_issue_number);
 
         let response = match github_get(client, &url, token).send().await {
             Ok(response) => response,
@@ -1094,20 +1144,16 @@ async fn fetch_target_issue_classified_with_client(
         match status {
             StatusCode::OK => {
                 let indexed_at = now_rfc3339();
-                let issue = response
-                    .json::<ApiIssue>()
-                    .await
-                    .map_err(|_| QghError::github("GitHub returned invalid issue JSON."))?;
+                let issue = match response.json::<ApiIssue>().await {
+                    Ok(issue) => issue,
+                    Err(_) => finish_target!(ClassifiedTargetIssueTerminal::Failed(
+                        invalid_issue_response()
+                    )),
+                };
                 if issue.pull_request.is_some() {
-                    return Err(QghError::validation(
-                        "validation.unsupported_source_type",
-                        "Targeted sync issue refresh does not index pull requests.",
-                    )
-                    .with_details(json!({
-                        "repo": current_repo.full_name(),
-                        "issue_number": current_issue_number
-                    }))
-                    .with_hint("Use a GitHub Issue number, not a pull request number."));
+                    finish_target!(ClassifiedTargetIssueTerminal::Failed(
+                        unsupported_source_type_error()
+                    ));
                 }
                 let issue = issue.into_record(profile, &current_repo, &indexed_at);
                 let mut cursor_updates = Vec::new();
@@ -1122,7 +1168,7 @@ async fn fetch_target_issue_classified_with_client(
                     &issue,
                     progress,
                 )
-                .await?
+                .await
                 {
                     CommentFetchOutcome::Fetched(comments) => comments,
                     CommentFetchOutcome::Backoff(backoff) => {
@@ -1160,6 +1206,9 @@ async fn fetch_target_issue_classified_with_client(
                     CommentFetchOutcome::AmbiguousForbidden => {
                         finish_target!(ClassifiedTargetIssueTerminal::AmbiguousForbidden);
                     }
+                    CommentFetchOutcome::Failed(error) => {
+                        finish_target!(ClassifiedTargetIssueTerminal::Failed(error));
+                    }
                 };
                 let lifecycle = if confirmed_transition.is_none() {
                     TargetIssueLifecycle {
@@ -1185,7 +1234,7 @@ async fn fetch_target_issue_classified_with_client(
                     },
                 )));
             }
-            StatusCode::MOVED_PERMANENTLY | StatusCode::PERMANENT_REDIRECT => {
+            StatusCode::MOVED_PERMANENTLY => {
                 let Some(location) = header_string(&headers, LOCATION) else {
                     finish_target!(ClassifiedTargetIssueTerminal::Transient(
                         GitHubTransientKind::UnexpectedResponse,
@@ -1197,6 +1246,16 @@ async fn fetch_target_issue_classified_with_client(
                         GitHubTransientKind::UnexpectedResponse,
                     ));
                 };
+                if same_issue_identity(
+                    &next_repo.full_name(),
+                    next_issue_number,
+                    &current_repo.full_name(),
+                    current_issue_number,
+                ) {
+                    finish_target!(ClassifiedTargetIssueTerminal::Transient(
+                        GitHubTransientKind::UnexpectedResponse,
+                    ));
+                }
                 alias_chain.push(location);
                 confirmed_transition = Some(ConfirmedRemoteState::SourceTransferred);
                 confirmed_transition_http_status.get_or_insert(status.as_u16());
@@ -1219,7 +1278,7 @@ async fn fetch_target_issue_classified_with_client(
                 current_repo = next_repo;
                 current_issue_number = next_issue_number;
             }
-            StatusCode::FOUND | StatusCode::TEMPORARY_REDIRECT => {
+            StatusCode::FOUND | StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT => {
                 finish_target!(ClassifiedTargetIssueTerminal::Transient(
                     GitHubTransientKind::UnexpectedResponse,
                 ));
@@ -1317,6 +1376,7 @@ pub async fn reconcile_sources(
     let mut unavailable_sources = Vec::new();
     let mut confirmed_permission_lost_repos = BTreeMap::new();
     let mut interruption = None;
+    let mut terminal_error = None;
     let total = candidates.len();
     let mut checked_sources = 0;
     for (index, candidate) in candidates.iter().enumerate() {
@@ -1333,9 +1393,17 @@ pub async fn reconcile_sources(
             }
             continue;
         }
-        let outcome =
-            check_candidate_lifecycle_classified(&client, profile, token, candidate, progress)
-                .await?;
+        let outcome = match check_candidate_lifecycle_classified(
+            &client, profile, token, candidate, progress,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                terminal_error = Some(content_free_validation_error(error));
+                break;
+            }
+        };
         checked_sources += 1;
         match outcome {
             ClassifiedLifecycleCheck::Active => {}
@@ -1395,6 +1463,7 @@ pub async fn reconcile_sources(
         unavailable_sources,
         confirmed_permission_lost_repos: confirmed_permission_lost_repos.into_values().collect(),
         interruption,
+        terminal_error,
     })
 }
 
@@ -1412,17 +1481,9 @@ pub async fn check_source_lifecycle(
 fn legacy_lifecycle_check(check: ClassifiedLifecycleCheck) -> Result<LifecycleCheck, QghError> {
     match check {
         ClassifiedLifecycleCheck::Active => Ok(LifecycleCheck::Active),
-        ClassifiedLifecycleCheck::Confirmed {
-            state:
-                state @ (ConfirmedRemoteState::SourceDeleted | ConfirmedRemoteState::SourceTransferred),
-            ..
-        } => Ok(LifecycleCheck::Unavailable {
-            reason: state.reason().to_string(),
-        }),
-        ClassifiedLifecycleCheck::Confirmed {
-            state: ConfirmedRemoteState::RepositoryPermissionLoss,
-            ..
-        } => Err(repository_permission_loss_requires_typed_handling()),
+        ClassifiedLifecycleCheck::Confirmed { .. } => {
+            Err(confirmed_lifecycle_requires_typed_handling())
+        }
         ClassifiedLifecycleCheck::AuthenticationFailed => Err(authentication_failure()),
         ClassifiedLifecycleCheck::Backoff(_) => Err(github_unavailable()),
         ClassifiedLifecycleCheck::Transient(_) => Err(github_unavailable()),
@@ -1450,7 +1511,7 @@ async fn fetch_issue_comments(
     repo: &RepoRef,
     issue: &IssueRecord,
     progress: Option<&dyn ProgressReporter>,
-) -> Result<CommentFetchOutcome, QghError> {
+) -> CommentFetchOutcome {
     let mut comments = Vec::new();
     let endpoint = comment_endpoint(repo, issue.number);
     let stored_cursor = cursor_map.get(&endpoint);
@@ -1466,16 +1527,14 @@ async fn fetch_issue_comments(
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
-                return Ok(CommentFetchOutcome::Transient(classify_transport_failure(
-                    &error,
-                )));
+                return CommentFetchOutcome::Transient(classify_transport_failure(&error));
             }
         };
         let status = response.status();
         let headers = response.headers().clone();
         if let Some(backoff) = backoff_from_response(status, &headers, &endpoint) {
             emit_backoff(progress, &backoff);
-            return Ok(CommentFetchOutcome::Backoff(backoff));
+            return CommentFetchOutcome::Backoff(backoff);
         }
         if status == StatusCode::NO_CONTENT {
             break;
@@ -1493,44 +1552,40 @@ async fn fetch_issue_comments(
             let disposition =
                 classify_response(status, &headers, &body, &endpoint, ResponseTarget::Source);
             if let Some(first) = permission_evidence(&disposition) {
-                return Ok(
-                    match confirm_source_denial_with_repository(
-                        client, profile, token, repo, first, progress,
-                    )
-                    .await
-                    {
-                        ClassifiedLifecycleCheck::Confirmed {
-                            state: ConfirmedRemoteState::RepositoryPermissionLoss,
+                return match confirm_source_denial_with_repository(
+                    client, profile, token, repo, first, progress,
+                )
+                .await
+                {
+                    ClassifiedLifecycleCheck::Confirmed {
+                        state: ConfirmedRemoteState::RepositoryPermissionLoss,
+                        http_status,
+                    } => CommentFetchOutcome::ConfirmedRepositoryPermissionLoss(
+                        ConfirmedRepositoryPermissionLoss {
+                            repo: repo.full_name(),
                             http_status,
-                        } => CommentFetchOutcome::ConfirmedRepositoryPermissionLoss(
-                            ConfirmedRepositoryPermissionLoss {
-                                repo: repo.full_name(),
-                                http_status,
-                            },
-                        ),
-                        ClassifiedLifecycleCheck::Confirmed {
-                            state: ConfirmedRemoteState::SourceDeleted,
-                            http_status,
-                        } => CommentFetchOutcome::SourceDeleted { http_status },
-                        ClassifiedLifecycleCheck::AuthenticationFailed => {
-                            CommentFetchOutcome::AuthenticationFailed
-                        }
-                        ClassifiedLifecycleCheck::Backoff(plan) => {
-                            CommentFetchOutcome::Backoff(plan)
-                        }
-                        ClassifiedLifecycleCheck::Transient(kind) => {
-                            CommentFetchOutcome::Transient(kind)
-                        }
-                        ClassifiedLifecycleCheck::AmbiguousForbidden
-                        | ClassifiedLifecycleCheck::Active
-                        | ClassifiedLifecycleCheck::Confirmed {
-                            state: ConfirmedRemoteState::SourceTransferred,
-                            ..
-                        } => CommentFetchOutcome::AmbiguousForbidden,
-                    },
-                );
+                        },
+                    ),
+                    ClassifiedLifecycleCheck::Confirmed {
+                        state: ConfirmedRemoteState::SourceDeleted,
+                        http_status,
+                    } => CommentFetchOutcome::SourceDeleted { http_status },
+                    ClassifiedLifecycleCheck::AuthenticationFailed => {
+                        CommentFetchOutcome::AuthenticationFailed
+                    }
+                    ClassifiedLifecycleCheck::Backoff(plan) => CommentFetchOutcome::Backoff(plan),
+                    ClassifiedLifecycleCheck::Transient(kind) => {
+                        CommentFetchOutcome::Transient(kind)
+                    }
+                    ClassifiedLifecycleCheck::AmbiguousForbidden
+                    | ClassifiedLifecycleCheck::Active
+                    | ClassifiedLifecycleCheck::Confirmed {
+                        state: ConfirmedRemoteState::SourceTransferred,
+                        ..
+                    } => CommentFetchOutcome::AmbiguousForbidden,
+                };
             }
-            return Ok(match disposition {
+            return match disposition {
                 ResponseDisposition::AuthenticationFailed => {
                     CommentFetchOutcome::AuthenticationFailed
                 }
@@ -1543,13 +1598,13 @@ async fn fetch_issue_comments(
                 ResponseDisposition::Success
                 | ResponseDisposition::PermissionCandidate { .. }
                 | ResponseDisposition::SourceGone { .. } => unreachable!(),
-            });
+            };
         }
         response_etag = header_string(&headers, ETAG).or(response_etag);
-        let page: Vec<ApiComment> = response
-            .json()
-            .await
-            .map_err(|_| QghError::github("GitHub returned invalid comment JSON."))?;
+        let page: Vec<ApiComment> = match response.json().await {
+            Ok(page) => page,
+            Err(_) => return CommentFetchOutcome::Failed(invalid_comment_response()),
+        };
         if !page.is_empty() {
             emit(
                 progress,
@@ -1573,7 +1628,7 @@ async fn fetch_issue_comments(
         etag: response_etag,
         not_modified: endpoint_not_modified,
     });
-    Ok(CommentFetchOutcome::Fetched(comments))
+    CommentFetchOutcome::Fetched(comments)
 }
 
 pub struct RepoCommentsResult {
@@ -1586,6 +1641,7 @@ pub struct RepoCommentsResult {
     pub backoff: Option<BackoffPlan>,
     pub confirmed_permission_lost_repos: Vec<ConfirmedRepositoryPermissionLoss>,
     pub interruption: Option<LifecycleInterruption>,
+    pub terminal_error: Option<QghError>,
 }
 
 /// Fetch fresh issue comments repo-wide via `/issues/comments?sort=updated&since`
@@ -1615,6 +1671,18 @@ pub async fn fetch_repo_comments(
         progress,
     )
     .await?;
+    legacy_repo_comments_outcome(outcome)
+}
+
+fn legacy_repo_comments_outcome(
+    outcome: RepoCommentsResult,
+) -> Result<RepoCommentsResult, QghError> {
+    if !outcome.confirmed_permission_lost_repos.is_empty() {
+        return Err(confirmed_lifecycle_requires_typed_handling());
+    }
+    if let Some(error) = outcome.terminal_error.clone() {
+        return Err(error);
+    }
     match outcome.interruption.as_ref() {
         None => Ok(outcome),
         Some(LifecycleInterruption::AuthenticationFailed) => Err(authentication_failure()),
@@ -1644,6 +1712,7 @@ pub async fn fetch_repo_comments_classified(
     let mut backoff = None;
     let mut confirmed_permission_lost_repos = BTreeMap::new();
     let mut interruption = None;
+    let mut terminal_error = None;
 
     'repos: for repo in &profile.repos {
         let repo_name = repo.full_name();
@@ -1748,10 +1817,13 @@ pub async fn fetch_repo_comments_classified(
             if let Some(etag) = header_string(&headers, ETAG) {
                 response_etag = Some(etag);
             }
-            let page: Vec<ApiComment> = response
-                .json()
-                .await
-                .map_err(|_| QghError::github("GitHub returned invalid comment JSON."))?;
+            let page: Vec<ApiComment> = match response.json().await {
+                Ok(page) => page,
+                Err(_) => {
+                    terminal_error = Some(invalid_comment_response());
+                    break 'repos;
+                }
+            };
             let indexed_at = now_rfc3339();
             for comment in page {
                 let updated_at = comment.updated_at.clone();
@@ -1770,8 +1842,7 @@ pub async fn fetch_repo_comments_classified(
                         handled = true;
                     } else if remote_lookups < parent_resolution_budget {
                         remote_lookups += 1;
-                        match classify_parent(&client, profile, token, repo, number, progress)
-                            .await?
+                        match classify_parent(&client, profile, token, repo, number, progress).await
                         {
                             ParentClass::PullRequest => {
                                 known_pull_requests.insert(number);
@@ -1785,6 +1856,14 @@ pub async fn fetch_repo_comments_classified(
                                 wait_for_backoff(&plan);
                                 backoff = Some(plan);
                                 break;
+                            }
+                            ParentClass::Transient(kind) => {
+                                interruption = Some(LifecycleInterruption::Transient(kind));
+                                break 'repos;
+                            }
+                            ParentClass::Failed(error) => {
+                                terminal_error = Some(error);
+                                break 'repos;
                             }
                         }
                     } else {
@@ -1826,6 +1905,7 @@ pub async fn fetch_repo_comments_classified(
         backoff,
         confirmed_permission_lost_repos: confirmed_permission_lost_repos.into_values().collect(),
         interruption,
+        terminal_error,
     })
 }
 
@@ -1833,6 +1913,8 @@ enum ParentClass {
     PullRequest,
     IssueOrUnknown,
     Backoff(BackoffPlan),
+    Transient(GitHubTransientKind),
+    Failed(QghError),
 }
 
 async fn classify_parent(
@@ -1842,17 +1924,17 @@ async fn classify_parent(
     repo: &RepoRef,
     issue_number: i64,
     progress: Option<&dyn ProgressReporter>,
-) -> Result<ParentClass, QghError> {
+) -> ParentClass {
     let url = issue_object_url(profile, repo, issue_number);
-    let response = github_get(client, &url, token)
-        .send()
-        .await
-        .map_err(|_| QghError::github("GitHub request failed before a response."))?;
+    let response = match github_get(client, &url, token).send().await {
+        Ok(response) => response,
+        Err(error) => return ParentClass::Transient(classify_transport_failure(&error)),
+    };
     let status = response.status();
     let headers = response.headers().clone();
     if let Some(backoff) = backoff_from_response(status, &headers, &repo_comment_endpoint(repo)) {
         emit_backoff(progress, &backoff);
-        return Ok(ParentClass::Backoff(backoff));
+        return ParentClass::Backoff(backoff);
     }
     if !status.is_success() {
         let body = if status == StatusCode::FORBIDDEN {
@@ -1868,19 +1950,19 @@ async fn classify_parent(
             ResponseTarget::Source,
         ) {
             emit_backoff(progress, &plan);
-            return Ok(ParentClass::Backoff(plan));
+            return ParentClass::Backoff(plan);
         }
         // Cannot classify (deleted/permission/etc.): defer rather than guess.
-        return Ok(ParentClass::IssueOrUnknown);
+        return ParentClass::IssueOrUnknown;
     }
-    let issue: ApiIssue = response
-        .json()
-        .await
-        .map_err(|_| QghError::github("GitHub returned invalid issue JSON."))?;
+    let issue: ApiIssue = match response.json().await {
+        Ok(issue) => issue,
+        Err(_) => return ParentClass::Failed(invalid_issue_response()),
+    };
     if issue.pull_request.is_some() {
-        Ok(ParentClass::PullRequest)
+        ParentClass::PullRequest
     } else {
-        Ok(ParentClass::IssueOrUnknown)
+        ParentClass::IssueOrUnknown
     }
 }
 
@@ -1944,6 +2026,7 @@ enum CommentFetchOutcome {
     AuthenticationFailed,
     Transient(GitHubTransientKind),
     AmbiguousForbidden,
+    Failed(QghError),
 }
 
 fn classify_response(
@@ -2344,15 +2427,20 @@ async fn check_candidate_lifecycle_classified(
     };
     let disposition = classify_response(status, &headers, &body, &scope, ResponseTarget::Source);
     if disposition == ResponseDisposition::Redirect {
+        let destination = header_string(&headers, LOCATION)
+            .as_deref()
+            .and_then(|location| parse_issue_location(profile, location));
         return Ok(
-            if matches!(
-                status,
-                StatusCode::MOVED_PERMANENTLY | StatusCode::PERMANENT_REDIRECT
-            ) && candidate.entity_type == "issue"
-                && header_string(&headers, LOCATION)
-                    .as_deref()
-                    .and_then(|location| parse_issue_location(profile, location))
-                    .is_some()
+            if status == StatusCode::MOVED_PERMANENTLY
+                && candidate.entity_type == "issue"
+                && destination.is_some_and(|(repo, issue_number)| {
+                    !same_issue_identity(
+                        &repo.full_name(),
+                        issue_number,
+                        &candidate.repo,
+                        candidate.issue_number,
+                    )
+                })
             {
                 ClassifiedLifecycleCheck::Confirmed {
                     state: ConfirmedRemoteState::SourceTransferred,
@@ -2408,13 +2496,80 @@ fn github_unavailable() -> QghError {
         .with_hint("Retry later; local content was not removed.")
 }
 
-fn repository_permission_loss_requires_typed_handling() -> QghError {
+fn confirmed_lifecycle_requires_typed_handling() -> QghError {
     QghError::new(
-        "github.repository_permission_loss_requires_typed_handling",
-        "Confirmed repository permission loss requires repository-level purge handling.",
+        "github.confirmed_lifecycle_requires_typed_handling",
+        "Confirmed lifecycle evidence requires typed purge handling.",
         3,
     )
-    .with_hint("Retry through a command that applies confirmed repository purge evidence.")
+    .with_hint(
+        "Retry through a command that queues confirmed lifecycle evidence before continuing.",
+    )
+}
+
+fn invalid_issue_response() -> QghError {
+    QghError::new(
+        "github.invalid_issue_json",
+        "GitHub returned invalid issue JSON.",
+        3,
+    )
+}
+
+fn invalid_comment_response() -> QghError {
+    QghError::new(
+        "github.invalid_comment_json",
+        "GitHub returned invalid comment JSON.",
+        3,
+    )
+}
+
+fn unsupported_source_type_error() -> QghError {
+    QghError::validation(
+        "validation.unsupported_source_type",
+        "The requested source type is not supported.",
+    )
+}
+
+fn transfer_cycle_error() -> QghError {
+    QghError::validation(
+        "sync.transfer_cycle",
+        "Issue transfer alias chain contains a cycle.",
+    )
+}
+
+fn transfer_chain_too_long_error() -> QghError {
+    QghError::validation(
+        "sync.transfer_chain_too_long",
+        "Issue transfer alias chain exceeded the follow limit.",
+    )
+}
+
+fn content_free_commit_error(error: QghError) -> QghError {
+    let (code, exit_code) = stable_error_identity(&error, "sync.commit_page_failed", 6);
+    QghError::new(code, "Local page commit failed.", exit_code)
+}
+
+fn content_free_validation_error(error: QghError) -> QghError {
+    let (code, exit_code) = stable_error_identity(&error, "validation.lifecycle_failed", 2);
+    QghError::new(code, "Lifecycle validation failed.", exit_code)
+}
+
+fn stable_error_identity(
+    error: &QghError,
+    fallback_code: &str,
+    fallback_exit: i32,
+) -> (String, i32) {
+    let stable_code = !error.code.is_empty()
+        && error.code.len() <= 96
+        && error
+            .code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if stable_code {
+        (error.code.clone(), error.exit_code)
+    } else {
+        (fallback_code.to_string(), fallback_exit)
+    }
 }
 
 fn github_get(client: &reqwest::Client, url: &str, token: &str) -> reqwest::RequestBuilder {
@@ -2496,6 +2651,15 @@ fn parse_issue_location(profile: &Profile, location: &str) -> Option<(RepoRef, i
         },
         issue_number,
     ))
+}
+
+fn same_issue_identity(
+    left_repo: &str,
+    left_issue_number: i64,
+    right_repo: &str,
+    right_issue_number: i64,
+) -> bool {
+    left_repo.eq_ignore_ascii_case(right_repo) && left_issue_number == right_issue_number
 }
 
 #[derive(Debug, Deserialize)]
@@ -3166,6 +3330,7 @@ mod permission_classification_tests {
             assert!(legacy_fetch_outcome(ClassifiedFetchOutcome {
                 result: empty_fetch_result(),
                 interruption: Some(interruption),
+                terminal_error: None,
             })
             .is_err());
         }
@@ -3177,21 +3342,35 @@ mod permission_classification_tests {
                 retry_after_seconds: 1,
                 reset_at: None,
             })),
+            terminal_error: None,
         })
         .unwrap();
         assert!(matches!(fetch_backoff, FetchOutcome::Backoff(_)));
+
+        let Err(terminal_error) = legacy_fetch_outcome(ClassifiedFetchOutcome {
+            result: empty_fetch_result(),
+            interruption: None,
+            terminal_error: Some(invalid_issue_response()),
+        }) else {
+            panic!("evidence-empty terminal error must surface unchanged");
+        };
+        assert_eq!(terminal_error.code, "github.invalid_issue_json");
     }
 
     #[test]
-    fn compatibility_wrappers_only_mark_confirmed_states_unavailable() {
-        let lifecycle = legacy_lifecycle_check(ClassifiedLifecycleCheck::Confirmed {
+    fn compatibility_wrappers_require_typed_handling_for_all_confirmed_states() {
+        let Err(lifecycle_error) = legacy_lifecycle_check(ClassifiedLifecycleCheck::Confirmed {
             state: ConfirmedRemoteState::SourceDeleted,
             http_status: 404,
-        })
-        .unwrap();
-        assert!(matches!(lifecycle, LifecycleCheck::Unavailable { .. }));
+        }) else {
+            panic!("confirmed lifecycle must require typed handling");
+        };
+        assert_eq!(
+            lifecycle_error.code,
+            "github.confirmed_lifecycle_requires_typed_handling"
+        );
 
-        let target = legacy_target_issue_outcome(target_outcome_for_test(
+        let Err(target_error) = legacy_target_issue_outcome(target_outcome_for_test(
             ClassifiedTargetIssueTerminal::Confirmed {
                 state: ConfirmedRemoteState::SourceDeleted,
                 repo: "owner/repo".to_string(),
@@ -3203,9 +3382,13 @@ mod permission_classification_tests {
                     alias_chain: Vec::new(),
                 },
             },
-        ))
-        .unwrap();
-        assert!(matches!(target, TargetIssueFetchOutcome::Unavailable(_)));
+        )) else {
+            panic!("confirmed target must require typed handling");
+        };
+        assert_eq!(
+            target_error.code,
+            "github.confirmed_lifecycle_requires_typed_handling"
+        );
 
         let Err(lifecycle_error) = legacy_lifecycle_check(ClassifiedLifecycleCheck::Confirmed {
             state: ConfirmedRemoteState::RepositoryPermissionLoss,
@@ -3215,7 +3398,7 @@ mod permission_classification_tests {
         };
         assert_eq!(
             lifecycle_error.code,
-            "github.repository_permission_loss_requires_typed_handling"
+            "github.confirmed_lifecycle_requires_typed_handling"
         );
 
         let Err(target_error) = legacy_target_issue_outcome(target_outcome_for_test(
@@ -3235,17 +3418,17 @@ mod permission_classification_tests {
         };
         assert_eq!(
             target_error.code,
-            "github.repository_permission_loss_requires_typed_handling"
+            "github.confirmed_lifecycle_requires_typed_handling"
         );
     }
 
     #[test]
-    fn full_and_backfill_legacy_wrappers_preserve_confirmed_repo_evidence() {
+    fn full_and_backfill_legacy_wrappers_reject_confirmed_repo_evidence() {
         let confirmed = ConfirmedRepositoryPermissionLoss {
             repo: "owner/repo".to_string(),
             http_status: 404,
         };
-        let fetched = legacy_fetch_outcome(ClassifiedFetchOutcome {
+        let Err(fetched) = legacy_fetch_outcome(ClassifiedFetchOutcome {
             result: FetchResult {
                 issues: 0,
                 comments: 0,
@@ -3254,17 +3437,16 @@ mod permission_classification_tests {
                 confirmed_source_deletions: Vec::new(),
             },
             interruption: None,
-        })
-        .unwrap();
-        let FetchOutcome::Fetched(fetched) = fetched else {
-            panic!("confirmed evidence must remain a fetched payload");
+            terminal_error: Some(invalid_issue_response()),
+        }) else {
+            panic!("confirmed full-fetch evidence must require typed handling");
         };
         assert_eq!(
-            fetched.confirmed_permission_lost_repos,
-            vec![confirmed.clone()]
+            fetched.code,
+            "github.confirmed_lifecycle_requires_typed_handling"
         );
 
-        let backfill = legacy_backfill_outcome(BackfillOutcome {
+        let Err(backfill_error) = legacy_backfill_outcome(BackfillOutcome {
             issues: 0,
             comments: 0,
             skipped_pull_requests: 0,
@@ -3272,10 +3454,54 @@ mod permission_classification_tests {
             confirmed_source_deletions: Vec::new(),
             all_reached_end: false,
             backoff: None,
-            interruption: None,
-        })
-        .unwrap();
-        assert_eq!(backfill.confirmed_permission_lost_repos, vec![confirmed]);
+            interruption: Some(LifecycleInterruption::Transient(
+                GitHubTransientKind::Server,
+            )),
+            terminal_error: None,
+        }) else {
+            panic!("confirmed backfill evidence must require typed handling");
+        };
+        assert_eq!(
+            backfill_error.code,
+            "github.confirmed_lifecycle_requires_typed_handling"
+        );
+
+        let Err(repo_comments_error) = legacy_repo_comments_outcome(RepoCommentsResult {
+            comments: Vec::new(),
+            cursor_updates: Vec::new(),
+            skipped_pr_comments: 0,
+            deferred_comments: 0,
+            backoff: None,
+            confirmed_permission_lost_repos: vec![confirmed],
+            interruption: Some(LifecycleInterruption::Transient(
+                GitHubTransientKind::Server,
+            )),
+            terminal_error: None,
+        }) else {
+            panic!("confirmed repo-comments evidence must require typed handling");
+        };
+        assert_eq!(
+            repo_comments_error.code,
+            "github.confirmed_lifecycle_requires_typed_handling"
+        );
+
+        let Err(target_error) = legacy_target_issue_outcome(ClassifiedTargetIssueFetchOutcome {
+            confirmed_transitions: vec![ConfirmedIssueTransition {
+                source_repo: "owner/a".to_string(),
+                source_issue_number: 1,
+                target_repo: "owner/b".to_string(),
+                target_issue_number: 2,
+                state: ConfirmedRemoteState::SourceTransferred,
+                http_status: 301,
+            }],
+            terminal: ClassifiedTargetIssueTerminal::Failed(invalid_issue_response()),
+        }) else {
+            panic!("confirmed target transition must require typed handling");
+        };
+        assert_eq!(
+            target_error.code,
+            "github.confirmed_lifecycle_requires_typed_handling"
+        );
     }
 
     #[tokio::test]
@@ -3520,11 +3746,142 @@ mod permission_classification_tests {
     }
 
     #[tokio::test]
+    async fn full_fetch_retains_prior_confirmation_with_later_content_free_failures() {
+        let (base_url, request_count, handle) = spawn_owned_responses(vec![
+            NOT_FOUND_RESPONSE.to_string(),
+            NOT_FOUND_RESPONSE.to_string(),
+            json_response("200 OK", "", "{}"),
+        ]);
+        let profile = two_repo_profile(&base_url);
+        let mut commit = |_page: FetchPage| Ok(());
+        let outcome =
+            fetch_issues_classified(&profile, "test-token", &[], false, None, &mut commit)
+                .await
+                .unwrap();
+        handle.join().unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(outcome.result.confirmed_permission_lost_repos.len(), 1);
+        assert!(outcome.interruption.is_none());
+        let error = outcome.terminal_error.expect("typed invalid JSON failure");
+        assert_eq!(error.code, "github.invalid_issue_json");
+
+        let private_message = "private callback content must not escape";
+        let (base_url, request_count, handle) = spawn_owned_responses(vec![
+            NOT_FOUND_RESPONSE.to_string(),
+            NOT_FOUND_RESPONSE.to_string(),
+            json_response("204 No Content", "", ""),
+        ]);
+        let profile = two_repo_profile(&base_url);
+        let mut commit =
+            |_page: FetchPage| Err(QghError::new("storage.commit_failed", private_message, 6));
+        let outcome =
+            fetch_issues_classified(&profile, "test-token", &[], false, None, &mut commit)
+                .await
+                .unwrap();
+        handle.join().unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(outcome.result.confirmed_permission_lost_repos.len(), 1);
+        let error = outcome.terminal_error.expect("typed commit failure");
+        assert_eq!(error.code, "storage.commit_failed");
+        assert!(!format!("{error:?}").contains(private_message));
+    }
+
+    #[tokio::test]
+    async fn classified_bulk_paths_retain_confirmation_before_later_typed_failure() {
+        let responses = vec![
+            NOT_FOUND_RESPONSE.to_string(),
+            NOT_FOUND_RESPONSE.to_string(),
+            json_response("200 OK", "", "{}"),
+        ];
+        let (base_url, _, handle) = spawn_owned_responses(responses);
+        let profile = two_repo_profile(&base_url);
+        let mut commit = |_page: FetchPage| Ok(());
+        let backfill = fetch_backfill_issues_classified(
+            &profile,
+            "test-token",
+            &[],
+            None,
+            None,
+            None,
+            &mut commit,
+        )
+        .await
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(backfill.confirmed_permission_lost_repos.len(), 1);
+        assert_eq!(
+            backfill
+                .terminal_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("github.invalid_issue_json")
+        );
+
+        let responses = vec![
+            NOT_FOUND_RESPONSE.to_string(),
+            NOT_FOUND_RESPONSE.to_string(),
+            json_response("200 OK", "", "{}"),
+        ];
+        let (base_url, _, handle) = spawn_owned_responses(responses);
+        let profile = two_repo_profile(&base_url);
+        let repo_comments =
+            fetch_repo_comments_classified(&profile, "test-token", &[], 0, &|_, _| None, None)
+                .await
+                .unwrap();
+        handle.join().unwrap();
+        assert_eq!(repo_comments.confirmed_permission_lost_repos.len(), 1);
+        assert_eq!(
+            repo_comments
+                .terminal_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("github.invalid_comment_json")
+        );
+
+        let (base_url, _, handle) = spawn_owned_responses(vec![
+            NOT_FOUND_RESPONSE.to_string(),
+            OK_RESPONSE.to_string(),
+        ]);
+        let profile = two_repo_profile(&base_url);
+        let candidates = vec![
+            ReconciliationCandidate {
+                source_id: "qgh://example.test/issue/I_A".to_string(),
+                entity_type: "issue".to_string(),
+                repo: "owner/a".to_string(),
+                issue_number: 1,
+                github_id: 1,
+            },
+            ReconciliationCandidate {
+                source_id: "qgh://example.test/unsupported/X".to_string(),
+                entity_type: "unsupported".to_string(),
+                repo: "owner/b".to_string(),
+                issue_number: 2,
+                github_id: 2,
+            },
+        ];
+        let reconciliation = reconcile_sources(&profile, "test-token", &candidates, None)
+            .await
+            .unwrap();
+        handle.join().unwrap();
+        assert_eq!(reconciliation.unavailable_sources.len(), 1);
+        assert_eq!(
+            reconciliation
+                .terminal_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("validation.unsupported_source_type")
+        );
+    }
+
+    #[tokio::test]
     async fn temporary_or_invalid_redirect_never_confirms_transfer() {
         let responses = [
             "HTTP/1.1 302 Found\r\nlocation: /repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
             "HTTP/1.1 307 Temporary Redirect\r\nlocation: /repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
             "HTTP/1.1 301 Moved Permanently\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/repo/issues/42\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/OWNER/REPO/issues/42\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 308 Permanent Redirect\r\nlocation: /repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
             "HTTP/1.1 308 Permanent Redirect\r\nlocation: not a url\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
             "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/repo/pulls/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
             "HTTP/1.1 308 Permanent Redirect\r\nlocation: https://other.example/repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
@@ -3549,7 +3906,7 @@ mod permission_classification_tests {
 
     #[tokio::test]
     async fn followed_permanent_transfer_carries_typed_transition() {
-        const REDIRECT: &str = "HTTP/1.1 308 Permanent Redirect\r\nlocation: /repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+        const REDIRECT: &str = "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
         let issue = r#"{"id":99,"node_id":"I_MOVED","number":99,"title":"Moved","body":"Public","state":"open","labels":[],"milestone":null,"assignees":[],"user":{"login":"alice"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","closed_at":null,"html_url":"https://example.test/owner/repo/issues/99"}"#;
         let responses = vec![
             REDIRECT.to_string(),
@@ -3573,8 +3930,106 @@ mod permission_classification_tests {
             Some(ConfirmedRemoteState::SourceTransferred)
         );
         assert_eq!(fetched.lifecycle.status, "transferred");
-        assert_eq!(fetched.lifecycle.http_status, Some(308));
+        assert_eq!(fetched.lifecycle.http_status, Some(301));
         assert_eq!(request_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn followed_transfer_retains_transition_across_parse_and_validation_failures() {
+        let redirect = "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/b/issues/2\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}".to_string();
+        let issue = r#"{"id":2,"node_id":"I_B","number":2,"title":"Moved","body":"Public","state":"open","labels":[],"milestone":null,"assignees":[],"user":{"login":"alice"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","closed_at":null,"html_url":"https://example.test/owner/b/issues/2"}"#;
+        let pull_request = issue.replace("\"html_url\"", "\"pull_request\":{},\"html_url\"");
+        let cases = vec![
+            (
+                vec![redirect.clone(), json_response("200 OK", "", "{}")],
+                "github.invalid_issue_json",
+            ),
+            (
+                vec![
+                    redirect.clone(),
+                    json_response("200 OK", "", issue),
+                    json_response("200 OK", "", "{}"),
+                ],
+                "github.invalid_comment_json",
+            ),
+            (
+                vec![redirect, json_response("200 OK", "", &pull_request)],
+                "validation.unsupported_source_type",
+            ),
+        ];
+
+        for (responses, expected_code) in cases {
+            let (base_url, _, handle) = spawn_owned_responses(responses);
+            let profile = two_repo_profile(&base_url);
+            let outcome = fetch_target_issue_classified(&profile, "test-token", &repo_a(), 1, None)
+                .await
+                .unwrap();
+            handle.join().unwrap();
+            assert_eq!(outcome.confirmed_transitions.len(), 1);
+            let ClassifiedTargetIssueTerminal::Failed(error) = outcome.terminal else {
+                panic!("post-transfer failure must remain typed");
+            };
+            assert_eq!(error.code, expected_code);
+            assert!(error
+                .details
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty));
+        }
+    }
+
+    #[tokio::test]
+    async fn followed_transfer_retains_all_transitions_on_cycle_and_limit_failure() {
+        let responses = vec![
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/b/issues/2\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}".to_string(),
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/a/issues/1\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}".to_string(),
+        ];
+        let (base_url, request_count, handle) = spawn_owned_responses(responses);
+        let profile = two_repo_profile(&base_url);
+        let outcome = fetch_target_issue_classified(&profile, "test-token", &repo_a(), 1, None)
+            .await
+            .unwrap();
+        handle.join().unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(outcome.confirmed_transitions.len(), 2);
+        let ClassifiedTargetIssueTerminal::Failed(error) = outcome.terminal else {
+            panic!("transfer cycle must remain typed");
+        };
+        assert_eq!(error.code, "sync.transfer_cycle");
+        assert!(error
+            .details
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty));
+
+        let repos = (0..=8)
+            .map(|index| RepoRef {
+                owner: "owner".to_string(),
+                name: format!("r{index}"),
+            })
+            .collect::<Vec<_>>();
+        let start_repo = repos[0].clone();
+        let responses = (1..=8)
+            .map(|index| {
+                format!(
+                    "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/r{index}/issues/{index}\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}"
+                )
+            })
+            .collect::<Vec<_>>();
+        let (base_url, request_count, handle) = spawn_owned_responses(responses);
+        let profile = test_profile_with_repos(&base_url, repos);
+        let outcome = fetch_target_issue_classified(&profile, "test-token", &start_repo, 1, None)
+            .await
+            .unwrap();
+        handle.join().unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), 8);
+        assert_eq!(outcome.confirmed_transitions.len(), 8);
+        let ClassifiedTargetIssueTerminal::Failed(error) = outcome.terminal else {
+            panic!("transfer follow limit must remain typed");
+        };
+        assert_eq!(error.code, "sync.transfer_chain_too_long");
+        assert!(error
+            .details
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty));
     }
 
     #[tokio::test]
@@ -3619,7 +4074,7 @@ mod permission_classification_tests {
 
     #[tokio::test]
     async fn followed_transfer_preserves_transition_with_comment_repo_loss() {
-        const REDIRECT: &str = "HTTP/1.1 308 Permanent Redirect\r\nlocation: /repos/owner/b/issues/2\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+        const REDIRECT: &str = "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/b/issues/2\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
         let issue = r#"{"id":2,"node_id":"I_B","number":2,"title":"Moved","body":"Public","state":"open","labels":[],"milestone":null,"assignees":[],"user":{"login":"alice"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","closed_at":null,"html_url":"https://example.test/owner/b/issues/2"}"#;
         let responses = vec![
             REDIRECT.to_string(),
@@ -3675,7 +4130,7 @@ mod permission_classification_tests {
 
         let responses = vec![
             "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/b/issues/2\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}".to_string(),
-            "HTTP/1.1 308 Permanent Redirect\r\nlocation: /repos/owner/b/issues/3\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}".to_string(),
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/b/issues/3\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}".to_string(),
             json_response("429 Too Many Requests", "retry-after: 0\r\n", "{}"),
         ];
         let (base_url, _, handle) = spawn_owned_responses(responses);
@@ -3728,6 +4183,9 @@ mod permission_classification_tests {
         };
         for response in [
             "HTTP/1.1 302 Found\r\nlocation: /repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 308 Permanent Redirect\r\nlocation: /repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/repo/issues/42\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/OWNER/REPO/issues/42\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
             "HTTP/1.1 301 Moved Permanently\r\nlocation: https://other.example/repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
         ] {
             let (base_url, _, handle) = spawn_responses(vec![response]);
