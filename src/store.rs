@@ -709,14 +709,34 @@ impl Store {
         if !embedding_schema_exists(&self.conn)? {
             return Ok(0);
         }
-        const STALE_CHUNK_FILTER: &str = "SELECT c.id
+        let protected_generation_clause =
+            if table_exists(&self.conn, "embedding_generation_chunks")? {
+                " AND c.id NOT IN (
+                SELECT egc.chunk_id
+                FROM embedding_generation_chunks egc
+                JOIN retrieval_publications rp
+                  ON rp.embedding_generation_id = egc.generation_id
+                WHERE rp.active = 1
+                   OR rp.publication_id = (
+                       SELECT publication_id FROM retrieval_publications
+                       WHERE active = 0 AND embedding_generation_id IS NOT NULL
+                       ORDER BY created_at DESC LIMIT 1
+                   )
+            )"
+            } else {
+                ""
+            };
+        let stale_chunk_filter = format!(
+            "SELECT c.id
              FROM chunks c
              LEFT JOIN source_entities se ON se.source_id = c.source_id
              LEFT JOIN issue_metadata im ON im.source_id = c.source_id
              LEFT JOIN comment_metadata cm ON cm.source_id = c.source_id
              WHERE se.lifecycle_state IS NULL
                 OR se.lifecycle_state != 'active'
-                OR c.source_version_id != coalesce(im.latest_version_id, cm.latest_version_id, -1)";
+                OR (c.source_version_id != coalesce(im.latest_version_id, cm.latest_version_id, -1)
+                    {protected_generation_clause})"
+        );
 
         let vector_table_exists = vector_table_dimension(&self.conn)?.is_some();
         let tx = self.conn.transaction()?;
@@ -725,7 +745,7 @@ impl Store {
                 &format!(
                     "DELETE FROM {CHUNK_EMBEDDING_VECTORS_TABLE}
                      WHERE rowid NOT IN (SELECT id FROM chunks)
-                        OR rowid IN ({STALE_CHUNK_FILTER})"
+                        OR rowid IN ({stale_chunk_filter})"
                 ),
                 [],
             )?;
@@ -733,16 +753,46 @@ impl Store {
         tx.execute(
             &format!(
                 "DELETE FROM chunk_embeddings
-                 WHERE chunk_id IN ({STALE_CHUNK_FILTER})"
+                 WHERE chunk_id IN ({stale_chunk_filter})"
             ),
             [],
         )?;
         let deleted_chunks = tx.execute(
-            &format!("DELETE FROM chunks WHERE id IN ({STALE_CHUNK_FILTER})"),
+            &format!("DELETE FROM chunks WHERE id IN ({stale_chunk_filter})"),
             [],
         )?;
         tx.commit()?;
         Ok(deleted_chunks)
+    }
+
+    pub fn cleanup_tombstoned_embedding_artifacts(&mut self) -> Result<usize, QghError> {
+        if !embedding_schema_exists(&self.conn)? {
+            return Ok(0);
+        }
+        const TOMBSTONED_CHUNKS: &str = "SELECT c.id FROM chunks c
+             LEFT JOIN source_entities se ON se.source_id = c.source_id
+             WHERE se.lifecycle_state IS NULL OR se.lifecycle_state != 'active'";
+        let vector_table_exists = vector_table_dimension(&self.conn)?.is_some();
+        let tx = self.conn.transaction()?;
+        if vector_table_exists {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {CHUNK_EMBEDDING_VECTORS_TABLE}
+                     WHERE rowid IN ({TOMBSTONED_CHUNKS})"
+                ),
+                [],
+            )?;
+        }
+        tx.execute(
+            &format!("DELETE FROM chunk_embeddings WHERE chunk_id IN ({TOMBSTONED_CHUNKS})"),
+            [],
+        )?;
+        let deleted = tx.execute(
+            &format!("DELETE FROM chunks WHERE id IN ({TOMBSTONED_CHUNKS})"),
+            [],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub fn active_embedding_chunks(&self) -> Result<Vec<StoredChunk>, QghError> {
@@ -1230,6 +1280,7 @@ impl Store {
 
     pub fn generation_vector_search(
         &self,
+        generation_id: i64,
         query_vector: &[f32],
         filters: &VectorSearchFilters,
         limit: usize,
@@ -1237,51 +1288,116 @@ impl Store {
         if limit == 0 || query_vector.is_empty() || filters.source_types.is_empty() {
             return Ok(Vec::new());
         }
-        let Some(generation_id) = self
-            .active_retrieval_publication()?
-            .and_then(|publication| publication.embedding_generation_id)
-        else {
-            return Ok(Vec::new());
-        };
-        let mut sql = String::from(
-            "SELECT gc.vector_blob, gc.vector_dimension, c.id, c.source_id,
+        if !query_vector.iter().all(|value| value.is_finite())
+            || query_vector.iter().all(|value| *value == 0.0)
+        {
+            return Err(QghError::validation(
+                "embedding.invalid_query_vector",
+                "Query embedding must contain finite, non-zero values.",
+            ));
+        }
+        let (state, output_dimension, total_chunks, completed_chunks): (String, i64, i64, i64) =
+            self.conn.query_row(
+                "SELECT state, output_dimension, total_chunks, completed_chunks
+                 FROM embedding_generations WHERE id = ?1",
+                params![generation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let generation_rows: i64 = self.conn.query_row(
+            "SELECT count(*) FROM embedding_generation_chunks WHERE generation_id = ?1",
+            params![generation_id],
+            |row| row.get(0),
+        )?;
+        let vector_rows: i64 = self.conn.query_row(
+            "SELECT count(*) FROM embedding_generation_vector_rows WHERE generation_id = ?1",
+            params![generation_id],
+            |row| row.get(0),
+        )?;
+        if !matches!(state.as_str(), "active" | "ready")
+            || output_dimension as usize != query_vector.len()
+            || completed_chunks != total_chunks
+            || generation_rows != total_chunks
+            || vector_rows != total_chunks
+        {
+            return Err(QghError::validation(
+                "embedding.generation_corrupt",
+                "The published embedding generation is incomplete or inconsistent.",
+            ));
+        }
+        let vector_table = generation_vector_table_name(output_dimension as usize);
+        if !table_exists(&self.conn, &vector_table)? {
+            return Err(QghError::validation(
+                "embedding.generation_corrupt",
+                "The published embedding generation vector index is missing.",
+            ));
+        }
+        let candidate_limit = limit.saturating_mul(4).max(limit).max(1);
+        let mut prefilter_sql = String::from(
+            "SELECT c2.id FROM chunks c2
+             JOIN source_entities se ON se.source_id = c2.source_id
+             LEFT JOIN issue_metadata im ON im.source_id = c2.source_id
+             LEFT JOIN comment_metadata cm ON cm.source_id = c2.source_id
+             WHERE se.lifecycle_state = 'active'",
+        );
+        let mut params = vec![
+            Value::Blob(encode_embedding_blob(query_vector)),
+            Value::Integer(candidate_limit as i64),
+            Value::Integer(generation_id),
+        ];
+        push_vector_filter_sql(filters, &mut prefilter_sql, &mut params);
+        params.push(Value::Integer(limit as i64));
+        let sql = format!(
+            "WITH vector_candidates AS (
+                SELECT m.chunk_id, v.distance
+                FROM {vector_table} v
+                JOIN embedding_generation_vector_rows m ON m.vector_rowid = v.rowid
+                WHERE v.embedding MATCH ? AND v.k = ?
+                  AND m.generation_id = ?
+                  AND m.chunk_id IN ({prefilter_sql})
+                ORDER BY v.distance
+             )
+             SELECT gc.vector_blob, gc.vector_dimension, gc.vector_checksum,
+                    c.id, c.source_id,
                     c.source_version_id, c.body, c.chunk_index, c.token_start,
                     c.token_end, c.byte_start, c.byte_end, c.chunker_version,
-                    c.chunker_fingerprint, c.heading_path_json, sv.body_hash
-             FROM embedding_generation_chunks gc
+                    c.chunker_fingerprint, c.heading_path_json, sv.body_hash,
+                    vector_candidates.distance
+             FROM vector_candidates
+             JOIN embedding_generation_chunks gc
+               ON gc.generation_id = {generation_id}
+              AND gc.chunk_id = vector_candidates.chunk_id
              JOIN chunks c ON c.id = gc.chunk_id
              JOIN source_versions sv ON sv.id = c.source_version_id
-             JOIN source_entities se ON se.source_id = c.source_id
-             LEFT JOIN issue_metadata im ON im.source_id = c.source_id
-             LEFT JOIN comment_metadata cm ON cm.source_id = c.source_id
-             WHERE gc.generation_id = ? AND se.lifecycle_state = 'active'",
+             ORDER BY vector_candidates.distance, c.id
+             LIMIT ?",
         );
-        let mut params = vec![Value::Integer(generation_id)];
-        push_vector_filter_sql(filters, &mut sql, &mut params);
         let mut stmt = self.conn.prepare(&sql)?;
         let mut candidates = Vec::new();
         for row in stmt.query_map(params_from_iter(params.iter()), |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, i64>(1)? as usize,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, i64>(6)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
                 row.get::<_, i64>(7)?,
                 row.get::<_, i64>(8)?,
                 row.get::<_, i64>(9)?,
                 row.get::<_, i64>(10)?,
-                row.get::<_, String>(11)?,
+                row.get::<_, i64>(11)?,
                 row.get::<_, String>(12)?,
                 row.get::<_, String>(13)?,
                 row.get::<_, String>(14)?,
+                row.get::<_, String>(15)?,
+                row.get::<_, f32>(16)?,
             ))
         })? {
             let (
                 blob,
                 dimension,
+                checksum,
                 chunk_id,
                 source_id,
                 source_version_id,
@@ -1295,14 +1411,23 @@ impl Store {
                 chunker_fingerprint,
                 heading_path_json,
                 source_version_hash,
+                distance,
             ) = row?;
-            let Ok(vector) = decode_embedding_blob(&blob, dimension) else {
-                continue;
-            };
-            if vector.len() != query_vector.len() {
-                continue;
+            if dimension != query_vector.len() || embedding_blob_checksum(&blob) != checksum {
+                return Err(QghError::validation(
+                    "embedding.generation_corrupt",
+                    "A published embedding row failed checksum or dimension validation.",
+                ));
             }
-            let distance = 1.0 - cosine_similarity(query_vector, &vector);
+            let vector = decode_embedding_blob(&blob, dimension)?;
+            if !vector.iter().all(|value| value.is_finite())
+                || vector.iter().all(|value| *value == 0.0)
+            {
+                return Err(QghError::validation(
+                    "embedding.generation_corrupt",
+                    "A published embedding row contains invalid values.",
+                ));
+            }
             candidates.push(VectorSearchHit {
                 source_id: source_id.clone(),
                 chunk: StoredChunk {
@@ -1323,7 +1448,6 @@ impl Store {
                 vector_distance: distance,
             });
         }
-        candidates.sort_by(|a, b| a.vector_distance.total_cmp(&b.vector_distance));
         let mut seen = BTreeSet::new();
         Ok(candidates
             .into_iter()
@@ -1698,6 +1822,17 @@ impl Store {
             .map_err(QghError::from)
     }
 
+    pub fn index_path_for_generation(&self, generation: i64) -> Result<Option<String>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT path FROM index_generations WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(QghError::from)
+    }
+
     pub fn record_reconciliation_run(
         &self,
         mode: &str,
@@ -1925,6 +2060,17 @@ impl Store {
                 "SELECT id FROM sync_runs
                  WHERE completed_successfully = 1
                  ORDER BY completed_at DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(QghError::from)
+    }
+
+    pub fn latest_sync_run_id(&self) -> Result<Option<String>, QghError> {
+        self.conn
+            .query_row(
+                "SELECT id FROM sync_runs ORDER BY started_at DESC, rowid DESC LIMIT 1",
                 [],
                 |row| row.get(0),
             )
@@ -2332,7 +2478,9 @@ impl Store {
             .map_err(QghError::from)
     }
 
-    pub fn active_embedding_generation_coverage(&self) -> Result<Option<(i64, i64)>, QghError> {
+    pub fn active_embedding_generation_coverage(
+        &self,
+    ) -> Result<Option<(i64, i64, i64, bool)>, QghError> {
         if !table_exists(&self.conn, "embedding_generations")?
             || !table_exists(&self.conn, "embedding_generation_chunks")?
             || !table_exists(&self.conn, "retrieval_publications")?
@@ -2342,13 +2490,26 @@ impl Store {
         }
         self.conn
             .query_row(
-                "SELECT eg.id, count(egc.chunk_id) FROM retrieval_publication_pointer p
+                "SELECT eg.id, eg.total_chunks, eg.completed_chunks,
+                        (eg.state IN ('active', 'ready')
+                         AND eg.total_chunks = eg.completed_chunks
+                         AND eg.total_chunks = count(DISTINCT egc.chunk_id)
+                         AND eg.total_chunks = count(DISTINCT egvr.chunk_id))
+                 FROM retrieval_publication_pointer p
              JOIN retrieval_publications rp ON rp.publication_id = p.publication_id
              JOIN embedding_generations eg ON eg.id = rp.embedding_generation_id
              LEFT JOIN embedding_generation_chunks egc ON egc.generation_id = eg.id
+             LEFT JOIN embedding_generation_vector_rows egvr ON egvr.generation_id = eg.id
              WHERE p.id = 1 GROUP BY eg.id",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get::<_, i64>(3)? != 0,
+                    ))
+                },
             )
             .optional()
             .map_err(QghError::from)
@@ -2448,6 +2609,28 @@ impl Store {
                  ON CONFLICT(id) DO UPDATE SET publication_id = excluded.publication_id",
                 params![publication_id],
             )?;
+            let index_exists = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM index_generations WHERE generation = ?1",
+                    params![tantivy_generation],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !index_exists {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    "publication.tantivy_generation_missing".to_string(),
+                ));
+            }
+            self.conn.execute(
+                "UPDATE index_generations SET active = CASE WHEN generation = ?1 THEN 1 ELSE 0 END",
+                params![tantivy_generation],
+            )?;
+            self.conn.execute(
+                "UPDATE index_tasks SET completed_at = ?1 WHERE completed_at IS NULL",
+                params![now],
+            )?;
             if let Some(generation_id) = embedding_generation_id {
                 self.conn.execute(
                     "UPDATE embedding_generations SET state = 'active', updated_at = ?2 WHERE id = ?1",
@@ -2484,6 +2667,15 @@ impl Store {
                 Err(QghError::validation(
                     "publication.cas_conflict",
                     "Retrieval publication changed before activation.",
+                ))
+            }
+            Err(rusqlite::Error::InvalidParameterName(code))
+                if code == "publication.tantivy_generation_missing" =>
+            {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(QghError::validation(
+                    "publication.tantivy_generation_missing",
+                    "The retrieval publication references a missing Tantivy generation.",
                 ))
             }
             Err(error) => {
@@ -3215,20 +3407,6 @@ fn encode_embedding_blob(vector: &[f32]) -> Vec<u8> {
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect()
-}
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let (mut dot, mut na, mut nb) = (0.0, 0.0, 0.0);
-    for (x, y) in a.iter().zip(b) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na.sqrt() * nb.sqrt())
-    }
 }
 
 fn decode_embedding_blob(bytes: &[u8], dimension: usize) -> Result<Vec<f32>, QghError> {
@@ -4063,6 +4241,9 @@ mod tests {
         store
             .validate_embedding_generation(second_generation)
             .unwrap();
+        store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
         let publication = store
             .activate_retrieval_publication("generation-sync", 1, Some(second_generation), None)
             .unwrap();
@@ -4073,6 +4254,25 @@ mod tests {
             Some(second_generation)
         );
         assert_eq!(publication_view.output_dimension, Some(3));
+        store
+            .conn
+            .execute(
+                "DELETE FROM embedding_generation_vector_rows WHERE generation_id = ?1",
+                params![second_generation],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .generation_vector_search(
+                    second_generation,
+                    &[1.0, 2.0, 3.0],
+                    &VectorSearchFilters::default(),
+                    5,
+                )
+                .unwrap_err()
+                .code,
+            "embedding.generation_corrupt"
+        );
         let missing_generation = store
             .begin_embedding_generation(&EmbeddingGenerationSpec {
                 model_manifest_hash: "manifest-missing".to_string(),
@@ -4114,6 +4314,9 @@ mod tests {
     fn retrieval_publication_cas_keeps_bm25_embedding_null_and_rolls_back_conflicts() {
         let paths = temp_profile_paths("publication-cas");
         let mut store = Store::open(&paths).unwrap();
+        store
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
         let first = store
             .activate_retrieval_publication("sync-one", 1, None, None)
             .unwrap();
@@ -4121,12 +4324,19 @@ mod tests {
         assert_eq!(active.publication_id, first);
         assert_eq!(active.embedding_generation_id, None);
         assert_eq!(active.tantivy_generation, 1);
+        store
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
         let second = store
             .activate_retrieval_publication("sync-two", 2, None, Some(first))
             .unwrap();
         assert_ne!(first, second);
+        store
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
         let conflict = store.activate_retrieval_publication("sync-three", 3, None, Some(first));
         assert_eq!(conflict.unwrap_err().code, "publication.cas_conflict");
+        assert_eq!(store.active_index_generation().unwrap(), Some(2));
         assert_eq!(
             store
                 .active_retrieval_publication()

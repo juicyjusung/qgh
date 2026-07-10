@@ -378,7 +378,11 @@ fn sync_reports_human_progress_on_stderr_without_polluting_stdout() {
 
     let quiet = fixture.qgh(["sync", "--quiet"]);
     assert_success(&quiet);
-    assert!(stderr_text(&quiet).is_empty());
+    assert!(
+        stderr_text(&quiet).is_empty(),
+        "quiet stderr: {}",
+        stderr_text(&quiet)
+    );
     assert!(stdout_text(&quiet).contains("qgh sync complete"));
     assert!(!stdout_text(&quiet).starts_with('{'));
 

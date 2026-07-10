@@ -11,6 +11,7 @@ use tantivy::{Index, TantivyDocument, Term};
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub source_id: String,
+    pub source_updated_at: Option<String>,
     pub score: f32,
 }
 
@@ -160,6 +161,7 @@ pub fn search_with_filters_profile(
     let author = schema
         .get_field("author")
         .map_err(|e| QghError::index(e.to_string()))?;
+    let updated_at = schema.get_field("updated_at").ok();
     let reader = index.reader().map_err(|e| QghError::index(e.to_string()))?;
     let searcher = reader.searcher();
     let mut query_fields = vec![title, body, labels, repo, issue_number];
@@ -207,6 +209,10 @@ pub fn search_with_filters_profile(
         };
         hits.push(SearchHit {
             source_id: source_id_text.to_string(),
+            source_updated_at: updated_at
+                .and_then(|field| doc.get_first(field))
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
             score,
         });
     }
@@ -486,6 +492,11 @@ mod tests {
         assert_eq!(
             hits.first().map(|hit| hit.source_id.as_str()),
             Some("qgh://github.com/issue/I_kwDOCJK1")
+        );
+        assert_eq!(
+            hits.first()
+                .and_then(|hit| hit.source_updated_at.as_deref()),
+            Some("2026-01-01T00:00:00Z")
         );
         let _ = fs::remove_dir_all(index_root);
     }

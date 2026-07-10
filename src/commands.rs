@@ -30,8 +30,8 @@ use crate::model::{
 };
 use crate::paths::ProfilePaths;
 use crate::resolution::ResolvedRepoScope;
-use crate::store::Store;
-use chrono::{DateTime, Utc};
+use crate::store::{RetrievalPublicationView, Store};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt;
@@ -43,6 +43,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 const GET_BATCH_SIZE_CAP: usize = 20;
 const HYBRID_RRF_K: f32 = 60.0;
+const STALE_BUILDING_RETENTION_HOURS: i64 = 24;
+const PREVIOUS_READY_RETENTION_DAYS: i64 = 7;
 const HYBRID_OVERFETCH_FACTOR: usize = 4;
 
 /// Default `--if-stale` threshold when neither the flag nor `[sync].max_age`
@@ -831,29 +833,34 @@ fn rebuild_bm25_index(
         store.reserve_index_generation(&profile.paths.index_root, sources.len())?;
     let generation_path = index::rebuild(&profile.paths.index_root, generation, &sources)?;
     debug_assert_eq!(generation_path, reserved_generation_path);
-    store.mark_index_published(
-        generation,
-        &generation_path.to_string_lossy(),
-        sources.len(),
-    )?;
     let expected_publication_id = store
         .active_retrieval_publication()?
         .map(|publication| publication.publication_id);
     if profile.embedding.is_none() || embedding_generation_id.is_some() {
-        if let Some(sync_run_id) = store.latest_successful_sync_run_id()? {
-            if store
-                .activate_retrieval_publication(
-                    &sync_run_id,
-                    generation,
-                    embedding_generation_id,
-                    expected_publication_id,
-                )
-                .is_err()
-            {
-                warnings.push(embedding_sync_warning(
+        if let Some(sync_run_id) = store.latest_sync_run_id()? {
+            match store.activate_retrieval_publication(
+                &sync_run_id,
+                generation,
+                embedding_generation_id,
+                expected_publication_id,
+            ) {
+                Ok(_) if profile.embedding.is_some() => {
+                    match cleanup_old_embedding_generations(store) {
+                        Ok(removed) if removed > 0 => progress.line(format_args!(
+                            "qgh sync: cleaned expired embedding generations count={removed}"
+                        )),
+                        Ok(_) => {}
+                        Err(_) => warnings.push(embedding_sync_warning(
+                            "embedding.generation_cleanup_failed",
+                            "Expired embedding generation cleanup failed after publication. Retrieval remains available.",
+                        )),
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => warnings.push(embedding_sync_warning(
                     "publication.activation_failed",
                     "Retrieval publication activation failed after BM25 rebuild. The previous publication remains active.",
-                ));
+                )),
             }
         }
     }
@@ -899,17 +906,16 @@ fn refresh_embedding_for_sync_if_enabled(
         ));
         return (warnings, None);
     }
-    match store.cleanup_inactive_embedding_artifacts() {
+    match store.cleanup_tombstoned_embedding_artifacts() {
         Ok(cleaned_chunks) if cleaned_chunks > 0 => progress.line(format_args!(
-            "qgh sync: cleaned stale embedding artifacts chunks={cleaned_chunks}"
+            "qgh sync: purged tombstoned embedding artifacts chunks={cleaned_chunks}"
         )),
         Ok(_) => {}
         Err(_) => warnings.push(embedding_sync_warning(
-            "embedding.sync_cleanup_failed",
-            "Embedding artifact cleanup failed during sync. BM25 index refresh remains available.",
+            "embedding.tombstone_cleanup_failed",
+            "Tombstoned embedding artifact cleanup failed during sync. BM25 results remain available.",
         )),
     }
-
     let tokenizer = match embedding_tokenizer(embedding) {
         Ok(tokenizer) => tokenizer,
         Err(_) => {
@@ -1102,6 +1108,18 @@ fn embedding_sync_warning(code: &'static str, message: &'static str) -> Value {
     })
 }
 
+fn cleanup_old_embedding_generations(store: &mut Store) -> Result<usize, QghError> {
+    let now = Utc::now();
+    let stale_building_before = (now - Duration::hours(STALE_BUILDING_RETENTION_HOURS))
+        .to_rfc3339_opts(SecondsFormat::Secs, true);
+    let previous_ready_before = (now - Duration::days(PREVIOUS_READY_RETENTION_DAYS))
+        .to_rfc3339_opts(SecondsFormat::Secs, true);
+    let removed_generations =
+        store.cleanup_embedding_generations(&stale_building_before, &previous_ready_before)?;
+    let removed_chunks = store.cleanup_inactive_embedding_artifacts()?;
+    Ok(removed_generations + removed_chunks)
+}
+
 #[cfg(feature = "fastembed-provider")]
 fn embedding_tokenizer(
     embedding: &EmbeddingConfig,
@@ -1261,6 +1279,23 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
         runtime.provider.as_ref(),
         runtime.fingerprint_seed.clone(),
     )?;
+    let mut warnings = Vec::new();
+    let publication_activated = store
+        .active_retrieval_publication()?
+        .and_then(|publication| publication.embedding_generation_id)
+        .is_some();
+    if publication_activated {
+        match cleanup_old_embedding_generations(&mut store) {
+            Ok(removed) if removed > 0 => progress.line(format_args!(
+                "qgh embed: cleaned expired embedding generations count={removed}"
+            )),
+            Ok(_) => {}
+            Err(_) => warnings.push(embedding_sync_warning(
+                "embedding.generation_cleanup_failed",
+                "Expired embedding generation cleanup failed after publication. Retrieval remains available.",
+            )),
+        }
+    }
     Ok(LocalReadOutcome {
         data: json!({
             "profile_id": profile.id,
@@ -1270,7 +1305,7 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
                 "embedded": data["embedded_chunks"]
             }
         }),
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -2318,6 +2353,7 @@ pub fn query(
         false
     };
     let overrides = freshness_overrides(args.max_age.as_deref(), args.require_fresh)?;
+    let publication = store.active_retrieval_publication()?;
     if let Some(results) = exact_results(&store, &args.query, &filters, &profile.id)? {
         let last_successful_sync_at =
             query_freshness_sync_time(&store, &profile, &filters, &results)?;
@@ -2357,11 +2393,19 @@ pub fn query(
         });
     }
     let (hybrid_vector_hits, mut hybrid_warnings) = if vector_enabled {
-        hybrid_vector_hits(&profile, &store, &args.query, &filters, limit)?
+        hybrid_vector_hits(
+            &profile,
+            &store,
+            publication.as_ref(),
+            &args.query,
+            &filters,
+            limit,
+        )?
     } else {
         (None, vector_open_warnings)
     };
-    let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
+    let active_index_path =
+        publication_index_path(&store, publication.as_ref(), &profile.paths.index_active)?;
     let lexical_limit = if hybrid_vector_hits.is_some() {
         hybrid_candidate_limit(limit)
     } else {
@@ -2388,6 +2432,21 @@ pub fn query(
             unresolvable_hits += 1;
             continue;
         };
+        let lexical_version_matches = hit
+            .lexical_source_updated_at
+            .as_ref()
+            .is_none_or(|indexed| indexed == stored_source_updated_at(&source));
+        let vector_version_matches = match hit.vector_evidence.as_ref() {
+            Some(evidence) => {
+                store.latest_source_version_id(&hit.source_id)?
+                    == Some(evidence.chunk.source_version_id)
+            }
+            None => true,
+        };
+        if !lexical_version_matches || !vector_version_matches {
+            unresolvable_hits += 1;
+            continue;
+        }
         if !filters.matches(&source) {
             continue;
         }
@@ -2429,6 +2488,13 @@ pub fn query(
         }),
         warnings,
     })
+}
+
+fn stored_source_updated_at(source: &StoredSource) -> &str {
+    match source {
+        StoredSource::Issue(issue) => &issue.source_version.github_updated_at,
+        StoredSource::Comment(comment) => &comment.source_version.github_updated_at,
+    }
 }
 
 fn explicit_profile_for_init(profile_arg: Option<&str>) -> Option<(String, &'static str)> {
@@ -2641,6 +2707,7 @@ impl QueryFilters {
 #[derive(Debug)]
 struct QueryHit {
     source_id: String,
+    lexical_source_updated_at: Option<String>,
     ranking: Ranking,
     vector_evidence: Option<MatchedChunkEvidence>,
     lexical_evidence: Option<MatchedChunkEvidence>,
@@ -2660,6 +2727,7 @@ impl QueryHit {
     fn from_bm25(hit: index::SearchHit) -> Self {
         Self {
             source_id: hit.source_id,
+            lexical_source_updated_at: hit.source_updated_at,
             ranking: Ranking::Bm25(hit.score),
             vector_evidence: None,
             lexical_evidence: None,
@@ -2672,6 +2740,7 @@ struct HybridAccumulator {
     source_id: String,
     bm25_rank: Option<usize>,
     bm25_score: Option<f32>,
+    lexical_source_updated_at: Option<String>,
     vector_rank: Option<usize>,
     vector_distance: Option<f32>,
     vector_evidence: Option<MatchedChunkEvidence>,
@@ -2685,10 +2754,11 @@ impl HybridAccumulator {
         }
     }
 
-    fn record_bm25(&mut self, rank: usize, score: f32) {
+    fn record_bm25(&mut self, rank: usize, score: f32, source_updated_at: Option<String>) {
         if self.bm25_rank.is_none_or(|current| rank < current) {
             self.bm25_rank = Some(rank);
             self.bm25_score = Some(score);
+            self.lexical_source_updated_at = source_updated_at;
         }
     }
 
@@ -2740,6 +2810,7 @@ impl HybridAccumulator {
         };
         QueryHit {
             source_id: self.source_id,
+            lexical_source_updated_at: self.lexical_source_updated_at,
             ranking,
             vector_evidence: self.vector_evidence,
             lexical_evidence: None,
@@ -2766,7 +2837,7 @@ fn fuse_hybrid_hits(
         candidates
             .entry(hit.source_id.clone())
             .or_insert_with(|| HybridAccumulator::new(hit.source_id))
-            .record_bm25(rank + 1, hit.score);
+            .record_bm25(rank + 1, hit.score, hit.source_updated_at);
     }
     for (rank, hit) in vector_hits.into_iter().enumerate() {
         let source_id = hit.source_id.clone();
@@ -2794,6 +2865,7 @@ fn fuse_hybrid_hits(
 fn hybrid_vector_hits(
     profile: &Profile,
     store: &Store,
+    publication: Option<&RetrievalPublicationView>,
     query_text: &str,
     filters: &QueryFilters,
     limit: usize,
@@ -2819,8 +2891,7 @@ fn hybrid_vector_hits(
             ));
         }
     };
-    let publication = store.active_retrieval_publication()?;
-    let publication_matches_runtime = publication.as_ref().is_some_and(|publication| {
+    let publication_matches_runtime = publication.is_some_and(|publication| {
         publication.output_dimension.is_some_and(|dimension| {
             publication
                 .model_manifest_hash
@@ -2869,7 +2940,13 @@ fn hybrid_vector_hits(
             )],
         ));
     }
+    let Some(generation_id) =
+        publication.and_then(|publication| publication.embedding_generation_id)
+    else {
+        return Ok((None, Vec::new()));
+    };
     match store.generation_vector_search(
+        generation_id,
         &query_vector,
         &filters.vector_search_filters(),
         hybrid_candidate_limit(limit),
@@ -2935,9 +3012,21 @@ fn embedding_coverage_state(
     let Some(embedding) = profile.embedding.as_ref() else {
         return Ok(None);
     };
-    if let Some((_generation_id, completed_chunks)) =
+    if let Some((_generation_id, total_chunks, completed_chunks, generation_valid)) =
         store.active_embedding_generation_coverage()?
     {
+        if !generation_valid {
+            return Ok(Some(EmbeddingCoverageState {
+                active_fingerprint: None,
+                generation_active: true,
+                active_matches_config: true,
+                artifact_corrupt: true,
+                total_chunks,
+                completed_chunks,
+                missing_chunks: total_chunks.saturating_sub(completed_chunks),
+                mismatched_chunks: 0,
+            }));
+        }
         // Publication validation proves structural coverage. When the config
         // fully pins the fingerprint inputs, status can compare offline. A
         // mutable revision remains structurally complete and is verified
@@ -2974,7 +3063,7 @@ fn embedding_coverage_state(
             generation_active: true,
             active_matches_config,
             artifact_corrupt: false,
-            total_chunks: completed_chunks,
+            total_chunks,
             completed_chunks: if active_matches_config {
                 completed_chunks
             } else {
@@ -3904,6 +3993,25 @@ fn active_index_path(store: &Store, fallback: &std::path::Path) -> Result<PathBu
         .unwrap_or_else(|| fallback.to_path_buf()))
 }
 
+fn publication_index_path(
+    store: &Store,
+    publication: Option<&RetrievalPublicationView>,
+    fallback: &std::path::Path,
+) -> Result<PathBuf, QghError> {
+    match publication {
+        Some(publication) => store
+            .index_path_for_generation(publication.tantivy_generation)?
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                QghError::validation(
+                    "publication.tantivy_generation_missing",
+                    "The active retrieval publication references a missing Tantivy generation.",
+                )
+            }),
+        None => active_index_path(store, fallback),
+    }
+}
+
 fn freshness_overrides(
     max_age: Option<&str>,
     require_fresh: bool,
@@ -4303,18 +4411,22 @@ mod tests {
         let bm25_hits = vec![
             index::SearchHit {
                 source_id: "source-a".to_string(),
+                source_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
                 score: 10.0,
             },
             index::SearchHit {
                 source_id: "source-b".to_string(),
+                source_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
                 score: 9.0,
             },
             index::SearchHit {
                 source_id: "source-d".to_string(),
+                source_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
                 score: 8.0,
             },
             index::SearchHit {
                 source_id: "source-a".to_string(),
+                source_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
                 score: 1.0,
             },
         ];
@@ -4476,6 +4588,9 @@ mod tests {
             query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
         };
 
+        store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
         store
             .activate_retrieval_publication("embed-sync", 1, None, None)
             .unwrap();
