@@ -49,6 +49,15 @@ pub enum EvalLexicalProfile {
     MetadataBoostV1,
 }
 
+/// Returns the fixed lexical profile used by production query paths.
+#[doc(hidden)]
+pub fn production_lexical_profile_for_eval() -> EvalLexicalProfile {
+    match LexicalRankingProfile::default() {
+        LexicalRankingProfile::V1 => EvalLexicalProfile::ProductionV1,
+        LexicalRankingProfile::MetadataBoostV1 => EvalLexicalProfile::MetadataBoostV1,
+    }
+}
+
 impl From<EvalLexicalProfile> for LexicalRankingProfile {
     fn from(profile: EvalLexicalProfile) -> Self {
         match profile {
@@ -744,6 +753,11 @@ mod tests {
                 .unwrap();
 
         assert_eq!(LexicalRankingProfile::default(), LexicalRankingProfile::V1);
+        assert_eq!(
+            production_lexical_profile_for_eval(),
+            EvalLexicalProfile::ProductionV1,
+            "the live-eval identity must derive from the actual production default"
+        );
         assert_eq!(
             source_ids(&default_hits),
             source_ids(&comparison.v1),

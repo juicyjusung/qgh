@@ -533,6 +533,10 @@ fn lexical_profile_freeze_contains_a_selected_profile_and_dev_report_binding() {
             "corpus_sha256": "corpus-sha256",
             "qrels_dev_sha256": "dev-sha256",
             "active_tantivy_generation": 7,
+            "active_tantivy_path": "/frozen/tantivy/generation-7",
+            "tantivy_schema_fingerprint": "schema-sha256",
+            "heldout_confirmation_required": false,
+            "heldout_fallback_profile": "production_v1",
         })
     );
 }
@@ -664,6 +668,192 @@ fn lexical_profile_rejects_filter_roundtrip_or_stale_regression() {
         assert_eq!(selection["selected_profile"], "production_v1");
         assert_eq!(selection["reasons"], json!([reason]));
     }
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn lexical_profile_rejects_nonempty_class_quality_gate_failures() {
+    let baseline = json!({
+        "weighted_ndcg_at_10": 0.50,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.50, 0.50, 0.50, 0.50],
+        "quality_gate_failures": [],
+    });
+    let candidate = json!({
+        "weighted_ndcg_at_10": 0.60,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.60, 0.60, 0.60, 0.60],
+        "quality_gate_failures": ["korean_recall_at_5"],
+    });
+
+    assert_eq!(
+        live_model_eval_runtime::lexical_profile_selection_for_test(baseline, candidate),
+        json!({
+            "selected_profile": "production_v1",
+            "reasons": ["quality_gate_failure:korean_recall_at_5"],
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn heldout_confirmation_preserves_dev_selection_and_falls_back_to_v1_on_regression() {
+    let production_v1 = json!({
+        "weighted_ndcg_at_10": 0.55,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.55, 0.55, 0.55, 0.55],
+        "quality_gate_failures": [],
+    });
+    let frozen_selected = json!({
+        "weighted_ndcg_at_10": 0.54,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.55, 0.55, 0.55, 0.55],
+        "quality_gate_failures": ["korean_recall_at_5"],
+    });
+
+    assert_eq!(
+        live_model_eval_runtime::lexical_profile_heldout_confirmation_for_test(
+            "frozen-config-sha256",
+            "dev-report-sha256",
+            "metadata_boost_v1",
+            production_v1,
+            frozen_selected,
+        ),
+        json!({
+            "frozen_config_sha256": "frozen-config-sha256",
+            "dev_report_sha256": "dev-report-sha256",
+            "frozen_dev_selection": "metadata_boost_v1",
+            "effective_profile": "production_v1",
+            "promotion_eligible": false,
+            "blockers": [
+                "heldout_weighted_ndcg_regression",
+                "quality_gate_failure:korean_recall_at_5",
+            ],
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn heldout_confirmation_never_reselects_metadata_after_dev_kept_v1() {
+    let production_v1 = json!({
+        "weighted_ndcg_at_10": 0.50,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.50, 0.50, 0.50, 0.50],
+        "quality_gate_failures": [],
+    });
+    let metadata_boost_v1 = json!({
+        "weighted_ndcg_at_10": 0.60,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.60, 0.60, 0.60, 0.60],
+        "quality_gate_failures": [],
+    });
+
+    assert_eq!(
+        live_model_eval_runtime::lexical_profile_heldout_confirmation_for_test(
+            "frozen-config-sha256",
+            "dev-report-sha256",
+            "production_v1",
+            production_v1,
+            metadata_boost_v1,
+        ),
+        json!({
+            "frozen_config_sha256": "frozen-config-sha256",
+            "dev_report_sha256": "dev-report-sha256",
+            "frozen_dev_selection": "production_v1",
+            "effective_profile": "production_v1",
+            "promotion_eligible": false,
+            "blockers": ["dev_selection_is_production_v1"],
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn heldout_confirmation_allows_the_frozen_metadata_selection_only_when_clean() {
+    let production_v1 = json!({
+        "weighted_ndcg_at_10": 0.50,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.50, 0.50, 0.50, 0.50],
+        "quality_gate_failures": [],
+    });
+    let metadata_boost_v1 = json!({
+        "weighted_ndcg_at_10": 0.50,
+        "exact_top_1": 1.0,
+        "hard_filter_violations": 0,
+        "get_round_trip": 1.0,
+        "stale_leakage": 0,
+        "comment_only": [0.50, 0.50, 0.50, 0.50],
+        "quality_gate_failures": [],
+    });
+
+    assert_eq!(
+        live_model_eval_runtime::lexical_profile_heldout_confirmation_for_test(
+            "frozen-config-sha256",
+            "dev-report-sha256",
+            "metadata_boost_v1",
+            production_v1,
+            metadata_boost_v1,
+        ),
+        json!({
+            "frozen_config_sha256": "frozen-config-sha256",
+            "dev_report_sha256": "dev-report-sha256",
+            "frozen_dev_selection": "metadata_boost_v1",
+            "effective_profile": "metadata_boost_v1",
+            "promotion_eligible": true,
+            "blockers": [],
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn model_metrics_are_blocked_when_dev_selected_a_nonproduction_lexical_profile() {
+    assert_eq!(
+        qgh::search_eval::production_lexical_profile_for_eval(),
+        qgh::search_eval::EvalLexicalProfile::ProductionV1,
+    );
+    assert_eq!(
+        live_model_eval_runtime::model_candidate_lexical_gate_for_test("metadata_boost_v1"),
+        json!({
+            "can_run_model_metrics": false,
+            "blocker_code": "eval.lexical_profile_promotion_required",
+            "blocker_reason": "lexical_profile_promotion_required",
+            "dev_metrics": null,
+            "held_out_metrics": null,
+        })
+    );
+    assert_eq!(
+        live_model_eval_runtime::model_candidate_lexical_gate_for_test("production_v1"),
+        json!({
+            "can_run_model_metrics": true,
+            "blocker_code": null,
+            "blocker_reason": null,
+            "dev_metrics": null,
+            "held_out_metrics": null,
+        })
+    );
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -893,6 +1083,88 @@ fn context_probe_uses_only_the_embedding_generation_in_the_active_publication() 
     )
     .is_err());
     std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn frozen_bm25_snapshot_rejects_an_active_publication_pointer_switch() {
+    let root = std::env::temp_dir().join(format!(
+        "qgh-live-model-frozen-tantivy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let generation_a = root.join("generation-7");
+    let generation_b = root.join("generation-8");
+    std::fs::create_dir_all(&generation_a).unwrap();
+    std::fs::create_dir_all(&generation_b).unwrap();
+    for path in [&generation_a, &generation_b] {
+        std::fs::write(
+            path.join("meta.json"),
+            serde_json::to_vec(&json!({"schema": {"fields": []}})).unwrap(),
+        )
+        .unwrap();
+    }
+    let db_path = root.join("qgh.sqlite3");
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(&format!(
+            "CREATE TABLE retrieval_publications(
+               publication_id INTEGER PRIMARY KEY, tantivy_generation INTEGER, active INTEGER
+             );
+             CREATE TABLE retrieval_publication_pointer(
+               id INTEGER PRIMARY KEY, publication_id INTEGER
+             );
+             CREATE TABLE index_generations(
+               generation INTEGER PRIMARY KEY, path TEXT, active INTEGER
+             );
+             INSERT INTO retrieval_publications VALUES (70, 7, 1), (80, 8, 0);
+             INSERT INTO retrieval_publication_pointer VALUES (1, 70);
+             INSERT INTO index_generations VALUES
+               (7, '{}', 1), (8, '{}', 0);",
+            generation_a.display(),
+            generation_b.display(),
+        ))
+        .unwrap();
+    drop(connection);
+
+    let frozen = live_model_eval_runtime::freeze_tantivy_snapshot_for_test(&db_path)
+        .expect("active snapshot freezes");
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "UPDATE retrieval_publications SET active = (publication_id = 80);
+             UPDATE index_generations SET active = (generation = 8);
+             UPDATE retrieval_publication_pointer SET publication_id = 80 WHERE id = 1;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let error =
+        live_model_eval_runtime::revalidate_tantivy_snapshot_for_test(&db_path, frozen.clone())
+            .expect_err("pointer switch must invalidate the frozen run");
+    assert_eq!(error.to_string(), "eval.frozen_identity_changed");
+
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "UPDATE retrieval_publications SET active = (publication_id = 70);
+             UPDATE index_generations SET active = (generation = 7);
+             UPDATE retrieval_publication_pointer SET publication_id = 70 WHERE id = 1;",
+        )
+        .unwrap();
+    drop(connection);
+    std::fs::write(
+        generation_a.join("meta.json"),
+        serde_json::to_vec(&json!({"schema": {"fields": ["changed"]}})).unwrap(),
+    )
+    .unwrap();
+    let error = live_model_eval_runtime::revalidate_tantivy_snapshot_for_test(&db_path, frozen)
+        .expect_err("schema change within the same generation must invalidate the frozen run");
+    assert_eq!(error.to_string(), "eval.frozen_identity_changed");
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -1336,6 +1608,35 @@ fn redaction_audit_scans_canonical_gate_artifacts_and_partial_canary_fragments()
     assert_eq!(
         evidence["violation_artifacts"],
         json!(["contract-gate-bundle.json", "nested/eval-write.partial"])
+    );
+    assert_eq!(evidence["passed"], false);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn redaction_audit_detects_json_escaped_sensitive_values() {
+    let root = std::env::temp_dir().join(format!(
+        "qgh-live-model-redaction-escaped-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let sensitive = "private line\n\"quoted\"\\path";
+    std::fs::write(
+        root.join("escaped-report.json"),
+        serde_json::to_vec(&json!({"message": sensitive})).unwrap(),
+    )
+    .unwrap();
+
+    let evidence = live_model_eval_runtime::redaction_file_scan_for_test(&root, sensitive)
+        .expect("redaction scan completes");
+    assert_eq!(
+        evidence["violation_artifacts"],
+        json!(["escaped-report.json"])
     );
     assert_eq!(evidence["passed"], false);
     std::fs::remove_dir_all(root).unwrap();
