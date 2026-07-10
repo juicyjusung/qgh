@@ -1630,7 +1630,7 @@ impl PreparedModelStore {
 
     #[cfg(feature = "fastembed-provider")]
     fn ensure_requests_root(&self) -> Result<PathBuf, EmbeddingProviderError> {
-        create_dir_all_durable(
+        create_prepared_store_root_durable(
             &self.root,
             "embedding.acquisition_pin_invalid",
             "Prepared model acquisition pin storage could not be created durably.",
@@ -1974,7 +1974,7 @@ impl PreparedModelStore {
         mut manifest: ModelManifestV1,
         sources: Vec<RuntimeArtifactSource>,
     ) -> Result<(PathBuf, PreparedModelAliasV1, Vec<ModelArtifactV1>), EmbeddingProviderError> {
-        create_dir_all_durable(
+        create_prepared_store_root_durable(
             &self.root,
             "embedding.acquisition_artifact_invalid",
             "Prepared model store could not be created durably.",
@@ -3471,6 +3471,20 @@ fn create_dir_all_durable(
         sync_durable_directory(directory, code, message)?;
     }
     sync_durable_directory(&existing_parent, code, message)
+}
+
+fn create_prepared_store_root_durable(
+    root: &Path,
+    code: &str,
+    message: &str,
+) -> Result<(), EmbeddingProviderError> {
+    create_dir_all_durable(root, code, message)?;
+    if let Some(cache_boundary) = root.parent().and_then(Path::parent) {
+        if cache_boundary.parent().is_some() {
+            sync_durable_directory(cache_boundary, code, message)?;
+        }
+    }
+    Ok(())
 }
 
 fn sync_durable_directory(
@@ -5881,6 +5895,42 @@ mod tests {
             .expect("retry re-syncs the already visible store root and its parent");
         assert_eq!(pinned.revision, "a".repeat(40));
         assert!(store.acquisition_pin_path(&options).is_file());
+    }
+
+    #[test]
+    fn durable_directory_retry_reasserts_every_visible_ancestor() {
+        let root = temp_dir("qgh-multilevel-directory-durability");
+        let prepared = root.join("cache/qgh/prepared-models");
+
+        fail_durable_create_sync_after(2);
+        let first = create_prepared_store_root_durable(
+            &prepared,
+            "embedding.acquisition_artifact_invalid",
+            "Prepared directory ancestry sync failed.",
+        )
+        .unwrap_err();
+        assert!(prepared.is_dir());
+
+        fail_durable_create_sync_after(2);
+        let second = create_prepared_store_root_durable(
+            &prepared,
+            "embedding.acquisition_artifact_invalid",
+            "Prepared directory ancestry sync failed.",
+        )
+        .unwrap_err();
+
+        assert_eq!(first.code(), "embedding.acquisition_artifact_invalid");
+        assert_eq!(second.code(), "embedding.acquisition_artifact_invalid");
+        assert!(!second
+            .details()
+            .to_string()
+            .contains(&root.to_string_lossy()[..]));
+        create_prepared_store_root_durable(
+            &prepared,
+            "embedding.acquisition_artifact_invalid",
+            "Prepared directory ancestry sync failed.",
+        )
+        .expect("retry reaches and syncs the pre-existing external ancestor");
     }
 
     #[cfg(all(feature = "fastembed-provider", unix))]
