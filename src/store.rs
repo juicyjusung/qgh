@@ -4975,108 +4975,15 @@ impl Store {
             }
             return Err(embedding_generation_corrupt_error());
         }
-        let mut stmt = tx.prepare(
-            "SELECT gc.vector_blob, gc.vector_checksum, gc.vector_dimension,
-                    gc.source_version_id, gc.source_version_hash, gc.context_hash,
-                    sv.body_hash, coalesce(im.latest_version_id, cm.latest_version_id), c.body,
-                    se.entity_type, se.host, se.repo,
-                    im.issue_number, cm.issue_number, im.title, cm.parent_issue_title
-             FROM embedding_generation_chunks gc
-             JOIN source_versions sv ON sv.id = gc.source_version_id
-             JOIN chunks c ON c.id = gc.chunk_id
-             JOIN source_entities se ON se.source_id = c.source_id
-             LEFT JOIN issue_metadata im ON im.source_id = sv.source_id
-             LEFT JOIN comment_metadata cm ON cm.source_id = sv.source_id
-             WHERE gc.generation_id = ?1",
-        )?;
-        let rows = stmt.query_map(params![generation_id], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as usize,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-                row.get::<_, String>(8)?,
-                row.get::<_, String>(9)?,
-                row.get::<_, String>(10)?,
-                row.get::<_, String>(11)?,
-                row.get::<_, Option<i64>>(12)?,
-                row.get::<_, Option<i64>>(13)?,
-                row.get::<_, Option<String>>(14)?,
-                row.get::<_, Option<String>>(15)?,
-            ))
-        })?;
-        let mut invalid = false;
-        let mut validated_rows = 0i64;
-        for row in rows {
-            validated_rows += 1;
-            let (
-                bytes,
-                checksum,
-                stored_dimension,
-                source_version_id,
-                source_hash,
-                context_hash,
-                body_hash,
-                latest_version_id,
-                chunk_body,
-                entity_type,
-                host,
-                repo,
-                issue_number,
-                parent_issue_number,
-                issue_title,
-                parent_issue_title,
-            ) = row?;
-            let repository = format!("{host}/{repo}");
-            let prepared_input =
-                match entity_type.as_str() {
-                    "issue" => issue_number
-                        .zip(issue_title.as_deref())
-                        .map(|(number, title)| {
-                            prepare_embedding_input(
-                                EmbeddingSourceContext::Issue {
-                                    repository: &repository,
-                                    issue_number: number,
-                                    title,
-                                },
-                                &chunk_body,
-                            )
-                        }),
-                    "issue_comment" => parent_issue_number.zip(parent_issue_title.as_deref()).map(
-                        |(number, title)| {
-                            prepare_embedding_input(
-                                EmbeddingSourceContext::Comment {
-                                    repository: &repository,
-                                    parent_issue_number: number,
-                                    parent_issue_title: title,
-                                },
-                                &chunk_body,
-                            )
-                        },
-                    ),
-                    _ => None,
-                };
-            if stored_dimension != dimension
-                || decode_embedding_blob(&bytes, dimension).is_err()
-                || embedding_blob_checksum(&bytes) != checksum
-                || source_hash != body_hash
-                || latest_version_id != Some(source_version_id)
-                || prepared_input.as_ref().is_none_or(|prepared| {
-                    context_hash
-                        != prepared.context_hash(&model_manifest_hash, &chunker_fingerprint)
-                        || prepared.context_template_version() != context_template_version
-                })
-            {
-                invalid = true;
-                break;
-            }
-        }
-        drop(stmt);
-        if invalid || validated_rows != total_chunks {
+        if !embedding_generation_content_rows_valid(
+            &tx,
+            generation_id,
+            dimension,
+            total_chunks,
+            &model_manifest_hash,
+            &chunker_fingerprint,
+            &context_template_version,
+        )? {
             if building {
                 mark_embedding_generation_failed(
                     &tx,
@@ -5184,6 +5091,86 @@ impl Store {
             )
             .optional()
             .map_err(QghError::from)
+    }
+
+    /// Deeply validates the vector artifacts owned by the embedding generation
+    /// pinned by the active retrieval publication. This is intentionally
+    /// read-only so diagnostics cannot promote, fail, or repair generations.
+    #[cfg(feature = "vector-search")]
+    pub fn validate_active_embedding_generation_artifacts(&self) -> Result<bool, QghError> {
+        let Some(publication) = self.active_retrieval_publication()? else {
+            return Ok(false);
+        };
+        let Some(generation_id) = publication.embedding_generation_id else {
+            return Ok(false);
+        };
+        self.validate_query_publication_snapshot(Some(&publication))?;
+        let (
+            stored_dimension,
+            total_chunks,
+            completed_chunks,
+            model_manifest_hash,
+            chunker_fingerprint,
+            context_template_version,
+            generation_epoch,
+            generation_inventory_hash,
+        ): (i64, i64, i64, String, String, String, i64, Option<String>) = self.conn.query_row(
+            "SELECT output_dimension, total_chunks, completed_chunks,
+                        model_manifest_hash, chunker_fingerprint,
+                        context_template_version, write_epoch,
+                        embedding_inventory_hash
+                 FROM embedding_generations WHERE id = ?1",
+            params![generation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )?;
+        let dimension = usize::try_from(stored_dimension)
+            .ok()
+            .filter(|dimension| *dimension > 0)
+            .ok_or_else(embedding_generation_corrupt_error)?;
+        let authoritative_chunks = self.active_contextual_embedding_chunks()?;
+        let authoritative_inventory_hash = embedding_inventory_hash(&authoritative_chunks);
+        if generation_epoch != self.content_write_epoch
+            || completed_chunks != total_chunks
+            || usize::try_from(total_chunks).ok() != Some(authoritative_chunks.len())
+            || generation_inventory_hash.as_deref() != Some(authoritative_inventory_hash.as_str())
+        {
+            return Err(embedding_generation_corrupt_error());
+        }
+        if !embedding_generation_content_rows_valid(
+            &self.conn,
+            generation_id,
+            dimension,
+            total_chunks,
+            &model_manifest_hash,
+            &chunker_fingerprint,
+            &context_template_version,
+        )? {
+            return Err(embedding_generation_corrupt_error());
+        }
+        register_sqlite_vec_extension(&self.conn)?;
+        validate_embedding_generation_vector_artifacts(
+            &self.conn,
+            generation_id,
+            dimension,
+            total_chunks,
+        )?;
+        Ok(true)
+    }
+
+    #[cfg(not(feature = "vector-search"))]
+    pub fn validate_active_embedding_generation_artifacts(&self) -> Result<bool, QghError> {
+        Ok(false)
     }
 
     #[cfg(test)]
@@ -7534,6 +7521,116 @@ fn validate_generation_vector_mapping_ownership(
         return Err(embedding_generation_corrupt_error());
     }
     Ok(expected_table)
+}
+
+fn embedding_generation_content_rows_valid(
+    conn: &Connection,
+    generation_id: i64,
+    dimension: usize,
+    total_chunks: i64,
+    model_manifest_hash: &str,
+    chunker_fingerprint: &str,
+    context_template_version: &str,
+) -> Result<bool, QghError> {
+    let mut stmt = conn.prepare(
+        "SELECT gc.vector_blob, gc.vector_checksum, gc.vector_dimension,
+                gc.source_version_id, gc.source_version_hash, gc.context_hash,
+                sv.body_hash, coalesce(im.latest_version_id, cm.latest_version_id), c.body,
+                se.entity_type, se.host, se.repo,
+                im.issue_number, cm.issue_number, im.title, cm.parent_issue_title
+         FROM embedding_generation_chunks gc
+         JOIN source_versions sv ON sv.id = gc.source_version_id
+         JOIN chunks c ON c.id = gc.chunk_id
+         JOIN source_entities se ON se.source_id = c.source_id
+         LEFT JOIN issue_metadata im ON im.source_id = sv.source_id
+         LEFT JOIN comment_metadata cm ON cm.source_id = sv.source_id
+         WHERE gc.generation_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![generation_id], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)? as usize,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Option<i64>>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, Option<i64>>(12)?,
+            row.get::<_, Option<i64>>(13)?,
+            row.get::<_, Option<String>>(14)?,
+            row.get::<_, Option<String>>(15)?,
+        ))
+    })?;
+    let mut validated_rows = 0i64;
+    for row in rows {
+        validated_rows += 1;
+        let (
+            bytes,
+            checksum,
+            stored_dimension,
+            source_version_id,
+            source_hash,
+            context_hash,
+            body_hash,
+            latest_version_id,
+            chunk_body,
+            entity_type,
+            host,
+            repo,
+            issue_number,
+            parent_issue_number,
+            issue_title,
+            parent_issue_title,
+        ) = row?;
+        let repository = format!("{host}/{repo}");
+        let prepared_input = match entity_type.as_str() {
+            "issue" => issue_number
+                .zip(issue_title.as_deref())
+                .map(|(number, title)| {
+                    prepare_embedding_input(
+                        EmbeddingSourceContext::Issue {
+                            repository: &repository,
+                            issue_number: number,
+                            title,
+                        },
+                        &chunk_body,
+                    )
+                }),
+            "issue_comment" => {
+                parent_issue_number
+                    .zip(parent_issue_title.as_deref())
+                    .map(|(number, title)| {
+                        prepare_embedding_input(
+                            EmbeddingSourceContext::Comment {
+                                repository: &repository,
+                                parent_issue_number: number,
+                                parent_issue_title: title,
+                            },
+                            &chunk_body,
+                        )
+                    })
+            }
+            _ => None,
+        };
+        if stored_dimension != dimension
+            || decode_embedding_blob(&bytes, dimension).is_err()
+            || embedding_blob_checksum(&bytes) != checksum
+            || source_hash != body_hash
+            || latest_version_id != Some(source_version_id)
+            || prepared_input.as_ref().is_none_or(|prepared| {
+                context_hash != prepared.context_hash(model_manifest_hash, chunker_fingerprint)
+                    || prepared.context_template_version() != context_template_version
+            })
+        {
+            return Ok(false);
+        }
+    }
+    Ok(validated_rows == total_chunks)
 }
 
 fn validate_embedding_generation_vector_artifacts(
@@ -13629,6 +13726,78 @@ mod tests {
             .validate_query_publication_snapshot(Some(&publication))
             .unwrap_err();
         assert_eq!(error.code, "publication.embedding_snapshot_mismatch");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn active_embedding_generation_artifact_validation_is_read_only() {
+        let (paths, mut store, _, generation_id, _) =
+            ready_generation_fixture("doctor-active-generation-artifacts");
+        let publication_id = publish_test_retrieval(&mut store, &paths, Some(generation_id));
+        let state_before = store.embedding_generation_state(generation_id).unwrap();
+
+        assert!(store
+            .validate_active_embedding_generation_artifacts()
+            .unwrap());
+        assert_eq!(
+            store
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            publication_id
+        );
+        assert_eq!(
+            store.embedding_generation_state(generation_id).unwrap(),
+            state_before
+        );
+
+        store
+            .conn
+            .execute(
+                "UPDATE issue_metadata SET title = 'changed after publication'",
+                [],
+            )
+            .unwrap();
+        assert!(store
+            .validate_active_embedding_generation_artifacts()
+            .is_err());
+        store
+            .conn
+            .execute(
+                "UPDATE issue_metadata SET title = 'Vector storage regression'",
+                [],
+            )
+            .unwrap();
+        assert!(store
+            .validate_active_embedding_generation_artifacts()
+            .unwrap());
+
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_generation_chunks
+                 SET vector_checksum = 'invalid' WHERE generation_id = ?1",
+                params![generation_id],
+            )
+            .unwrap();
+        assert!(store
+            .validate_active_embedding_generation_artifacts()
+            .is_err());
+        assert_eq!(
+            store
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            publication_id
+        );
+        assert_eq!(
+            store.embedding_generation_state(generation_id).unwrap(),
+            state_before
+        );
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }

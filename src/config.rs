@@ -1072,14 +1072,27 @@ fn parse_embedding_config(raw: &RawEmbeddingConfig) -> Result<(), QghError> {
             token_source_env: None,
             cache_dir: None,
         };
-        let prepared = match default_prepared_model_store() {
-            Ok(store) => store.load(&options),
-            Err(_) => PreparedModelStore::new(PathBuf::new()).load_manifest(manifest_path),
-        };
-        match prepared {
-            Ok(_) => {}
-            Err(error) if error.code() == "embedding.prepared_snapshot_missing" => {}
-            Err(error) => {
+        if let Err(prepared_error) =
+            default_prepared_model_store().and_then(|store| store.inspect(&options))
+        {
+            if let Err(source_error) =
+                PreparedModelStore::new(PathBuf::new()).inspect_manifest(manifest_path)
+            {
+                let error = if matches!(
+                    prepared_error.code(),
+                    "embedding.manifest_invalid"
+                        | "embedding.manifest_schema_unsupported"
+                        | "embedding.manifest_revision_invalid"
+                        | "embedding.manifest_contract_invalid"
+                        | "embedding.manifest_context_template_unsupported"
+                        | "embedding.dynamic_quantization_unsupported"
+                        | "embedding.manifest_artifacts_invalid"
+                        | "embedding.artifact_path_invalid"
+                ) {
+                    prepared_error
+                } else {
+                    source_error
+                };
                 return Err(QghError::validation(error.code(), error.message())
                     .with_details(error.details().clone()));
             }

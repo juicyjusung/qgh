@@ -3,8 +3,9 @@ use chrono::{Duration, SecondsFormat, Utc};
 use qgh::embedding::LOCAL_MODEL_REVISION;
 #[cfg(feature = "fastembed-provider")]
 use qgh::embedding::{
-    ArtifactRole, ModelArtifactV1, ModelManifestV1, ModelProviderKind, ModelSourceV1,
-    NormalizationKind, QuantizationKind, TokenizerKind, MODEL_MANIFEST_SCHEMA_VERSION,
+    ArtifactRole, FastembedProviderOptions, ModelArtifactV1, ModelManifestV1, ModelProviderKind,
+    ModelSourceV1, NormalizationKind, QuantizationKind, TokenizerKind,
+    MODEL_MANIFEST_SCHEMA_VERSION,
 };
 use qgh::embedding::{
     EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_HF_MODEL_REVISION,
@@ -2645,7 +2646,116 @@ quantization = "none"
     assert_eq!(status_json["data"]["embedding"]["fingerprint"], Value::Null);
 }
 
-#[cfg(feature = "vector-search")]
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn status_does_not_checksum_or_initialize_explicit_model_artifacts() {
+    let fixture = TestFixture::new("embedding-status-body-free");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    let (manifest_path, _) = fixture.write_prepared_embedding_manifest();
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        &format!(
+            "provider = \"local\"\nmanifest_path = \"{}\"",
+            manifest_path.display()
+        ),
+    );
+    let requests_before = server.request_count();
+
+    let valid_but_not_onnx = fixture.qgh(["status", "--json"]);
+    assert_success(&valid_but_not_onnx);
+    assert_eq!(
+        stdout_json(&valid_but_not_onnx)["data"]["embedding"]["state"],
+        "missing"
+    );
+    fs::write(
+        manifest_path.parent().unwrap().join("onnx/model.onnx"),
+        b"corrupt!",
+    )
+    .unwrap();
+
+    let same_size_corrupt = fixture.qgh(["status", "--json"]);
+    assert_success(&same_size_corrupt);
+    let status_json = stdout_json(&same_size_corrupt);
+    assert_eq!(status_json["data"]["embedding"]["state"], "missing");
+    assert_eq!(server.request_count(), requests_before);
+    assert!(!String::from_utf8_lossy(&same_size_corrupt.stdout).contains("corrupt!"));
+    assert!(same_size_corrupt.stderr.is_empty());
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn status_degrades_structurally_corrupt_prepared_alias() {
+    let fixture = TestFixture::new("embedding-status-corrupt-alias");
+    let (manifest_path, _) = fixture.write_prepared_embedding_manifest();
+    fixture.write_config_with_embedding(
+        "http://127.0.0.1:1",
+        &format!(
+            "provider = \"local\"\nmanifest_path = \"{}\"",
+            manifest_path.display()
+        ),
+    );
+    let embed = fixture.qgh(["embed", "--force", "--json"]);
+    assert!(!embed.status.success());
+    fs::write(fixture.single_prepared_request_alias(), b"{").unwrap();
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["embedding"]["state"], "corrupt");
+    assert!(status.stderr.is_empty());
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn status_preserves_corrupt_prepared_state_without_explicit_manifest() {
+    let fixture = TestFixture::new("embedding-status-corrupt-preset-alias");
+    fixture.write_default_embedding_config("http://127.0.0.1:1");
+    fixture.write_corrupt_prepared_request_alias(&FastembedProviderOptions {
+        manifest_path: None,
+        model: Some(format!("hf:{DEFAULT_HF_MODEL_ID}")),
+        model_path: None,
+        file: Some("onnx/model_quantized.onnx".to_string()),
+        pooling: Some(PoolingKind::Cls),
+        query_prefix: Some(DEFAULT_QUERY_PREFIX.to_string()),
+        quantization: None,
+        token_source_env: None,
+        cache_dir: None,
+    });
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    assert_eq!(
+        stdout_json(&status)["data"]["embedding"]["state"],
+        "corrupt"
+    );
+}
+
+#[cfg(all(feature = "fastembed-provider", unix))]
+#[test]
+fn status_rejects_symlink_explicit_manifest_contract() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("embedding-status-symlink-manifest");
+    let (manifest_path, _) = fixture.write_prepared_embedding_manifest();
+    let linked_manifest = manifest_path.parent().unwrap().join("linked-manifest.json");
+    symlink(&manifest_path, &linked_manifest).unwrap();
+    fixture.write_config_with_embedding(
+        "http://127.0.0.1:1",
+        &format!(
+            "provider = \"local\"\nmanifest_path = \"{}\"",
+            linked_manifest.display()
+        ),
+    );
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert!(!status.status.success());
+    assert_eq!(
+        stdout_json(&status)["error"]["code"],
+        "embedding.prepared_manifest_invalid"
+    );
+}
+
+#[cfg(all(feature = "vector-search", feature = "fastembed-provider"))]
 #[test]
 fn status_embedding_coverage_counts_completed_and_missing_chunks() {
     let fixture = TestFixture::new("embedding-coverage-counts");
@@ -2653,7 +2763,15 @@ fn status_embedding_coverage_counts_completed_and_missing_chunks() {
     fixture.write_config(&server.base_url);
 
     assert_success(&fixture.qgh(["sync", "--json"]));
-    fixture.write_default_embedding_config(&server.base_url);
+    let (manifest_path, manifest_hash) = fixture.write_prepared_embedding_manifest();
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        &format!(
+            "provider = \"local\"\nmanifest_path = \"{}\"",
+            manifest_path.display()
+        ),
+    );
+    assert!(!fixture.qgh(["embed", "--force", "--json"]).status.success());
     assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
     let issue_chunk = fixture.insert_chunk_for_source(
         "qgh://github.com/issue/I_kwDOISSUE1",
@@ -2687,7 +2805,8 @@ fn status_embedding_coverage_counts_completed_and_missing_chunks() {
         2
     );
 
-    fixture.insert_matching_active_embedding_fingerprint();
+    fixture
+        .insert_active_embedding_fingerprint_with_revision("local:offline-fixture", &manifest_hash);
     fixture.insert_embedding_for_chunk(issue_chunk);
     let partial = fixture.qgh(["status", "--json"]);
     assert_success(&partial);
@@ -2721,7 +2840,7 @@ fn status_embedding_coverage_counts_completed_and_missing_chunks() {
     );
 }
 
-#[cfg(feature = "vector-search")]
+#[cfg(all(feature = "vector-search", feature = "fastembed-provider"))]
 #[test]
 fn status_embedding_coverage_reports_fingerprint_mismatch() {
     let fixture = TestFixture::new("embedding-coverage-mismatch");
@@ -2729,7 +2848,15 @@ fn status_embedding_coverage_reports_fingerprint_mismatch() {
     fixture.write_config(&server.base_url);
 
     assert_success(&fixture.qgh(["sync", "--json"]));
-    fixture.write_default_embedding_config(&server.base_url);
+    let (manifest_path, _) = fixture.write_prepared_embedding_manifest();
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        &format!(
+            "provider = \"local\"\nmanifest_path = \"{}\"",
+            manifest_path.display()
+        ),
+    );
+    assert!(!fixture.qgh(["embed", "--force", "--json"]).status.success());
     assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
     let chunk_id = fixture.insert_chunk_for_source(
         "qgh://github.com/issue/I_kwDOISSUE1",
@@ -3307,7 +3434,7 @@ quantization = "none"
     assert_success(&status);
     assert_eq!(
         stdout_json(&status)["data"]["embedding"]["state"],
-        "complete"
+        "missing"
     );
 }
 
@@ -4466,6 +4593,66 @@ fn doctor_reports_null_rate_limit_headers_when_token_is_unavailable() {
     assert_eq!(rate_limit["ok"], false);
     assert_eq!(rate_limit["headers"]["x-ratelimit-remaining"], Value::Null);
     assert_eq!(rate_limit["headers"]["x-ratelimit-reset"], Value::Null);
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn doctor_verifies_prepared_artifacts_without_exposing_local_details() {
+    let fixture = TestFixture::new("doctor-embedding-artifacts");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    let (manifest_path, manifest_hash) = fixture.write_prepared_embedding_manifest();
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        &format!(
+            "provider = \"local\"\nmanifest_path = \"{}\"",
+            manifest_path.display()
+        ),
+    );
+
+    let embed = fixture.qgh(["embed", "--force", "--json"]);
+    assert!(
+        !embed.status.success(),
+        "invalid ONNX fixture must not initialize"
+    );
+
+    let doctor = fixture.qgh(["doctor", "--json"]);
+    assert_success(&doctor);
+    let doctor_json = stdout_json(&doctor);
+    let checks = doctor_json["data"]["checks"].as_array().unwrap();
+    assert_eq!(doctor_check_ok(checks, "embedding_artifacts"), Some(true));
+    assert_eq!(doctor_check_ok(checks, "embedding_runtime"), Some(false));
+    assert_eq!(doctor_check_ok(checks, "embedding_generation"), Some(false));
+    for check in checks.iter().filter(|check| {
+        check["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("embedding_"))
+    }) {
+        assert_eq!(
+            json_object_keys(check),
+            BTreeSet::from(["name".to_string(), "ok".to_string()])
+        );
+    }
+
+    fs::write(
+        fixture.prepared_snapshot_artifact(&manifest_hash, "onnx/model.onnx"),
+        b"corrupt!",
+    )
+    .unwrap();
+    let corrupt = fixture.qgh(["doctor", "--json"]);
+    assert_success(&corrupt);
+    let corrupt_json = stdout_json(&corrupt);
+    let corrupt_checks = corrupt_json["data"]["checks"].as_array().unwrap();
+    assert_eq!(
+        doctor_check_ok(corrupt_checks, "embedding_artifacts"),
+        Some(false)
+    );
+    assert_eq!(
+        doctor_check_ok(corrupt_checks, "embedding_runtime"),
+        Some(false)
+    );
+    let stdout = String::from_utf8_lossy(&corrupt.stdout);
+    assert!(!stdout.contains("corrupt!"));
+    assert!(!stdout.contains(manifest_path.to_string_lossy().as_ref()));
 }
 
 #[test]
@@ -6889,6 +7076,46 @@ query_prefix = "query: "
         (manifest_path, manifest_hash)
     }
 
+    #[cfg(feature = "fastembed-provider")]
+    fn prepared_snapshot_artifact(&self, manifest_hash: &str, relative_path: &str) -> PathBuf {
+        self.cache_home
+            .join("qgh/prepared-models/snapshots")
+            .join(manifest_hash)
+            .join(relative_path)
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn single_prepared_request_alias(&self) -> PathBuf {
+        let request_dir = self.cache_home.join("qgh/prepared-models/requests");
+        let aliases = fs::read_dir(request_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), 1);
+        aliases.into_iter().next().unwrap()
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    fn write_corrupt_prepared_request_alias(&self, options: &FastembedProviderOptions) {
+        let identity = format!(
+            "manifest={:?}\nmodel={:?}\nmodel_path={:?}\nfile={:?}\npooling={:?}\nquery_prefix={:?}\nquantization={:?}",
+            options.manifest_path,
+            options.model,
+            options.model_path,
+            options.file,
+            options.pooling,
+            options.query_prefix,
+            options.quantization
+        );
+        let key = Sha256::digest(identity.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let requests = self.cache_home.join("qgh/prepared-models/requests");
+        fs::create_dir_all(&requests).unwrap();
+        fs::write(requests.join(format!("{key}.json")), b"{").unwrap();
+    }
+
     fn write_config_repo_listing_comments(&self, api_base_url: &str) {
         self.write_config_repo_listing_comments_with_repo(api_base_url, "owner/repo");
     }
@@ -9193,6 +9420,13 @@ fn json_object_keys(value: &Value) -> BTreeSet<String> {
         .keys()
         .cloned()
         .collect()
+}
+
+fn doctor_check_ok(checks: &[Value], name: &str) -> Option<bool> {
+    checks
+        .iter()
+        .find(|check| check["name"] == name)
+        .and_then(|check| check["ok"].as_bool())
 }
 
 fn warning_codes(output_json: &Value) -> Vec<&str> {

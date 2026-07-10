@@ -16,8 +16,8 @@ use crate::embedding::{
 #[cfg(feature = "fastembed-provider")]
 use crate::embedding::{
     default_prepared_model_store, validate_batch_comparability, FastembedEngine,
-    FastembedTokenizer, LocalEmbeddingProvider, ModelSourceV1, PreparedModelSnapshot,
-    PreparedModelStore,
+    FastembedTokenizer, LocalEmbeddingProvider, ModelManifestV1, ModelSourceV1,
+    PreparedModelInspection, PreparedModelSnapshot, PreparedModelStore,
 };
 #[cfg(debug_assertions)]
 use crate::embedding::{PoolingKind, TokenSpan, DEFAULT_QUERY_PREFIX};
@@ -2248,6 +2248,7 @@ fn test_embedding_runtime(
             "Test embedding vectors must be non-empty and share one dimension.",
         ));
     }
+    let configured = configured_embedding_snapshot(embedding);
     Ok(Some(EmbeddingRuntime {
         tokenizer: Box::new(TestEmbeddingTokenizer),
         provider: Box::new(TestEmbeddingProvider {
@@ -2258,9 +2259,11 @@ fn test_embedding_runtime(
             .to_string(),
         fingerprint_seed: EmbeddingFingerprintSeed {
             provider: embedding_provider_name(embedding.provider).to_string(),
-            model_id: configured_embedding_model_id(embedding)
+            model_id: configured
+                .model_id
                 .unwrap_or_else(|| "qgh-test-embedding".to_string()),
-            model_revision: configured_embedding_model_revision(embedding)
+            model_revision: configured
+                .model_revision
                 .unwrap_or_else(|| LOCAL_MODEL_REVISION.to_string()),
             pooling: embedding.pooling.unwrap_or(PoolingKind::Cls),
             query_prefix: embedding
@@ -2337,52 +2340,90 @@ fn embedding_runtime_with_access(
         EmbeddingProviderKind::Local => {
             let options = embedding.fastembed_options();
             let prepared_store = default_prepared_model_store().map_err(embedding_error)?;
-            let snapshot = match access {
-                PreparedModelAccess::Acquire => prepared_store.acquire(&options),
-                PreparedModelAccess::LoadLocal => prepared_store.load(&options),
-            }
-            .map_err(embedding_error)?;
-            let cache_key = cache_profile_id
-                .map(|profile_id| format!("{profile_id}:{}", snapshot.manifest.hash()));
-            if let Some(cache_key) = cache_key.as_ref() {
-                if let Some(runtime) = EMBEDDING_RUNTIME_CACHE
-                    .get_or_init(|| Mutex::new(HashMap::new()))
-                    .lock()
-                    .expect("embedding runtime cache mutex poisoned")
-                    .get(cache_key)
-                    .cloned()
-                {
-                    return Ok(runtime);
+            match access {
+                PreparedModelAccess::Acquire => {
+                    let snapshot = prepared_store.acquire(&options).map_err(embedding_error)?;
+                    build_embedding_runtime(embedding, &snapshot)
+                }
+                PreparedModelAccess::LoadLocal => {
+                    let inspection = prepared_store.inspect(&options).map_err(embedding_error)?;
+                    if let Some(profile_id) = cache_profile_id {
+                        let cache_key = prepared_runtime_cache_key(profile_id, &inspection);
+                        let profile_prefix = format!("{profile_id}:");
+                        return runtime_cache_get_or_try_init(
+                            EMBEDDING_RUNTIME_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+                            &cache_key,
+                            &profile_prefix,
+                            || {
+                                let snapshot =
+                                    prepared_store.verify(inspection).map_err(embedding_error)?;
+                                build_embedding_runtime(embedding, &snapshot)
+                            },
+                        );
+                    }
+                    let snapshot = prepared_store.verify(inspection).map_err(embedding_error)?;
+                    build_embedding_runtime(embedding, &snapshot)
                 }
             }
-            let tokenizer = FastembedTokenizer::from_prepared_snapshot(&snapshot)
-                .map(|tokenizer| Box::new(tokenizer) as Box<dyn EmbeddingTokenizer>)
-                .map_err(embedding_error)?;
-            let engine =
-                FastembedEngine::from_prepared_snapshot(&snapshot).map_err(embedding_error)?;
-            let provider =
-                LocalEmbeddingProvider::with_contract(engine, snapshot.manifest.runtime_contract())
-                    .map_err(embedding_error)?;
-            validate_batch_comparability(&provider, "qgh prepared model smoke")
-                .map_err(embedding_error)?;
-            let runtime = Arc::new(EmbeddingRuntime {
-                tokenizer,
-                provider: Box::new(provider),
-                model_manifest_hash: snapshot.manifest.hash(),
-                fingerprint_seed: embedding_fingerprint_seed(embedding, &snapshot),
-            });
-            if let (Some(profile_id), Some(cache_key)) = (cache_profile_id, cache_key) {
-                let mut cache = EMBEDDING_RUNTIME_CACHE
-                    .get_or_init(|| Mutex::new(HashMap::new()))
-                    .lock()
-                    .expect("embedding runtime cache mutex poisoned");
-                let profile_prefix = format!("{profile_id}:");
-                cache.retain(|key, _| !key.starts_with(&profile_prefix));
-                cache.insert(cache_key, Arc::clone(&runtime));
-            }
-            Ok(runtime)
         }
     }
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn prepared_runtime_cache_key(profile_id: &str, inspection: &PreparedModelInspection) -> String {
+    format!(
+        "{profile_id}:{}:{}",
+        inspection.manifest_hash(),
+        inspection.artifact_stamp()
+    )
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn runtime_cache_get_or_try_init<T, E>(
+    cache: &Mutex<HashMap<String, Arc<T>>>,
+    cache_key: &str,
+    profile_prefix: &str,
+    initialize: impl FnOnce() -> Result<Arc<T>, E>,
+) -> Result<Arc<T>, E> {
+    if let Some(runtime) = cache
+        .lock()
+        .expect("embedding runtime cache mutex poisoned")
+        .get(cache_key)
+        .cloned()
+    {
+        return Ok(runtime);
+    }
+    let runtime = initialize()?;
+    let mut cache = cache
+        .lock()
+        .expect("embedding runtime cache mutex poisoned");
+    if let Some(existing) = cache.get(cache_key).cloned() {
+        return Ok(existing);
+    }
+    cache.retain(|key, _| !key.starts_with(profile_prefix));
+    cache.insert(cache_key.to_string(), Arc::clone(&runtime));
+    Ok(runtime)
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn build_embedding_runtime(
+    embedding: &EmbeddingConfig,
+    snapshot: &PreparedModelSnapshot,
+) -> Result<Arc<EmbeddingRuntime>, QghError> {
+    let tokenizer = FastembedTokenizer::from_prepared_snapshot(snapshot)
+        .map(|tokenizer| Box::new(tokenizer) as Box<dyn EmbeddingTokenizer>)
+        .map_err(embedding_error)?;
+    let engine = FastembedEngine::from_prepared_snapshot(snapshot).map_err(embedding_error)?;
+    let provider =
+        LocalEmbeddingProvider::with_contract(engine, snapshot.manifest.runtime_contract())
+            .map_err(embedding_error)?;
+    validate_batch_comparability(&provider, "qgh prepared model smoke").map_err(embedding_error)?;
+    Ok(Arc::new(EmbeddingRuntime {
+        tokenizer,
+        provider: Box::new(provider),
+        model_manifest_hash: snapshot.manifest.hash(),
+        fingerprint_seed: embedding_fingerprint_seed(embedding, snapshot),
+    }))
 }
 
 #[cfg(not(feature = "fastembed-provider"))]
@@ -2432,7 +2473,12 @@ fn embedding_fingerprint_seed(
 
 #[cfg(feature = "fastembed-provider")]
 fn prepared_model_id(snapshot: &PreparedModelSnapshot) -> String {
-    match &snapshot.manifest.model_source {
+    prepared_manifest_model_id(&snapshot.manifest)
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn prepared_manifest_model_id(manifest: &ModelManifestV1) -> String {
+    match &manifest.model_source {
         ModelSourceV1::Hf { model_id, .. } => model_id.clone(),
         ModelSourceV1::Local { declared_id } => format!("local:{declared_id}"),
     }
@@ -3834,6 +3880,22 @@ struct EmbeddingCoverageState {
     completed_chunks: i64,
     missing_chunks: i64,
     mismatched_chunks: i64,
+    prepared_runtime: PreparedRuntimeAvailability,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedRuntimeAvailability {
+    Available,
+    Missing,
+    Corrupt,
+}
+
+struct ConfiguredEmbeddingSnapshot {
+    model_id: Option<String>,
+    model_revision: Option<String>,
+    pooling: Option<crate::embedding::PoolingKind>,
+    query_prefix: Option<String>,
+    prepared_runtime: PreparedRuntimeAvailability,
 }
 
 impl EmbeddingCoverageState {
@@ -3856,6 +3918,16 @@ impl EmbeddingCoverageState {
         }
     }
 
+    fn status_state(&self) -> &'static str {
+        match self.prepared_runtime {
+            PreparedRuntimeAvailability::Corrupt => "corrupt",
+            PreparedRuntimeAvailability::Missing if !self.artifact_corrupt => "missing",
+            PreparedRuntimeAvailability::Available | PreparedRuntimeAvailability::Missing => {
+                self.state()
+            }
+        }
+    }
+
     fn has_active_embedding(&self) -> bool {
         self.generation_active || self.active_fingerprint.is_some()
     }
@@ -3875,11 +3947,20 @@ fn embedding_coverage_state(
     let Some(embedding) = profile.embedding.as_ref() else {
         return Ok(None);
     };
+    let configured = configured_embedding_snapshot(embedding);
+    embedding_coverage_state_for_config(embedding, store, &configured).map(Some)
+}
+
+fn embedding_coverage_state_for_config(
+    embedding: &EmbeddingConfig,
+    store: &Store,
+    configured: &ConfiguredEmbeddingSnapshot,
+) -> Result<EmbeddingCoverageState, QghError> {
     if let Some((_generation_id, total_chunks, completed_chunks, generation_valid)) =
         store.active_embedding_generation_coverage()?
     {
         if !generation_valid {
-            return Ok(Some(EmbeddingCoverageState {
+            return Ok(EmbeddingCoverageState {
                 active_fingerprint: None,
                 generation_active: true,
                 active_matches_config: true,
@@ -3888,13 +3969,14 @@ fn embedding_coverage_state(
                 completed_chunks,
                 missing_chunks: total_chunks.saturating_sub(completed_chunks),
                 mismatched_chunks: 0,
-            }));
+                prepared_runtime: configured.prepared_runtime,
+            });
         }
         // Publication validation proves structural coverage. When the config
         // fully pins the fingerprint inputs, status can compare offline. A
         // mutable revision remains structurally complete and is verified
         // after the local runtime resolves it in `hybrid_vector_hits`.
-        let expectation = embedding_fingerprint_expectation(embedding);
+        let expectation = embedding_fingerprint_expectation_from_snapshot(embedding, configured);
         let comparable_seed = expectation
             .model_id
             .zip(expectation.model_revision)
@@ -3921,7 +4003,7 @@ fn embedding_coverage_state(
                 })
                 .is_some_and(|(dimension, hash)| hash == seed.with_dimension(dimension).hash())
         });
-        return Ok(Some(EmbeddingCoverageState {
+        return Ok(EmbeddingCoverageState {
             active_fingerprint: None,
             generation_active: true,
             active_matches_config,
@@ -3942,16 +4024,31 @@ fn embedding_coverage_state(
             } else {
                 completed_chunks
             },
-        }));
+            prepared_runtime: configured.prepared_runtime,
+        });
     }
-    let expectation = embedding_fingerprint_expectation(embedding);
+    let expectation = embedding_fingerprint_expectation_from_snapshot(embedding, configured);
     let total_chunks = match store.active_embedding_chunk_count() {
         Ok(total_chunks) => total_chunks,
-        Err(_) => return Ok(Some(corrupt_embedding_coverage(None, false, 0))),
+        Err(_) => {
+            return Ok(corrupt_embedding_coverage(
+                None,
+                false,
+                0,
+                configured.prepared_runtime,
+            ));
+        }
     };
     let active_fingerprint = match store.active_embedding_fingerprint() {
         Ok(active_fingerprint) => active_fingerprint,
-        Err(_) => return Ok(Some(corrupt_embedding_coverage(None, false, total_chunks))),
+        Err(_) => {
+            return Ok(corrupt_embedding_coverage(
+                None,
+                false,
+                total_chunks,
+                configured.prepared_runtime,
+            ));
+        }
     };
     let active_matches_config = active_fingerprint
         .as_ref()
@@ -3961,11 +4058,12 @@ fn embedding_coverage_state(
         {
             Ok(count) => count,
             Err(_) => {
-                return Ok(Some(corrupt_embedding_coverage(
+                return Ok(corrupt_embedding_coverage(
                     active_fingerprint,
                     active_matches_config,
                     total_chunks,
-                )));
+                    configured.prepared_runtime,
+                ));
             }
         },
         None => 0,
@@ -3977,11 +4075,12 @@ fn embedding_coverage_state(
                 Ok(true)
             )
         {
-            return Ok(Some(corrupt_embedding_coverage(
+            return Ok(corrupt_embedding_coverage(
                 active_fingerprint,
                 active_matches_config,
                 total_chunks,
-            )));
+                configured.prepared_runtime,
+            ));
         }
     }
     let completed_chunks = if active_matches_config {
@@ -3996,7 +4095,7 @@ fn embedding_coverage_state(
         0
     };
 
-    Ok(Some(EmbeddingCoverageState {
+    Ok(EmbeddingCoverageState {
         active_fingerprint,
         generation_active: false,
         active_matches_config,
@@ -4005,13 +4104,15 @@ fn embedding_coverage_state(
         completed_chunks,
         missing_chunks,
         mismatched_chunks,
-    }))
+        prepared_runtime: configured.prepared_runtime,
+    })
 }
 
 fn corrupt_embedding_coverage(
     active_fingerprint: Option<EmbeddingFingerprint>,
     active_matches_config: bool,
     total_chunks: i64,
+    prepared_runtime: PreparedRuntimeAvailability,
 ) -> EmbeddingCoverageState {
     EmbeddingCoverageState {
         active_fingerprint,
@@ -4022,6 +4123,7 @@ fn corrupt_embedding_coverage(
         completed_chunks: 0,
         missing_chunks: total_chunks,
         mismatched_chunks: 0,
+        prepared_runtime,
     }
 }
 
@@ -4181,59 +4283,77 @@ fn embedding_warnings(profile: &Profile, store: &Store) -> Result<Vec<Value>, Qg
     let Some(coverage) = embedding_coverage_state(profile, store)? else {
         return Ok(Vec::new());
     };
-    match coverage.state() {
-        "missing" => Ok(vec![json!({
+    Ok(embedding_warnings_for_coverage(&coverage))
+}
+
+fn embedding_warnings_for_coverage(coverage: &EmbeddingCoverageState) -> Vec<Value> {
+    embedding_warnings_for_state(coverage.state())
+}
+
+fn embedding_warnings_for_state(state: &str) -> Vec<Value> {
+    match state {
+        "missing" => vec![json!({
             "code": "embedding.coverage_missing",
             "severity": "warn",
             "message": "No usable embeddings are available. Hybrid retrieval is disabled and BM25 results are still returned."
-        })]),
-        "partial" => Ok(vec![json!({
+        })],
+        "partial" => vec![json!({
             "code": "embedding.coverage_partial",
             "severity": "warn",
             "message": "Embedding coverage is incomplete. Hybrid retrieval is disabled and BM25 results are still returned."
-        })]),
-        "fingerprint_mismatch" => Ok(vec![json!({
+        })],
+        "fingerprint_mismatch" => vec![json!({
             "code": "embedding.fingerprint_mismatch",
             "severity": "warn_strong",
             "message": "Stored embeddings were created with a different embedding fingerprint and will not be used for vector search. BM25 results are still returned."
-        })]),
-        "corrupt" => Ok(vec![embedding_warning(
+        })],
+        "corrupt" => vec![embedding_warning(
             "embedding.artifact_corrupt",
             "Stored embedding artifacts are corrupt or incomplete. Hybrid retrieval is disabled and BM25 results are still returned.",
-        )]),
-        "complete" => Ok(Vec::new()),
+        )],
+        "complete" => Vec::new(),
         _ => unreachable!("embedding coverage state is closed"),
     }
 }
 
-fn embedding_status(profile: &Profile, store: &Store) -> Result<Option<Value>, QghError> {
+fn embedding_status_report(
+    profile: &Profile,
+    store: &Store,
+) -> Result<(Option<Value>, Vec<Value>), QghError> {
     let Some(embedding) = profile.embedding.as_ref() else {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     };
-    let Some(coverage) = embedding_coverage_state(profile, store)? else {
-        return Ok(None);
-    };
+    let configured = configured_embedding_snapshot(embedding);
+    let coverage = embedding_coverage_state_for_config(embedding, store, &configured)?;
+    let status_state = coverage.status_state();
+    let warnings = embedding_warnings_for_state(status_state);
 
-    Ok(Some(json!({
-        "state": coverage.state(),
-        "coverage": {
-            "total_chunks": coverage.total_chunks,
-            "completed_chunks": coverage.completed_chunks,
-            "missing_chunks": coverage.missing_chunks,
-            "mismatched_chunks": coverage.mismatched_chunks
-        },
-        "configured_model": configured_embedding_model_json(embedding),
-        "fingerprint": coverage
-            .active_fingerprint
-            .as_ref()
-            .map(|fingerprint| embedding_fingerprint_status_json(
-                fingerprint,
-                coverage.active_matches_config
-            ))
-    })))
+    Ok((
+        Some(json!({
+            "state": status_state,
+            "coverage": {
+                "total_chunks": coverage.total_chunks,
+                "completed_chunks": coverage.completed_chunks,
+                "missing_chunks": coverage.missing_chunks,
+                "mismatched_chunks": coverage.mismatched_chunks
+            },
+            "configured_model": configured_embedding_model_json(embedding, &configured),
+            "fingerprint": coverage
+                .active_fingerprint
+                .as_ref()
+                .map(|fingerprint| embedding_fingerprint_status_json(
+                    fingerprint,
+                    coverage.active_matches_config
+                ))
+        })),
+        warnings,
+    ))
 }
 
-fn configured_embedding_model_json(embedding: &EmbeddingConfig) -> Value {
+fn configured_embedding_model_json(
+    embedding: &EmbeddingConfig,
+    configured: &ConfiguredEmbeddingSnapshot,
+) -> Value {
     let model =
         if embedding.model_path.is_some() || embedding.manifest_path.is_some() {
             None
@@ -4245,8 +4365,8 @@ fn configured_embedding_model_json(embedding: &EmbeddingConfig) -> Value {
     json!({
         "provider": embedding_provider_name(embedding.provider),
         "model": model,
-        "model_id": configured_embedding_model_id(embedding),
-        "model_revision": configured_embedding_model_revision(embedding),
+        "model_id": configured.model_id,
+        "model_revision": configured.model_revision,
         "model_path": embedding
             .model_path
             .as_ref()
@@ -4277,44 +4397,101 @@ fn embedding_fingerprint_status_json(
 fn embedding_fingerprint_expectation(
     embedding: &EmbeddingConfig,
 ) -> EmbeddingFingerprintExpectation {
-    #[cfg(feature = "fastembed-provider")]
-    if let Some(snapshot) = configured_prepared_snapshot(embedding) {
-        return EmbeddingFingerprintExpectation {
-            provider: embedding_provider_name(embedding.provider).to_string(),
-            model_id: Some(prepared_model_id(&snapshot)),
-            model_revision: Some(snapshot.manifest.hash()),
-            pooling: Some(snapshot.manifest.pooling),
-            query_prefix: Some(snapshot.manifest.query_prefix.unwrap_or_default()),
-        };
-    }
+    let configured = configured_embedding_snapshot(embedding);
+    embedding_fingerprint_expectation_from_snapshot(embedding, &configured)
+}
+
+fn embedding_fingerprint_expectation_from_snapshot(
+    embedding: &EmbeddingConfig,
+    configured: &ConfiguredEmbeddingSnapshot,
+) -> EmbeddingFingerprintExpectation {
     EmbeddingFingerprintExpectation {
         provider: embedding_provider_name(embedding.provider).to_string(),
-        model_id: configured_embedding_model_id(embedding),
-        model_revision: configured_embedding_model_revision(embedding),
+        model_id: configured.model_id.clone(),
+        model_revision: configured.model_revision.clone(),
+        pooling: configured.pooling,
+        query_prefix: configured.query_prefix.clone(),
+    }
+}
+
+fn configured_embedding_snapshot(embedding: &EmbeddingConfig) -> ConfiguredEmbeddingSnapshot {
+    #[cfg(feature = "fastembed-provider")]
+    let prepared_runtime = {
+        let mut prepared_runtime = PreparedRuntimeAvailability::Missing;
+        if let Ok(store) = default_prepared_model_store() {
+            let options = embedding.fastembed_options();
+            match store.inspect(&options) {
+                Ok(inspection) => {
+                    return configured_snapshot_from_inspection(
+                        &inspection,
+                        PreparedRuntimeAvailability::Available,
+                    );
+                }
+                Err(error) => {
+                    let availability = if error.code() == "embedding.prepared_snapshot_missing" {
+                        PreparedRuntimeAvailability::Missing
+                    } else {
+                        PreparedRuntimeAvailability::Corrupt
+                    };
+                    prepared_runtime = availability;
+                    if let Some(manifest_path) = options.manifest_path.as_deref() {
+                        if let Ok(inspection) =
+                            PreparedModelStore::new(PathBuf::new()).inspect_manifest(manifest_path)
+                        {
+                            return configured_snapshot_from_inspection(&inspection, availability);
+                        }
+                    }
+                }
+            }
+        }
+        prepared_runtime
+    };
+    #[cfg(not(feature = "fastembed-provider"))]
+    let prepared_runtime = PreparedRuntimeAvailability::Missing;
+
+    #[cfg(debug_assertions)]
+    let prepared_runtime = if std::env::var_os(TEST_EMBEDDING_QUERY_VECTORS_ENV).is_some()
+        || std::env::var_os(TEST_EMBEDDING_DOCUMENT_VECTORS_ENV).is_some()
+    {
+        PreparedRuntimeAvailability::Available
+    } else {
+        prepared_runtime
+    };
+
+    ConfiguredEmbeddingSnapshot {
+        model_id: if embedding.model_path.is_some() {
+            embedding
+                .model_path
+                .as_ref()
+                .map(|path| format!("model_path:{}", path.to_string_lossy()))
+        } else {
+            Some(configured_hf_model_reference(embedding).model_id)
+        },
+        model_revision: configured_embedding_model_revision_without_snapshot(embedding),
         pooling: embedding.pooling,
         query_prefix: embedding.query_prefix.clone(),
+        prepared_runtime,
     }
 }
 
-fn configured_embedding_model_id(embedding: &EmbeddingConfig) -> Option<String> {
-    #[cfg(feature = "fastembed-provider")]
-    if let Some(snapshot) = configured_prepared_snapshot(embedding) {
-        return Some(prepared_model_id(&snapshot));
+#[cfg(feature = "fastembed-provider")]
+fn configured_snapshot_from_inspection(
+    inspection: &PreparedModelInspection,
+    prepared_runtime: PreparedRuntimeAvailability,
+) -> ConfiguredEmbeddingSnapshot {
+    let manifest = inspection.manifest();
+    ConfiguredEmbeddingSnapshot {
+        model_id: Some(prepared_manifest_model_id(manifest)),
+        model_revision: Some(inspection.manifest_hash().to_string()),
+        pooling: Some(manifest.pooling),
+        query_prefix: Some(manifest.query_prefix.clone().unwrap_or_default()),
+        prepared_runtime,
     }
-    if embedding.model_path.is_some() {
-        return embedding
-            .model_path
-            .as_ref()
-            .map(|path| format!("model_path:{}", path.to_string_lossy()));
-    }
-    Some(configured_hf_model_reference(embedding).model_id)
 }
 
-fn configured_embedding_model_revision(embedding: &EmbeddingConfig) -> Option<String> {
-    #[cfg(feature = "fastembed-provider")]
-    if let Some(snapshot) = configured_prepared_snapshot(embedding) {
-        return Some(snapshot.manifest.hash());
-    }
+fn configured_embedding_model_revision_without_snapshot(
+    embedding: &EmbeddingConfig,
+) -> Option<String> {
     if embedding.model_path.is_some() {
         return Some(LOCAL_MODEL_REVISION.to_string());
     }
@@ -4343,20 +4520,6 @@ fn configured_hf_model_reference(
                 .expect("validated embedding model reference or preset")
         })
         .unwrap_or_else(default_hf_model_reference)
-}
-
-#[cfg(feature = "fastembed-provider")]
-fn configured_prepared_snapshot(embedding: &EmbeddingConfig) -> Option<PreparedModelSnapshot> {
-    let store = default_prepared_model_store().ok()?;
-    let options = embedding.fastembed_options();
-    match store.load(&options) {
-        Ok(snapshot) => Some(snapshot),
-        Err(_) => options.manifest_path.as_deref().and_then(|manifest_path| {
-            PreparedModelStore::new(PathBuf::new())
-                .load_manifest(manifest_path)
-                .ok()
-        }),
-    }
 }
 
 fn embedding_provider_name(provider: EmbeddingProviderKind) -> &'static str {
@@ -4772,8 +4935,8 @@ pub fn status(
         return Err(freshness_error(freshness.block, freshness.warnings));
     }
     let mut warnings = freshness.warnings;
-    warnings.extend(embedding_warnings(&profile, &store)?);
-    let embedding = embedding_status(&profile, &store)?;
+    let (embedding, embedding_warnings) = embedding_status_report(&profile, &store)?;
+    warnings.extend(embedding_warnings);
     let source_count = (status.issue_count + status.comment_count) as usize;
     let age_days = status
         .last_reconciliation
@@ -4885,39 +5048,45 @@ pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
         Ok(token) => doctor_github_probe(&profile, &token).await,
         Err(_) => (false, false, rate_limit_headers_json(None, None)),
     };
+    let mut checks = vec![
+        json!({
+            "name": "config",
+            "ok": true
+        }),
+        json!({
+            "name": "file_permissions",
+            "ok": permissions_ok
+        }),
+        json!({
+            "name": "sqlite",
+            "ok": sqlite_ok
+        }),
+        json!({
+            "name": "tantivy",
+            "ok": tantivy_ok
+        }),
+    ];
+    if let Some(embedding) = profile.embedding.as_ref() {
+        checks.extend(doctor_embedding_checks(embedding, &store));
+    }
+    checks.extend([
+        json!({
+            "name": "github_auth_reachability",
+            "ok": github_ok
+        }),
+        json!({
+            "name": "rate_limit_headers",
+            "ok": rate_limit_ok,
+            "headers": rate_limit_headers
+        }),
+        json!({
+            "name": "purge",
+            "ok": purge_ok
+        }),
+    ]);
     Ok(json!({
         "profile_id": profile.id,
-        "checks": [
-            {
-                "name": "config",
-                "ok": true
-            },
-            {
-                "name": "file_permissions",
-                "ok": permissions_ok
-            },
-            {
-                "name": "sqlite",
-                "ok": sqlite_ok
-            },
-            {
-                "name": "tantivy",
-                "ok": tantivy_ok
-            },
-            {
-                "name": "github_auth_reachability",
-                "ok": github_ok
-            },
-            {
-                "name": "rate_limit_headers",
-                "ok": rate_limit_ok,
-                "headers": rate_limit_headers
-            },
-            {
-                "name": "purge",
-                "ok": purge_ok
-            }
-        ],
+        "checks": checks,
         "purge": {
             "pending_count": purge["pending_count"],
             "successor_repair_required": purge["successor_repair_required"],
@@ -4933,6 +5102,35 @@ pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
             "tools": ["query", "get", "status"]
         }
     }))
+}
+
+fn doctor_embedding_checks(embedding: &EmbeddingConfig, store: &Store) -> [Value; 3] {
+    #[cfg(feature = "fastembed-provider")]
+    let (artifacts_ok, runtime_ok) = {
+        let snapshot = default_prepared_model_store().and_then(|prepared_store| {
+            prepared_store
+                .inspect(&embedding.fastembed_options())
+                .and_then(|inspection| prepared_store.verify(inspection))
+        });
+        let artifacts_ok = snapshot.is_ok();
+        let runtime_ok = snapshot
+            .as_ref()
+            .is_ok_and(|snapshot| build_embedding_runtime(embedding, snapshot).is_ok());
+        (artifacts_ok, runtime_ok)
+    };
+    #[cfg(not(feature = "fastembed-provider"))]
+    let (artifacts_ok, runtime_ok) = {
+        let _ = embedding;
+        (false, false)
+    };
+    let generation_ok = store
+        .validate_active_embedding_generation_artifacts()
+        .unwrap_or(false);
+    [
+        json!({"name": "embedding_artifacts", "ok": artifacts_ok}),
+        json!({"name": "embedding_runtime", "ok": runtime_ok}),
+        json!({"name": "embedding_generation", "ok": generation_ok}),
+    ]
 }
 
 fn purge_report(store: &Store) -> Result<Value, QghError> {
@@ -5334,6 +5532,61 @@ fn lexical_evidence(
 mod tests {
     use super::*;
     use crate::model::{IssueRecord, SourceVersionView};
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn warm_runtime_cache_hit_skips_verifier_and_runtime_factory() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = Mutex::new(HashMap::from([(
+            "work:manifest:stamp".to_string(),
+            Arc::new(7_usize),
+        )]));
+        let builds = AtomicUsize::new(0);
+
+        let runtime = runtime_cache_get_or_try_init(
+            &cache,
+            "work:manifest:stamp",
+            "work:",
+            || -> Result<Arc<usize>, ()> {
+                builds.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(9))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*runtime, 7);
+        assert_eq!(builds.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn changed_runtime_cache_stamp_verifies_before_replacing_profile_entry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = Mutex::new(HashMap::from([(
+            "work:manifest:old-stamp".to_string(),
+            Arc::new(7_usize),
+        )]));
+        let builds = AtomicUsize::new(0);
+
+        let runtime = runtime_cache_get_or_try_init(
+            &cache,
+            "work:manifest:new-stamp",
+            "work:",
+            || -> Result<Arc<usize>, ()> {
+                builds.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(9))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*runtime, 9);
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        let cache = cache.lock().unwrap();
+        assert!(!cache.contains_key("work:manifest:old-stamp"));
+        assert!(cache.contains_key("work:manifest:new-stamp"));
+    }
 
     fn test_stored_chunk(source_id: &str) -> StoredChunk {
         StoredChunk {
@@ -5948,9 +6201,10 @@ mod tests {
             )
         );
         let profile = pinned_embedding_profile(&paths, model_revision);
-        let coverage = embedding_coverage_state(&profile, &store)
-            .unwrap()
-            .expect("configured embedding coverage");
+        let embedding = profile.embedding.as_ref().unwrap();
+        let mut configured = configured_embedding_snapshot(embedding);
+        configured.prepared_runtime = PreparedRuntimeAvailability::Available;
+        let coverage = embedding_coverage_state_for_config(embedding, &store, &configured).unwrap();
         assert_eq!(coverage.state(), "complete");
         assert!(coverage.hybrid_ready());
 

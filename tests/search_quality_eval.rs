@@ -1638,7 +1638,11 @@ query_prefix = "query: "
             source_vectors.len(),
             "qgh embed --force must embed every candidate document vector"
         );
-        let status = self.qgh(&["status", "--json"]);
+        let status = self.qgh_with_embedding_vectors(
+            &["status", "--json"],
+            None,
+            Some(&document_vectors_json),
+        );
         assert_success(&status);
         let status_json = stdout_json(&status);
         assert_eq!(status_json["data"]["embedding"]["state"], "complete");

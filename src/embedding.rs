@@ -4,7 +4,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
@@ -40,6 +41,8 @@ const GRANITE_311M_R2_REVISION: &str = "44399559930365213510b1ee2eb15ded83374f0e
 pub const HUGGINGFACE_ENDPOINT: &str = "https://huggingface.co";
 pub const EMBEDDING_FINGERPRINT_SCHEMA_VERSION: &str = "qgh.embedding_fingerprint.v1";
 pub const MODEL_MANIFEST_SCHEMA_VERSION: &str = "qgh.model_manifest.v1";
+const MAX_PREPARED_ALIAS_BYTES: u64 = 64 * 1024;
+const MAX_MODEL_MANIFEST_BYTES: u64 = 1024 * 1024;
 // v2: chunks slice the tokenizer's canonical (normalized) text instead of
 // the raw source body, so v1 chunk bodies and embeddings are not comparable.
 pub const CHUNKER_VERSION: &str = "qgh.chunker.v2";
@@ -592,6 +595,53 @@ pub struct PreparedModelSnapshot {
     paths: BTreeMap<ArtifactRole, Vec<PathBuf>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedModelInspection {
+    manifest: ModelManifestV1,
+    manifest_hash: String,
+    root: PathBuf,
+    artifacts: Vec<PreparedArtifactInspection>,
+    artifact_stamp: String,
+}
+
+impl PreparedModelInspection {
+    pub fn manifest(&self) -> &ModelManifestV1 {
+        &self.manifest
+    }
+
+    pub fn manifest_hash(&self) -> &str {
+        &self.manifest_hash
+    }
+
+    pub fn artifact_stamp(&self) -> &str {
+        &self.artifact_stamp
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PreparedArtifactInspection {
+    role: ArtifactRole,
+    relative_path: String,
+    canonical_path: PathBuf,
+    expected_sha256: String,
+    expected_byte_size: u64,
+    identity: ArtifactFileIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactFileIdentity {
+    byte_size: u64,
+    modified_nanos: Option<u128>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    ctime_seconds: i64,
+    #[cfg(unix)]
+    ctime_nanos: i64,
+}
+
 impl PreparedModelSnapshot {
     pub fn path_for_role(&self, role: ArtifactRole) -> Option<&Path> {
         self.paths
@@ -681,11 +731,20 @@ impl PreparedModelStore {
         &self,
         options: &FastembedProviderOptions,
     ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
-        let bytes = match fs::read(self.alias_path(options)) {
-            Ok(bytes) => bytes,
+        let inspection = self.inspect(options)?;
+        self.verify(inspection)
+    }
+
+    pub fn inspect(
+        &self,
+        options: &FastembedProviderOptions,
+    ) -> Result<PreparedModelInspection, EmbeddingProviderError> {
+        let alias_path = self.alias_path(options);
+        let alias_metadata = match fs::symlink_metadata(&alias_path) {
+            Ok(metadata) => metadata,
             Err(error) => {
                 if let Some(manifest_path) = &options.manifest_path {
-                    self.load_manifest(manifest_path)?;
+                    self.inspect_manifest(manifest_path)?;
                 }
                 return Err(EmbeddingProviderError::structured(
                     "embedding.prepared_snapshot_missing",
@@ -694,6 +753,37 @@ impl PreparedModelStore {
                 .with_details(json!({ "error": error.to_string() })));
             }
         };
+        if alias_metadata.file_type().is_symlink() || !alias_metadata.is_file() {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.prepared_alias_invalid",
+                "Prepared model alias must be a regular non-symlink file.",
+            ));
+        }
+        if alias_metadata.len() > MAX_PREPARED_ALIAS_BYTES {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.prepared_alias_invalid",
+                "Prepared model alias exceeds the supported size.",
+            ));
+        }
+        let requests_root = canonical_store_subdirectory(
+            &self.root,
+            "requests",
+            "embedding.prepared_alias_invalid",
+            "Prepared model request storage is invalid.",
+        )?;
+        if !fs::canonicalize(&alias_path)?.starts_with(&requests_root) {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.prepared_alias_invalid",
+                "Prepared model alias escapes the prepared model store.",
+            ));
+        }
+        let bytes = read_bounded_file(
+            &alias_path,
+            &artifact_file_identity(&alias_metadata),
+            MAX_PREPARED_ALIAS_BYTES,
+            "embedding.prepared_alias_invalid",
+            "Prepared model alias changed or exceeds the supported size.",
+        )?;
         let alias: PreparedModelAliasV1 = serde_json::from_slice(&bytes).map_err(|error| {
             EmbeddingProviderError::structured(
                 "embedding.prepared_alias_invalid",
@@ -714,20 +804,55 @@ impl PreparedModelStore {
             .join("snapshots")
             .join(&alias.manifest_hash)
             .join("manifest.json");
-        let snapshot = self.load_manifest(&manifest_path)?;
-        if snapshot.manifest.hash() != alias.manifest_hash {
+        let snapshots_root = canonical_store_subdirectory(
+            &self.root,
+            "snapshots",
+            "embedding.prepared_alias_invalid",
+            "Prepared model snapshot storage is invalid.",
+        )?;
+        let snapshot_root = manifest_path
+            .parent()
+            .expect("snapshot manifest has a parent");
+        let snapshot_metadata = fs::symlink_metadata(snapshot_root).map_err(|_| {
+            EmbeddingProviderError::structured(
+                "embedding.prepared_snapshot_missing",
+                "No prepared local model snapshot is available.",
+            )
+        })?;
+        if snapshot_metadata.file_type().is_symlink() || !snapshot_metadata.is_dir() {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.prepared_alias_invalid",
+                "Prepared model alias must reference a regular snapshot directory.",
+            ));
+        }
+        let inspection = self.inspect_manifest(&manifest_path)?;
+        if inspection.manifest_hash != alias.manifest_hash {
             return Err(EmbeddingProviderError::structured(
                 "embedding.prepared_alias_mismatch",
                 "Prepared model alias does not match the snapshot manifest.",
             ));
         }
-        Ok(snapshot)
+        if !inspection.root.starts_with(&snapshots_root) {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.prepared_alias_invalid",
+                "Prepared model alias escapes the prepared model store.",
+            ));
+        }
+        Ok(inspection)
     }
 
     pub fn load_manifest(
         &self,
         manifest_path: &Path,
     ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
+        let inspection = self.inspect_manifest(manifest_path)?;
+        self.verify(inspection)
+    }
+
+    pub fn inspect_manifest(
+        &self,
+        manifest_path: &Path,
+    ) -> Result<PreparedModelInspection, EmbeddingProviderError> {
         let metadata = fs::symlink_metadata(manifest_path).map_err(|error| {
             EmbeddingProviderError::structured(
                 "embedding.prepared_manifest_missing",
@@ -741,6 +866,12 @@ impl PreparedModelStore {
                 "Prepared model manifest must be a regular file.",
             ));
         }
+        if metadata.len() > MAX_MODEL_MANIFEST_BYTES {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.prepared_manifest_invalid",
+                "Prepared model manifest exceeds the supported size.",
+            ));
+        }
         let root = manifest_path.parent().ok_or_else(|| {
             EmbeddingProviderError::structured(
                 "embedding.prepared_manifest_invalid",
@@ -748,10 +879,19 @@ impl PreparedModelStore {
             )
         })?;
         let canonical_root = fs::canonicalize(root)?;
-        let manifest = ModelManifestV1::from_json_slice(&fs::read(manifest_path)?)?;
-        let mut paths = BTreeMap::<ArtifactRole, Vec<PathBuf>>::new();
+        let manifest_bytes = read_bounded_file(
+            manifest_path,
+            &artifact_file_identity(&metadata),
+            MAX_MODEL_MANIFEST_BYTES,
+            "embedding.prepared_manifest_invalid",
+            "Prepared model manifest changed or exceeds the supported size.",
+        )?;
+        let manifest = ModelManifestV1::from_json_slice(&manifest_bytes)?;
+        let manifest_hash = manifest.hash();
+        let mut artifacts = Vec::with_capacity(manifest.artifacts.len());
         for artifact in &manifest.artifacts {
             let relative = confined_relative_path(&artifact.relative_path)?;
+            reject_symlink_components(&canonical_root, relative)?;
             let path = canonical_root.join(relative);
             let metadata = fs::symlink_metadata(&path).map_err(|error| {
                 EmbeddingProviderError::structured(
@@ -788,18 +928,61 @@ impl PreparedModelStore {
                     "Prepared model artifact size does not match the manifest.",
                 ));
             }
-            let bytes = fs::read(&canonical_path)?;
-            if hex_digest(&Sha256::digest(bytes)) != artifact.sha256 {
+            artifacts.push(PreparedArtifactInspection {
+                role: artifact.role,
+                relative_path: artifact.relative_path.clone(),
+                canonical_path,
+                expected_sha256: artifact.sha256.clone(),
+                expected_byte_size: artifact.byte_size,
+                identity: artifact_file_identity(&metadata),
+            });
+        }
+        let artifact_stamp = prepared_artifact_stamp(&manifest_hash, &canonical_root, &artifacts);
+        Ok(PreparedModelInspection {
+            manifest,
+            manifest_hash,
+            root: canonical_root,
+            artifacts,
+            artifact_stamp,
+        })
+    }
+
+    pub fn verify(
+        &self,
+        inspection: PreparedModelInspection,
+    ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
+        let mut paths = BTreeMap::<ArtifactRole, Vec<PathBuf>>::new();
+        for artifact in &inspection.artifacts {
+            let mut file = File::open(&artifact.canonical_path)?;
+            let opened_identity = artifact_file_identity(&file.metadata()?);
+            if opened_identity != artifact.identity {
+                return Err(artifact_changed_error());
+            }
+            let (sha256, byte_size) = stream_sha256(&mut file)?;
+            let final_identity = artifact_file_identity(&file.metadata()?);
+            if final_identity != opened_identity {
+                return Err(artifact_changed_error());
+            }
+            if byte_size != artifact.expected_byte_size {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.artifact_size_mismatch",
+                    "Prepared model artifact size does not match the manifest.",
+                ));
+            }
+            if sha256 != artifact.expected_sha256 {
                 return Err(EmbeddingProviderError::structured(
                     "embedding.artifact_checksum_mismatch",
                     "Prepared model artifact checksum does not match the manifest.",
                 ));
             }
-            paths.entry(artifact.role).or_default().push(canonical_path);
+            paths
+                .entry(artifact.role)
+                .or_default()
+                .push(artifact.canonical_path.clone());
         }
         Ok(PreparedModelSnapshot {
-            manifest,
-            root: canonical_root,
+            manifest: inspection.manifest,
+            root: inspection.root,
             paths,
         })
     }
@@ -818,6 +1001,18 @@ impl PreparedModelStore {
     ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
         fs::create_dir_all(self.root.join("snapshots"))?;
         fs::create_dir_all(self.root.join("requests"))?;
+        canonical_store_subdirectory(
+            &self.root,
+            "snapshots",
+            "embedding.acquisition_artifact_invalid",
+            "Prepared model snapshot storage is invalid.",
+        )?;
+        canonical_store_subdirectory(
+            &self.root,
+            "requests",
+            "embedding.acquisition_artifact_invalid",
+            "Prepared model request storage is invalid.",
+        )?;
         let staging = self.root.join(format!(
             ".staging-{}-{}",
             std::process::id(),
@@ -826,7 +1021,7 @@ impl PreparedModelStore {
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        fs::create_dir_all(&staging)?;
+        fs::create_dir(&staging)?;
         let result = (|| {
             let mut artifacts = Vec::with_capacity(sources.len());
             for source in sources {
@@ -838,17 +1033,16 @@ impl PreparedModelStore {
                         "Model acquisition source must be a regular non-symlink file.",
                     ));
                 }
-                let bytes = fs::read(&source.source_path)?;
                 let destination = staging.join(relative_path);
                 if let Some(parent) = destination.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(destination, &bytes)?;
+                let (sha256, byte_size) = stream_copy_and_hash(&source.source_path, &destination)?;
                 artifacts.push(ModelArtifactV1 {
                     role: source.role,
                     relative_path: source.relative_path,
-                    sha256: hex_digest(&Sha256::digest(&bytes)),
-                    byte_size: bytes.len() as u64,
+                    sha256,
+                    byte_size,
                     external_initializer_name: source.external_initializer_name,
                 });
             }
@@ -870,10 +1064,17 @@ impl PreparedModelStore {
                 manifest_hash,
             };
             let alias_path = self.alias_path(options);
-            let alias_staging = alias_path.with_extension(format!("tmp-{}", std::process::id()));
-            fs::write(
+            let alias_staging = alias_path.with_extension(format!(
+                "tmp-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            write_new_bytes(
                 &alias_staging,
-                serde_json::to_vec_pretty(&alias).expect("prepared alias serializes"),
+                &serde_json::to_vec_pretty(&alias).expect("prepared alias serializes"),
             )?;
             fs::rename(alias_staging, alias_path)?;
             self.load(options)
@@ -1272,6 +1473,257 @@ fn confined_relative_path(value: &str) -> Result<&Path, EmbeddingProviderError> 
         ));
     }
     Ok(path)
+}
+
+fn canonical_store_subdirectory(
+    store_root: &Path,
+    name: &str,
+    code: &'static str,
+    message: &'static str,
+) -> Result<PathBuf, EmbeddingProviderError> {
+    let canonical_store_root = fs::canonicalize(store_root)?;
+    let subdirectory = store_root.join(name);
+    let metadata = fs::symlink_metadata(&subdirectory)
+        .map_err(|_| EmbeddingProviderError::structured(code, message))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(EmbeddingProviderError::structured(code, message));
+    }
+    let canonical_subdirectory = fs::canonicalize(&subdirectory)?;
+    if !canonical_subdirectory.starts_with(&canonical_store_root) {
+        return Err(EmbeddingProviderError::structured(code, message));
+    }
+    Ok(canonical_subdirectory)
+}
+
+fn reject_symlink_components(root: &Path, relative: &Path) -> Result<(), EmbeddingProviderError> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::CurDir => continue,
+            Component::Normal(component) => current.push(component),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.artifact_path_invalid",
+                    "Prepared model artifact path must stay below the manifest root.",
+                ));
+            }
+        }
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            EmbeddingProviderError::structured(
+                "embedding.artifact_missing",
+                "Prepared model artifact is missing.",
+            )
+            .with_details(json!({ "error": error.to_string() }))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.artifact_symlink_forbidden",
+                "Prepared model artifacts must not contain symbolic links.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn artifact_file_identity(metadata: &fs::Metadata) -> ArtifactFileIdentity {
+    let modified_nanos = metadata.modified().ok().and_then(|modified| {
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_nanos())
+    });
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ArtifactFileIdentity {
+            byte_size: metadata.len(),
+            modified_nanos,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            ctime_seconds: metadata.ctime(),
+            ctime_nanos: metadata.ctime_nsec(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ArtifactFileIdentity {
+            byte_size: metadata.len(),
+            modified_nanos,
+        }
+    }
+}
+
+fn prepared_artifact_stamp(
+    manifest_hash: &str,
+    root: &Path,
+    artifacts: &[PreparedArtifactInspection],
+) -> String {
+    let mut hasher = Sha256::new();
+    update_path_digest(&mut hasher, root);
+    hasher.update(manifest_hash.as_bytes());
+    for artifact in artifacts {
+        hasher.update(artifact.relative_path.as_bytes());
+        update_path_digest(&mut hasher, &artifact.canonical_path);
+        hasher.update(artifact.expected_byte_size.to_le_bytes());
+        hasher.update(artifact.identity.byte_size.to_le_bytes());
+        hasher.update(
+            artifact
+                .identity
+                .modified_nanos
+                .unwrap_or_default()
+                .to_le_bytes(),
+        );
+        #[cfg(unix)]
+        {
+            hasher.update(artifact.identity.device.to_le_bytes());
+            hasher.update(artifact.identity.inode.to_le_bytes());
+            hasher.update(artifact.identity.ctime_seconds.to_le_bytes());
+            hasher.update(artifact.identity.ctime_nanos.to_le_bytes());
+        }
+    }
+    hex_digest(&hasher.finalize())
+}
+
+fn update_path_digest(hasher: &mut Sha256, path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        hasher.update(bytes.len().to_le_bytes());
+        hasher.update(bytes);
+    }
+    #[cfg(not(unix))]
+    {
+        let path = path.to_string_lossy();
+        hasher.update(path.len().to_le_bytes());
+        hasher.update(path.as_bytes());
+    }
+}
+
+fn read_bounded_file(
+    path: &Path,
+    expected_identity: &ArtifactFileIdentity,
+    max_bytes: u64,
+    code: &'static str,
+    message: &'static str,
+) -> Result<Vec<u8>, EmbeddingProviderError> {
+    let mut file = File::open(path)?;
+    if &artifact_file_identity(&file.metadata()?) != expected_identity {
+        return Err(EmbeddingProviderError::structured(code, message));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes
+        || &artifact_file_identity(&file.metadata()?) != expected_identity
+    {
+        return Err(EmbeddingProviderError::structured(code, message));
+    }
+    Ok(bytes)
+}
+
+fn stream_sha256(reader: &mut impl Read) -> Result<(String, u64), EmbeddingProviderError> {
+    const BUFFER_BYTES: usize = 1024 * 1024;
+    let mut buffer = vec![0_u8; BUFFER_BYTES];
+    let mut hasher = Sha256::new();
+    let mut byte_size = 0_u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        byte_size = byte_size.checked_add(read as u64).ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.artifact_size_mismatch",
+                "Prepared model artifact size exceeds the supported range.",
+            )
+        })?;
+    }
+    Ok((hex_digest(&hasher.finalize()), byte_size))
+}
+
+fn stream_copy_and_hash(
+    source: &Path,
+    destination: &Path,
+) -> Result<(String, u64), EmbeddingProviderError> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.acquisition_artifact_invalid",
+            "Model acquisition source must be a regular non-symlink file.",
+        ));
+    }
+    let expected_identity = artifact_file_identity(&metadata);
+    let mut source_file = File::open(source)?;
+    if artifact_file_identity(&source_file.metadata()?) != expected_identity {
+        return Err(artifact_changed_error());
+    }
+    let result = stream_reader_to_new_file(&mut source_file, destination);
+    if artifact_file_identity(&source_file.metadata()?) != expected_identity {
+        let _ = fs::remove_file(destination);
+        return Err(artifact_changed_error());
+    }
+    result
+}
+
+fn stream_reader_to_new_file(
+    reader: &mut impl Read,
+    destination: &Path,
+) -> Result<(String, u64), EmbeddingProviderError> {
+    const BUFFER_BYTES: usize = 1024 * 1024;
+    let mut destination_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let result = (|| {
+        let mut buffer = vec![0_u8; BUFFER_BYTES];
+        let mut hasher = Sha256::new();
+        let mut byte_size = 0_u64;
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            destination_file.write_all(&buffer[..read])?;
+            hasher.update(&buffer[..read]);
+            byte_size = byte_size.checked_add(read as u64).ok_or_else(|| {
+                EmbeddingProviderError::structured(
+                    "embedding.artifact_size_mismatch",
+                    "Prepared model artifact size exceeds the supported range.",
+                )
+            })?;
+        }
+        destination_file.sync_all()?;
+        Ok((hex_digest(&hasher.finalize()), byte_size))
+    })();
+    if result.is_err() {
+        drop(destination_file);
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+fn write_new_bytes(path: &Path, bytes: &[u8]) -> Result<(), EmbeddingProviderError> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+fn artifact_changed_error() -> EmbeddingProviderError {
+    EmbeddingProviderError::structured(
+        "embedding.artifact_changed",
+        "Prepared model artifact changed during verification.",
+    )
 }
 
 impl PoolingKind {
@@ -2821,6 +3273,156 @@ mod tests {
     }
 
     #[test]
+    fn inspection_is_body_free_but_verification_rejects_same_size_corruption() {
+        let root = temp_dir("qgh-prepared-inspect-verify");
+        let snapshot_root = root.join("snapshot");
+        let manifest_path = write_prepared_manifest_fixture(&snapshot_root, b"graph-one");
+        fs::write(snapshot_root.join("model.onnx"), b"graph-two").unwrap();
+
+        let store = PreparedModelStore::new(root.join("store"));
+        let inspection = store.inspect_manifest(&manifest_path).unwrap();
+        let error = store.verify(inspection).unwrap_err();
+
+        assert_eq!(error.code(), "embedding.artifact_checksum_mismatch");
+    }
+
+    #[test]
+    fn verification_rejects_artifact_replaced_after_inspection() {
+        let root = temp_dir("qgh-prepared-replaced-after-inspection");
+        let snapshot_root = root.join("snapshot");
+        let manifest_path = write_prepared_manifest_fixture(&snapshot_root, b"graph-one");
+        let store = PreparedModelStore::new(root.join("store"));
+        let inspection = store.inspect_manifest(&manifest_path).unwrap();
+        fs::write(snapshot_root.join("model.onnx"), b"graph-two").unwrap();
+
+        let error = store.verify(inspection).unwrap_err();
+
+        assert_eq!(error.code(), "embedding.artifact_changed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_stamp_changes_after_same_size_file_replacement() {
+        let root = temp_dir("qgh-prepared-stamp-replacement");
+        let snapshot_root = root.join("snapshot");
+        let manifest_path = write_prepared_manifest_fixture(&snapshot_root, b"graph-one");
+        let store = PreparedModelStore::new(root.join("store"));
+        let before = store.inspect_manifest(&manifest_path).unwrap();
+        let replacement = snapshot_root.join("replacement.onnx");
+        fs::write(&replacement, b"graph-two").unwrap();
+        fs::rename(&replacement, snapshot_root.join("model.onnx")).unwrap();
+
+        let after = store.inspect_manifest(&manifest_path).unwrap();
+
+        assert_ne!(before.artifact_stamp(), after.artifact_stamp());
+    }
+
+    #[test]
+    fn stream_copy_removes_partial_destination_after_read_failure() {
+        struct FailingReader {
+            emitted: bool,
+        }
+
+        impl Read for FailingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.emitted {
+                    return Err(std::io::Error::other("fixture read failure"));
+                }
+                self.emitted = true;
+                buffer[..4].copy_from_slice(b"part");
+                Ok(4)
+            }
+        }
+
+        let root = temp_dir("qgh-stream-copy-cleanup");
+        let destination = root.join("artifact.bin");
+        let mut reader = FailingReader { emitted: false };
+
+        let error = stream_reader_to_new_file(&mut reader, &destination).unwrap_err();
+
+        assert_eq!(error.code(), "embedding.io");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_rejects_nested_symlink_and_alias_snapshot_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("qgh-prepared-nested-symlink");
+        let source_root = root.join("source");
+        let manifest_path = write_prepared_manifest_fixture(&source_root, b"graph-one");
+        let real = source_root.join("real");
+        fs::create_dir_all(&real).unwrap();
+        fs::rename(source_root.join("model.onnx"), real.join("model.onnx")).unwrap();
+        symlink(&real, source_root.join("linked")).unwrap();
+        let mut manifest =
+            ModelManifestV1::from_json_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.role == ArtifactRole::OnnxModel)
+            .unwrap()
+            .relative_path = "linked/model.onnx".to_string();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let store_root = root.join("store");
+        let store = PreparedModelStore::new(store_root.clone());
+
+        let error = store.inspect_manifest(&manifest_path).unwrap_err();
+        assert_eq!(error.code(), "embedding.artifact_symlink_forbidden");
+
+        fs::remove_file(source_root.join("linked")).unwrap();
+        fs::rename(real.join("model.onnx"), source_root.join("model.onnx")).unwrap();
+        fs::remove_dir(real).unwrap();
+        manifest
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.role == ArtifactRole::OnnxModel)
+            .unwrap()
+            .relative_path = "model.onnx".to_string();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let manifest_hash = manifest.hash();
+        fs::create_dir_all(store_root.join("snapshots")).unwrap();
+        fs::create_dir_all(store_root.join("requests")).unwrap();
+        symlink(
+            &source_root,
+            store_root.join("snapshots").join(&manifest_hash),
+        )
+        .unwrap();
+        let options = FastembedProviderOptions::default();
+        fs::write(
+            store.alias_path(&options),
+            serde_json::to_vec_pretty(&PreparedModelAliasV1 {
+                schema_version: PREPARED_MODEL_ALIAS_SCHEMA_VERSION.to_string(),
+                manifest_hash: manifest_hash.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = store.inspect(&options).unwrap_err();
+        assert_eq!(error.code(), "embedding.prepared_alias_invalid");
+
+        fs::remove_file(store_root.join("snapshots").join(&manifest_hash)).unwrap();
+        fs::remove_dir(store_root.join("snapshots")).unwrap();
+        let external_snapshots = root.join("external-snapshots");
+        fs::create_dir_all(&external_snapshots).unwrap();
+        fs::rename(&source_root, external_snapshots.join(&manifest_hash)).unwrap();
+        symlink(&external_snapshots, store_root.join("snapshots")).unwrap();
+
+        let error = store.inspect(&options).unwrap_err();
+        assert_eq!(error.code(), "embedding.prepared_alias_invalid");
+    }
+
+    #[test]
     fn manifest_runtime_applies_document_query_prefix_mrl_and_l2_normalization() {
         struct ContractEngine {
             calls: Mutex<Vec<Vec<String>>>,
@@ -3153,6 +3755,39 @@ mod tests {
             quantization: QuantizationKind::None,
             context_template_version: METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
         }
+    }
+
+    fn write_prepared_manifest_fixture(root: &Path, graph: &[u8]) -> PathBuf {
+        fs::create_dir_all(root).unwrap();
+        let declarations = [
+            (ArtifactRole::OnnxModel, "model.onnx", graph),
+            (ArtifactRole::Tokenizer, "tokenizer.json", b"{}".as_slice()),
+            (ArtifactRole::Config, "config.json", b"{}".as_slice()),
+            (
+                ArtifactRole::SpecialTokensMap,
+                "special_tokens_map.json",
+                b"{}".as_slice(),
+            ),
+            (
+                ArtifactRole::TokenizerConfig,
+                "tokenizer_config.json",
+                b"{}".as_slice(),
+            ),
+        ];
+        let artifacts = declarations
+            .iter()
+            .map(|(role, path, bytes)| {
+                fs::write(root.join(path), bytes).unwrap();
+                fixture_artifact(*role, path, bytes, None)
+            })
+            .collect();
+        let manifest_path = root.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&fixture_manifest(artifacts)).unwrap(),
+        )
+        .unwrap();
+        manifest_path
     }
 
     fn fixture_artifact(

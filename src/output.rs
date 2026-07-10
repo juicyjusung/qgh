@@ -721,6 +721,9 @@ fn doctor_hint(name: &str) -> &'static str {
         }
         "sqlite" => "run qgh sync and check the configured DB path",
         "tantivy" => "run qgh sync to rebuild the active Tantivy generation",
+        "embedding_artifacts" => "reacquire or replace the configured prepared model snapshot",
+        "embedding_runtime" => "verify the local model runtime and its tokenizer contract",
+        "embedding_generation" => "run qgh embed --force to publish a valid vector generation",
         "github_auth_reachability" => "check token source and GitHub host reachability",
         "rate_limit_headers" => "verify GitHub API responses include rate-limit headers",
         "repo_policy" => "update .qgh.toml or the selected profile repo allowlist",

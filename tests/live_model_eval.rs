@@ -1098,6 +1098,10 @@ fn resource_failure_preserves_heldout_quality_and_numeric_partial_evidence() {
     assert!(report["held_out_metrics"].is_object());
     assert_eq!(report["resources"]["complete"], false);
     assert_eq!(report["resources"]["phase"], "50k_embed");
+    assert_eq!(
+        report["resources"]["warm_path_includes_manifest_artifact_rehash"],
+        false
+    );
     assert_eq!(report["resources"]["measured_50k_chunk_count"], 12_500);
     assert_eq!(
         report["blocker"],
