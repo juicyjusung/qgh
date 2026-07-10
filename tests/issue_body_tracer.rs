@@ -3771,6 +3771,34 @@ fn repo_listing_permission_purge_recaptures_rows_processed_after_queue() {
 }
 
 #[test]
+fn repo_listing_permission_purge_canonicalizes_mixed_case_comment_repo() {
+    let fixture = TestFixture::new("repo-listing-permission-mixed-case");
+    let server = RepoCommentListingFakeGitHub::start();
+    fixture.write_config_repo_listing_comments(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.set_issue_metadata_repo_casing("qgh://github.com/issue/I_REPO_LISTING_1", "OWNER/REPO");
+
+    fixture.write_config_repo_listing_comments_with_repo(&server.base_url, "OWNER/REPO");
+    server.set_mode(REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE);
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+
+    let mixed_case_comment = fixture.qgh([
+        "get",
+        "qgh://github.com/issue-comment/IC_REPO_LISTING_PENDING",
+        "--json",
+    ]);
+    assert_eq!(mixed_case_comment.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&mixed_case_comment)["error"]["details"]["reason"],
+        "permission_loss"
+    );
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["pending_count"], 0);
+    assert_eq!(status["data"]["purge"]["retrieval_blocked"], false);
+}
+
+#[test]
 fn backfill_walks_history_and_completes_coverage() {
     let fixture = TestFixture::new("historical-backfill");
     let server = FakeGitHub::start(issue_payload_with_pr());
@@ -6686,6 +6714,10 @@ query_prefix = "query: "
     }
 
     fn write_config_repo_listing_comments(&self, api_base_url: &str) {
+        self.write_config_repo_listing_comments_with_repo(api_base_url, "owner/repo");
+    }
+
+    fn write_config_repo_listing_comments_with_repo(&self, api_base_url: &str, repo: &str) {
         let config = format!(
             r#"
 schema_version = "qgh.config.v1"
@@ -6694,7 +6726,7 @@ schema_version = "qgh.config.v1"
 host = "github.com"
 api_base_url = "{api_base_url}"
 web_base_url = "https://github.com"
-repos = ["owner/repo"]
+repos = ["{repo}"]
 comments_mode = "repo_listing"
 
 [profiles.work.token_source]
@@ -7545,6 +7577,16 @@ limit = 10
         .unwrap();
     }
 
+    fn set_issue_metadata_repo_casing(&self, source_id: &str, repo: &str) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE issue_metadata SET repo = ?2 WHERE source_id = ?1",
+            (source_id, repo),
+        )
+        .unwrap();
+    }
+
     fn clear_retrieval_publication(&self) {
         let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
         let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -8042,13 +8084,16 @@ fn handle_repo_comment_listing_connection(
     let bytes_read = stream.read(&mut buffer).unwrap_or(0);
     let request = String::from_utf8_lossy(&buffer[..bytes_read]);
     let request_line = request.lines().next().unwrap_or("").to_string();
+    let request_line_lower = request_line.to_ascii_lowercase();
     requests.lock().unwrap().push(request_line.clone());
     let mode = mode.load(Ordering::SeqCst);
 
-    let (status, body, extra_headers) = if request_line
-        .starts_with("GET /repos/owner/repo/issues/comments?")
+    let (status, body, extra_headers) = if request_line_lower
+        .starts_with("get /repos/owner/repo/issues/comments?")
     {
-        if mode == REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE && request_line.contains("page=2") {
+        if mode == REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE
+            && request_line_lower.contains("page=2")
+        {
             (
                 "403 Forbidden",
                 r#"{"message":"resource not accessible"}"#,
@@ -8065,11 +8110,17 @@ fn handle_repo_comment_listing_connection(
         } else {
             ("200 OK", repo_listing_comments_payload(), String::new())
         }
-    } else if request_line.starts_with("GET /repos/owner/repo/issues?")
-        && request_line.contains("state=all")
+    } else if request_line_lower.starts_with("get /repos/owner/repo/issues?")
+        && request_line_lower.contains("state=all")
     {
-        ("200 OK", repo_listing_issue_payload(), String::new())
-    } else if request_line.starts_with("GET /repos/owner/repo ") {
+        if mode == REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE
+            && request_line.contains("/repos/OWNER/REPO/")
+        {
+            ("304 Not Modified", "", String::new())
+        } else {
+            ("200 OK", repo_listing_issue_payload(), String::new())
+        }
+    } else if request_line_lower.starts_with("get /repos/owner/repo ") {
         if mode == REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE {
             (
                 "403 Forbidden",
@@ -8079,19 +8130,19 @@ fn handle_repo_comment_listing_connection(
         } else {
             ("200 OK", r#"{"full_name":"owner/repo"}"#, String::new())
         }
-    } else if request_line.starts_with("GET /repos/owner/repo/issues/2 ") {
+    } else if request_line_lower.starts_with("get /repos/owner/repo/issues/2 ") {
         (
             "200 OK",
             repo_listing_pull_request_object_payload(),
             String::new(),
         )
-    } else if request_line.starts_with("GET /repos/owner/repo/issues/3 ") {
+    } else if request_line_lower.starts_with("get /repos/owner/repo/issues/3 ") {
         (
             "200 OK",
             repo_listing_unsynced_issue_object_payload(),
             String::new(),
         )
-    } else if request_line.contains("/comments?") {
+    } else if request_line_lower.contains("/comments?") {
         // Per-issue comment endpoint must not be used in repo_listing mode.
         ("200 OK", "[]", String::new())
     } else {

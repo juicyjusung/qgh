@@ -682,7 +682,7 @@ impl Store {
                         .conn
                         .prepare(&format!(
                             "SELECT source_id FROM {table}
-                             WHERE repo = ?1 AND issue_number = ?2"
+                             WHERE lower(repo) = lower(?1) AND issue_number = ?2"
                         ))?
                         .query_map(params![repo, issue_number], |row| row.get::<_, String>(0))?
                         .collect::<Result<Vec<_>, _>>()?;
@@ -692,7 +692,7 @@ impl Store {
                 if self
                     .conn
                     .query_row(
-                        "SELECT 1 FROM sync_cursors WHERE endpoint = ?1",
+                        "SELECT 1 FROM sync_cursors WHERE lower(endpoint) = lower(?1)",
                         params![cursor],
                         |_| Ok(()),
                     )
@@ -768,29 +768,32 @@ impl Store {
             "SELECT
                  EXISTS(
                      SELECT 1 FROM purge_requests
-                     WHERE target_kind = 'repository' AND target_value = ?1
+                     WHERE target_kind = 'repository'
+                       AND lower(target_value) = lower(?1)
                        AND purge_pending = 1
                  )
-                 OR EXISTS(SELECT 1 FROM repositories WHERE repo = ?1)
+                 OR EXISTS(SELECT 1 FROM repositories WHERE lower(repo) = lower(?1))
                  OR EXISTS(
                      SELECT 1 FROM source_entities
-                     WHERE repo = ?1 AND lifecycle_state != 'tombstoned'
+                     WHERE lower(repo) = lower(?1) AND lifecycle_state != 'tombstoned'
                  )
-                 OR EXISTS(SELECT 1 FROM issue_metadata WHERE repo = ?1)
-                 OR EXISTS(SELECT 1 FROM comment_metadata WHERE repo = ?1)
+                 OR EXISTS(SELECT 1 FROM issue_metadata WHERE lower(repo) = lower(?1))
+                 OR EXISTS(SELECT 1 FROM comment_metadata WHERE lower(repo) = lower(?1))
                  OR EXISTS(
                      SELECT 1 FROM source_versions sv
                      JOIN source_entities se ON se.source_id = sv.source_id
-                     WHERE se.repo = ?1
+                     WHERE lower(se.repo) = lower(?1)
                  )
-                 OR EXISTS(SELECT 1 FROM repository_sync_state WHERE repo = ?1)
+                 OR EXISTS(
+                     SELECT 1 FROM repository_sync_state WHERE lower(repo) = lower(?1)
+                 )
                  OR EXISTS(
                      SELECT 1 FROM sync_cursors
-                     WHERE endpoint = 'issues:' || ?1
-                        OR endpoint = 'history:' || ?1
-                        OR endpoint = 'repo-comments:' || ?1
-                        OR substr(endpoint, 1, length('comments:' || ?1 || '#'))
-                           = 'comments:' || ?1 || '#'
+                     WHERE lower(endpoint) = lower('issues:' || ?1)
+                        OR lower(endpoint) = lower('history:' || ?1)
+                        OR lower(endpoint) = lower('repo-comments:' || ?1)
+                        OR lower(substr(endpoint, 1, length('comments:' || ?1 || '#')))
+                           = lower('comments:' || ?1 || '#')
                  )",
             params![repo],
             |row| row.get::<_, bool>(0),
@@ -803,7 +806,7 @@ impl Store {
                 "SELECT EXISTS(
                      SELECT 1 FROM chunks c
                      JOIN source_entities se ON se.source_id = c.source_id
-                     WHERE se.repo = ?1
+                     WHERE lower(se.repo) = lower(?1)
                  )",
                 params![repo],
                 |row| row.get::<_, bool>(0),
@@ -1156,7 +1159,10 @@ impl Store {
             return Err(purge_error());
         }
         if let PurgeTarget::Repository { repo } = target {
-            tx.execute("DELETE FROM repositories WHERE repo = ?1", params![repo])?;
+            tx.execute(
+                "DELETE FROM repositories WHERE lower(repo) = lower(?1)",
+                params![repo],
+            )?;
         }
         tx.execute(
             "INSERT INTO purge_requests
@@ -1434,22 +1440,22 @@ impl Store {
             PurgeTarget::Issue { repo, issue_number } => {
                 tx.execute(
                     "DELETE FROM sync_cursors
-                     WHERE endpoint = 'comments:' || ?1 || '#' || ?2",
+                     WHERE lower(endpoint) = lower('comments:' || ?1 || '#' || ?2)",
                     params![repo, issue_number],
                 )?;
             }
             PurgeTarget::Repository { repo } => {
                 tx.execute(
                     "DELETE FROM sync_cursors
-                     WHERE endpoint = 'issues:' || ?1
-                        OR endpoint = 'history:' || ?1
-                        OR endpoint = 'repo-comments:' || ?1
-                        OR substr(endpoint, 1, length('comments:' || ?1 || '#'))
-                           = 'comments:' || ?1 || '#'",
+                     WHERE lower(endpoint) = lower('issues:' || ?1)
+                        OR lower(endpoint) = lower('history:' || ?1)
+                        OR lower(endpoint) = lower('repo-comments:' || ?1)
+                        OR lower(substr(endpoint, 1, length('comments:' || ?1 || '#')))
+                           = lower('comments:' || ?1 || '#')",
                     params![repo],
                 )?;
                 tx.execute(
-                    "DELETE FROM repository_sync_state WHERE repo = ?1",
+                    "DELETE FROM repository_sync_state WHERE lower(repo) = lower(?1)",
                     params![repo],
                 )?;
             }
@@ -1804,6 +1810,7 @@ impl Store {
         )?;
 
         for issue in issues {
+            let repo = canonical_repository_identity(&tx, &issue.repo)?;
             tx.execute(
                 "INSERT INTO source_entities
                     (source_id, entity_type, host, repo, node_id, github_id, lifecycle_state, created_at, updated_at, last_seen_at)
@@ -1816,7 +1823,7 @@ impl Store {
                 params![
                     issue.source_id,
                     issue.host,
-                    issue.repo,
+                    repo,
                     issue.node_id,
                     issue.github_id,
                     issue.created_at,
@@ -1832,7 +1839,7 @@ impl Store {
                 "INSERT INTO repositories (repo, host, owner, name)
                  VALUES (?1, ?2, substr(?1, 1, instr(?1, '/') - 1), substr(?1, instr(?1, '/') + 1))
                  ON CONFLICT(repo) DO UPDATE SET host = excluded.host",
-                params![issue.repo, issue.host],
+                params![repo, issue.host],
             )?;
             let version_id = upsert_source_version(
                 &tx,
@@ -1863,7 +1870,7 @@ impl Store {
                     latest_version_id = excluded.latest_version_id",
                 params![
                     issue.source_id,
-                    issue.repo,
+                    repo,
                     issue.number,
                     issue.title,
                     issue.body,
@@ -1892,10 +1899,11 @@ impl Store {
                  VALUES (?1, 'upsert', ?2, NULL)",
                 params![issue.source_id, now],
             )?;
-            apply_pending_purge_guard(&tx, &issue.source_id, &issue.repo)?;
+            apply_pending_purge_guard(&tx, &issue.source_id, &repo, issue.number)?;
         }
 
         for comment in comments {
+            let repo = canonical_repository_identity(&tx, &comment.repo)?;
             tx.execute(
                 "INSERT INTO source_entities
                     (source_id, entity_type, host, repo, node_id, github_id, lifecycle_state, created_at, updated_at, last_seen_at)
@@ -1908,7 +1916,7 @@ impl Store {
                 params![
                     comment.source_id,
                     comment.host,
-                    comment.repo,
+                    repo,
                     comment.node_id,
                     comment.github_id,
                     comment.created_at,
@@ -1946,7 +1954,7 @@ impl Store {
                     latest_version_id = excluded.latest_version_id",
                 params![
                     comment.source_id,
-                    comment.repo,
+                    repo,
                     comment.parent_issue_number,
                     comment.body,
                     comment.author,
@@ -1976,7 +1984,7 @@ impl Store {
                  VALUES (?1, 'upsert', ?2, NULL)",
                 params![comment.source_id, now],
             )?;
-            apply_pending_purge_guard(&tx, &comment.source_id, &comment.repo)?;
+            apply_pending_purge_guard(&tx, &comment.source_id, &repo, comment.parent_issue_number)?;
         }
 
         for cursor in cursor_updates {
@@ -3324,7 +3332,8 @@ impl Store {
                  FROM issue_metadata im
                  JOIN source_entities se ON se.source_id = im.source_id
                  JOIN source_versions sv ON sv.id = im.latest_version_id
-                 WHERE im.repo = ?1 AND im.issue_number = ?2 AND se.lifecycle_state = 'active'",
+                 WHERE lower(im.repo) = lower(?1)
+                   AND im.issue_number = ?2 AND se.lifecycle_state = 'active'",
                 params![repo, issue_number],
                 stored_issue_from_row,
             )
@@ -3425,7 +3434,8 @@ impl Store {
              FROM comment_metadata cm
              JOIN source_entities se ON se.source_id = cm.source_id
              JOIN source_versions sv ON sv.id = cm.latest_version_id
-             WHERE cm.repo = ?1 AND cm.issue_number = ?2 AND se.lifecycle_state = 'active'
+             WHERE lower(cm.repo) = lower(?1)
+               AND cm.issue_number = ?2 AND se.lifecycle_state = 'active'
              ORDER BY cm.source_id",
         )?;
         let rows = stmt.query_map(params![repo, issue_number], |row| {
@@ -5458,7 +5468,7 @@ fn capture_purge_target_sources(
                         "INSERT OR IGNORE INTO purge_target_sources
                             (target_kind, target_value, source_id)
                          SELECT ?1, ?2, source_id FROM {table}
-                         WHERE repo = ?3 AND issue_number = ?4"
+                         WHERE lower(repo) = lower(?3) AND issue_number = ?4"
                     ),
                     params![kind, value, repo, issue_number],
                 )?;
@@ -5468,7 +5478,8 @@ fn capture_purge_target_sources(
             conn.execute(
                 "INSERT OR IGNORE INTO purge_target_sources
                     (target_kind, target_value, source_id)
-                 SELECT ?1, ?2, source_id FROM source_entities WHERE repo = ?3",
+                 SELECT ?1, ?2, source_id FROM source_entities
+                 WHERE lower(repo) = lower(?3)",
                 params![kind, value, repo],
             )?;
         }
@@ -5512,35 +5523,40 @@ fn canonicalize_purge_target_identity(
     conn: &Connection,
     target: &PurgeTarget,
 ) -> Result<PurgeTarget, QghError> {
-    let canonical_repo = |repo: &str| -> Result<String, QghError> {
-        Ok(conn
-            .query_row(
-                "SELECT repo FROM (
-                     SELECT repo, 1 AS priority FROM repositories
-                     UNION ALL
-                     SELECT repo, 2 AS priority FROM source_entities
-                     UNION ALL
-                     SELECT repo, 3 AS priority FROM repository_sync_state
-                 )
-                 WHERE lower(repo) = lower(?1)
-                 ORDER BY priority, repo
-                 LIMIT 1",
-                params![repo],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .unwrap_or_else(|| repo.to_string()))
-    };
     Ok(match target {
         PurgeTarget::Source { .. } => target.clone(),
         PurgeTarget::Issue { repo, issue_number } => PurgeTarget::Issue {
-            repo: canonical_repo(repo)?,
+            repo: canonical_repository_identity(conn, repo)?,
             issue_number: *issue_number,
         },
         PurgeTarget::Repository { repo } => PurgeTarget::Repository {
-            repo: canonical_repo(repo)?,
+            repo: canonical_repository_identity(conn, repo)?,
         },
     })
+}
+
+fn canonical_repository_identity(conn: &Connection, repo: &str) -> Result<String, QghError> {
+    Ok(conn
+        .query_row(
+            "SELECT repo FROM (
+                 SELECT target_value AS repo, 0 AS priority
+                 FROM purge_requests
+                 WHERE target_kind = 'repository' AND purge_pending = 1
+                 UNION ALL
+                 SELECT repo, 1 AS priority FROM repositories
+                 UNION ALL
+                 SELECT repo, 2 AS priority FROM source_entities
+                 UNION ALL
+                 SELECT repo, 3 AS priority FROM repository_sync_state
+             )
+             WHERE lower(repo) = lower(?1)
+             ORDER BY priority, repo COLLATE BINARY DESC
+             LIMIT 1",
+            params![repo],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| repo.to_string()))
 }
 
 fn conflicting_purge_trigger_error(
@@ -6085,15 +6101,18 @@ fn apply_pending_purge_guard(
     tx: &rusqlite::Transaction<'_>,
     source_id: &str,
     repo: &str,
+    issue_number: i64,
 ) -> Result<(), rusqlite::Error> {
     let pending = tx
         .query_row(
             "SELECT 1 FROM purge_requests
              WHERE purge_pending = 1
                AND ((target_kind = 'source' AND target_value = ?1)
-                 OR (target_kind = 'repository' AND target_value = ?2))
+                 OR (target_kind = 'repository' AND lower(target_value) = lower(?2))
+                 OR (target_kind = 'issue'
+                     AND lower(target_value) = lower(?2 || '#' || ?3)))
              LIMIT 1",
-            params![source_id, repo],
+            params![source_id, repo, issue_number],
             |_| Ok(()),
         )
         .optional()?
@@ -6817,6 +6836,68 @@ mod tests {
         assert_eq!(outcomes[0].purged_issues, 1);
         assert_eq!(outcomes[0].purged_comments, 1);
         assert!(store.known_repositories().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn mixed_case_issue_purge_guards_and_recaptures_later_comment() {
+        let paths = temp_profile_paths("purge-queue-mixed-case-issue");
+        let mut store = Store::open(&paths).unwrap();
+        let issue_id = "qgh://github.com/issue/I_QUEUE_CASE_ISSUE";
+        let first_comment_id = "qgh://github.com/issue-comment/IC_QUEUE_CASE_FIRST";
+        let later_comment_id = "qgh://github.com/issue-comment/IC_QUEUE_CASE_LATER";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-queue-mixed-case-issue",
+                &[test_issue(issue_id, "owner/repo", "issue-sensitive")],
+                &[test_comment(
+                    first_comment_id,
+                    issue_id,
+                    "owner/repo",
+                    "first-comment-sensitive",
+                )],
+                0,
+                &[],
+            )
+            .unwrap();
+        let request = (
+            PurgeTarget::Issue {
+                repo: "OWNER/REPO".to_string(),
+                issue_number: 47,
+            },
+            PurgeTrigger::ConfirmedDelete,
+        );
+        store.queue_purges(std::slice::from_ref(&request)).unwrap();
+
+        store
+            .upsert_sources_for_run_under_pending_purge(
+                "sync-purge-queue-mixed-case-later-comment",
+                &[],
+                &[test_comment(
+                    later_comment_id,
+                    issue_id,
+                    "OWNER/REPO",
+                    "later-comment-sensitive",
+                )],
+                0,
+                &[],
+            )
+            .unwrap();
+        store.queue_purges(&[request]).unwrap();
+
+        let outcomes = store.retry_pending_purges().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].purged_issues, 1);
+        assert_eq!(outcomes[0].purged_comments, 2);
+        assert_eq!(
+            store
+                .get_tombstone(later_comment_id)
+                .unwrap()
+                .unwrap()
+                .reason,
+            "deleted"
+        );
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
