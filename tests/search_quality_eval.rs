@@ -4,6 +4,7 @@ use qgh::embedding::{
     EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_HF_MODEL_REVISION,
     DEFAULT_QUERY_PREFIX,
 };
+use qgh::search_eval::{search_with_metadata_boost_v1_for_eval, SearchFilters};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -80,6 +81,7 @@ fn curated_search_quality_eval_gate_passes() {
     let server = EvalFakeGitHub::start();
     fixture.write_config(&server.base_url);
     assert_success(&fixture.qgh(&["sync", "--json"]));
+    assert_fixed_metadata_profile_eval_seam(&fixture);
 
     let regression_cases = bm25_regression_cases();
     let semantic_cases = semantic_eval_cases();
@@ -218,6 +220,22 @@ fn curated_search_quality_eval_gate_passes() {
     ] {
         assert!(docs.contains(required), "missing docs phrase: {required}");
     }
+}
+
+fn assert_fixed_metadata_profile_eval_seam(fixture: &EvalFixture) {
+    let hits = search_with_metadata_boost_v1_for_eval(
+        &fixture.active_index_path(),
+        "Release gate schema drift",
+        &SearchFilters::default(),
+        5,
+    )
+    .unwrap();
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.source_id == "qgh://github.com/issue/I_EVAL_103"),
+        "fixed MetadataBoostV1 eval seam must be callable from an external integration test"
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -627,7 +645,7 @@ impl EvalReport {
 
     fn summary(&self, name: &str) -> String {
         format!(
-            "{name} search quality eval failed\nexact_top1={:.2}\nidentifier_top1={:.2}\nkeyword_top5={:.2}\ncjk_top5={:.2}\ncomment_only_top5={:.2}\nsemantic_top5={:.2}\ncross_language_top5={:.2}\nnegative_abstention={:.2}\nhard_filter_violations={}\nget_round_trip={:.2}\nhybrid_ranked_results={}\nhybrid_path_queries={}/{}\nrecalibration_requires_prd_adr_update={}\ntop_failures={:#?}",
+            "{name} search quality eval failed\nexact_top1={:.2}\nidentifier_exact_route_top1={:.2}\nkeyword_top5={:.2}\ncjk_top5={:.2}\ncomment_only_top5={:.2}\nsemantic_top5={:.2}\ncross_language_top5={:.2}\nnegative_abstention={:.2}\nhard_filter_violations={}\nget_round_trip={:.2}\nhybrid_ranked_results={}\nhybrid_path_queries={}/{}\nrecalibration_requires_prd_adr_update={}\ntop_failures={:#?}",
             self.class_rate(QueryClass::Exact),
             self.identifier_rate(),
             self.class_rate(QueryClass::Keyword),
@@ -698,7 +716,17 @@ fn run_eval_cases(
             report.record_comment_only(passed);
         }
         if case.is_identifier() {
-            report.record_identifier(passed);
+            let ranking_kind = results
+                .first()
+                .and_then(|result| result["ranking"]["kind"].as_str());
+            assert_eq!(
+                ranking_kind,
+                Some("exact"),
+                "{} identifier query `{}` must prove the public exact route: {query_json}",
+                mode.as_str(),
+                case.query,
+            );
+            report.record_identifier(passed && ranking_kind == Some("exact"));
         }
         if !passed {
             report.top_failures.push(format!(
@@ -893,7 +921,7 @@ fn ab_summary(
     let section_8_3_triggers =
         section_8_3_triggers(semantic_hybrid_rate, cross_language_hybrid_rate);
     format!(
-        "search_quality_eval_ab_report\nbm25_regression_exact_top1={:.2}\nbm25_regression_identifier_top1={:.2}\nbm25_regression_keyword_top5={:.2}\nbm25_regression_cjk_top5={:.2}\nbm25_regression_comment_only_top5={:.2}\nbm25_regression_negative_abstention={:.2}\nhybrid_regression_exact_top1={:.2}\nhybrid_regression_identifier_top1={:.2}\nhybrid_regression_keyword_top5={:.2}\nhybrid_regression_cjk_top5={:.2}\nhybrid_regression_comment_only_top5={:.2}\nhybrid_regression_negative_abstention={:.2}\nhybrid_regression_path_queries={}/{}\nsemantic_bm25_top5={:.2}\nsemantic_hybrid_top5={:.2}\nsemantic_hybrid_delta={:.2}\nsemantic_hybrid_target={:.2}\nsemantic_hybrid_path_queries={}/{}\ncross_language_bm25_top5={:.2}\ncross_language_hybrid_top5={:.2}\ncross_language_hybrid_delta={:.2}\ncross_language_hybrid_target={:.2}\nhard_filter_violations={}\nget_round_trip={:.2}\nsection_8_3_triggers={:?}",
+        "search_quality_eval_ab_report\nbm25_regression_exact_top1={:.2}\nbm25_regression_identifier_exact_route_top1={:.2}\nbm25_regression_keyword_top5={:.2}\nbm25_regression_cjk_top5={:.2}\nbm25_regression_comment_only_top5={:.2}\nbm25_regression_negative_abstention={:.2}\nhybrid_regression_exact_top1={:.2}\nhybrid_regression_identifier_exact_route_top1={:.2}\nhybrid_regression_keyword_top5={:.2}\nhybrid_regression_cjk_top5={:.2}\nhybrid_regression_comment_only_top5={:.2}\nhybrid_regression_negative_abstention={:.2}\nhybrid_regression_path_queries={}/{}\nsemantic_bm25_top5={:.2}\nsemantic_hybrid_top5={:.2}\nsemantic_hybrid_delta={:.2}\nsemantic_hybrid_target={:.2}\nsemantic_hybrid_path_queries={}/{}\ncross_language_bm25_top5={:.2}\ncross_language_hybrid_top5={:.2}\ncross_language_hybrid_delta={:.2}\ncross_language_hybrid_target={:.2}\nhard_filter_violations={}\nget_round_trip={:.2}\nsection_8_3_triggers={:?}",
         bm25_regression.class_rate(QueryClass::Exact),
         bm25_regression.identifier_rate(),
         bm25_regression.class_rate(QueryClass::Keyword),
@@ -1598,6 +1626,16 @@ query_prefix = "query: "
 
     fn db_path(&self) -> PathBuf {
         self.data_home.join("qgh/profiles/work/qgh.sqlite3")
+    }
+
+    fn active_index_path(&self) -> PathBuf {
+        let conn = Connection::open(self.db_path()).unwrap();
+        conn.query_row(
+            "SELECT path FROM index_generations WHERE active = 1 ORDER BY generation DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0).map(PathBuf::from),
+        )
+        .unwrap()
     }
 }
 

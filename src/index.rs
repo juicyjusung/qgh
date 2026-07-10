@@ -220,6 +220,26 @@ fn search_with_filters_profile(
     Ok(hits)
 }
 
+/// Fixed experimental profile for release/live-qrels evaluation only.
+///
+/// This is intentionally not parameterized by boosts and is not used by the
+/// production query path, which remains pinned to `LexicalRankingProfile::V1`.
+#[doc(hidden)]
+pub fn search_with_metadata_boost_v1_for_eval(
+    active_path: &Path,
+    query_text: &str,
+    filters: &SearchFilters,
+    limit: usize,
+) -> Result<Vec<SearchHit>, QghError> {
+    search_with_filters_profile(
+        active_path,
+        query_text,
+        filters,
+        LexicalRankingProfile::MetadataBoostV1,
+        limit,
+    )
+}
+
 #[cfg(test)]
 struct LexicalProfileComparison {
     v1: Vec<SearchHit>,
@@ -241,11 +261,10 @@ fn compare_lexical_profiles(
             LexicalRankingProfile::V1,
             limit,
         )?,
-        metadata_boost_v1: search_with_filters_profile(
+        metadata_boost_v1: search_with_metadata_boost_v1_for_eval(
             active_path,
             query_text,
             filters,
-            LexicalRankingProfile::MetadataBoostV1,
             limit,
         )?,
     })
