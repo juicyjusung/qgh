@@ -79,11 +79,20 @@ pub enum PurgeTarget {
 }
 
 impl PurgeTarget {
+    /// Stable content-free target-kind label for status/doctor output.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Source { .. } => "source",
+            Self::Issue { .. } => "issue",
+            Self::Repository { .. } => "repository",
+        }
+    }
+
     fn kind_and_value(&self) -> (&'static str, String) {
         match self {
-            Self::Source { source_id } => ("source", source_id.clone()),
-            Self::Issue { repo, issue_number } => ("issue", format!("{repo}#{issue_number}")),
-            Self::Repository { repo } => ("repository", repo.clone()),
+            Self::Source { source_id } => (self.kind(), source_id.clone()),
+            Self::Issue { repo, issue_number } => (self.kind(), format!("{repo}#{issue_number}")),
+            Self::Repository { repo } => (self.kind(), repo.clone()),
         }
     }
 
@@ -115,7 +124,8 @@ pub enum PurgeTrigger {
 }
 
 impl PurgeTrigger {
-    fn as_str(self) -> &'static str {
+    /// Stable content-free label for status/doctor output.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::ConfirmedDelete => "confirmed_delete",
             Self::ConfirmedTombstone => "confirmed_tombstone",
@@ -155,7 +165,8 @@ pub enum PurgeFailureStage {
 }
 
 impl PurgeFailureStage {
-    fn as_str(self) -> &'static str {
+    /// Stable content-free label for status/doctor output.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::SecureDelete => "secure_delete",
             Self::Tantivy => "tantivy",
@@ -191,7 +202,9 @@ pub struct PurgeOutcome {
     pub purged_sources: usize,
     pub discarded_embedding_generations: usize,
     pub discarded_tantivy_generations: usize,
-    pub wal_truncated: bool,
+    /// True once WAL frames that could contain purged content were checkpointed
+    /// and truncated. Content-free completion frames may be written afterward.
+    pub sensitive_wal_truncated: bool,
 }
 
 /// Opaque epoch captured by a Store read transaction. Callers must end the
@@ -228,6 +241,7 @@ pub struct Store {
     profile_dir: PathBuf,
     index_root: PathBuf,
     content_write_epoch: i64,
+    index_build_tokens: BTreeMap<i64, String>,
     #[cfg(test)]
     purge_failure_stage: Option<PurgeFailureStage>,
 }
@@ -300,6 +314,7 @@ impl Store {
             profile_dir: paths.profile_dir.clone(),
             index_root: paths.index_root.clone(),
             content_write_epoch: 0,
+            index_build_tokens: BTreeMap::new(),
             #[cfg(test)]
             purge_failure_stage: None,
         };
@@ -332,7 +347,7 @@ impl Store {
                 purged_sources: 0,
                 discarded_embedding_generations: 0,
                 discarded_tantivy_generations: 0,
-                wal_truncated: false,
+                sensitive_wal_truncated: false,
             });
         }
         self.content_write_epoch = self.mark_purge_pending(&target, trigger)?;
@@ -350,6 +365,19 @@ impl Store {
             |row| row.get::<_, bool>(0),
         )?;
         if pending {
+            return Ok(false);
+        }
+        let completed = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM purge_requests
+                 WHERE target_kind = ?1 AND target_value = ?2
+                   AND purge_pending = 0 AND completion_ready = 1
+                   AND current_stage = 'finalize'
+             )",
+            params![kind, value],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !completed {
             return Ok(false);
         }
         if let PurgeTarget::Repository { repo } = target {
@@ -574,13 +602,14 @@ impl Store {
             self.record_purge_failure(&target, PurgeFailureStage::Tantivy)?;
             return Err(purge_error());
         }
-        let discarded_tantivy_generations = match self.purge_tantivy_generations(&target) {
-            Ok(count) => count,
-            Err(_) => {
-                self.record_purge_failure(&target, PurgeFailureStage::Tantivy)?;
-                return Err(purge_error());
-            }
-        };
+        let (discarded_tantivy_generations, tantivy_cleanup_required) =
+            match self.purge_tantivy_generations(&target) {
+                Ok(result) => result,
+                Err(_) => {
+                    self.record_purge_failure(&target, PurgeFailureStage::Tantivy)?;
+                    return Err(purge_error());
+                }
+            };
 
         self.set_purge_stage(&target, PurgeFailureStage::Storage)?;
         if self.should_fail_purge_stage(PurgeFailureStage::Storage) {
@@ -595,10 +624,12 @@ impl Store {
                     return Err(purge_error());
                 }
             };
-        self.set_purge_stage(&target, PurgeFailureStage::Tantivy)?;
-        if self.remove_all_managed_tantivy_files().is_err() {
-            self.record_purge_failure(&target, PurgeFailureStage::Tantivy)?;
-            return Err(purge_error());
+        if tantivy_cleanup_required {
+            self.set_purge_stage(&target, PurgeFailureStage::Tantivy)?;
+            if self.remove_all_managed_tantivy_files().is_err() {
+                self.record_purge_failure(&target, PurgeFailureStage::Tantivy)?;
+                return Err(purge_error());
+            }
         }
         self.set_purge_stage(&target, PurgeFailureStage::WalCheckpoint)?;
         if self.should_fail_purge_stage(PurgeFailureStage::WalCheckpoint)
@@ -627,7 +658,7 @@ impl Store {
             purged_sources,
             discarded_embedding_generations,
             discarded_tantivy_generations,
-            wal_truncated: true,
+            sensitive_wal_truncated: true,
         })
     }
 
@@ -955,14 +986,6 @@ impl Store {
                 .query_map([], |row| row.get::<_, i64>(0))?
                 .collect::<Result<Vec<_>, _>>()?;
             affected_generations.extend(building_generations);
-            #[cfg(not(feature = "vector-search"))]
-            if !source_ids.is_empty() {
-                let all_generations = tx
-                    .prepare("SELECT id FROM embedding_generations")?
-                    .query_map([], |row| row.get::<_, i64>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                affected_generations.extend(all_generations);
-            }
         }
         if has_chunks && table_exists(&tx, "embedding_generation_chunks")? {
             for source_id in &source_ids {
@@ -1072,14 +1095,6 @@ impl Store {
             }
         }
 
-        #[cfg(not(feature = "vector-search"))]
-        if !affected_generations.is_empty() {
-            clear_generation_vec0_shadow_payloads(&tx)?;
-            if table_exists(&tx, "embedding_generation_vector_rows")? {
-                tx.execute("DELETE FROM embedding_generation_vector_rows", [])?;
-            }
-        }
-
         for generation_id in &affected_generations {
             if table_exists(&tx, "embedding_generation_vector_rows")? {
                 let mappings = tx
@@ -1108,7 +1123,7 @@ impl Store {
                         )?;
                     }
                     #[cfg(not(feature = "vector-search"))]
-                    let _ = rowid;
+                    delete_vec0_shadow_row(&tx, &table, dimension, rowid)?;
                 }
                 tx.execute(
                     "DELETE FROM embedding_generation_vector_rows WHERE generation_id = ?1",
@@ -1217,9 +1232,13 @@ impl Store {
         Ok((source_ids.len(), affected_generations.len()))
     }
 
-    fn purge_tantivy_generations(&mut self, target: &PurgeTarget) -> Result<usize, QghError> {
+    fn purge_tantivy_generations(
+        &mut self,
+        target: &PurgeTarget,
+    ) -> Result<(usize, bool), QghError> {
+        self.quiesce_index_build_leases()?;
         if !self.purge_target_has_sensitive_content(target)? {
-            return Ok(0);
+            return Ok((0, false));
         }
         let generations = {
             let mut stmt = self
@@ -1252,7 +1271,34 @@ impl Store {
         tx.execute("DELETE FROM retrieval_publications", [])?;
         tx.execute("DELETE FROM index_generations", [])?;
         tx.commit()?;
-        Ok(generations.len())
+        Ok((generations.len(), true))
+    }
+
+    fn quiesce_index_build_leases(&mut self) -> Result<(), QghError> {
+        let leases = {
+            let mut stmt = self.conn.prepare(
+                "SELECT generation, owner_pid, owner_token
+                 FROM index_build_leases ORDER BY generation",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if leases
+            .iter()
+            .any(|(_, owner_pid, _)| index_builder_process_is_live(*owner_pid))
+        {
+            return Err(purge_error());
+        }
+        for (generation, _, owner_token) in leases {
+            self.cleanup_index_generation_for_token(generation, &owner_token)?;
+        }
+        Ok(())
     }
 
     fn remove_all_managed_tantivy_files(&self) -> Result<(), QghError> {
@@ -1310,8 +1356,75 @@ impl Store {
         Ok(())
     }
 
-    fn remove_reserved_index_generation(&self, generation: i64) -> Result<(), QghError> {
-        remove_reserved_index_generation_at(&self.index_root, generation)
+    fn cleanup_owned_index_generation(&mut self, generation: i64) -> Result<(), QghError> {
+        let Some(owner_token) = self.index_build_tokens.get(&generation).cloned() else {
+            return Ok(());
+        };
+        self.cleanup_index_generation_for_token(generation, &owner_token)?;
+        self.index_build_tokens.remove(&generation);
+        Ok(())
+    }
+
+    fn cleanup_index_generation_for_token(
+        &mut self,
+        generation: i64,
+        owner_token: &str,
+    ) -> Result<bool, QghError> {
+        self.validate_index_root_confinement()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let lease_matches = tx
+            .query_row(
+                "SELECT 1 FROM index_build_leases
+                 WHERE generation = ?1 AND owner_token = ?2",
+                params![generation, owner_token],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !lease_matches {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let expected_path = self.index_root.join(format!("generation-{generation}"));
+        let stored_path = tx
+            .query_row(
+                "SELECT path FROM index_generations WHERE generation = ?1",
+                params![generation],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if stored_path
+            .as_deref()
+            .is_some_and(|path| Path::new(path) != expected_path)
+        {
+            return Err(purge_error());
+        }
+        remove_index_generation_path_at(&self.index_root, generation)?;
+        tx.execute(
+            "DELETE FROM retrieval_publication_pointer
+             WHERE publication_id IN (
+                 SELECT publication_id FROM retrieval_publications
+                 WHERE tantivy_generation = ?1
+             )",
+            params![generation],
+        )?;
+        tx.execute(
+            "DELETE FROM retrieval_publications WHERE tantivy_generation = ?1",
+            params![generation],
+        )?;
+        tx.execute(
+            "DELETE FROM index_generations WHERE generation = ?1",
+            params![generation],
+        )?;
+        tx.execute(
+            "DELETE FROM index_build_leases
+             WHERE generation = ?1 AND owner_token = ?2",
+            params![generation, owner_token],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     fn purge_target_has_sensitive_content(&self, target: &PurgeTarget) -> Result<bool, QghError> {
@@ -2390,10 +2503,22 @@ impl Store {
         &mut self,
         fingerprint: &EmbeddingFingerprint,
     ) -> Result<usize, QghError> {
-        self.ensure_vector_storage(fingerprint.dimension)?;
+        self.ensure_vector_storage_for_fingerprint_inner(fingerprint, || {})
+    }
+
+    fn ensure_vector_storage_for_fingerprint_inner<F>(
+        &mut self,
+        fingerprint: &EmbeddingFingerprint,
+        after_candidate_read: F,
+    ) -> Result<usize, QghError>
+    where
+        F: FnOnce(),
+    {
         let fingerprint_hash = fingerprint.hash();
+        let tx = self.content_write_transaction()?;
+        Self::ensure_vector_storage_inner(&tx, fingerprint.dimension)?;
         let rows = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT ce.chunk_id, ce.vector_json
                  FROM chunk_embeddings ce
                  JOIN embedding_fingerprints ef ON ef.id = ce.fingerprint_id
@@ -2411,8 +2536,8 @@ impl Store {
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        after_candidate_read();
 
-        let tx = self.conn.transaction()?;
         for (chunk_id, vector_json) in &rows {
             let vector: EmbeddingVector = serde_json::from_str(vector_json).map_err(|error| {
                 QghError::storage(format!("Stored embedding vector is invalid: {error}"))
@@ -3090,14 +3215,15 @@ impl Store {
         }
         let now = now_rfc3339();
         let expected_epoch = self.content_write_epoch;
-        let index_root = self.index_root.clone();
-        let tx = match self.content_write_transaction() {
-            Ok(tx) => tx,
-            Err(error) => {
-                remove_reserved_index_generation_at(&index_root, generation)?;
-                return Err(error);
-            }
-        };
+        let owner_token = self.index_build_tokens.get(&generation).cloned();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Err(error) = ensure_content_write_allowed(&tx, expected_epoch) {
+            drop(tx);
+            self.cleanup_owned_index_generation(generation)?;
+            return Err(error);
+        }
         let generation_epoch = tx
             .query_row(
                 "SELECT write_epoch FROM index_generations WHERE generation = ?1",
@@ -3107,7 +3233,24 @@ impl Store {
             .optional()?;
         if generation_epoch != Some(expected_epoch) {
             drop(tx);
-            self.remove_reserved_index_generation(generation)?;
+            self.cleanup_owned_index_generation(generation)?;
+            return Err(write_fence_error());
+        }
+        let lease_matches = if let Some(owner_token) = owner_token.as_deref() {
+            tx.query_row(
+                "SELECT 1 FROM index_build_leases
+                 WHERE generation = ?1 AND write_epoch = ?2 AND owner_token = ?3",
+                params![generation, expected_epoch, owner_token],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        } else {
+            false
+        };
+        if !lease_matches {
+            drop(tx);
+            self.cleanup_owned_index_generation(generation)?;
             return Err(write_fence_error());
         }
         tx.execute("UPDATE index_generations SET active = 0", [])?;
@@ -3121,7 +3264,13 @@ impl Store {
             "UPDATE index_tasks SET completed_at = ?1 WHERE completed_at IS NULL",
             params![now],
         )?;
+        tx.execute(
+            "DELETE FROM index_build_leases
+             WHERE generation = ?1 AND owner_token = ?2",
+            params![generation, owner_token],
+        )?;
         tx.commit()?;
+        self.index_build_tokens.remove(&generation);
         Ok(())
     }
 
@@ -3252,14 +3401,23 @@ impl Store {
         self.validate_index_root_confinement()?;
         let now = now_rfc3339();
         let write_epoch = self.content_write_epoch;
+        let owner_pid = i64::from(std::process::id());
         let tx = self.content_write_transaction()?;
-        let current: Option<i64> = tx
-            .query_row("SELECT max(generation) FROM index_generations", [], |row| {
-                row.get(0)
-            })
-            .optional()?
-            .flatten();
-        let generation = current.unwrap_or(0) + 1;
+        let generation = tx.query_row(
+            "SELECT CAST(value AS INTEGER) FROM profile_meta
+             WHERE key = 'next_index_generation'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        tx.execute(
+            "UPDATE profile_meta SET value = CAST(?1 + 1 AS TEXT)
+             WHERE key = 'next_index_generation'",
+            params![generation],
+        )?;
+        let owner_token = format!(
+            "index-build-{owner_pid}-{generation}-{}",
+            now_run_id_suffix()
+        );
         let generation_path = index_root.join(format!("generation-{generation}"));
         tx.execute(
             "INSERT INTO index_generations
@@ -3273,7 +3431,14 @@ impl Store {
                 write_epoch,
             ],
         )?;
+        tx.execute(
+            "INSERT INTO index_build_leases
+                (generation, write_epoch, owner_pid, owner_token, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![generation, write_epoch, owner_pid, owner_token, now],
+        )?;
         tx.commit()?;
+        self.index_build_tokens.insert(generation, owner_token);
         Ok((generation, generation_path))
     }
 
@@ -3887,14 +4052,15 @@ impl Store {
         expected_publication_id: Option<i64>,
     ) -> Result<i64, QghError> {
         let expected_epoch = self.content_write_epoch;
-        let index_root = self.index_root.clone();
-        let tx = match self.content_write_transaction() {
-            Ok(tx) => tx,
-            Err(error) => {
-                remove_reserved_index_generation_at(&index_root, tantivy_generation)?;
-                return Err(error);
-            }
-        };
+        let owner_token = self.index_build_tokens.get(&tantivy_generation).cloned();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Err(error) = ensure_content_write_allowed(&tx, expected_epoch) {
+            drop(tx);
+            self.cleanup_owned_index_generation(tantivy_generation)?;
+            return Err(error);
+        }
         let embedding_metadata = if let Some(generation_id) = embedding_generation_id {
             Some(tx.query_row(
                 "SELECT state, model_manifest_hash, chunker_fingerprint,
@@ -3923,10 +4089,12 @@ impl Store {
         {
             if *generation_epoch != expected_epoch {
                 drop(tx);
-                self.remove_reserved_index_generation(tantivy_generation)?;
+                self.cleanup_owned_index_generation(tantivy_generation)?;
                 return Err(write_fence_error());
             }
             if state != "ready" || total_chunks != completed_chunks {
+                drop(tx);
+                self.cleanup_owned_index_generation(tantivy_generation)?;
                 return Err(QghError::validation(
                     "publication.embedding_not_ready",
                     "Only a complete ready embedding generation can be published.",
@@ -3941,21 +4109,23 @@ impl Store {
             )
             .optional()?;
         if expected_publication_id.is_some() && current != expected_publication_id {
+            drop(tx);
+            self.cleanup_owned_index_generation(tantivy_generation)?;
             return Err(QghError::validation(
                 "publication.cas_conflict",
                 "Retrieval publication changed before activation.",
             ));
         }
-        let index_epoch = tx
+        let index_state = tx
             .query_row(
-                "SELECT write_epoch FROM index_generations WHERE generation = ?1",
+                "SELECT write_epoch, active FROM index_generations WHERE generation = ?1",
                 params![tantivy_generation],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
             )
             .optional()?;
-        let Some(index_epoch) = index_epoch else {
+        let Some((index_epoch, index_active)) = index_state else {
             drop(tx);
-            self.remove_reserved_index_generation(tantivy_generation)?;
+            self.cleanup_owned_index_generation(tantivy_generation)?;
             return Err(QghError::validation(
                 "publication.tantivy_generation_missing",
                 "The retrieval publication references a missing Tantivy generation.",
@@ -3963,7 +4133,24 @@ impl Store {
         };
         if index_epoch != expected_epoch {
             drop(tx);
-            self.remove_reserved_index_generation(tantivy_generation)?;
+            self.cleanup_owned_index_generation(tantivy_generation)?;
+            return Err(write_fence_error());
+        }
+        let lease_matches = if let Some(owner_token) = owner_token.as_deref() {
+            tx.query_row(
+                "SELECT 1 FROM index_build_leases
+                 WHERE generation = ?1 AND write_epoch = ?2 AND owner_token = ?3",
+                params![tantivy_generation, expected_epoch, owner_token],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        } else {
+            false
+        };
+        if (!index_active && !lease_matches) || (index_active && owner_token.is_some()) {
+            drop(tx);
+            self.cleanup_owned_index_generation(tantivy_generation)?;
             return Err(write_fence_error());
         }
         let now = now_rfc3339();
@@ -4034,7 +4221,15 @@ impl Store {
                 )?;
             }
         }
+        if let Some(owner_token) = owner_token.as_deref() {
+            tx.execute(
+                "DELETE FROM index_build_leases
+                 WHERE generation = ?1 AND owner_token = ?2",
+                params![tantivy_generation, owner_token],
+            )?;
+        }
         tx.commit()?;
+        self.index_build_tokens.remove(&tantivy_generation);
         Ok(publication_id)
     }
 
@@ -4164,7 +4359,7 @@ impl Store {
         }
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = ensure_content_write_allowed(&self.conn, self.content_write_epoch)
-            .and_then(|()| self.ensure_vector_storage_inner(dimension));
+            .and_then(|()| Self::ensure_vector_storage_inner(&self.conn, dimension));
         match result {
             Ok(()) => {
                 self.conn.execute_batch("COMMIT")?;
@@ -4177,15 +4372,19 @@ impl Store {
         }
     }
 
-    fn ensure_vector_storage_inner(&self, dimension: usize) -> Result<(), QghError> {
-        if let Some(existing_dimension) = vector_table_dimension(&self.conn)? {
+    fn ensure_vector_storage_inner(conn: &Connection, dimension: usize) -> Result<(), QghError> {
+        if dimension == 0 {
+            return Err(QghError::storage(
+                "Cannot create sqlite-vec storage for zero-dimensional embeddings.",
+            ));
+        }
+        if let Some(existing_dimension) = vector_table_dimension(conn)? {
             if existing_dimension == dimension {
                 return Ok(());
             }
-            self.conn
-                .execute(&format!("DROP TABLE {CHUNK_EMBEDDING_VECTORS_TABLE}"), [])?;
+            conn.execute(&format!("DROP TABLE {CHUNK_EMBEDDING_VECTORS_TABLE}"), [])?;
         }
-        self.conn.execute(
+        conn.execute(
             &format!(
                 "CREATE VIRTUAL TABLE {CHUNK_EMBEDDING_VECTORS_TABLE}
                  USING vec0(embedding float[{dimension}])"
@@ -4545,6 +4744,14 @@ impl Store {
                 write_epoch INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS index_build_leases (
+                generation INTEGER PRIMARY KEY,
+                write_epoch INTEGER NOT NULL,
+                owner_pid INTEGER NOT NULL,
+                owner_token TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS index_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id TEXT NOT NULL,
@@ -4714,6 +4921,19 @@ impl Store {
             "write_epoch",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        self.conn.execute(
+            "INSERT INTO profile_meta (key, value)
+             SELECT 'next_index_generation',
+                    CAST(coalesce(max(generation), 0) + 1 AS TEXT)
+             FROM index_generations
+             WHERE 1
+             ON CONFLICT(key) DO UPDATE SET
+                value = CAST(max(
+                    CAST(profile_meta.value AS INTEGER),
+                    CAST(excluded.value AS INTEGER)
+                ) AS TEXT)",
+            [],
+        )?;
         ensure_column(
             &self.conn,
             "purge_requests",
@@ -4759,6 +4979,15 @@ impl Store {
             params!["qgh.purge.v1", now_rfc3339()],
         )?;
         Ok(())
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        let generations = self.index_build_tokens.keys().copied().collect::<Vec<_>>();
+        for generation in generations {
+            let _ = self.cleanup_owned_index_generation(generation);
+        }
     }
 }
 
@@ -4869,7 +5098,33 @@ fn is_managed_tantivy_generation_name(name: &str) -> bool {
     })
 }
 
-fn remove_reserved_index_generation_at(index_root: &Path, generation: i64) -> Result<(), QghError> {
+/// Unix can distinguish an abandoned builder without a TTL. Permission errors
+/// and unknown OS failures are treated as live. Other platforms conservatively
+/// keep every positive-PID lease live until its owner explicitly releases it.
+#[cfg(unix)]
+fn index_builder_process_is_live(owner_pid: i64) -> bool {
+    use std::os::raw::c_int;
+
+    if owner_pid <= 0 || owner_pid > i64::from(c_int::MAX) {
+        return false;
+    }
+    unsafe extern "C" {
+        fn kill(pid: c_int, signal: c_int) -> c_int;
+    }
+    let result = unsafe { kill(owner_pid as c_int, 0) };
+    if result == 0 {
+        return true;
+    }
+    // POSIX ESRCH is 3. EPERM and every unknown error stay fail-closed/live.
+    std::io::Error::last_os_error().raw_os_error() != Some(3)
+}
+
+#[cfg(not(unix))]
+fn index_builder_process_is_live(owner_pid: i64) -> bool {
+    owner_pid > 0
+}
+
+fn remove_index_generation_path_at(index_root: &Path, generation: i64) -> Result<(), QghError> {
     if !index_root.exists() {
         return Ok(());
     }
@@ -4967,23 +5222,91 @@ fn vec0_shadow_payload_exists(conn: &Connection) -> Result<bool, QghError> {
 }
 
 #[cfg(not(feature = "vector-search"))]
-fn clear_generation_vec0_shadow_payloads(conn: &Connection) -> Result<(), QghError> {
-    let mut stmt = conn.prepare(
-        "SELECT name FROM sqlite_schema
-         WHERE type = 'table' AND name LIKE 'embedding_generation_vectors_d%_rowids'",
-    )?;
-    let rowid_tables = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(stmt);
-    for rowid_table in rowid_tables {
-        let Some(base) = rowid_table.strip_suffix("_rowids") else {
-            continue;
-        };
-        if is_qgh_generation_vector_table(base) {
-            clear_vec0_shadow_payload_for_base(conn, base)?;
+fn delete_vec0_shadow_row(
+    conn: &Connection,
+    base: &str,
+    dimension: usize,
+    vector_rowid: i64,
+) -> Result<(), QghError> {
+    if base != generation_vector_table_name(dimension) || !is_qgh_generation_vector_table(base) {
+        return Err(purge_error());
+    }
+    let chunks_table = format!("{base}_chunks");
+    let rowids_table = format!("{base}_rowids");
+    let vectors_table = format!("{base}_vector_chunks00");
+    for table in [&chunks_table, &rowids_table, &vectors_table] {
+        if !table_exists(conn, table)? {
+            return Err(purge_error());
         }
     }
+    let Some((chunk_id, chunk_offset)) = conn
+        .query_row(
+            &format!(
+                "SELECT chunk_id, chunk_offset FROM \"{rowids_table}\"
+                 WHERE rowid = ?1"
+            ),
+            params![vector_rowid],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as usize)),
+        )
+        .optional()?
+    else {
+        return Err(purge_error());
+    };
+    let (mut validity, mut rowids): (Vec<u8>, Vec<u8>) = conn.query_row(
+        &format!("SELECT validity, rowids FROM \"{chunks_table}\" WHERE rowid = ?1"),
+        params![chunk_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let mut vectors: Vec<u8> = conn.query_row(
+        &format!("SELECT vectors FROM \"{vectors_table}\" WHERE rowid = ?1"),
+        params![chunk_id],
+        |row| row.get(0),
+    )?;
+    let validity_index = chunk_offset / 8;
+    let rowid_start = chunk_offset
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or_else(purge_error)?;
+    let vector_width = dimension
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(purge_error)?;
+    let vector_start = chunk_offset
+        .checked_mul(vector_width)
+        .ok_or_else(purge_error)?;
+    if validity_index >= validity.len()
+        || rowid_start + std::mem::size_of::<i64>() > rowids.len()
+        || vector_start + vector_width > vectors.len()
+    {
+        return Err(purge_error());
+    }
+    if rowids[rowid_start..rowid_start + std::mem::size_of::<i64>()] != vector_rowid.to_ne_bytes() {
+        return Err(purge_error());
+    }
+    validity[validity_index] &= !(1_u8 << (chunk_offset % 8));
+    rowids[rowid_start..rowid_start + std::mem::size_of::<i64>()].fill(0);
+    vectors[vector_start..vector_start + vector_width].fill(0);
+    if validity.iter().all(|byte| *byte == 0) {
+        conn.execute(
+            &format!("DELETE FROM \"{chunks_table}\" WHERE rowid = ?1"),
+            params![chunk_id],
+        )?;
+        conn.execute(
+            &format!("DELETE FROM \"{vectors_table}\" WHERE rowid = ?1"),
+            params![chunk_id],
+        )?;
+    } else {
+        conn.execute(
+            &format!("UPDATE \"{chunks_table}\" SET validity = ?2, rowids = ?3 WHERE rowid = ?1"),
+            params![chunk_id, validity, rowids],
+        )?;
+        conn.execute(
+            &format!("UPDATE \"{vectors_table}\" SET vectors = ?2 WHERE rowid = ?1"),
+            params![chunk_id, vectors],
+        )?;
+    }
+    conn.execute(
+        &format!("DELETE FROM \"{rowids_table}\" WHERE rowid = ?1"),
+        params![vector_rowid],
+    )?;
     Ok(())
 }
 
@@ -5419,6 +5742,23 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn purge_status_labels_are_stable_and_content_free() {
+        assert_eq!(
+            PurgeTarget::Issue {
+                repo: "owner/repo".to_string(),
+                issue_number: 47,
+            }
+            .kind(),
+            "issue"
+        );
+        assert_eq!(
+            PurgeTrigger::ConfirmedTombstone.as_str(),
+            "confirmed_tombstone"
+        );
+        assert_eq!(PurgeFailureStage::WalCheckpoint.as_str(), "wal_checkpoint");
+    }
+
+    #[test]
     fn purge_pending_immediately_blocks_store_get_and_query_eligibility() {
         let paths = temp_profile_paths("purge-pending-eligibility");
         let mut store = Store::open(&paths).unwrap();
@@ -5672,14 +6012,15 @@ mod tests {
         let (generation, generation_path) = stale_builder
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
-        purger
+        let purge_error = purger
             .purge(
                 PurgeTarget::Source {
                     source_id: source_id.to_string(),
                 },
                 PurgeTrigger::ConfirmedDelete,
             )
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(purge_error.code, "purge.failed");
         fs::create_dir_all(&generation_path).unwrap();
         fs::write(generation_path.join("segment"), "late-tantivy-marker").unwrap();
 
@@ -5689,8 +6030,127 @@ mod tests {
 
         assert_eq!(error.code, "purge.write_fenced");
         assert!(!generation_path.exists());
+        purger.retry_pending_purges().unwrap();
         let fresh = Store::open(&paths).unwrap();
         assert!(fresh.active_retrieval_publication().unwrap().is_none());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_stays_pending_while_live_index_builder_owns_generation() {
+        let paths = temp_profile_paths("purge-live-index-build-lease");
+        let mut builder = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_LIVE_INDEX_LEASE";
+        builder
+            .upsert_sources_for_run(
+                "sync-purge-live-index-lease",
+                &[test_issue(source_id, "owner/repo", "live-index-private")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let (generation, generation_path) = builder
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        fs::create_dir_all(&generation_path).unwrap();
+        fs::write(generation_path.join("segment"), "live-index-private").unwrap();
+        let mut purger = Store::open(&paths).unwrap();
+
+        let error = purger
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "purge.failed");
+        assert_eq!(
+            purger.pending_purges().unwrap()[0].failure_stage,
+            Some(PurgeFailureStage::Tantivy)
+        );
+        assert!(generation_path.join("segment").exists());
+        let stale_error = builder
+            .activate_retrieval_publication("sync-purge-live-index-lease", generation, None, None)
+            .unwrap_err();
+        assert_eq!(stale_error.code, "purge.write_fenced");
+        assert!(!generation_path.exists());
+        purger.retry_pending_purges().unwrap();
+        let (successor_generation, successor_path) = purger
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        assert!(successor_generation > generation);
+        fs::create_dir_all(&successor_path).unwrap();
+        fs::write(successor_path.join("segment"), "fresh-successor").unwrap();
+
+        let repeated_stale_error = builder
+            .mark_index_published(generation, &generation_path.to_string_lossy(), 1)
+            .unwrap_err();
+
+        assert_eq!(repeated_stale_error.code, "purge.write_fenced");
+        assert!(successor_path.join("segment").exists());
+        purger
+            .activate_retrieval_publication(
+                "sync-purge-live-index-lease-successor",
+                successor_generation,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_reclaims_dead_process_index_lease_without_ttl() {
+        let paths = temp_profile_paths("purge-dead-index-build-lease");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_DEAD_INDEX_LEASE";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-dead-index-lease",
+                &[test_issue(source_id, "owner/repo", "dead-index-private")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        fs::create_dir_all(&generation_path).unwrap();
+        fs::write(generation_path.join("segment"), "dead-index-private").unwrap();
+        store.index_build_tokens.remove(&generation);
+        store
+            .conn
+            .execute(
+                "UPDATE index_build_leases SET owner_pid = -1 WHERE generation = ?1",
+                params![generation],
+            )
+            .unwrap();
+
+        let outcome = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.purged_sources, 1);
+        assert!(!generation_path.exists());
+        let lease_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM index_build_leases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lease_count, 0);
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -5720,7 +6180,7 @@ mod tests {
                 },
                 PurgeTrigger::ConfirmedDelete,
             )
-            .unwrap();
+            .unwrap_err();
         fs::create_dir_all(&generation_path).unwrap();
 
         let error = stale_builder
@@ -5729,6 +6189,7 @@ mod tests {
 
         assert_eq!(error.code, "purge.write_fenced");
         assert!(!generation_path.exists());
+        purger.retry_pending_purges().unwrap();
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -6065,7 +6526,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.purged_sources, 2);
-        assert!(outcome.wal_truncated);
+        assert!(outcome.sensitive_wal_truncated);
         assert!(store.get_source(source_id).unwrap().is_none());
         assert!(store.get_source(comment_id).unwrap().is_none());
         for table in [
@@ -6204,6 +6665,226 @@ mod tests {
         assert!(!db.windows(marker.len()).any(|bytes| bytes == marker));
 
         let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(not(feature = "vector-search"))]
+    #[test]
+    fn bm25_only_purge_preserves_proven_target_free_generation_shadow_rows() {
+        let paths = temp_profile_paths("purge-bm25-targeted-generation-shadows");
+        let mut store = Store::open(&paths).unwrap();
+        let target_id = "qgh://github.com/issue/I_PURGE_BM25_GEN_TARGET";
+        let other_id = "qgh://github.com/issue/I_PURGE_BM25_GEN_OTHER";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-bm25-generation-shadows",
+                &[
+                    test_issue(target_id, "owner/target", "target-generation-private"),
+                    test_issue(other_id, "owner/other", "other-generation-safe"),
+                ],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let target_version = store.latest_source_version_id(target_id).unwrap().unwrap();
+        let other_version = store.latest_source_version_id(other_id).unwrap().unwrap();
+        let vector_table = generation_vector_table_name(2);
+        let shadow_chunks = format!("{vector_table}_chunks");
+        let shadow_rowids = format!("{vector_table}_rowids");
+        let shadow_vectors = format!("{vector_table}_vector_chunks00");
+        store
+            .conn
+            .execute_batch(&format!(
+                "CREATE TABLE chunks (
+                    id INTEGER PRIMARY KEY, source_id TEXT NOT NULL,
+                    source_version_id INTEGER NOT NULL
+                 );
+                 INSERT INTO chunks (id, source_id, source_version_id)
+                    VALUES (41, '{target_id}', {target_version});
+                 INSERT INTO chunks (id, source_id, source_version_id)
+                    VALUES (42, '{other_id}', {other_version});
+                 CREATE TABLE embedding_generations (
+                    id INTEGER PRIMARY KEY, state TEXT NOT NULL,
+                    write_epoch INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO embedding_generations (id, state) VALUES (1, 'ready');
+                 INSERT INTO embedding_generations (id, state) VALUES (2, 'ready');
+                 CREATE TABLE embedding_generation_chunks (
+                    generation_id INTEGER NOT NULL, chunk_id INTEGER NOT NULL,
+                    source_version_id INTEGER NOT NULL
+                 );
+                 INSERT INTO embedding_generation_chunks VALUES (1, 41, {target_version});
+                 INSERT INTO embedding_generation_chunks VALUES (2, 42, {other_version});
+                 CREATE TABLE embedding_generation_vector_rows (
+                    id INTEGER PRIMARY KEY, generation_id INTEGER NOT NULL,
+                    chunk_id INTEGER NOT NULL, dimension INTEGER NOT NULL,
+                    vector_table TEXT NOT NULL, vector_rowid INTEGER NOT NULL
+                 );
+                 INSERT INTO embedding_generation_vector_rows
+                    VALUES (101, 1, 41, 2, '{vector_table}', 101);
+                 INSERT INTO embedding_generation_vector_rows
+                    VALUES (102, 2, 42, 2, '{vector_table}', 102);
+                 CREATE TABLE {shadow_chunks} (
+                    chunk_id INTEGER PRIMARY KEY, size INTEGER NOT NULL,
+                    validity BLOB NOT NULL, rowids BLOB NOT NULL
+                 );
+                 CREATE TABLE {shadow_rowids} (
+                    rowid INTEGER PRIMARY KEY, id, chunk_id INTEGER, chunk_offset INTEGER
+                 );
+                 INSERT INTO {shadow_rowids} VALUES (101, 101, 1, 0);
+                 INSERT INTO {shadow_rowids} VALUES (102, 102, 1, 1);
+                 CREATE TABLE {shadow_vectors} (
+                    rowid PRIMARY KEY, vectors BLOB NOT NULL
+                 );"
+            ))
+            .unwrap();
+        let target_marker = b"SECRETV!";
+        let other_vector = encode_embedding_blob(&[0.3, 0.4]);
+        let mut rowids_blob = Vec::new();
+        rowids_blob.extend_from_slice(&101_i64.to_ne_bytes());
+        rowids_blob.extend_from_slice(&102_i64.to_ne_bytes());
+        let mut vectors_blob = target_marker.to_vec();
+        vectors_blob.extend_from_slice(&other_vector);
+        store
+            .conn
+            .execute(
+                &format!(
+                    "INSERT INTO {shadow_chunks} (chunk_id, size, validity, rowids)
+                     VALUES (1, 2, ?1, ?2)"
+                ),
+                params![vec![0b0000_0011_u8], rowids_blob],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                &format!("INSERT INTO {shadow_vectors} (rowid, vectors) VALUES (1, ?1)"),
+                params![vectors_blob],
+            )
+            .unwrap();
+        drop(store);
+        let mut store = Store::open(&paths).unwrap();
+
+        store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: target_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+
+        assert!(store.embedding_generation_state(1).is_err());
+        assert_eq!(store.embedding_generation_state(2).unwrap(), "ready");
+        let other_mapping_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM embedding_generation_vector_rows
+                 WHERE generation_id = 2 AND vector_rowid = 102",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(other_mapping_count, 1);
+        let target_shadow_count: i64 = store
+            .conn
+            .query_row(
+                &format!("SELECT count(*) FROM {shadow_rowids} WHERE rowid = 101"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let other_shadow_count: i64 = store
+            .conn
+            .query_row(
+                &format!("SELECT count(*) FROM {shadow_rowids} WHERE rowid = 102"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_shadow_count, 0);
+        assert_eq!(other_shadow_count, 1);
+        let (validity, rowids, vectors): (Vec<u8>, Vec<u8>, Vec<u8>) = store
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT c.validity, c.rowids, v.vectors
+                     FROM {shadow_chunks} c JOIN {shadow_vectors} v ON v.rowid = c.chunk_id
+                     WHERE c.chunk_id = 1"
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(validity, vec![0b0000_0010_u8]);
+        assert_eq!(&rowids[..8], &[0_u8; 8]);
+        assert_eq!(&rowids[8..16], &102_i64.to_ne_bytes());
+        assert_eq!(&vectors[..8], &[0_u8; 8]);
+        assert_eq!(
+            decode_embedding_blob(&vectors[8..16], 2).unwrap(),
+            vec![0.3, 0.4]
+        );
+        drop(store);
+        let db = fs::read(&paths.db_path).unwrap();
+        assert!(!db
+            .windows(target_marker.len())
+            .any(|bytes| bytes == target_marker));
+        let wal_path = PathBuf::from(format!("{}-wal", paths.db_path.display()));
+        if wal_path.exists() {
+            let wal = fs::read(wal_path).unwrap();
+            assert!(!wal
+                .windows(target_marker.len())
+                .any(|bytes| bytes == target_marker));
+        }
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(not(feature = "vector-search"))]
+    #[test]
+    fn bm25_shadow_delete_fails_closed_on_corrupt_rowid_ownership() {
+        let conn = Connection::open_in_memory().unwrap();
+        let base = generation_vector_table_name(2);
+        let chunks = format!("{base}_chunks");
+        let rowids = format!("{base}_rowids");
+        let vectors = format!("{base}_vector_chunks00");
+        conn.execute_batch(&format!(
+            "CREATE TABLE {chunks} (
+                chunk_id INTEGER PRIMARY KEY, size INTEGER NOT NULL,
+                validity BLOB NOT NULL, rowids BLOB NOT NULL
+             );
+             CREATE TABLE {rowids} (
+                rowid INTEGER PRIMARY KEY, id, chunk_id INTEGER, chunk_offset INTEGER
+             );
+             INSERT INTO {rowids} VALUES (101, 101, 1, 0);
+             CREATE TABLE {vectors} (rowid PRIMARY KEY, vectors BLOB NOT NULL);"
+        ))
+        .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {chunks} (chunk_id, size, validity, rowids)
+                 VALUES (1, 1, ?1, ?2)"
+            ),
+            params![vec![1_u8], 999_i64.to_ne_bytes().to_vec()],
+        )
+        .unwrap();
+        conn.execute(
+            &format!("INSERT INTO {vectors} (rowid, vectors) VALUES (1, ?1)"),
+            params![b"PRIVATE!".as_slice()],
+        )
+        .unwrap();
+
+        let error = delete_vec0_shadow_row(&conn, &base, 2, 101).unwrap_err();
+
+        assert_eq!(error.code, "purge.failed");
+        assert!(!serde_json::to_string(&error).unwrap().contains("PRIVATE"));
+        let payload: Vec<u8> = conn
+            .query_row(&format!("SELECT vectors FROM {vectors}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(payload, b"PRIVATE!");
+        assert!(delete_vec0_shadow_row(&conn, &base, 2, 404).is_err());
     }
 
     #[cfg(feature = "vector-search")]
@@ -6614,7 +7295,7 @@ mod tests {
                 source_id: source_id.to_string(),
             }
         );
-        assert!(outcomes[0].wal_truncated);
+        assert!(outcomes[0].sensitive_wal_truncated);
         assert!(store.pending_purges().unwrap().is_empty());
         assert!(store.get_source(source_id).unwrap().is_none());
         assert!(store.retry_pending_purges().unwrap().is_empty());
@@ -7082,7 +7763,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.purged_sources, 0);
-        assert!(!outcome.wal_truncated);
+        assert!(!outcome.sensitive_wal_truncated);
         assert_eq!(read_content_write_epoch(&store.conn).unwrap(), epoch_before);
         assert_eq!(
             store
@@ -7092,6 +7773,42 @@ mod tests {
                 .publication_id,
             publication
         );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn first_empty_repository_purge_fences_later_stale_ingest() {
+        let paths = temp_profile_paths("purge-first-empty-repository");
+        let mut stale_writer = Store::open(&paths).unwrap();
+        let mut purger = Store::open(&paths).unwrap();
+        let epoch_before = read_content_write_epoch(&purger.conn).unwrap();
+
+        let outcome = purger
+            .purge(
+                PurgeTarget::Repository {
+                    repo: "owner/removed".to_string(),
+                },
+                PurgeTrigger::AllowlistRemoval,
+            )
+            .unwrap();
+
+        assert!(outcome.sensitive_wal_truncated);
+        assert!(read_content_write_epoch(&purger.conn).unwrap() >= epoch_before + 2);
+        let error = stale_writer
+            .upsert_sources_for_run(
+                "sync-after-empty-repository-purge",
+                &[test_issue(
+                    "qgh://github.com/issue/I_PURGE_EMPTY_REPO",
+                    "owner/removed",
+                    "must-be-fenced",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "purge.write_fenced");
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -7142,7 +7859,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.purged_sources, 0);
-        assert!(!outcome.wal_truncated);
+        assert!(!outcome.sensitive_wal_truncated);
         assert_eq!(read_content_write_epoch(&store.conn).unwrap(), epoch_before);
         assert!(generation_path.join("segment").exists());
         assert_eq!(
@@ -7154,6 +7871,83 @@ mod tests {
             publication
         );
         assert!(store.get_source(other_id).unwrap().is_some());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn first_absent_source_purge_fences_store_opened_before_confirmation() {
+        let paths = temp_profile_paths("purge-first-absent-source");
+        let mut stale_writer = Store::open(&paths).unwrap();
+        let mut purger = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_FIRST_ABSENT";
+        let epoch_before = read_content_write_epoch(&purger.conn).unwrap();
+
+        let outcome = purger
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+
+        assert!(outcome.sensitive_wal_truncated);
+        assert!(read_content_write_epoch(&purger.conn).unwrap() >= epoch_before + 2);
+        let error = stale_writer
+            .upsert_sources_for_run(
+                "sync-after-first-absent-purge",
+                &[test_issue(source_id, "owner/repo", "must-be-fenced")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "purge.write_fenced");
+        assert!(purger.pending_purges().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn first_absent_issue_purge_does_not_remove_unrelated_index_files() {
+        let paths = temp_profile_paths("purge-first-absent-issue-index");
+        let mut store = Store::open(&paths).unwrap();
+        let other_id = "qgh://github.com/issue/I_PURGE_ABSENT_ISSUE_OTHER";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-absent-issue-index",
+                &[test_issue(other_id, "owner/other", "other-index-content")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        fs::create_dir_all(&generation_path).unwrap();
+        fs::write(generation_path.join("segment"), "other-index-content").unwrap();
+        store
+            .activate_retrieval_publication("sync-purge-absent-issue-index", generation, None, None)
+            .unwrap();
+
+        store
+            .purge(
+                PurgeTarget::Issue {
+                    repo: "owner/missing".to_string(),
+                    issue_number: 47,
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+
+        assert!(generation_path.join("segment").exists());
+        assert_eq!(
+            store.index_path_for_generation(generation).unwrap(),
+            Some(generation_path.to_string_lossy().to_string())
+        );
+        assert!(store.active_retrieval_publication().unwrap().is_none());
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -7215,7 +8009,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.purged_sources, 0);
-        assert!(!outcome.wal_truncated);
+        assert!(!outcome.sensitive_wal_truncated);
         assert_eq!(read_content_write_epoch(&store.conn).unwrap(), epoch_before);
         assert!(generation_path.join("segment").exists());
         assert_eq!(
@@ -7265,6 +8059,127 @@ mod tests {
             )
             .unwrap();
         assert_eq!(active_count, 1);
+        let lease_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM index_build_leases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lease_count, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn index_generation_identity_is_never_reused_after_purge() {
+        let paths = temp_profile_paths("index-generation-never-reused");
+        let mut store = Store::open(&paths).unwrap();
+        let target_id = "qgh://github.com/issue/I_GENERATION_NEVER_REUSE_TARGET";
+        let other_id = "qgh://github.com/issue/I_GENERATION_NEVER_REUSE_OTHER";
+        store
+            .upsert_sources_for_run(
+                "sync-generation-never-reused",
+                &[
+                    test_issue(target_id, "owner/target", "target-generation"),
+                    test_issue(other_id, "owner/other", "other-generation"),
+                ],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let (first_generation, first_path) = store
+            .reserve_index_generation(&paths.index_root, 2)
+            .unwrap();
+        fs::create_dir_all(&first_path).unwrap();
+        store
+            .activate_retrieval_publication(
+                "sync-generation-never-reused",
+                first_generation,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: target_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+
+        let (second_generation, second_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+
+        assert!(second_generation > first_generation);
+        assert_ne!(second_path, first_path);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn index_generation_sequence_migrates_above_existing_rows() {
+        let paths = temp_profile_paths("index-generation-sequence-migration");
+        let store = Store::open(&paths).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO index_generations
+                    (generation, path, source_count, created_at, active, write_epoch)
+                 VALUES (42, ?1, 0, ?2, 0, 0)",
+                params![
+                    paths.index_root.join("generation-42").to_string_lossy(),
+                    now_rfc3339()
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE profile_meta SET value = '1' WHERE key = 'next_index_generation'",
+                [],
+            )
+            .unwrap();
+        drop(store);
+
+        let mut reopened = Store::open(&paths).unwrap();
+        let (generation, _) = reopened
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        assert_eq!(generation, 43);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn dropping_builder_releases_only_its_owned_generation_lease() {
+        let paths = temp_profile_paths("index-build-lease-drop");
+        let mut builder = Store::open(&paths).unwrap();
+        let (generation, generation_path) = builder
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        fs::create_dir_all(&generation_path).unwrap();
+        fs::write(generation_path.join("segment"), "abandoned-build").unwrap();
+
+        drop(builder);
+
+        assert!(!generation_path.exists());
+        let reopened = Store::open(&paths).unwrap();
+        let lease_count: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT count(*) FROM index_build_leases WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lease_count, 0);
+        assert!(reopened
+            .index_path_for_generation(generation)
+            .unwrap()
+            .is_none());
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -7364,6 +8279,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, "[0.400000,0.500000,0.600000,0.700000]");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn vector_storage_rebuild_cannot_resurrect_rows_across_purge_commit() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        let paths = temp_profile_paths("vector-storage-purge-race");
+        let mut writer = Store::open(&paths).unwrap();
+        writer.enable_vector().unwrap();
+        let source_id = "qgh://github.com/issue/I_VECTOR_PURGE_RACE";
+        let chunk_id =
+            insert_test_issue_chunk(&mut writer, source_id, "sync-vector-storage-purge-race");
+        let fingerprint = embedding_fingerprint("Example/vector-purge-race");
+        writer
+            .replace_all_chunk_embeddings(&fingerprint, &[(chunk_id, vec![0.1, 0.2, 0.3])])
+            .unwrap();
+        let mut purge_store = Store::open(&paths).unwrap();
+        purge_store.enable_vector().unwrap();
+        let purge_store = Rc::new(RefCell::new(purge_store));
+        let first_purge_succeeded = Rc::new(Cell::new(false));
+        let hook_store = Rc::clone(&purge_store);
+        let hook_succeeded = Rc::clone(&first_purge_succeeded);
+
+        writer
+            .ensure_vector_storage_for_fingerprint_inner(&fingerprint, move || {
+                hook_succeeded.set(
+                    hook_store
+                        .borrow_mut()
+                        .purge(
+                            PurgeTarget::Source {
+                                source_id: source_id.to_string(),
+                            },
+                            PurgeTrigger::ConfirmedDelete,
+                        )
+                        .is_ok(),
+                );
+            })
+            .unwrap();
+        purge_store
+            .borrow_mut()
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+
+        assert_eq!(vector_row_count(&writer.conn), 0);
+        if first_purge_succeeded.get() {
+            assert!(writer.get_source(source_id).unwrap().is_none());
+        }
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
