@@ -579,6 +579,7 @@ fn load_config_file() -> Result<ConfigFile, QghError> {
             "Invalid config TOML",
             &text,
             error.span(),
+            redacted_toml_reason(error.message()),
         ))
     })?;
     if config.schema_version != "qgh.config.v1" {
@@ -802,6 +803,7 @@ pub(crate) fn load_repo_policy_at(path: &Path) -> Result<RepoPolicy, QghError> {
             "Invalid repo policy TOML",
             &text,
             error.span(),
+            redacted_toml_reason(error.message()),
         ))
     })?;
     if policy.schema_version != "qgh.repo.v1" {
@@ -825,12 +827,13 @@ fn redacted_toml_error(
     context: &str,
     source: &str,
     span: Option<std::ops::Range<usize>>,
+    reason: &str,
 ) -> String {
     let Some(start) = span
         .map(|span| span.start)
         .filter(|start| *start <= source.len())
     else {
-        return format!("{context}: syntax or schema violation.");
+        return format!("{context}: {reason}.");
     };
     let prefix = &source[..start];
     let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
@@ -838,7 +841,22 @@ fn redacted_toml_error(
         .rsplit_once('\n')
         .map(|(_, line_prefix)| line_prefix.chars().count() + 1)
         .unwrap_or_else(|| prefix.chars().count() + 1);
-    format!("{context} at line {line}, column {column}: syntax or schema violation.")
+    format!("{context} at line {line}, column {column}: {reason}.")
+}
+
+fn redacted_toml_reason(message: &str) -> &'static str {
+    for (needle, reason) in [
+        ("unknown field", "unknown field"),
+        ("unknown variant", "unknown variant"),
+        ("invalid type", "type mismatch"),
+        ("missing field", "missing required field"),
+        ("duplicate field", "duplicate field"),
+    ] {
+        if message.contains(needle) {
+            return reason;
+        }
+    }
+    "syntax or schema violation"
 }
 
 fn parse_repo_policy_defaults(raw: RawRepoPolicyDefaults) -> Result<RepoPolicyDefaults, QghError> {
