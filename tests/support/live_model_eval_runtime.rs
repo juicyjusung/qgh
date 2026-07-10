@@ -70,7 +70,7 @@ struct ContractGateSpec {
     requires_binary_witness: bool,
 }
 
-const REQUIRED_CONTRACT_GATES: [ContractGateSpec; 7] = [
+const REQUIRED_CONTRACT_GATES: [ContractGateSpec; 6] = [
     ContractGateSpec {
         name: "edit_reconciliation",
         arguments: &[
@@ -149,21 +149,7 @@ const REQUIRED_CONTRACT_GATES: [ContractGateSpec; 7] = [
             "--all-features",
             "--test",
             "live_model_eval",
-            "bm25_baseline_applies_hard_filters_and_round_trips",
-            "--",
-            "--exact",
-        ],
-        requires_binary_witness: false,
-    },
-    ContractGateSpec {
-        name: "hard_filter_exclusion",
-        arguments: &[
-            "test",
-            "--release",
-            "--all-features",
-            "--test",
-            "live_model_eval",
-            "production_release_hard_filter_contract_excludes_competing_sources",
+            "production_release_bm25_filter_and_round_trip_contract",
             "--",
             "--exact",
             "--nocapture",
@@ -365,6 +351,36 @@ impl std::fmt::Display for ContextContractFailure {
 
 impl Error for ContextContractFailure {}
 
+#[derive(Debug)]
+struct HybridFilterContractFailure;
+
+impl std::fmt::Display for HybridFilterContractFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "release candidate failed the production hybrid hard-filter contract"
+        )
+    }
+}
+
+impl Error for HybridFilterContractFailure {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CandidateHybridFilterContract {
+    schema_version: &'static str,
+    candidate: String,
+    manifest_relative_path: String,
+    manifest_hash: String,
+    prepared_snapshot_sha256: String,
+    release_binary_sha256: String,
+    active_competing_sources: usize,
+    embedded_chunks: usize,
+    hybrid_filtered_queries: usize,
+    hybrid_ranked_results: usize,
+    hybrid_results_with_both_branches: usize,
+    exact_issue_queries: usize,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ContractGateRecord {
@@ -490,7 +506,7 @@ fn load_contract_gate_bundle(
     }
     let bundle: ContractGateBundle = serde_json::from_slice(&bytes)
         .map_err(|_| "canonical live-eval contract gate bundle is invalid")?;
-    if bundle.schema_version != "qgh.live_model_eval_gate_bundle.v2"
+    if bundle.schema_version != "qgh.live_model_eval_gate_bundle.v3"
         || bundle.git_sha != expected_git_sha
         || bundle.binary_sha256 != expected_binary_sha256
         || bundle.cargo_profile != "release"
@@ -521,7 +537,7 @@ fn load_contract_gate_bundle(
         }
         let result: ContractGateResult = serde_json::from_slice(&result_bytes)
             .map_err(|_| "canonical live-eval contract gate result is invalid")?;
-        if result.schema_version != "qgh.live_model_eval_gate_result.v2"
+        if result.schema_version != "qgh.live_model_eval_gate_result.v3"
             || result.name != actual.name
             || result.git_sha != bundle.git_sha
             || result.binary_sha256 != bundle.binary_sha256
@@ -540,7 +556,7 @@ fn load_contract_gate_bundle(
         }
     }
     Ok(VerifiedContractGateBundle {
-        schema_version: "qgh.live_model_eval_verified_gate_bundle.v2",
+        schema_version: "qgh.live_model_eval_verified_gate_bundle.v3",
         artifact: CONTRACT_GATE_BUNDLE_FILE,
         sha256,
         git_sha: bundle.git_sha,
@@ -707,7 +723,7 @@ fn run_contract_gate_bundle(
         }
         let result_artifact = format!("contract-gates/{}.json", spec.name);
         let result = ContractGateResult {
-            schema_version: "qgh.live_model_eval_gate_result.v2".to_string(),
+            schema_version: "qgh.live_model_eval_gate_result.v3".to_string(),
             name: spec.name.to_string(),
             git_sha: git_sha.to_string(),
             binary_sha256: binary_sha256.to_string(),
@@ -740,7 +756,7 @@ fn run_contract_gate_bundle(
         return Err("contract gate run identity changed during execution".into());
     }
     let bundle = ContractGateBundle {
-        schema_version: "qgh.live_model_eval_gate_bundle.v2".to_string(),
+        schema_version: "qgh.live_model_eval_gate_bundle.v3".to_string(),
         git_sha: git_sha.to_string(),
         binary_sha256: binary_sha256.to_string(),
         cargo_profile: binary_witness.cargo_profile,
@@ -773,7 +789,7 @@ pub(super) fn contract_gate_bundle_json_for_test(
         let command = contract_gate_command(&spec);
         let result_artifact = format!("contract-gates/{}.json", spec.name);
         let result = ContractGateResult {
-            schema_version: "qgh.live_model_eval_gate_result.v2".to_string(),
+            schema_version: "qgh.live_model_eval_gate_result.v3".to_string(),
             name: spec.name.to_string(),
             git_sha: git_sha.to_string(),
             binary_sha256: binary_sha256.to_string(),
@@ -803,7 +819,7 @@ pub(super) fn contract_gate_bundle_json_for_test(
         });
     }
     Ok(serde_json::to_value(ContractGateBundle {
-        schema_version: "qgh.live_model_eval_gate_bundle.v2".to_string(),
+        schema_version: "qgh.live_model_eval_gate_bundle.v3".to_string(),
         git_sha: git_sha.to_string(),
         binary_sha256: binary_sha256.to_string(),
         cargo_profile: "release".to_string(),
@@ -886,6 +902,7 @@ struct CandidateReport {
     candidate_database_schema_fingerprint: Option<String>,
     candidate_tantivy_schema_fingerprint: Option<String>,
     context_contract: Option<ContextContractEvidence>,
+    hybrid_filter_contract: Option<CandidateHybridFilterContract>,
     dev_metrics: Option<RetrievalMetrics>,
     held_out_metrics: Option<RetrievalMetrics>,
     offline_dev_diagnostics: Vec<OfflineFusionDiagnostic>,
@@ -945,6 +962,7 @@ struct FrozenCandidateState {
     prepared_snapshot_bytes: Option<u64>,
     prepared_snapshot_file_count: Option<usize>,
     download_transfer_bytes: Option<u64>,
+    hybrid_filter_contract: Option<CandidateHybridFilterContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2176,7 +2194,7 @@ pub(super) struct HardFilterProbeEvidence {
 }
 
 #[cfg(not(debug_assertions))]
-pub(super) struct ReleaseHardFilterProbeEvidence {
+pub(super) struct ReleaseBm25FilterProbeEvidence {
     pub(super) active_competing_sources: usize,
     pub(super) bm25_filtered_queries: usize,
     pub(super) exact_issue_queries: usize,
@@ -2196,32 +2214,134 @@ struct HardFilterQuerySetEvidence {
     results_with_both_branches: usize,
 }
 
+struct PreparedHardFilterProbe {
+    _server: PublicSnapshotServer,
+    fixture: CliFixture,
+    sources: Vec<CorpusRecord>,
+    source_count: usize,
+}
+
 pub(super) fn run_hard_filter_contract_probe(
     binary: &Path,
     corpus_raw: &str,
 ) -> Result<HardFilterProbeEvidence, DynError> {
-    run_hard_filter_contract_probe_with_mode(binary, corpus_raw, true)
-}
+    let prepared = prepare_hard_filter_probe(
+        binary,
+        corpus_raw,
+        PathBuf::from("target/qgh-eval/hard-filter-contract-debug"),
+    )?;
+    let fixture = &prepared.fixture;
+    let bm25 = run_hard_filter_query_set(fixture, None, ExpectedRankingPath::Bm25)?;
+    fixture.write_hard_filter_probe_config(
+        FILTER_PROBE_TARGET_REPO,
+        FILTER_PROBE_COMPETING_REPO,
+        true,
+    )?;
+    let schema_init =
+        fixture.qgh_with_test_vectors(&["embed", "--force", "--json"], None, Some("{}"));
+    let schema_init = schema_init.expect_err("empty test vectors must stop after writer setup");
+    if !schema_init
+        .to_string()
+        .contains("embedding.test_vectors_empty")
+    {
+        return Err("hard-filter writer setup returned an unexpected error".into());
+    }
+    let query_vectors_json = serde_json::to_string(&BTreeMap::from([(
+        FILTER_PROBE_SENTINEL,
+        vec![1.0_f32, 0.0, 0.0, 0.0],
+    )]))?;
+    fixture.seed_hard_filter_chunks(&prepared.sources)?;
+    let document_vectors_json = hard_filter_document_vectors_json(&prepared.sources)?;
+    let embed = fixture.qgh_with_test_vectors(
+        &["embed", "--force", "--json"],
+        None,
+        Some(&document_vectors_json),
+    )?;
+    let embed: Value = serde_json::from_slice(&embed.stdout)?;
+    if embed["data"]["embedding_state"].as_str() != Some("refreshed")
+        || embed["data"]["chunks"]["embedded"].as_u64() != Some(prepared.sources.len() as u64)
+    {
+        return Err("deterministic local embed did not publish every filter source".into());
+    }
+    let hybrid = run_hard_filter_query_set(
+        fixture,
+        Some(&query_vectors_json),
+        ExpectedRankingPath::Hybrid,
+    )?;
+    let exact_issue_queries = run_exact_issue_filter_queries(fixture, Some(&query_vectors_json))?;
 
-#[cfg(not(debug_assertions))]
-pub(super) fn run_release_hard_filter_contract_probe(
-    binary: &Path,
-    corpus_raw: &str,
-) -> Result<ReleaseHardFilterProbeEvidence, DynError> {
-    let evidence = run_hard_filter_contract_probe_with_mode(binary, corpus_raw, false)?;
-    Ok(ReleaseHardFilterProbeEvidence {
-        active_competing_sources: evidence.active_competing_sources,
-        bm25_filtered_queries: evidence.bm25_filtered_queries,
-        exact_issue_queries: evidence.exact_issue_queries,
+    Ok(HardFilterProbeEvidence {
+        active_competing_sources: prepared.source_count,
+        bm25_filtered_queries: bm25.query_count,
+        hybrid_filtered_queries: hybrid.query_count,
+        hybrid_ranked_results: hybrid.ranked_results,
+        hybrid_results_with_both_branches: hybrid.results_with_both_branches,
+        exact_issue_queries,
     })
 }
 
-fn run_hard_filter_contract_probe_with_mode(
+#[cfg(not(debug_assertions))]
+pub(super) fn run_release_bm25_filter_contract_probe(
     binary: &Path,
     corpus_raw: &str,
-    include_debug_hybrid: bool,
-) -> Result<HardFilterProbeEvidence, DynError> {
+) -> Result<ReleaseBm25FilterProbeEvidence, DynError> {
+    let prepared = prepare_hard_filter_probe(
+        binary,
+        corpus_raw,
+        PathBuf::from("target/qgh-eval/release-bm25-filter-contract"),
+    )?;
+    let bm25 = run_hard_filter_query_set(&prepared.fixture, None, ExpectedRankingPath::Bm25)?;
+    let exact_issue_queries = run_exact_issue_filter_queries(&prepared.fixture, None)?;
+    Ok(ReleaseBm25FilterProbeEvidence {
+        active_competing_sources: prepared.source_count,
+        bm25_filtered_queries: bm25.query_count,
+        exact_issue_queries,
+    })
+}
+
+fn prepare_hard_filter_probe(
+    binary: &Path,
+    corpus_raw: &str,
+    root: PathBuf,
+) -> Result<PreparedHardFilterProbe, DynError> {
     let corpus = parse_jsonl::<CorpusRecord>(corpus_raw);
+    let (sources, issue_metadata) = hard_filter_probe_sources(&corpus)?;
+    let server = PublicSnapshotServer::start_with_issue_metadata(&sources, &issue_metadata)?;
+    ensure_target_root(&root)?;
+    let fixture = CliFixture::new(root, binary.to_path_buf(), server.base_url.clone())?;
+    fixture.init_git_worktree()?;
+    fixture.write_hard_filter_probe_config(
+        FILTER_PROBE_TARGET_REPO,
+        FILTER_PROBE_COMPETING_REPO,
+        false,
+    )?;
+    fixture.sync()?;
+
+    let connection = Connection::open(fixture.db_path())?;
+    let source_count: usize = connection.query_row(
+        "SELECT COUNT(*) FROM source_entities WHERE lifecycle_state = 'active'",
+        [],
+        |row| row.get(0),
+    )?;
+    if source_count != sources.len() {
+        return Err(format!(
+            "hard-filter probe expected {} competing sources, found {source_count}",
+            sources.len()
+        )
+        .into());
+    }
+    drop(connection);
+    Ok(PreparedHardFilterProbe {
+        _server: server,
+        fixture,
+        sources,
+        source_count,
+    })
+}
+
+fn hard_filter_probe_sources(
+    corpus: &[CorpusRecord],
+) -> Result<(Vec<CorpusRecord>, BTreeMap<String, IssueApiMetadata>), DynError> {
     let issue_seed = corpus
         .iter()
         .find(|source| source.entity_type == "issue")
@@ -2320,10 +2440,34 @@ fn run_hard_filter_contract_probe_with_mode(
             metadata("open", "target-author", &["target-label"]),
         ),
     ]);
+    Ok((sources, issue_metadata))
+}
+
+fn run_candidate_hybrid_filter_contract(
+    root: &Path,
+    binary: &Path,
+    candidate: &str,
+    manifest_path: &Path,
+    corpus: &[CorpusRecord],
+) -> Result<CandidateHybridFilterContract, DynError> {
+    let repo_root = std::env::current_dir()?.canonicalize()?;
+    let binary_witness = release_binary_witness(&repo_root, binary)?;
+    let manifest_bytes = fs::read(manifest_path)?;
+    let manifest = ModelManifestV1::from_json_slice(&manifest_bytes)?;
+    let manifest_hash = manifest.hash();
+    let manifest_relative_path = confined_root_relative_identity(root, manifest_path)?;
+    let snapshot = prepared_snapshot_digest(
+        manifest_path
+            .parent()
+            .ok_or("candidate hybrid filter manifest parent missing")?,
+    )?;
+    let (sources, issue_metadata) = hard_filter_probe_sources(corpus)?;
     let server = PublicSnapshotServer::start_with_issue_metadata(&sources, &issue_metadata)?;
-    let root = PathBuf::from("target/qgh-eval/hard-filter-contract");
-    ensure_target_root(&root)?;
-    let fixture = CliFixture::new(root, binary.to_path_buf(), server.base_url.clone())?;
+    let fixture = CliFixture::new(
+        root.join(format!("{candidate}-hybrid-filter-contract")),
+        binary.to_path_buf(),
+        server.base_url.clone(),
+    )?;
     fixture.init_git_worktree()?;
     fixture.write_hard_filter_probe_config(
         FILTER_PROBE_TARGET_REPO,
@@ -2331,84 +2475,117 @@ fn run_hard_filter_contract_probe_with_mode(
         false,
     )?;
     fixture.sync()?;
-
-    let connection = Connection::open(fixture.db_path())?;
-    let source_count: usize = connection.query_row(
-        "SELECT COUNT(*) FROM source_entities WHERE lifecycle_state = 'active'",
-        [],
-        |row| row.get(0),
-    )?;
-    if source_count != sources.len() {
-        return Err(format!(
-            "hard-filter probe expected {} competing sources, found {source_count}",
-            sources.len()
-        )
-        .into());
-    }
-    drop(connection);
-
-    let bm25 = run_hard_filter_query_set(&fixture, None, ExpectedRankingPath::Bm25)?;
-
-    if !include_debug_hybrid {
-        let exact_issue_queries = run_exact_issue_filter_queries(&fixture, "{}")?;
-        return Ok(HardFilterProbeEvidence {
-            active_competing_sources: source_count,
-            bm25_filtered_queries: bm25.query_count,
-            hybrid_filtered_queries: 0,
-            hybrid_ranked_results: 0,
-            hybrid_results_with_both_branches: 0,
-            exact_issue_queries,
-        });
-    }
-
-    fixture.write_hard_filter_probe_config(
+    fixture.write_hard_filter_probe_manifest_config(
         FILTER_PROBE_TARGET_REPO,
         FILTER_PROBE_COMPETING_REPO,
-        true,
+        manifest_path,
     )?;
-    let query_vectors_json = serde_json::to_string(&BTreeMap::from([
-        ("prepare vector schema", vec![0.0_f32, 1.0, 0.0, 0.0]),
-        (FILTER_PROBE_SENTINEL, vec![1.0_f32, 0.0, 0.0, 0.0]),
-    ]))?;
-    let _ = fixture.qgh_with_test_vectors(
-        &[
-            "query",
-            "prepare vector schema",
-            "--repo",
-            FILTER_PROBE_TARGET_REPO,
-            "--json",
-        ],
-        Some(&query_vectors_json),
-        None,
-    )?;
-    fixture.seed_hard_filter_chunks(&sources)?;
-    let document_vectors_json = hard_filter_document_vectors_json(&sources)?;
-    let embed = fixture.qgh_with_test_vectors(
-        &["embed", "--force", "--json"],
-        None,
-        Some(&document_vectors_json),
-    )?;
-    let embed: Value = serde_json::from_slice(&embed.stdout)?;
-    if embed["data"]["embedding_state"].as_str() != Some("refreshed")
-        || embed["data"]["chunks"]["embedded"].as_u64() != Some(sources.len() as u64)
-    {
-        return Err("deterministic local embed did not publish every filter source".into());
+    let embed = fixture.qgh(&["embed", "--force", "--json"])?;
+    let envelope: Value = serde_json::from_slice(&embed.stdout)?;
+    let embedded_chunks = envelope["data"]["chunks"]["embedded"]
+        .as_u64()
+        .ok_or("candidate hybrid filter embed count missing")? as usize;
+    if embedded_chunks != sources.len() {
+        return Err("candidate hybrid filter did not embed every adversarial source".into());
     }
-    let hybrid = run_hard_filter_query_set(
-        &fixture,
-        Some(&query_vectors_json),
-        ExpectedRankingPath::Hybrid,
+    let source_count = Connection::open(fixture.db_path())?.query_row(
+        "SELECT COUNT(*) FROM source_entities WHERE lifecycle_state = 'active'",
+        [],
+        |row| row.get::<_, usize>(0),
     )?;
-    let exact_issue_queries = run_exact_issue_filter_queries(&fixture, &query_vectors_json)?;
+    let hybrid = run_hard_filter_query_set(&fixture, None, ExpectedRankingPath::Hybrid)?;
+    let exact_issue_queries = run_exact_issue_filter_queries(&fixture, None)?;
+    if source_count != 7
+        || hybrid.query_count != 4
+        || hybrid.ranked_results != 17
+        || hybrid.results_with_both_branches != hybrid.ranked_results
+        || exact_issue_queries != 2
+    {
+        return Err("candidate hybrid filter evidence is incomplete".into());
+    }
+    let evidence = candidate_hybrid_filter_contract_evidence(
+        candidate,
+        manifest_relative_path,
+        manifest_hash,
+        snapshot.sha256,
+        binary_witness.candidate_binary_sha256,
+        source_count,
+        embedded_chunks,
+        hybrid.query_count,
+        hybrid.ranked_results,
+        hybrid.results_with_both_branches,
+        exact_issue_queries,
+    )?;
+    Ok(evidence)
+}
 
-    Ok(HardFilterProbeEvidence {
-        active_competing_sources: source_count,
-        bm25_filtered_queries: bm25.query_count,
-        hybrid_filtered_queries: hybrid.query_count,
-        hybrid_ranked_results: hybrid.ranked_results,
-        hybrid_results_with_both_branches: hybrid.results_with_both_branches,
+#[allow(clippy::too_many_arguments)]
+fn candidate_hybrid_filter_contract_evidence(
+    candidate: &str,
+    manifest_relative_path: String,
+    manifest_hash: String,
+    prepared_snapshot_sha256: String,
+    release_binary_sha256: String,
+    active_competing_sources: usize,
+    embedded_chunks: usize,
+    hybrid_filtered_queries: usize,
+    hybrid_ranked_results: usize,
+    hybrid_results_with_both_branches: usize,
+    exact_issue_queries: usize,
+) -> Result<CandidateHybridFilterContract, DynError> {
+    let manifest_identity = Path::new(&manifest_relative_path);
+    if candidate.is_empty()
+        || manifest_identity.is_absolute()
+        || manifest_identity.as_os_str().is_empty()
+        || manifest_identity
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        || !is_sha256(&manifest_hash)
+        || !is_sha256(&prepared_snapshot_sha256)
+        || !is_sha256(&release_binary_sha256)
+        || active_competing_sources != 7
+        || embedded_chunks != 7
+        || hybrid_filtered_queries != 4
+        || hybrid_ranked_results != 17
+        || hybrid_results_with_both_branches != hybrid_ranked_results
+        || exact_issue_queries != 2
+    {
+        return Err("candidate hybrid filter contract evidence is invalid".into());
+    }
+    Ok(CandidateHybridFilterContract {
+        schema_version: "qgh.candidate_hybrid_filter_contract.v1",
+        candidate: candidate.to_string(),
+        manifest_relative_path,
+        manifest_hash,
+        prepared_snapshot_sha256,
+        release_binary_sha256,
+        active_competing_sources,
+        embedded_chunks,
+        hybrid_filtered_queries,
+        hybrid_ranked_results,
+        hybrid_results_with_both_branches,
         exact_issue_queries,
     })
+}
+
+pub(super) fn candidate_hybrid_filter_contract_for_test(
+    manifest_relative_path: &str,
+) -> Result<Value, DynError> {
+    Ok(serde_json::to_value(
+        candidate_hybrid_filter_contract_evidence(
+            "candidate",
+            manifest_relative_path.to_string(),
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            7,
+            7,
+            4,
+            17,
+            17,
+            2,
+        )?,
+    )?)
 }
 
 fn hard_filter_document_vectors_json(sources: &[CorpusRecord]) -> Result<String, DynError> {
@@ -2622,7 +2799,7 @@ fn run_hard_filter_query_set(
 
 fn run_exact_issue_filter_queries(
     fixture: &CliFixture,
-    query_vectors_json: &str,
+    query_vectors_json: Option<&str>,
 ) -> Result<usize, DynError> {
     let expected = [(
         "qgh://github.com/issue/I_FILTER_TARGET",
@@ -2644,7 +2821,7 @@ fn run_exact_issue_filter_queries(
                 "--json",
             ],
             &expected,
-            Some(query_vectors_json),
+            query_vectors_json,
             ExpectedRankingPath::Exact,
         ),
         assert_hard_filter_results(
@@ -2667,7 +2844,7 @@ fn run_exact_issue_filter_queries(
                 "--json",
             ],
             &expected,
-            Some(query_vectors_json),
+            query_vectors_json,
             ExpectedRankingPath::Exact,
         ),
     ] {
@@ -3067,6 +3244,7 @@ struct PreparedCandidate {
     candidate_database_schema_fingerprint: String,
     candidate_tantivy_schema_fingerprint: String,
     context_contract: ContextContractEvidence,
+    hybrid_filter_contract: CandidateHybridFilterContract,
     fixture: CliFixture,
     manifest_path: PathBuf,
     snapshot_bytes: u64,
@@ -3127,6 +3305,7 @@ fn frozen_prepared_candidate_state(
         prepared_snapshot_bytes: Some(snapshot.bytes),
         prepared_snapshot_file_count: Some(snapshot.file_count),
         download_transfer_bytes: prepared.download_transfer_bytes,
+        hybrid_filter_contract: Some(prepared.hybrid_filter_contract.clone()),
     })
 }
 
@@ -3161,6 +3340,7 @@ fn frozen_blocked_candidate_state(
         prepared_snapshot_bytes: None,
         prepared_snapshot_file_count: None,
         download_transfer_bytes: None,
+        hybrid_filter_contract: None,
     };
     let manifest_path = root
         .join("models")
@@ -3425,6 +3605,29 @@ impl FrozenRunGuard {
                 || frozen.prepared_snapshot_file_count != Some(snapshot.file_count)
             {
                 return Err("prepared candidate snapshot changed after dev".into());
+            }
+            if frozen.dev_state == "prepared" {
+                let evidence = frozen
+                    .hybrid_filter_contract
+                    .as_ref()
+                    .ok_or("prepared candidate hybrid filter evidence is missing")?;
+                if evidence.schema_version != "qgh.candidate_hybrid_filter_contract.v1"
+                    || evidence.candidate != frozen.candidate
+                    || evidence.manifest_relative_path != relative
+                    || evidence.manifest_hash != actual_manifest_hash
+                    || evidence.prepared_snapshot_sha256 != snapshot.sha256
+                    || evidence.release_binary_sha256 != self.release_binary_sha256
+                    || evidence.active_competing_sources != 7
+                    || evidence.embedded_chunks != 7
+                    || evidence.hybrid_filtered_queries != 4
+                    || evidence.hybrid_ranked_results != 17
+                    || evidence.hybrid_results_with_both_branches != 17
+                    || evidence.exact_issue_queries != 2
+                {
+                    return Err(
+                        "prepared candidate hybrid filter evidence changed after dev".into(),
+                    );
+                }
             }
         }
         Ok(())
@@ -3813,7 +4016,7 @@ pub(super) fn run(
     // deployable frozen values are the actual source constants: k=60 and
     // TOP_K(20) * overfetch(4) = 80.  The k/window grid above is diagnostic.
     let frozen = FrozenConfig {
-        schema_version: "qgh.live_model_eval_config.v3",
+        schema_version: "qgh.live_model_eval_config.v4",
         integrated_git_head: integrated_git_head.clone(),
         worktree_clean,
         release_binary_sha256: host.binary_sha256.clone(),
@@ -3984,7 +4187,7 @@ pub(super) fn run(
     );
     frozen_guard.revalidate_before_final_report(root, &binary)?;
     let mut report = FullReport {
-        schema_version: "qgh.live_model_eval_report.v2",
+        schema_version: "qgh.live_model_eval_report.v3",
         run_finished_at: command_output("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
         corpus_snapshot_at: provenance.snapshot_at,
         host,
@@ -4193,23 +4396,19 @@ fn prepare_candidate_dev(
         Ok(prepared) => Ok(prepared),
         Err(error) => {
             let context_failure = error.downcast_ref::<ContextContractFailure>();
-            let code = if context_failure.is_some() {
-                "eval.context_contract_failed"
+            let hybrid_filter_failure = error.downcast_ref::<HybridFilterContractFailure>();
+            let (code, phase) = if context_failure.is_some() {
+                ("eval.context_contract_failed", "context_contract")
+            } else if hybrid_filter_failure.is_some() {
+                (
+                    "eval.hybrid_filter_contract_failed",
+                    "dev_hybrid_filter_contract",
+                )
             } else {
-                "eval.runtime_failed"
+                ("eval.runtime_failed", "dev_preparation")
             };
             eprintln!("live-eval candidate={candidate} status=blocked code={code}");
-            let mut report = blocked_candidate(
-                candidate,
-                model_id,
-                revision,
-                code,
-                if context_failure.is_some() {
-                    "context_contract"
-                } else {
-                    "dev_preparation"
-                },
-            );
+            let mut report = blocked_candidate(candidate, model_id, revision, code, phase);
             if let Some(failure) = context_failure {
                 report.manifest_hash = Some(failure.manifest_hash.clone());
                 report.candidate_database_schema_fingerprint =
@@ -4281,7 +4480,6 @@ fn try_prepare_candidate_dev(
             evidence: context_contract,
         }));
     }
-
     eprintln!("live-eval candidate={candidate} phase=cold-processes status=running");
     let mut cold_samples_ms = Vec::with_capacity(COLD_PROCESS_RUNS);
     let mut isolated_peak_rss = quality_embed.peak_rss_bytes;
@@ -4301,6 +4499,9 @@ fn try_prepare_candidate_dev(
         &fixture.root.join("dev-events.jsonl"),
     )?;
     let offline_dev_diagnostics = offline_fusion_diagnostics(dev, &dev_run.diagnostic)?;
+    let hybrid_filter_contract =
+        run_candidate_hybrid_filter_contract(root, binary, candidate, manifest_path, corpus)
+            .map_err(|_| -> DynError { Box::new(HybridFilterContractFailure) })?;
     Ok(PreparedCandidate {
         candidate: candidate.to_string(),
         model_id: model_id.to_string(),
@@ -4309,6 +4510,7 @@ fn try_prepare_candidate_dev(
         candidate_database_schema_fingerprint,
         candidate_tantivy_schema_fingerprint,
         context_contract,
+        hybrid_filter_contract,
         fixture,
         manifest_path: manifest_path.to_path_buf(),
         snapshot_bytes,
@@ -4603,6 +4805,7 @@ fn prepared_candidate_report(
         candidate_database_schema_fingerprint: Some(prepared.candidate_database_schema_fingerprint),
         candidate_tantivy_schema_fingerprint: Some(prepared.candidate_tantivy_schema_fingerprint),
         context_contract: Some(prepared.context_contract),
+        hybrid_filter_contract: Some(prepared.hybrid_filter_contract),
         dev_metrics: Some(prepared.dev_metrics),
         held_out_metrics,
         offline_dev_diagnostics: prepared.offline_dev_diagnostics,
@@ -4633,6 +4836,7 @@ fn blocked_candidate(
         candidate_database_schema_fingerprint: None,
         candidate_tantivy_schema_fingerprint: None,
         context_contract: None,
+        hybrid_filter_contract: None,
         dev_metrics: None,
         held_out_metrics: None,
         offline_dev_diagnostics: Vec::new(),
@@ -4685,6 +4889,7 @@ fn dragonkue_blocker(root: &Path) -> Result<CandidateReport, DynError> {
         candidate_database_schema_fingerprint: None,
         candidate_tantivy_schema_fingerprint: None,
         context_contract: None,
+        hybrid_filter_contract: None,
         dev_metrics: None,
         held_out_metrics: None,
         offline_dev_diagnostics: Vec::new(),
@@ -4719,22 +4924,10 @@ fn measure_50k_backfill(
     )
     .map_err(|_| resource_run_failure("50k_setup", &partial))?;
     fixture
-        .write_config(None)
+        .write_config(Some(manifest_path))
         .map_err(|_| resource_run_failure("50k_setup", &partial))?;
     fixture
         .sync()
-        .map_err(|_| resource_run_failure("50k_setup", &partial))?;
-    fixture
-        .write_config(Some(manifest_path))
-        .map_err(|_| resource_run_failure("50k_setup", &partial))?;
-    let _ = fixture
-        .qgh(&[
-            "query",
-            "resource schema initialization",
-            "--repo",
-            "juicyjusung/qgh",
-            "--json",
-        ])
         .map_err(|_| resource_run_failure("50k_setup", &partial))?;
     let chunk = public_900_token_chunk(manifest_path, corpus)
         .map_err(|_| resource_run_failure("50k_tokenize", &partial))?;
@@ -5062,21 +5255,15 @@ pub(super) fn resource_seed_embed_contract_for_test(
         fixture.write_config(None)?;
         fixture.sync()?;
         fixture.write_test_embedding_config()?;
-        let query_vectors = serde_json::to_string(&BTreeMap::from([(
-            "resource schema initialization",
-            vec![0.0_f32, 1.0, 0.0, 0.0],
-        )]))?;
-        let _ = fixture.qgh_with_test_vectors(
-            &[
-                "query",
-                "resource schema initialization",
-                "--repo",
-                "juicyjusung/qgh",
-                "--json",
-            ],
-            Some(&query_vectors),
-            None,
-        )?;
+        let schema_init =
+            fixture.qgh_with_test_vectors(&["embed", "--force", "--json"], None, Some("{}"));
+        let schema_init = schema_init.expect_err("empty test vectors stop after writer setup");
+        if !schema_init
+            .to_string()
+            .contains("embedding.test_vectors_empty")
+        {
+            return Err("resource writer setup returned an unexpected error".into());
+        }
         let body = "public deterministic resource measurement chunk";
         seed_50k_chunks(&fixture.db_path(), body, 1)?;
         let preflight = resource_seed_preflight(&fixture.db_path())?;
@@ -6379,6 +6566,29 @@ model = "arctic-l-v2-fp32"
         } else {
             String::new()
         };
+        self.write_hard_filter_probe_config_with_embedding(target_repo, competing_repo, &embedding)
+    }
+
+    fn write_hard_filter_probe_manifest_config(
+        &self,
+        target_repo: &str,
+        competing_repo: &str,
+        manifest_path: &Path,
+    ) -> Result<(), DynError> {
+        let manifest_path = manifest_path.canonicalize()?;
+        let embedding = format!(
+            "\n[embedding]\nprovider = \"local\"\nmanifest_path = \"{}\"\n",
+            manifest_path.to_string_lossy()
+        );
+        self.write_hard_filter_probe_config_with_embedding(target_repo, competing_repo, &embedding)
+    }
+
+    fn write_hard_filter_probe_config_with_embedding(
+        &self,
+        target_repo: &str,
+        competing_repo: &str,
+        embedding: &str,
+    ) -> Result<(), DynError> {
         let config = format!(
             r#"schema_version = "qgh.config.v1"
 

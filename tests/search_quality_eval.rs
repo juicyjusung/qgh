@@ -104,7 +104,13 @@ fn curated_search_quality_eval_gate_passes() {
 
     let default_model_vectors = eval_model_vectors(MODEL_AB_CANDIDATES[0]);
     fixture.write_config_with_embedding_model(&server.base_url, MODEL_AB_CANDIDATES[0]);
-    assert_success(&fixture.qgh(&["query", "prepare vector schema", "--json"]));
+    let schema_init =
+        fixture.qgh_with_embedding_vectors(&["embed", "--force", "--json"], None, Some("{}"));
+    assert_eq!(schema_init.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&schema_init)["error"]["code"],
+        "embedding.test_vectors_empty"
+    );
     fixture.seed_eval_chunks(&default_model_vectors.source_vectors);
 
     let mut model_reports = Vec::new();

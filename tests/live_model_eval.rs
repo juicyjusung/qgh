@@ -2012,11 +2012,11 @@ fn production_hard_filter_contract_excludes_competing_sources() {
 
 #[cfg(all(feature = "fastembed-provider", not(debug_assertions)))]
 #[test]
-fn production_release_hard_filter_contract_excludes_competing_sources() {
+fn production_release_bm25_filter_and_round_trip_contract() {
     let binary = std::path::Path::new(env!("CARGO_BIN_EXE_qgh"));
     let evidence =
-        live_model_eval_runtime::run_release_hard_filter_contract_probe(binary, CORPUS_JSONL)
-            .expect("release hard-filter contract probe passes");
+        live_model_eval_runtime::run_release_bm25_filter_contract_probe(binary, CORPUS_JSONL)
+            .expect("release BM25 filter contract probe passes");
     assert_eq!(evidence.active_competing_sources, 7);
     assert_eq!(evidence.bm25_filtered_queries, 4);
     assert_eq!(evidence.exact_issue_queries, 2);
@@ -2042,6 +2042,71 @@ fn heldout_parse_occurs_after_frozen_config_write() {
         .find("parse_jsonl_checked::<QrelRecord>(test_raw)")
         .unwrap();
     assert!(freeze < heldout_parse);
+}
+
+#[test]
+fn actual_candidate_hybrid_filter_gate_precedes_freeze_and_heldout_open() {
+    let candidate_preparation = RUNTIME_SUPPORT
+        .find("candidate_states.push(prepare_candidate_dev(")
+        .expect("candidate dev preparation exists");
+    let freeze = RUNTIME_SUPPORT
+        .find("fs::write(root.join(\"frozen-config.json\")")
+        .expect("frozen config exists");
+    let heldout_parse = RUNTIME_SUPPORT
+        .find("parse_jsonl_checked::<QrelRecord>(test_raw)")
+        .expect("held-out parse exists");
+    assert!(candidate_preparation < freeze && freeze < heldout_parse);
+    let candidate_dev = &RUNTIME_SUPPORT[RUNTIME_SUPPORT
+        .find("fn try_prepare_candidate_dev(")
+        .expect("candidate dev function exists")..];
+    let dev_metrics = candidate_dev
+        .find("let offline_dev_diagnostics =")
+        .expect("candidate dev metrics are frozen");
+    let hybrid_filter = candidate_dev
+        .find("let hybrid_filter_contract =")
+        .expect("candidate hybrid filter contract runs");
+    assert!(dev_metrics < hybrid_filter);
+    assert!(RUNTIME_SUPPORT.contains("manifest_relative_path"));
+    assert!(RUNTIME_SUPPORT.contains("prepared_snapshot_sha256"));
+    assert!(RUNTIME_SUPPORT.contains("release_binary_sha256"));
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn candidate_hybrid_filter_evidence_is_complete_and_root_relative() {
+    let evidence = live_model_eval_runtime::candidate_hybrid_filter_contract_for_test(
+        "models/candidate/manifest.json",
+    )
+    .expect("complete root-relative evidence");
+    assert_eq!(
+        evidence["schema_version"],
+        "qgh.candidate_hybrid_filter_contract.v1"
+    );
+    assert_eq!(evidence["active_competing_sources"], 7);
+    assert_eq!(evidence["embedded_chunks"], 7);
+    assert_eq!(evidence["hybrid_filtered_queries"], 4);
+    assert_eq!(evidence["hybrid_ranked_results"], 17);
+    assert_eq!(evidence["hybrid_results_with_both_branches"], 17);
+    assert_eq!(evidence["exact_issue_queries"], 2);
+    assert_eq!(
+        evidence["manifest_relative_path"],
+        "models/candidate/manifest.json"
+    );
+    assert!(evidence["manifest_hash"].as_str().unwrap().len() == 64);
+    assert!(evidence["prepared_snapshot_sha256"].as_str().unwrap().len() == 64);
+    assert!(evidence["release_binary_sha256"].as_str().unwrap().len() == 64);
+    assert!(
+        live_model_eval_runtime::candidate_hybrid_filter_contract_for_test(
+            "/absolute/models/candidate/manifest.json"
+        )
+        .is_err()
+    );
+    assert!(
+        live_model_eval_runtime::candidate_hybrid_filter_contract_for_test(
+            "models/../candidate/manifest.json"
+        )
+        .is_err()
+    );
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -2353,6 +2418,10 @@ fn canonical_gate_bundle_is_strict_and_bound_to_git_binary_and_file_hash() {
     let bundle =
         live_model_eval_runtime::contract_gate_bundle_json_for_test(&root, &git_sha, &binary_sha)
             .expect("gate result artifacts");
+    assert_eq!(
+        bundle["schema_version"],
+        "qgh.live_model_eval_gate_bundle.v3"
+    );
     let names = bundle["gates"]
         .as_array()
         .unwrap()
@@ -2368,7 +2437,6 @@ fn canonical_gate_bundle_is_strict_and_bound_to_git_binary_and_file_hash() {
             "parent_context_invalidation",
             "concurrent_publication_snapshot",
             "bm25_search_quality",
-            "hard_filter_exclusion",
         ]
     );
     let commands = bundle["gates"]
@@ -2385,8 +2453,7 @@ fn canonical_gate_bundle_is_strict_and_bound_to_git_binary_and_file_hash() {
             "cargo test --release --all-features --test issue_body_tracer pending_purge_is_retried_by_next_sync_without_touching_user_backup -- --exact",
             "cargo test --release --all-features --test live_model_eval parent_issue_title_change_invalidates_comment_context_hash_in_release_contract -- --exact",
             "cargo test --release --all-features --test issue_body_tracer concurrent_cli_sync_and_mcp_reads_keep_index_queryable -- --exact",
-            "cargo test --release --all-features --test live_model_eval bm25_baseline_applies_hard_filters_and_round_trips -- --exact",
-            "cargo test --release --all-features --test live_model_eval production_release_hard_filter_contract_excludes_competing_sources -- --exact --nocapture",
+            "cargo test --release --all-features --test live_model_eval production_release_bm25_filter_and_round_trip_contract -- --exact --nocapture",
         ]
     );
     let path = root.join("contract-gate-bundle.json");
@@ -2403,6 +2470,10 @@ fn canonical_gate_bundle_is_strict_and_bound_to_git_binary_and_file_hash() {
     let first_result_path = root.join("contract-gates/edit_reconciliation.json");
     let mut empty_result: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&first_result_path).unwrap()).unwrap();
+    assert_eq!(
+        empty_result["schema_version"],
+        "qgh.live_model_eval_gate_result.v3"
+    );
     assert_eq!(empty_result["observed_test_count"], 1);
     assert_eq!(
         empty_result["command_output_sha256"]
@@ -2447,7 +2518,7 @@ fn canonical_gate_bundle_is_strict_and_bound_to_git_binary_and_file_hash() {
             .expect("restore non-empty gate result artifacts");
     std::fs::write(&path, serde_json::to_vec_pretty(&bundle).unwrap()).unwrap();
 
-    let hard_filter_result_path = root.join("contract-gates/hard_filter_exclusion.json");
+    let hard_filter_result_path = root.join("contract-gates/bm25_search_quality.json");
     let mut debug_mismatch: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&hard_filter_result_path).unwrap()).unwrap();
     assert_eq!(debug_mismatch["candidate_binary_exercised"], true);
@@ -2455,7 +2526,7 @@ fn canonical_gate_bundle_is_strict_and_bound_to_git_binary_and_file_hash() {
     let debug_mismatch_bytes = serde_json::to_vec_pretty(&debug_mismatch).unwrap();
     std::fs::write(&hard_filter_result_path, &debug_mismatch_bytes).unwrap();
     let mut debug_bundle = bundle.clone();
-    debug_bundle["gates"][6]["result_sha256"] =
+    debug_bundle["gates"][5]["result_sha256"] =
         json!(format!("{:x}", Sha256::digest(&debug_mismatch_bytes)));
     std::fs::write(&path, serde_json::to_vec_pretty(&debug_bundle).unwrap()).unwrap();
     assert!(
