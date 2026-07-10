@@ -1,3 +1,9 @@
+mod purge_fs;
+
+use self::purge_fs::{
+    filesystem_identity, filesystem_identity_from_file, open_anchored_directory,
+    remove_anchored_directory_contents, sync_directory, FilesystemIdentity,
+};
 use crate::chunking::MarkdownChunk;
 use crate::context::{prepare_embedding_input, EmbeddingSourceContext, PreparedEmbeddingInput};
 use crate::embedding::{EmbeddingFingerprint, EmbeddingVector};
@@ -297,6 +303,10 @@ pub struct Store {
     #[cfg(test)]
     cleanup_fail_after_first_generation_delete: bool,
     #[cfg(test)]
+    purge_swap_generation_after_validation: Option<i64>,
+    #[cfg(test)]
+    purge_swap_quarantine_after_open: Option<i64>,
+    #[cfg(test)]
     activation_failure: Option<QghError>,
 }
 
@@ -416,11 +426,17 @@ impl Store {
     /// repairs. Existing stores are opened with SQLite read-only flags so
     /// query/get/status/doctor cannot detach publications, advance purge
     /// guards, or otherwise turn observation into recovery work. A missing
-    /// database is bootstrapped once through the normal writer path, then
-    /// reopened read-only.
+    /// database is represented by an in-memory empty schema so read commands
+    /// do not create profile, cache, log, or database files.
     pub fn open_for_read(paths: &ProfilePaths) -> Result<Self, QghError> {
         if !paths.db_path.exists() {
-            drop(Self::open(paths)?);
+            let conn = Connection::open_in_memory()?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            conn.pragma_update(None, "secure_delete", "ON")?;
+            let mut store = Self::from_connection(conn, paths);
+            store.migrate()?;
+            store.content_write_epoch = read_content_write_epoch(&store.conn)?;
+            return Ok(store);
         }
         let conn = Connection::open_with_flags(
             &paths.db_path,
@@ -448,6 +464,10 @@ impl Store {
             cleanup_promote_generation_after_scan: None,
             #[cfg(test)]
             cleanup_fail_after_first_generation_delete: false,
+            #[cfg(test)]
+            purge_swap_generation_after_validation: None,
+            #[cfg(test)]
+            purge_swap_quarantine_after_open: None,
             #[cfg(test)]
             activation_failure: None,
         }
@@ -1375,6 +1395,56 @@ impl Store {
         self.purge_queue_failure_after_first = true;
     }
 
+    #[cfg(test)]
+    fn swap_generation_after_purge_validation(&mut self, generation: i64) {
+        self.purge_swap_generation_after_validation = Some(generation);
+    }
+
+    #[cfg(test)]
+    fn swap_quarantine_after_purge_open(&mut self, generation: i64) {
+        self.purge_swap_quarantine_after_open = Some(generation);
+    }
+
+    #[cfg(test)]
+    fn inject_generation_swap_after_validation(
+        &mut self,
+        generation: i64,
+        generation_path: &Path,
+    ) -> Result<(), QghError> {
+        if self.purge_swap_generation_after_validation != Some(generation) {
+            return Ok(());
+        }
+        self.purge_swap_generation_after_validation = None;
+        let displaced_path = self
+            .index_root
+            .join(format!(".qgh-test-displaced-generation-{generation}"));
+        fs::rename(generation_path, &displaced_path).map_err(|_| purge_error())?;
+        fs::create_dir(generation_path).map_err(|_| purge_error())?;
+        fs::write(generation_path.join("foreign-sentinel"), b"preserve")
+            .map_err(|_| purge_error())?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn inject_quarantine_swap_after_open(
+        &mut self,
+        generation: i64,
+        quarantine_path: &Path,
+    ) -> Result<(), QghError> {
+        if self.purge_swap_quarantine_after_open != Some(generation) {
+            return Ok(());
+        }
+        self.purge_swap_quarantine_after_open = None;
+        let displaced_path = self
+            .index_root
+            .join(format!(".qgh-test-displaced-quarantine-{generation}"));
+        fs::rename(quarantine_path, &displaced_path).map_err(|_| purge_error())?;
+        fs::create_dir(quarantine_path).map_err(|_| purge_error())?;
+        fs::write(quarantine_path.join("foreign-sentinel"), b"preserve")
+            .map_err(|_| purge_error())?;
+        Ok(())
+    }
+
     fn should_fail_purge_stage(&mut self, stage: PurgeFailureStage) -> bool {
         #[cfg(test)]
         {
@@ -1860,8 +1930,14 @@ impl Store {
         }
         let generations = {
             let mut stmt = self.conn.prepare(
-                "SELECT generation, path, source_count, source_inventory_hash
-                     FROM index_generations ORDER BY generation",
+                "SELECT generation.generation, generation.path,
+                        generation.source_count, generation.source_inventory_hash,
+                        ownership.owner_token
+                 FROM index_generations generation
+                 JOIN index_build_leases ownership
+                   ON ownership.generation = generation.generation
+                  AND ownership.owner_pid = 0
+                 ORDER BY generation.generation",
             )?;
             let rows = stmt
                 .query_map([], |row| {
@@ -1870,9 +1946,18 @@ impl Store {
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
+            let registered_count: i64 =
+                self.conn
+                    .query_row("SELECT count(*) FROM index_generations", [], |row| {
+                        row.get(0)
+                    })?;
+            if i64::try_from(rows.len()).ok() != Some(registered_count) {
+                return Err(purge_error());
+            }
             rows
         };
         self.remove_registered_tantivy_generations(&generations)?;
@@ -1887,6 +1972,7 @@ impl Store {
         }
         tx.execute("DELETE FROM retrieval_publication_pointer", [])?;
         tx.execute("DELETE FROM retrieval_publications", [])?;
+        tx.execute("DELETE FROM index_build_leases WHERE owner_pid = 0", [])?;
         tx.execute("DELETE FROM index_generations", [])?;
         tx.commit()?;
         Ok((generations.len(), true))
@@ -1896,7 +1982,9 @@ impl Store {
         let leases = {
             let mut stmt = self.conn.prepare(
                 "SELECT generation, owner_pid, owner_token
-                 FROM index_build_leases ORDER BY generation",
+                 FROM index_build_leases
+                 WHERE owner_pid != 0
+                 ORDER BY generation",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -1920,8 +2008,8 @@ impl Store {
     }
 
     fn remove_registered_tantivy_generations(
-        &self,
-        generations: &[(i64, String, i64, Option<String>)],
+        &mut self,
+        generations: &[(i64, String, i64, Option<String>, String)],
     ) -> Result<(), QghError> {
         self.validate_index_root_confinement()?;
         if !self.index_root.exists() {
@@ -1934,7 +2022,9 @@ impl Store {
         {
             return Err(purge_error());
         }
-        for (generation, stored_path, source_count, source_inventory_hash) in generations {
+        for (generation, stored_path, source_count, source_inventory_hash, owner_token) in
+            generations
+        {
             let expected_path = self.index_root.join(format!("generation-{generation}"));
             if Path::new(stored_path) != expected_path {
                 return Err(purge_error());
@@ -1945,8 +2035,29 @@ impl Store {
             let Some(source_inventory_hash) = source_inventory_hash.as_deref() else {
                 return Err(purge_error());
             };
-            if !expected_path.exists() {
-                continue;
+            let quarantine_path =
+                tantivy_purge_quarantine_path(&self.index_root, *generation, owner_token);
+            match (expected_path.exists(), quarantine_path.exists()) {
+                (false, false) => continue,
+                (true, true) => return Err(purge_error()),
+                (false, true) => {
+                    validate_quarantined_tantivy_generation(
+                        &quarantine_path,
+                        *generation,
+                        owner_token,
+                        source_count,
+                        source_inventory_hash,
+                    )?;
+                    let identity = filesystem_identity(&quarantine_path)?;
+                    self.remove_quarantined_tantivy_generation(
+                        *generation,
+                        owner_token,
+                        &quarantine_path,
+                        identity,
+                    )?;
+                    continue;
+                }
+                (true, false) => {}
             }
             validate_managed_tantivy_generation_path(
                 &self.profile_dir,
@@ -1961,9 +2072,72 @@ impl Store {
                 source_inventory_hash,
             )
             .map_err(|_| purge_error())?;
-            fs::remove_dir_all(expected_path).map_err(|_| purge_error())?;
+            crate::index::validate_owned_generation_directory(
+                &expected_path,
+                *generation,
+                owner_token,
+            )
+            .map_err(|_| purge_error())?;
+            let expected_identity = filesystem_identity(&expected_path)?;
+            #[cfg(test)]
+            self.inject_generation_swap_after_validation(*generation, &expected_path)?;
+            crate::index::rename_without_replacement(&expected_path, &quarantine_path)
+                .map_err(|_| purge_error())?;
+            sync_directory(&self.index_root)?;
+            let post_rename = (|| -> Result<(), QghError> {
+                if filesystem_identity(&quarantine_path)? != expected_identity {
+                    return Err(purge_error());
+                }
+                validate_quarantined_tantivy_generation(
+                    &quarantine_path,
+                    *generation,
+                    owner_token,
+                    source_count,
+                    source_inventory_hash,
+                )
+            })();
+            if post_rename.is_err() {
+                let _ = crate::index::rename_without_replacement(&quarantine_path, &expected_path);
+                let _ = sync_directory(&self.index_root);
+                return Err(purge_error());
+            }
+            self.remove_quarantined_tantivy_generation(
+                *generation,
+                owner_token,
+                &quarantine_path,
+                expected_identity,
+            )?;
         }
         Ok(())
+    }
+
+    fn remove_quarantined_tantivy_generation(
+        &mut self,
+        generation: i64,
+        owner_token: &str,
+        quarantine_path: &Path,
+        expected_identity: FilesystemIdentity,
+    ) -> Result<(), QghError> {
+        let directory = open_anchored_directory(quarantine_path)?;
+        if filesystem_identity_from_file(&directory)? != expected_identity {
+            return Err(purge_error());
+        }
+        #[cfg(test)]
+        self.inject_quarantine_swap_after_open(generation, quarantine_path)?;
+        if filesystem_identity(quarantine_path)? != expected_identity {
+            return Err(purge_error());
+        }
+        crate::index::validate_owned_generation_directory(quarantine_path, generation, owner_token)
+            .map_err(|_| purge_error())?;
+        if filesystem_identity(quarantine_path)? != expected_identity {
+            return Err(purge_error());
+        }
+        remove_anchored_directory_contents(&directory)?;
+        if filesystem_identity(quarantine_path)? != expected_identity {
+            return Err(purge_error());
+        }
+        fs::remove_dir(quarantine_path).map_err(|_| purge_error())?;
+        sync_directory(&self.index_root)
     }
 
     fn validate_index_root_confinement(&self) -> Result<(), QghError> {
@@ -2043,9 +2217,16 @@ impl Store {
             return Err(purge_error());
         }
         let shadow_path = self.index_root.join(format!("shadow-{generation}"));
-        if shadow_path.exists() {
-            crate::index::validate_owned_build_directory(&shadow_path, generation, owner_token)
-                .map_err(|_| purge_error())?;
+        if shadow_path.exists()
+            && crate::index::validate_owned_build_directory(&shadow_path, generation, owner_token)
+                .is_err()
+        {
+            crate::index::validate_owned_generation_directory(
+                &shadow_path,
+                generation,
+                owner_token,
+            )
+            .map_err(|_| purge_error())?;
         }
         if expected_path.exists() {
             let source_count = usize::try_from(source_count).map_err(|_| purge_error())?;
@@ -2057,8 +2238,12 @@ impl Store {
                 &expected_path,
             )
             .map_err(|_| purge_error())?;
-            crate::index::validate_owned_build_directory(&expected_path, generation, owner_token)
-                .map_err(|_| purge_error())?;
+            crate::index::validate_owned_generation_directory(
+                &expected_path,
+                generation,
+                owner_token,
+            )
+            .map_err(|_| purge_error())?;
             validate_tantivy_generation_artifact(
                 &expected_path,
                 source_count,
@@ -3500,8 +3685,12 @@ impl Store {
             params![generation_id],
             |row| row.get(0),
         )?;
+        let output_dimension = usize::try_from(output_dimension)
+            .ok()
+            .filter(|dimension| *dimension > 0)
+            .ok_or_else(embedding_generation_corrupt_error)?;
         if !matches!(state.as_str(), "active" | "ready")
-            || output_dimension as usize != query_vector.len()
+            || output_dimension != query_vector.len()
             || completed_chunks != total_chunks
             || generation_rows != total_chunks
             || vector_rows != total_chunks
@@ -3511,36 +3700,13 @@ impl Store {
                 "The published embedding generation is incomplete or inconsistent.",
             ));
         }
-        let vector_table = generation_vector_table_name(output_dimension as usize);
-        if !table_exists(&self.conn, &vector_table)? {
-            return Err(QghError::validation(
-                "embedding.generation_corrupt",
-                "The published embedding generation vector index is missing.",
-            ));
-        }
-        let (indexed_rows, byte_identical_rows): (i64, i64) = self.conn.query_row(
-            &format!(
-                "SELECT count(*),
-                        coalesce(sum(CASE WHEN v.embedding = gc.vector_blob
-                                          THEN 1 ELSE 0 END), 0)
-                 FROM {vector_table} v
-                 JOIN embedding_generation_vector_rows m ON m.vector_rowid = v.rowid
-                 JOIN embedding_generation_chunks gc
-                   ON gc.generation_id = m.generation_id AND gc.chunk_id = m.chunk_id
-                 WHERE m.generation_id = ?1
-                   AND m.dimension = ?2
-                   AND m.vector_table = ?3
-                   AND m.vector_rowid = m.id"
-            ),
-            params![generation_id, output_dimension, vector_table],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+        validate_embedding_generation_vector_artifacts(
+            &self.conn,
+            generation_id,
+            output_dimension,
+            total_chunks,
         )?;
-        if indexed_rows != total_chunks || byte_identical_rows != total_chunks {
-            return Err(QghError::validation(
-                "embedding.generation_corrupt",
-                "The published embedding vector index does not match its authoritative generation.",
-            ));
-        }
+        let vector_table = generation_vector_table_name(output_dimension);
         let candidate_limit = limit.saturating_mul(4).max(limit).max(1);
         let mut prefilter_sql = String::from(
             "SELECT c2.id FROM chunks c2
@@ -4101,6 +4267,19 @@ impl Store {
             let _ = self.cleanup_owned_index_generation(generation);
             return Err(error);
         }
+        let Some(owner_token_value) = owner_token.as_deref() else {
+            drop(tx);
+            return Err(write_fence_error());
+        };
+        if let Err(error) = crate::index::validate_owned_generation_directory(
+            &expected_path,
+            generation,
+            owner_token_value,
+        ) {
+            drop(tx);
+            let _ = self.cleanup_owned_index_generation(generation);
+            return Err(error);
+        }
         if let Err(error) = validate_tantivy_generation_artifact(
             &expected_path,
             source_count,
@@ -4138,11 +4317,15 @@ impl Store {
             "UPDATE index_tasks SET completed_at = ?1 WHERE completed_at IS NULL",
             params![now],
         )?;
-        tx.execute(
-            "DELETE FROM index_build_leases
+        let ownership_retained = tx.execute(
+            "UPDATE index_build_leases
+             SET owner_pid = 0
              WHERE generation = ?1 AND owner_token = ?2",
-            params![generation, owner_token],
+            params![generation, owner_token_value],
         )?;
+        if ownership_retained != 1 {
+            return Err(write_fence_error());
+        }
         tx.commit()?;
         self.index_build_tokens.remove(&generation);
         Ok(())
@@ -5669,7 +5852,7 @@ impl Store {
             drop(tx);
             return Err(write_fence_error());
         };
-        if let Err(error) = crate::index::validate_owned_build_directory(
+        if let Err(error) = crate::index::validate_owned_generation_directory(
             &expected_generation_path,
             tantivy_generation,
             owner_token,
@@ -5797,11 +5980,15 @@ impl Store {
                 )?;
             }
         }
-        tx.execute(
-            "DELETE FROM index_build_leases
+        let ownership_retained = tx.execute(
+            "UPDATE index_build_leases
+             SET owner_pid = 0
              WHERE generation = ?1 AND owner_token = ?2",
             params![tantivy_generation, owner_token],
         )?;
+        if ownership_retained != 1 {
+            return Err(write_fence_error());
+        }
         if successor_repair_required {
             clear_successor_repair_required(&tx)?;
         }
@@ -7535,6 +7722,35 @@ fn validate_tantivy_generation_artifact(
     Ok(())
 }
 
+fn tantivy_purge_quarantine_path(index_root: &Path, generation: i64, owner_token: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(b"qgh.tantivy-purge-quarantine.v1");
+    hasher.update(generation.to_le_bytes());
+    hash_text(&mut hasher, owner_token);
+    let digest = digest_hex(hasher);
+    index_root.join(format!(
+        ".qgh-purge-generation-{generation}-{}",
+        &digest[..32]
+    ))
+}
+
+fn validate_quarantined_tantivy_generation(
+    quarantine_path: &Path,
+    generation: i64,
+    owner_token: &str,
+    expected_source_count: usize,
+    expected_source_inventory_hash: &str,
+) -> Result<(), QghError> {
+    crate::index::validate_owned_generation_directory(quarantine_path, generation, owner_token)
+        .map_err(|_| purge_error())?;
+    validate_tantivy_generation_artifact(
+        quarantine_path,
+        expected_source_count,
+        expected_source_inventory_hash,
+    )
+    .map_err(|_| purge_error())
+}
+
 fn tantivy_artifact_not_ready_error() -> QghError {
     QghError::validation(
         "publication.tantivy_artifact_not_ready",
@@ -7919,16 +8135,18 @@ fn validate_embedding_generation_vector_artifacts(
     if !generation_vector_table_schema_matches(conn, &expected_table, generation_dimension)? {
         return Err(embedding_generation_corrupt_error());
     }
+    let mapping_sql = format!(
+        "SELECT gc.vector_blob, gc.vector_checksum, gc.vector_dimension,
+                m.id, m.dimension, m.vector_table, m.vector_rowid, v.embedding
+         FROM embedding_generation_chunks gc
+         LEFT JOIN embedding_generation_vector_rows m
+           ON m.generation_id = gc.generation_id AND m.chunk_id = gc.chunk_id
+         LEFT JOIN {expected_table} v ON v.rowid = m.vector_rowid
+         WHERE gc.generation_id = ?1
+         ORDER BY gc.chunk_id"
+    );
     let mappings = conn
-        .prepare(
-            "SELECT gc.vector_blob, gc.vector_checksum, gc.vector_dimension,
-                    m.id, m.dimension, m.vector_table, m.vector_rowid
-             FROM embedding_generation_chunks gc
-             LEFT JOIN embedding_generation_vector_rows m
-               ON m.generation_id = gc.generation_id AND m.chunk_id = gc.chunk_id
-             WHERE gc.generation_id = ?1
-             ORDER BY gc.chunk_id",
-        )?
+        .prepare(&mapping_sql)?
         .query_map(params![generation_id], |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
@@ -7938,6 +8156,7 @@ fn validate_embedding_generation_vector_artifacts(
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<Vec<u8>>>(7)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -7952,6 +8171,7 @@ fn validate_embedding_generation_vector_artifacts(
         stored_dimension,
         stored_table,
         vector_rowid,
+        indexed_blob,
     ) in mappings
     {
         if usize::try_from(blob_dimension).ok() != Some(generation_dimension)
@@ -7973,13 +8193,6 @@ fn validate_embedding_generation_vector_artifacts(
             generation_dimension,
         )?;
         debug_assert_eq!(owned_table, expected_table);
-        let indexed_blob = conn
-            .query_row(
-                &format!("SELECT embedding FROM {expected_table} WHERE rowid = ?1"),
-                params![vector_rowid],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?;
         if indexed_blob.as_deref() != Some(expected_blob.as_slice()) {
             return Err(embedding_generation_corrupt_error());
         }
@@ -10086,7 +10299,6 @@ mod tests {
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
         rebuild_reserved_generation(&store, &paths, tantivy_generation);
-        fs::write(generation_path.join("segment"), marker).unwrap();
         store
             .activate_retrieval_publication(
                 "sync-legacy-tombstone-migration",
@@ -10098,7 +10310,7 @@ mod tests {
         store.tombstone_source(source_id, "transferred").unwrap();
         let epoch_before = read_content_write_epoch(&store.conn).unwrap();
         assert!(store.pending_purges().unwrap().is_empty());
-        assert!(generation_path.join("segment").exists());
+        assert!(generation_path.exists());
         drop(store);
 
         let mut reopened = Store::open(&paths).unwrap();
@@ -10120,7 +10332,7 @@ mod tests {
             epoch_before + 1
         );
         assert!(reopened.active_retrieval_publication().unwrap().is_none());
-        assert!(generation_path.join("segment").exists());
+        assert!(generation_path.exists());
         assert!(reopened
             .embedding_generation_state(embedding_generation)
             .is_ok());
@@ -10794,8 +11006,6 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(purge_error.code, "purge.failed");
-        fs::write(generation_path.join("segment"), "late-tantivy-marker").unwrap();
-
         let error = stale_builder
             .activate_retrieval_publication("sync-late-stale-tantivy", generation, None, None)
             .unwrap_err();
@@ -10830,7 +11040,6 @@ mod tests {
         builder
             .rebuild_reserved_index_generation(generation, &builder.active_index_sources().unwrap())
             .unwrap();
-        fs::write(generation_path.join("segment"), "live-index-private").unwrap();
         let mut purger = Store::open(&paths).unwrap();
 
         let error = purger
@@ -10847,7 +11056,7 @@ mod tests {
             purger.pending_purges().unwrap()[0].failure_stage,
             Some(PurgeFailureStage::Tantivy)
         );
-        assert!(generation_path.join("segment").exists());
+        assert!(generation_path.exists());
         let stale_error = builder
             .activate_retrieval_publication("sync-purge-live-index-lease", generation, None, None)
             .unwrap_err();
@@ -10863,14 +11072,12 @@ mod tests {
             .unwrap();
         assert!(successor_generation > generation);
         rebuild_reserved_generation(&purger, &paths, successor_generation);
-        fs::write(successor_path.join("segment"), "fresh-successor").unwrap();
-
         let repeated_stale_error = builder
             .mark_index_published(generation, &generation_path.to_string_lossy(), 1)
             .unwrap_err();
 
         assert_eq!(repeated_stale_error.code, "purge.write_fenced");
-        assert!(successor_path.join("segment").exists());
+        assert!(successor_path.exists());
         purger
             .activate_retrieval_publication(&successor_snapshot, successor_generation, None, None)
             .unwrap();
@@ -10900,7 +11107,6 @@ mod tests {
         store
             .rebuild_reserved_index_generation(generation, &store.active_index_sources().unwrap())
             .unwrap();
-        fs::write(generation_path.join("segment"), "dead-index-private").unwrap();
         store.index_build_tokens.remove(&generation);
         store
             .conn
@@ -12209,7 +12415,6 @@ mod tests {
         fs::create_dir_all(&shadow_backup_path).unwrap();
         let model_artifact = paths.cache_dir.join("models/model.onnx");
         fs::create_dir_all(model_artifact.parent().unwrap()).unwrap();
-        fs::write(first_path.join("segment"), "tantivy-private-marker").unwrap();
         fs::write(paths.index_active.join("segment"), "tantivy-private-marker").unwrap();
         fs::write(backup_path.join("keep"), "user-owned-backup").unwrap();
         fs::write(generation_backup_path.join("keep"), "user-owned-backup").unwrap();
@@ -12222,7 +12427,6 @@ mod tests {
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
         rebuild_reserved_generation(&store, &paths, second_generation);
-        fs::write(second_path.join("segment"), "tantivy-private-marker").unwrap();
         store
             .activate_retrieval_publication(
                 "sync-purge-tantivy",
@@ -12314,6 +12518,228 @@ mod tests {
     }
 
     #[test]
+    fn purge_keeps_pending_and_preserves_foreign_entry_added_after_publication() {
+        let paths = temp_profile_paths("purge-tantivy-foreign-entry");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_FOREIGN_ENTRY";
+        let private_marker = "private-foreign-entry-query";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-foreign-entry",
+                &[test_issue(source_id, "owner/repo", private_marker)],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication("sync-purge-foreign-entry", generation, None, None)
+            .unwrap();
+        let foreign_entry = generation_path.join("foreign-backup-marker");
+        fs::write(&foreign_entry, "preserve").unwrap();
+
+        let error = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "purge.failed");
+        assert!(!error.message.contains(private_marker));
+        assert!(!error
+            .message
+            .contains(&generation_path.to_string_lossy().to_string()));
+        assert!(foreign_entry.exists());
+        assert_eq!(
+            store.pending_purges().unwrap()[0].failure_stage,
+            Some(PurgeFailureStage::Tantivy)
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_resumes_from_durable_owned_quarantine_after_rename_crash() {
+        let paths = temp_profile_paths("purge-tantivy-quarantine-resume");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_QUARANTINE_RESUME";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-quarantine-resume",
+                &[test_issue(source_id, "owner/repo", "private-resume-marker")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication("sync-purge-quarantine-resume", generation, None, None)
+            .unwrap();
+        let (owner_pid, owner_token): (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT owner_pid, owner_token FROM index_build_leases
+                 WHERE generation = ?1",
+                params![generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(owner_pid, 0);
+        let quarantine_path =
+            tantivy_purge_quarantine_path(&paths.index_root, generation, &owner_token);
+        crate::index::rename_without_replacement(&generation_path, &quarantine_path).unwrap();
+        sync_directory(&paths.index_root).unwrap();
+
+        let outcome = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.discarded_tantivy_generations, 1);
+        assert!(!generation_path.exists());
+        assert!(!quarantine_path.exists());
+        assert!(store.pending_purges().unwrap().is_empty());
+        let ownership_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM index_build_leases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(ownership_count, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_detects_generation_swap_after_validation_without_deleting_foreign_tree() {
+        let paths = temp_profile_paths("purge-tantivy-generation-swap");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_GENERATION_SWAP";
+        let private_marker = "private-generation-swap-query";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-generation-swap",
+                &[test_issue(source_id, "owner/repo", private_marker)],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication("sync-purge-generation-swap", generation, None, None)
+            .unwrap();
+        store.swap_generation_after_purge_validation(generation);
+
+        let error = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "purge.failed");
+        assert!(!error.message.contains(private_marker));
+        assert!(generation_path.join("foreign-sentinel").exists());
+        assert!(paths
+            .index_root
+            .join(format!(".qgh-test-displaced-generation-{generation}"))
+            .exists());
+        assert_eq!(
+            store.pending_purges().unwrap()[0].failure_stage,
+            Some(PurgeFailureStage::Tantivy)
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_fails_closed_when_quarantine_path_is_swapped_after_fd_open() {
+        let paths = temp_profile_paths("purge-tantivy-quarantine-swap");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_QUARANTINE_SWAP";
+        let private_marker = "private-quarantine-swap-query";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-quarantine-swap",
+                &[test_issue(source_id, "owner/repo", private_marker)],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication("sync-purge-quarantine-swap", generation, None, None)
+            .unwrap();
+        let owner_token: String = store
+            .conn
+            .query_row(
+                "SELECT owner_token FROM index_build_leases WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let quarantine_path =
+            tantivy_purge_quarantine_path(&paths.index_root, generation, &owner_token);
+        store.swap_quarantine_after_purge_open(generation);
+
+        let error = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "purge.failed");
+        assert!(!error.message.contains(private_marker));
+        assert!(!error
+            .message
+            .contains(&quarantine_path.to_string_lossy().to_string()));
+        assert!(quarantine_path.join("foreign-sentinel").exists());
+        let displaced = paths
+            .index_root
+            .join(format!(".qgh-test-displaced-quarantine-{generation}"));
+        assert!(displaced.exists());
+        assert!(fs::read_dir(&displaced).unwrap().next().is_some());
+        assert_eq!(
+            store.pending_purges().unwrap()[0].failure_stage,
+            Some(PurgeFailureStage::Tantivy)
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
     fn mapped_partially_cleaned_tombstone_still_discards_tantivy() {
         let paths = temp_profile_paths("purge-partially-cleaned-tombstone-tantivy");
         let mut store = Store::open(&paths).unwrap();
@@ -12333,7 +12759,6 @@ mod tests {
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
         rebuild_reserved_generation(&store, &paths, generation);
-        fs::write(generation_path.join("segment"), marker).unwrap();
         store
             .activate_retrieval_publication(
                 "sync-partially-cleaned-tombstone",
@@ -12358,7 +12783,7 @@ mod tests {
                 .unwrap();
         }
         assert!(store.get_tombstone(source_id).unwrap().is_some());
-        assert!(generation_path.join("segment").exists());
+        assert!(generation_path.exists());
 
         let outcome = store
             .purge(
@@ -13229,7 +13654,6 @@ mod tests {
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
         rebuild_reserved_generation(&store, &paths, generation);
-        fs::write(generation_path.join("segment"), "other-only").unwrap();
         let publication = store
             .activate_retrieval_publication(&successor_snapshot, generation, None, None)
             .unwrap();
@@ -13247,7 +13671,7 @@ mod tests {
         assert_eq!(outcome.purged_sources, 0);
         assert!(!outcome.sensitive_wal_truncated);
         assert_eq!(read_content_write_epoch(&store.conn).unwrap(), epoch_before);
-        assert!(generation_path.join("segment").exists());
+        assert!(generation_path.exists());
         assert_eq!(
             store
                 .active_retrieval_publication()
@@ -13266,7 +13690,7 @@ mod tests {
             read_content_write_epoch(&reopened.conn).unwrap(),
             epoch_before_reopen
         );
-        assert!(generation_path.join("segment").exists());
+        assert!(generation_path.exists());
         assert_eq!(
             reopened
                 .active_retrieval_publication()
@@ -13356,7 +13780,6 @@ mod tests {
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
         rebuild_reserved_generation(&store, &paths, generation);
-        fs::write(generation_path.join("segment"), "other-index-content").unwrap();
         store
             .activate_retrieval_publication("sync-purge-absent-issue-index", generation, None, None)
             .unwrap();
@@ -13371,7 +13794,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(generation_path.join("segment").exists());
+        assert!(generation_path.exists());
         assert_eq!(
             store.index_path_for_generation(generation).unwrap(),
             Some(generation_path.to_string_lossy().to_string())
@@ -13425,7 +13848,6 @@ mod tests {
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
         rebuild_reserved_generation(&store, &paths, generation);
-        fs::write(generation_path.join("segment"), "other-issue-only").unwrap();
         let publication = store
             .activate_retrieval_publication(&successor_snapshot, generation, None, None)
             .unwrap();
@@ -13444,7 +13866,7 @@ mod tests {
         assert_eq!(outcome.purged_sources, 0);
         assert!(!outcome.sensitive_wal_truncated);
         assert_eq!(read_content_write_epoch(&store.conn).unwrap(), epoch_before);
-        assert!(generation_path.join("segment").exists());
+        assert!(generation_path.exists());
         assert_eq!(
             store
                 .active_retrieval_publication()
@@ -13463,7 +13885,7 @@ mod tests {
             read_content_write_epoch(&reopened.conn).unwrap(),
             epoch_before_reopen
         );
-        assert!(generation_path.join("segment").exists());
+        assert!(generation_path.exists());
         assert_eq!(
             reopened
                 .active_retrieval_publication()
@@ -13534,13 +13956,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(active_count, 1);
-        let lease_count: i64 = store
+        let ownership_count: i64 = store
             .conn
-            .query_row("SELECT count(*) FROM index_build_leases", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT count(*) FROM index_build_leases WHERE owner_pid = 0",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(lease_count, 0);
+        assert_eq!(ownership_count, 2);
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -13676,8 +14100,6 @@ mod tests {
         builder
             .rebuild_reserved_index_generation(generation, &[])
             .unwrap();
-        fs::write(generation_path.join("segment"), "abandoned-build").unwrap();
-
         drop(builder);
 
         assert!(!generation_path.exists());
@@ -13691,6 +14113,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lease_count, 0);
+        assert!(reopened
+            .index_path_for_generation(generation)
+            .unwrap()
+            .is_none());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn dropping_builder_cleans_sealed_shadow_left_before_generation_promotion() {
+        let paths = temp_profile_paths("index-sealed-shadow-drop");
+        let mut builder = Store::open(&paths).unwrap();
+        let (generation, generation_path) = builder
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        builder
+            .rebuild_reserved_index_generation(generation, &[])
+            .unwrap();
+        let shadow_path = paths.index_root.join(format!("shadow-{generation}"));
+        fs::rename(&generation_path, &shadow_path).unwrap();
+
+        drop(builder);
+
+        assert!(!generation_path.exists());
+        assert!(!shadow_path.exists());
+        let reopened = Store::open(&paths).unwrap();
         assert!(reopened
             .index_path_for_generation(generation)
             .unwrap()
@@ -14492,7 +14940,9 @@ mod tests {
         let (tantivy_generation, _) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, tantivy_generation, snapshot.sources()).unwrap();
+        store
+            .rebuild_reserved_index_generation(tantivy_generation, snapshot.sources())
+            .unwrap();
         store
             .activate_retrieval_publication(
                 snapshot.identity().sync_run_id(),
@@ -14702,7 +15152,9 @@ mod tests {
         let (tantivy_generation, generation_path) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, tantivy_generation, snapshot.sources()).unwrap();
+        store
+            .rebuild_reserved_index_generation(tantivy_generation, snapshot.sources())
+            .unwrap();
         let legacy_publication_id = store
             .activate_retrieval_publication(
                 snapshot.identity().sync_run_id(),
@@ -14935,7 +15387,9 @@ mod tests {
         let (generation, generation_path) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .rebuild_reserved_index_generation(generation, snapshot.sources())
+            .unwrap();
         store
             .activate_retrieval_publication(
                 snapshot.identity().sync_run_id(),
@@ -15000,7 +15454,9 @@ mod tests {
         let (generation, generation_path) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .rebuild_reserved_index_generation(generation, snapshot.sources())
+            .unwrap();
         store
             .activate_retrieval_publication(
                 snapshot.identity().sync_run_id(),
@@ -15061,7 +15517,9 @@ mod tests {
         let (generation, _) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .rebuild_reserved_index_generation(generation, snapshot.sources())
+            .unwrap();
         let publication_id = store
             .activate_retrieval_publication(
                 snapshot.identity().sync_run_id(),
@@ -15149,7 +15607,9 @@ mod tests {
         let (generation, generation_path) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .rebuild_reserved_index_generation(generation, snapshot.sources())
+            .unwrap();
         let publication_id = store
             .activate_retrieval_publication(
                 snapshot.identity().sync_run_id(),
@@ -15214,7 +15674,9 @@ mod tests {
         let (generation, generation_path) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .rebuild_reserved_index_generation(generation, snapshot.sources())
+            .unwrap();
         let publication_id = store
             .activate_retrieval_publication(
                 snapshot.identity().sync_run_id(),
@@ -15339,8 +15801,12 @@ mod tests {
         let (second_generation, _) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, first_generation, &snapshot.sources).unwrap();
-        crate::index::rebuild(&paths.index_root, second_generation, &snapshot.sources).unwrap();
+        store
+            .rebuild_reserved_index_generation(first_generation, &snapshot.sources)
+            .unwrap();
+        store
+            .rebuild_reserved_index_generation(second_generation, &snapshot.sources)
+            .unwrap();
         let publication = store
             .activate_retrieval_publication(
                 &snapshot.identity.sync_run_id,
@@ -15485,7 +15951,9 @@ mod tests {
             source.title = format!("Altered artifact title {index}");
             source.body = format!("Altered artifact body {index}");
         }
-        crate::index::rebuild(&paths.index_root, generation, &altered_sources).unwrap();
+        store
+            .rebuild_reserved_index_generation(generation, &altered_sources)
+            .unwrap();
 
         let error = store
             .activate_retrieval_publication(
@@ -15524,7 +15992,9 @@ mod tests {
         let (generation, generation_path) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .rebuild_reserved_index_generation(generation, snapshot.sources())
+            .unwrap();
         let publication_id = store
             .activate_retrieval_publication(
                 snapshot.identity().sync_run_id(),
@@ -15576,7 +16046,9 @@ mod tests {
         let (generation, generation_path) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .rebuild_reserved_index_generation(generation, snapshot.sources())
+            .unwrap();
         let outside = paths.profile_dir.join("outside-generation");
         fs::write(&outside, b"outside fixture").unwrap();
         symlink(&outside, generation_path.join("unexpected-link")).unwrap();
@@ -15623,7 +16095,9 @@ mod tests {
         let (generation, generation_path) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .rebuild_reserved_index_generation(generation, snapshot.sources())
+            .unwrap();
         let outside = paths.profile_dir.join("outside-legacy-generation");
         fs::write(&outside, b"outside fixture").unwrap();
         symlink(&outside, generation_path.join("unexpected-link")).unwrap();
@@ -15662,7 +16136,9 @@ mod tests {
         let (generation, _) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .rebuild_reserved_index_generation(generation, snapshot.sources())
+            .unwrap();
         store
             .activate_retrieval_publication(
                 snapshot.identity().sync_run_id(),
@@ -15713,12 +16189,9 @@ mod tests {
         let (first_generation, _) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &first_snapshot)
             .unwrap();
-        crate::index::rebuild(
-            &paths.index_root,
-            first_generation,
-            first_snapshot.sources(),
-        )
-        .unwrap();
+        store
+            .rebuild_reserved_index_generation(first_generation, first_snapshot.sources())
+            .unwrap();
         let first_publication = store
             .activate_retrieval_publication(
                 first_snapshot.identity().sync_run_id(),
@@ -15731,12 +16204,9 @@ mod tests {
         let (second_generation, _) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &second_snapshot)
             .unwrap();
-        crate::index::rebuild(
-            &paths.index_root,
-            second_generation,
-            second_snapshot.sources(),
-        )
-        .unwrap();
+        store
+            .rebuild_reserved_index_generation(second_generation, second_snapshot.sources())
+            .unwrap();
         store
             .activate_retrieval_publication(
                 second_snapshot.identity().sync_run_id(),
@@ -15784,7 +16254,9 @@ mod tests {
         let (generation, expected_path) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .rebuild_reserved_index_generation(generation, snapshot.sources())
+            .unwrap();
         store
             .activate_retrieval_publication(
                 snapshot.identity().sync_run_id(),
@@ -15833,7 +16305,9 @@ mod tests {
         let (generation, _) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .rebuild_reserved_index_generation(generation, snapshot.sources())
+            .unwrap();
         store
             .activate_retrieval_publication(
                 snapshot.identity().sync_run_id(),
@@ -15881,7 +16355,9 @@ mod tests {
         let (generation, generation_path) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, generation, snapshot.sources()).unwrap();
+        store
+            .rebuild_reserved_index_generation(generation, snapshot.sources())
+            .unwrap();
         store
             .activate_retrieval_publication(
                 snapshot.identity().sync_run_id(),
@@ -15920,7 +16396,8 @@ mod tests {
         let (first_generation, _) = writer
             .reserve_index_generation_for_snapshot(&paths.index_root, &first_snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, first_generation, &first_snapshot.sources)
+        writer
+            .rebuild_reserved_index_generation(first_generation, &first_snapshot.sources)
             .unwrap();
         let first_publication = writer
             .activate_retrieval_publication(
@@ -15951,12 +16428,9 @@ mod tests {
         let (second_generation, _) = writer
             .reserve_index_generation_for_snapshot(&paths.index_root, &second_snapshot)
             .unwrap();
-        crate::index::rebuild(
-            &paths.index_root,
-            second_generation,
-            &second_snapshot.sources,
-        )
-        .unwrap();
+        writer
+            .rebuild_reserved_index_generation(second_generation, &second_snapshot.sources)
+            .unwrap();
         let second_publication = writer
             .activate_retrieval_publication(
                 &second_snapshot.identity.sync_run_id,
@@ -16019,12 +16493,9 @@ mod tests {
         let (mixed_generation, _) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &lexical_snapshot)
             .unwrap();
-        crate::index::rebuild(
-            &paths.index_root,
-            mixed_generation,
-            &lexical_snapshot.sources,
-        )
-        .unwrap();
+        store
+            .rebuild_reserved_index_generation(mixed_generation, &lexical_snapshot.sources)
+            .unwrap();
         let activation_error = store
             .activate_retrieval_publication(
                 &lexical_snapshot.identity.sync_run_id,
@@ -16041,12 +16512,9 @@ mod tests {
         let (lexical_generation, _) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &lexical_snapshot)
             .unwrap();
-        crate::index::rebuild(
-            &paths.index_root,
-            lexical_generation,
-            &lexical_snapshot.sources,
-        )
-        .unwrap();
+        store
+            .rebuild_reserved_index_generation(lexical_generation, &lexical_snapshot.sources)
+            .unwrap();
         store
             .activate_retrieval_publication(
                 &lexical_snapshot.identity.sync_run_id,
@@ -16135,7 +16603,9 @@ mod tests {
         let (tantivy_generation, _) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, tantivy_generation, &snapshot.sources).unwrap();
+        store
+            .rebuild_reserved_index_generation(tantivy_generation, &snapshot.sources)
+            .unwrap();
 
         let error = store
             .activate_retrieval_publication(
@@ -16788,6 +17258,64 @@ mod tests {
             .execute(
                 &format!("UPDATE {vector_table} SET embedding = ?1 WHERE rowid = ?2"),
                 params![encode_embedding_blob(&[10_000.0, 10_000.0]), vector_rowid],
+            )
+            .unwrap();
+        let query = [1.0 + first_chunk as f32, 2.0];
+
+        let error = store
+            .generation_vector_search(generation_id, &query, &VectorSearchFilters::default(), 1)
+            .unwrap_err();
+
+        assert_eq!(error.code, "embedding.generation_corrupt");
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn generation_vector_search_rejects_joint_authoritative_and_vec0_tamper() {
+        let paths = temp_profile_paths("vector-search-joint-row-tamper");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let first_chunk = insert_test_issue_chunk(
+            &mut store,
+            "qgh://github.com/issue/I_VECTOR_JOINT_TAMPER_FIRST",
+            "sync-vector-joint-tamper-first",
+        );
+        let second_chunk = insert_test_issue_chunk(
+            &mut store,
+            "qgh://github.com/issue/I_VECTOR_JOINT_TAMPER_SECOND",
+            "sync-vector-joint-tamper-second",
+        );
+        let generation_id = stage_test_generation(
+            &mut store,
+            "manifest-vector-joint-tamper",
+            &[first_chunk, second_chunk],
+        );
+        let (vector_table, vector_rowid): (String, i64) = store
+            .conn
+            .query_row(
+                "SELECT vector_table, vector_rowid
+                 FROM embedding_generation_vector_rows
+                 WHERE generation_id = ?1 AND chunk_id = ?2",
+                params![generation_id, first_chunk],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let tampered = encode_embedding_blob(&[10_000.0, 10_000.0]);
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_generation_chunks
+                 SET vector_blob = ?1
+                 WHERE generation_id = ?2 AND chunk_id = ?3",
+                params![&tampered, generation_id, first_chunk],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                &format!("UPDATE {vector_table} SET embedding = ?1 WHERE rowid = ?2"),
+                params![tampered, vector_rowid],
             )
             .unwrap();
         let query = [1.0 + first_chunk as f32, 2.0];

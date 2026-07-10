@@ -4,7 +4,7 @@ use crate::paths::{ensure_private_dir, set_private_dir, set_private_file};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
@@ -13,6 +13,7 @@ use tantivy::{Index, TantivyDocument, Term};
 
 const SOURCE_INVENTORY_COMMIT_PREFIX: &str = "qgh.source_inventory.v1:";
 const INDEX_BUILD_MARKER_FILE: &str = ".qgh-build-owner-v1";
+const INDEX_BUILD_MARKER_SEAL_TEMP: &str = ".qgh-build-owner-v1.sealing";
 
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -91,15 +92,11 @@ pub fn rebuild(
     ensure_private_dir(index_root)?;
     let shadow_path = index_root.join(format!("shadow-{generation}"));
     let generation_path = index_root.join(format!("generation-{generation}"));
-    if generation_path.exists() {
+    if generation_path.exists() || shadow_path.exists() {
         return Err(index_build_collision_error());
     }
-    if shadow_path.exists() {
-        validate_build_marker_format(&shadow_path)?;
-    } else {
-        ensure_private_dir(&shadow_path)?;
-    }
-    rebuild_in_shadow(&shadow_path, &generation_path, sources)?;
+    ensure_private_dir(&shadow_path)?;
+    rebuild_in_shadow(&shadow_path, &generation_path, sources, None)?;
     Ok(generation_path)
 }
 
@@ -152,8 +149,13 @@ pub(crate) fn rebuild_owned(
         return Err(index_build_collision_error());
     }
     validate_owned_build_directory(&shadow_path, generation, owner_token)?;
-    rebuild_in_shadow(&shadow_path, &generation_path, sources)?;
-    validate_owned_build_directory(&generation_path, generation, owner_token)?;
+    rebuild_in_shadow(
+        &shadow_path,
+        &generation_path,
+        sources,
+        Some((generation, owner_token)),
+    )?;
+    validate_owned_generation_directory(&generation_path, generation, owner_token)?;
     Ok(generation_path)
 }
 
@@ -161,6 +163,7 @@ fn rebuild_in_shadow(
     shadow_path: &Path,
     generation_path: &Path,
     sources: &[IndexSource],
+    ownership: Option<(i64, &str)>,
 ) -> Result<(), QghError> {
     let (schema, fields) = schema();
     let index =
@@ -186,11 +189,46 @@ fn rebuild_in_shadow(
     writer
         .wait_merging_threads()
         .map_err(|e| QghError::index(e.to_string()))?;
+    if let Some((generation, owner_token)) = ownership {
+        seal_owned_generation_directory(shadow_path, generation, owner_token)?;
+    }
     if generation_path.exists() {
         return Err(index_build_collision_error());
     }
     rename_without_replacement(shadow_path, generation_path)?;
     set_private_dir(generation_path)?;
+    Ok(())
+}
+
+fn seal_owned_generation_directory(
+    path: &Path,
+    generation: i64,
+    owner_token: &str,
+) -> Result<(), QghError> {
+    validate_owned_build_directory(path, generation, owner_token)?;
+    let seal_temp = path.join(INDEX_BUILD_MARKER_SEAL_TEMP);
+    if seal_temp.exists() {
+        return Err(index_build_collision_error());
+    }
+    let tree_digest = owned_generation_tree_digest(path)?;
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&seal_temp)
+        .map_err(|_| index_build_collision_error())?;
+    let sealed = sealed_index_build_marker(generation, owner_token, &tree_digest);
+    if marker.write_all(sealed.as_bytes()).is_err()
+        || marker.sync_all().is_err()
+        || set_private_file(&seal_temp).is_err()
+    {
+        let _ = fs::remove_file(&seal_temp);
+        return Err(index_build_collision_error());
+    }
+    fs::rename(&seal_temp, path.join(INDEX_BUILD_MARKER_FILE))
+        .map_err(|_| index_build_collision_error())?;
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| index_build_collision_error())?;
     Ok(())
 }
 
@@ -216,15 +254,11 @@ pub(crate) fn validate_owned_build_directory(
     Ok(())
 }
 
-fn index_build_marker(generation: i64, owner_token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"qgh.index-build-owner.v1");
-    hasher.update(generation.to_le_bytes());
-    hasher.update(owner_token.as_bytes());
-    format!("qgh.index-build-owner.v1:{}", digest_hex(hasher))
-}
-
-fn validate_build_marker_format(path: &Path) -> Result<(), QghError> {
+pub(crate) fn validate_owned_generation_directory(
+    path: &Path,
+    generation: i64,
+    owner_token: &str,
+) -> Result<(), QghError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| index_build_collision_error())?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(index_build_collision_error());
@@ -236,11 +270,104 @@ fn validate_build_marker_format(path: &Path) -> Result<(), QghError> {
         return Err(index_build_collision_error());
     }
     let observed = fs::read_to_string(marker_path).map_err(|_| index_build_collision_error())?;
-    let Some(digest) = observed.strip_prefix("qgh.index-build-owner.v1:") else {
+    let tree_digest = owned_generation_tree_digest(path)?;
+    if observed != sealed_index_build_marker(generation, owner_token, &tree_digest) {
         return Err(index_build_collision_error());
-    };
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(index_build_collision_error());
+    }
+    Ok(())
+}
+
+fn index_build_marker(generation: i64, owner_token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"qgh.index-build-owner.v1");
+    hasher.update(generation.to_le_bytes());
+    hasher.update(owner_token.as_bytes());
+    format!("qgh.index-build-owner.v1:{}", digest_hex(hasher))
+}
+
+fn sealed_index_build_marker(generation: i64, owner_token: &str, tree_digest: &str) -> String {
+    format!(
+        "qgh.index-generation-owner.v1:{}:{tree_digest}",
+        index_build_owner_digest(generation, owner_token)
+    )
+}
+
+fn index_build_owner_digest(generation: i64, owner_token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"qgh.index-build-owner.v1");
+    hasher.update(generation.to_le_bytes());
+    hasher.update(owner_token.as_bytes());
+    digest_hex(hasher)
+}
+
+fn owned_generation_tree_digest(root: &Path) -> Result<String, QghError> {
+    let mut entries = Vec::new();
+    collect_owned_generation_entries(root, root, &mut entries)?;
+    entries.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"qgh.index-generation-tree.v1");
+    for path in entries {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| index_build_collision_error())?;
+        let relative_bytes = relative.as_os_str().as_encoded_bytes();
+        hasher.update((relative_bytes.len() as u64).to_le_bytes());
+        hasher.update(relative_bytes);
+        let metadata = fs::symlink_metadata(&path).map_err(|_| index_build_collision_error())?;
+        if metadata.file_type().is_symlink() {
+            return Err(index_build_collision_error());
+        }
+        if metadata.is_dir() {
+            hasher.update(b"d");
+        } else if metadata.is_file() {
+            hasher.update(b"f");
+            hasher.update(metadata.len().to_le_bytes());
+            let mut file = fs::File::open(&path).map_err(|_| index_build_collision_error())?;
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .map_err(|_| index_build_collision_error())?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+        } else {
+            return Err(index_build_collision_error());
+        }
+    }
+    Ok(digest_hex(hasher))
+}
+
+fn collect_owned_generation_entries(
+    root: &Path,
+    directory: &Path,
+    entries: &mut Vec<PathBuf>,
+) -> Result<(), QghError> {
+    let mut children = fs::read_dir(directory)
+        .map_err(|_| index_build_collision_error())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| index_build_collision_error())?;
+    children.sort_by_key(|entry| entry.file_name());
+    for entry in children {
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| index_build_collision_error())?;
+        if relative == Path::new(INDEX_BUILD_MARKER_FILE) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|_| index_build_collision_error())?;
+        if metadata.file_type().is_symlink() {
+            return Err(index_build_collision_error());
+        }
+        entries.push(path.clone());
+        if metadata.is_dir() {
+            collect_owned_generation_entries(root, &path, entries)?;
+        } else if !metadata.is_file() {
+            return Err(index_build_collision_error());
+        }
     }
     Ok(())
 }
@@ -253,7 +380,7 @@ fn index_build_collision_error() -> QghError {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn rename_without_replacement(from: &Path, to: &Path) -> Result<(), QghError> {
+pub(crate) fn rename_without_replacement(from: &Path, to: &Path) -> Result<(), QghError> {
     use std::ffi::CString;
     use std::os::raw::{c_char, c_int, c_uint};
     use std::os::unix::ffi::OsStrExt;
@@ -307,7 +434,7 @@ fn rename_without_replacement(from: &Path, to: &Path) -> Result<(), QghError> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn rename_without_replacement(from: &Path, to: &Path) -> Result<(), QghError> {
+pub(crate) fn rename_without_replacement(from: &Path, to: &Path) -> Result<(), QghError> {
     if to.exists() {
         return Err(index_build_collision_error());
     }

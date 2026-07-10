@@ -6446,8 +6446,9 @@ mod tests {
         let (generation, reserved_path) = store
             .reserve_index_generation_for_snapshot(&paths.index_root, &first_snapshot)
             .unwrap();
-        let generation_path =
-            index::rebuild(&paths.index_root, generation, first_snapshot.sources()).unwrap();
+        let generation_path = store
+            .rebuild_reserved_index_generation(generation, first_snapshot.sources())
+            .unwrap();
         assert_eq!(generation_path, reserved_path);
         store
             .activate_retrieval_publication("sync-command-embed", generation, None, None)

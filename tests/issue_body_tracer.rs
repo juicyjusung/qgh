@@ -518,6 +518,48 @@ fn query_and_default_get_do_not_repair_invalid_publication_on_open() {
 }
 
 #[test]
+fn read_commands_do_not_bootstrap_a_missing_store_on_disk() {
+    let fixture = TestFixture::new("missing-store-read-only");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    let profile_dir = fixture.data_home.join("qgh/profiles/work");
+    let runtime_cache_dir = fixture.cache_home.join("qgh");
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    assert_eq!(
+        stdout_json(&status)["data"]["freshness"]["decision"],
+        "never_synced"
+    );
+    assert!(!profile_dir.exists());
+    assert!(!runtime_cache_dir.exists());
+
+    let doctor = fixture.qgh(["doctor", "--json"]);
+    assert_success(&doctor);
+    assert!(!profile_dir.exists());
+    assert!(!runtime_cache_dir.exists());
+
+    let query = fixture.qgh(["query", "nothing persisted", "--json"]);
+    assert_success(&query);
+    assert!(stdout_json(&query)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(!profile_dir.exists());
+    assert!(!runtime_cache_dir.exists());
+
+    let get = fixture.qgh([
+        "get",
+        "qgh://github.com/issue/I_MISSING_READ_ONLY",
+        "--json",
+    ]);
+    assert_eq!(get.status.code(), Some(4));
+    assert_eq!(stdout_json(&get)["error"]["code"], "source.not_found");
+    assert!(!profile_dir.exists());
+    assert!(!runtime_cache_dir.exists());
+}
+
+#[test]
 fn sync_sends_github_rest_headers_required_by_real_api() {
     let fixture = TestFixture::new("github-required-headers");
     let server = HeaderCheckingFakeGitHub::start();
@@ -4358,7 +4400,7 @@ fn repo_listing_permission_evidence_is_pending_before_comment_upsert_failure() {
     let fixture = TestFixture::new("repo-listing-permission-before-upsert");
     let server = RepoCommentListingFakeGitHub::start();
     fixture.write_config_repo_listing_comments(&server.base_url);
-    assert_success(&fixture.qgh(["status", "--json"]));
+    assert_success(&fixture.qgh(["sync", "--json"]));
     fixture.install_repo_comment_upsert_failure_trigger();
     server.set_mode(REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE);
 
