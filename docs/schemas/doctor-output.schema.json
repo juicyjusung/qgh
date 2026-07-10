@@ -3,7 +3,7 @@
   "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/doctor-output.schema.json",
   "title": "qgh doctor data",
   "type": "object",
-  "required": ["profile_id", "checks", "mcp", "resolution"],
+  "required": ["profile_id", "checks", "purge", "mcp", "resolution"],
   "properties": {
     "profile_id": {
       "type": "string"
@@ -13,6 +13,9 @@
       "items": {
         "$ref": "#/$defs/check"
       }
+    },
+    "purge": {
+      "$ref": "#/$defs/purge"
     },
     "mcp": {
       "type": "object",
@@ -50,6 +53,7 @@
             "tantivy",
             "github_auth_reachability",
             "rate_limit_headers",
+            "purge",
             "repo_policy",
             "profile_resolution"
           ]
@@ -80,6 +84,63 @@
         }
       },
       "additionalProperties": false
+    },
+    "purge": {
+      "type": "object",
+      "required": [
+        "pending_count",
+        "retrieval_blocked",
+        "target_kinds",
+        "triggers",
+        "current_stages",
+        "failure_stages",
+        "unmanaged_filesystem_backups"
+      ],
+      "properties": {
+        "pending_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retrieval_blocked": {
+          "type": "boolean"
+        },
+        "target_kinds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": ["source", "issue", "repository"]
+          }
+        },
+        "triggers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "confirmed_delete",
+              "confirmed_tombstone",
+              "permission_loss",
+              "allowlist_removal"
+            ]
+          }
+        },
+        "current_stages": {
+          "$ref": "#/$defs/purge_stages"
+        },
+        "failure_stages": {
+          "$ref": "#/$defs/purge_stages"
+        },
+        "unmanaged_filesystem_backups": {
+          "const": "not_deleted_by_qgh"
+        }
+      },
+      "additionalProperties": false
+    },
+    "purge_stages": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": ["secure_delete", "tantivy", "storage", "wal_checkpoint", "finalize"]
+      }
     },
     "rate_limit_headers": {
       "type": "object",

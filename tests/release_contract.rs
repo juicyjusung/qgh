@@ -540,6 +540,12 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "validation.backfill_conflicts",
         "validation.requires_backfill",
         "validation.repo_required",
+        "purge.failed",
+        "purge.retry_failed",
+        "purge.read_fenced",
+        "purge.write_fenced",
+        "purge.successor_blocked",
+        "purge.successor_snapshot_missing",
     ] {
         assert!(
             error_codes.contains(&json!(code)),
@@ -904,6 +910,23 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "#/$defs/index"
     );
     assert_eq!(status_schema["properties"]["sync"]["$ref"], "#/$defs/sync");
+    assert_eq!(
+        status_schema["properties"]["purge"]["$ref"],
+        "#/$defs/purge"
+    );
+    let status_purge = &status_schema["$defs"]["purge"];
+    assert_eq!(status_purge["additionalProperties"], false);
+    assert_eq!(
+        status_purge["required"],
+        json!([
+            "pending_count",
+            "retrieval_blocked",
+            "target_kinds",
+            "triggers",
+            "current_stages",
+            "failure_stages"
+        ])
+    );
     assert_eq!(
         status_schema["properties"]["reconciliation"]["$ref"],
         "#/$defs/reconciliation"
@@ -2065,9 +2088,20 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "tantivy",
             "github_auth_reachability",
             "rate_limit_headers",
+            "purge",
             "repo_policy",
             "profile_resolution"
         ])
+    );
+    assert_eq!(
+        doctor_schema["properties"]["purge"]["$ref"],
+        "#/$defs/purge"
+    );
+    let doctor_purge = &doctor_schema["$defs"]["purge"];
+    assert_eq!(doctor_purge["additionalProperties"], false);
+    assert_eq!(
+        doctor_purge["properties"]["unmanaged_filesystem_backups"]["const"],
+        "not_deleted_by_qgh"
     );
     assert_eq!(
         doctor_check["properties"]["headers"]["$ref"],

@@ -10,11 +10,26 @@ Stable error families:
 - `auth.*`: token source failures.
 - `github.*`: GitHub request failures outside structured backoff state.
 - `source.*`: missing or tombstoned source lookups.
+- `purge.*`: fail-closed purge, retry, publication, and read/write-fence failures.
 - `storage.*`: SQLite or local filesystem storage failures.
 - `index.*`: Tantivy index failures.
 - `internal.*`: unexpected internal failures.
 
-Common codes include `config.no_matching_profile`, `config.ambiguous_profile`, `config.invalid_repo_policy`, `validation.cli`, `validation.mcp`, `validation.unsupported_filter`, `validation.batch_size`, `freshness.stale`, `auth.token_unavailable`, `source.not_found`, `source.tombstoned`, and `source.outside_effective_scope`.
+Common codes include `config.no_matching_profile`, `config.ambiguous_profile`,
+`config.invalid_repo_policy`, `validation.cli`, `validation.mcp`,
+`validation.unsupported_filter`, `validation.batch_size`, `freshness.stale`,
+`auth.token_unavailable`, `source.not_found`, `source.tombstoned`,
+`source.outside_effective_scope`, `purge.failed`, `purge.retry_failed`,
+`purge.read_fenced`, and `purge.write_fenced`.
+
+When a confirmed lifecycle or explicit allowlist-removal purge is incomplete,
+the affected source, issue, or repository remains fail closed. Retrieval may
+return `purge.read_fenced`, mutation may return `purge.write_fenced`, and the
+next otherwise-valid `sync` retries qgh-managed cleanup before any GitHub
+request. A retry that remains incomplete returns `purge.retry_failed` with only
+aggregate target/trigger kinds and coarse stage names; it does not include
+source bodies, queries, tokens, or raw transport errors. `purge.successor_*`
+codes mean qgh could not publish the required clean lexical successor snapshot.
 
 `query`/`search` and `status` may return `freshness.stale` when the local
 snapshot violates a fail-mode freshness policy or `--require-fresh` is passed.

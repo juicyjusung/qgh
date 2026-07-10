@@ -947,6 +947,32 @@ fn pending_purge_is_retried_by_next_sync_without_touching_user_backup() {
         "purge preflight precedes network"
     );
 
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["purge"]["pending_count"], 1);
+    assert_eq!(status_json["data"]["purge"]["retrieval_blocked"], true);
+    assert_eq!(
+        status_json["data"]["purge"]["current_stages"],
+        json!(["tantivy"])
+    );
+
+    let doctor = fixture.qgh(["doctor", "--json"]);
+    assert_success(&doctor);
+    let doctor_json = stdout_json(&doctor);
+    assert_eq!(doctor_json["data"]["purge"]["pending_count"], 1);
+    assert_eq!(
+        doctor_json["data"]["purge"]["unmanaged_filesystem_backups"],
+        "not_deleted_by_qgh"
+    );
+    let purge_check = doctor_json["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "purge")
+        .unwrap();
+    assert_eq!(purge_check["ok"], false);
+
     assert!(backup_marker.exists());
 
     fs::remove_file(&index_root).unwrap();
@@ -954,6 +980,9 @@ fn pending_purge_is_retried_by_next_sync_without_touching_user_backup() {
     let retry = fixture.qgh(["sync", "--json"]);
     assert_success(&retry);
     assert!(backup_marker.exists());
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    assert_eq!(stdout_json(&status)["data"]["purge"]["pending_count"], 0);
     assert_success(&fixture.qgh(["query", "shared repo policy tracer", "--json"]));
 }
 
@@ -2314,6 +2343,7 @@ fn status_shape_is_unchanged_without_embedding_config() {
             "paths".to_string(),
             "privacy".to_string(),
             "profile_id".to_string(),
+            "purge".to_string(),
             "reconciliation".to_string(),
             "resolution".to_string(),
             "sources".to_string(),

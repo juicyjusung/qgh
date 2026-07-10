@@ -95,8 +95,13 @@ metadata when resolution has run:
 - `meta.repo_policy_path`: current worktree repo policy path when a repo policy supplied scope, otherwise `null`.
 
 `status` also includes `data.resolution` with the same resolved profile and
-repo-scope fields. CLI-only `doctor` includes the same diagnostics and is the
-explicit command that may run probes. MCP exposes `status`, but not `doctor`.
+repo-scope fields. Its read-only `data.purge` block reports only aggregate,
+content-free pending-purge state: count, whether affected retrieval is fenced,
+target/trigger kinds, and coarse current/failure stages. CLI-only `doctor`
+includes the same diagnostics and is the explicit command that may run probes.
+Its purge block also states that user-created filesystem backups and snapshots
+outside qgh-managed generation paths are not deleted by qgh. Neither `status`
+nor `doctor` retries or starts a purge. MCP exposes `status`, but not `doctor`.
 CLI-only top-level `init` bootstraps profile config plus repo scope. `init repo`
 creates tracked repo policy only. Neither command is exposed to MCP.
 
@@ -121,9 +126,10 @@ it is optimized for a person reading the terminal:
   error state.
 - `status`: selected profile, local snapshot freshness, effective repo scope
   and repo source, DB path, Tantivy index path, source counts, default sync
-  scope, optional local embedding coverage, and `qgh sync --all` guidance.
-- `doctor`: failed checks first with actionable hints, then all checks and MCP
-  exposure status.
+  scope, content-free pending-purge state, optional local embedding coverage,
+  and `qgh sync --all` guidance.
+- `doctor`: failed checks first with actionable hints, then all checks, pending
+  purge state, the unmanaged-backup deletion boundary, and MCP exposure status.
 
 Human output is deliberately not schema-stable. `--json` remains the contract
 source for agents, scripts, MCP parity checks, and release schema validation.

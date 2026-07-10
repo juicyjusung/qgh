@@ -14,6 +14,7 @@
     "index",
     "sync",
     "reconciliation",
+    "purge",
     "resolution",
     "privacy"
   ],
@@ -51,6 +52,9 @@
     "reconciliation": {
       "$ref": "#/$defs/reconciliation"
     },
+    "purge": {
+      "$ref": "#/$defs/purge"
+    },
     "resolution": {
       "$ref": "#/$defs/resolution"
     },
@@ -60,6 +64,59 @@
   },
   "additionalProperties": false,
   "$defs": {
+    "purge": {
+      "type": "object",
+      "required": [
+        "pending_count",
+        "retrieval_blocked",
+        "target_kinds",
+        "triggers",
+        "current_stages",
+        "failure_stages"
+      ],
+      "properties": {
+        "pending_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retrieval_blocked": {
+          "type": "boolean"
+        },
+        "target_kinds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": ["source", "issue", "repository"]
+          }
+        },
+        "triggers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "confirmed_delete",
+              "confirmed_tombstone",
+              "permission_loss",
+              "allowlist_removal"
+            ]
+          }
+        },
+        "current_stages": {
+          "$ref": "#/$defs/purge_stages"
+        },
+        "failure_stages": {
+          "$ref": "#/$defs/purge_stages"
+        }
+      },
+      "additionalProperties": false
+    },
+    "purge_stages": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": ["secure_delete", "tantivy", "storage", "wal_checkpoint", "finalize"]
+      }
+    },
     "github": {
       "type": "object",
       "required": ["host", "api_base_url", "web_base_url"],

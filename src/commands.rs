@@ -4151,6 +4151,7 @@ pub fn status(
     let repo_policy = discover_repo_policy()?;
     let store = Store::open(&profile.paths)?;
     let status = store.status()?;
+    let purge = purge_report(&store)?;
     let coverage = coverage::evaluate(&store.coverage_snapshot()?, false);
     let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
     let last_successful_sync_at = match repo_scope {
@@ -4253,6 +4254,7 @@ pub fn status(
             "last_tombstoned_count": last_reconciliation.map(|run| run.tombstoned_count),
             "last_estimated_api_cost_class": last_reconciliation.map(|run| run.estimated_api_cost_class.clone())
         },
+        "purge": purge,
         "privacy": {
             "classification": "sensitive_derivative_data",
             "default_network_egress": "configured_github_host_only",
@@ -4273,6 +4275,8 @@ pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
     let profile = load_profile(profile_id)?;
     let store = Store::open(&profile.paths)?;
     let status = store.status()?;
+    let purge = purge_report(&store)?;
+    let purge_ok = purge["pending_count"].as_u64() == Some(0);
     let permissions_ok = private_paths_ok(&profile.paths);
     let sqlite_ok = status.active_generation >= 0;
     let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
@@ -4309,12 +4313,53 @@ pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
                 "name": "rate_limit_headers",
                 "ok": rate_limit_ok,
                 "headers": rate_limit_headers
+            },
+            {
+                "name": "purge",
+                "ok": purge_ok
             }
         ],
+        "purge": {
+            "pending_count": purge["pending_count"],
+            "retrieval_blocked": purge["retrieval_blocked"],
+            "target_kinds": purge["target_kinds"],
+            "triggers": purge["triggers"],
+            "current_stages": purge["current_stages"],
+            "failure_stages": purge["failure_stages"],
+            "unmanaged_filesystem_backups": "not_deleted_by_qgh"
+        },
         "mcp": {
             "doctor_exposed": false,
             "tools": ["query", "get", "status"]
         }
+    }))
+}
+
+fn purge_report(store: &Store) -> Result<Value, QghError> {
+    let pending = store.pending_purges()?;
+    let target_kinds = pending
+        .iter()
+        .map(|request| request.target.kind())
+        .collect::<BTreeSet<_>>();
+    let triggers = pending
+        .iter()
+        .map(|request| request.trigger.as_str())
+        .collect::<BTreeSet<_>>();
+    let current_stages = pending
+        .iter()
+        .map(|request| request.current_stage.as_str())
+        .collect::<BTreeSet<_>>();
+    let failure_stages = pending
+        .iter()
+        .filter_map(|request| request.failure_stage.map(|stage| stage.as_str()))
+        .collect::<BTreeSet<_>>();
+    Ok(json!({
+        "pending_count": pending.len(),
+        "retrieval_blocked": !pending.is_empty(),
+        "target_kinds": target_kinds,
+        "triggers": triggers,
+        "current_stages": current_stages,
+        "failure_stages": failure_stages
     }))
 }
 
