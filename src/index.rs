@@ -29,7 +29,7 @@ pub struct SearchFilters {
 /// production default remains `V1`; experiments can opt into a named profile
 /// without exposing arbitrary user-controlled boosts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LexicalRankingProfile {
+enum LexicalRankingProfile {
     #[default]
     V1,
     MetadataBoostV1,
@@ -108,7 +108,7 @@ pub fn search_with_filters(
     )
 }
 
-pub fn search_with_filters_profile(
+fn search_with_filters_profile(
     active_path: &Path,
     query_text: &str,
     filters: &SearchFilters,
@@ -174,10 +174,11 @@ pub fn search_with_filters_profile(
     let mut parser = QueryParser::for_index(&index, query_fields);
     if matches!(profile, LexicalRankingProfile::MetadataBoostV1) {
         parser.set_field_boost(title, 2.0);
-        parser.set_field_boost(labels, 1.5);
-        parser.set_field_boost(issue_number, 1.5);
         if let Ok(parent_issue_title) = schema.get_field("parent_issue_title") {
-            parser.set_field_boost(parent_issue_title, 1.5);
+            parser.set_field_boost(parent_issue_title, 2.0);
+        }
+        if let Ok(cjk_ngrams) = schema.get_field("cjk_ngrams") {
+            parser.set_field_boost(cjk_ngrams, 0.25);
         }
     }
     let expanded_query = expand_cjk_query(query_text);
@@ -217,6 +218,56 @@ pub fn search_with_filters_profile(
         });
     }
     Ok(hits)
+}
+
+/// Fixed experimental profile for release/live-qrels evaluation only.
+///
+/// This is intentionally not parameterized by boosts and is not used by the
+/// production query path, which remains pinned to `LexicalRankingProfile::V1`.
+#[doc(hidden)]
+pub fn search_with_metadata_boost_v1_for_eval(
+    active_path: &Path,
+    query_text: &str,
+    filters: &SearchFilters,
+    limit: usize,
+) -> Result<Vec<SearchHit>, QghError> {
+    search_with_filters_profile(
+        active_path,
+        query_text,
+        filters,
+        LexicalRankingProfile::MetadataBoostV1,
+        limit,
+    )
+}
+
+#[cfg(test)]
+struct LexicalProfileComparison {
+    v1: Vec<SearchHit>,
+    metadata_boost_v1: Vec<SearchHit>,
+}
+
+#[cfg(test)]
+fn compare_lexical_profiles(
+    active_path: &Path,
+    query_text: &str,
+    filters: &SearchFilters,
+    limit: usize,
+) -> Result<LexicalProfileComparison, QghError> {
+    Ok(LexicalProfileComparison {
+        v1: search_with_filters_profile(
+            active_path,
+            query_text,
+            filters,
+            LexicalRankingProfile::V1,
+            limit,
+        )?,
+        metadata_boost_v1: search_with_metadata_boost_v1_for_eval(
+            active_path,
+            query_text,
+            filters,
+            limit,
+        )?,
+    })
 }
 
 fn filtered_query(
@@ -578,6 +629,91 @@ mod tests {
     }
 
     #[test]
+    fn default_search_is_v1_and_profile_comparison_is_eval_only() {
+        let index_root = temp_index_root("lexical-profile-isolation");
+        let generation_path = rebuild(
+            &index_root,
+            1,
+            &[
+                test_source("ONE", "owner/repo", "open", "alice", &[], "needle"),
+                test_source("TWO", "owner/repo", "open", "alice", &[], "needle needle"),
+            ],
+        )
+        .unwrap();
+
+        let default_hits =
+            search_with_filters(&generation_path, "needle", &SearchFilters::default(), 5).unwrap();
+        let comparison =
+            compare_lexical_profiles(&generation_path, "needle", &SearchFilters::default(), 5)
+                .unwrap();
+
+        assert_eq!(LexicalRankingProfile::default(), LexicalRankingProfile::V1);
+        assert_eq!(
+            source_ids(&default_hits),
+            source_ids(&comparison.v1),
+            "the production search interface must stay pinned to V1"
+        );
+        assert_eq!(comparison.v1.len(), comparison.metadata_boost_v1.len());
+        let _ = fs::remove_dir_all(index_root);
+    }
+
+    #[test]
+    fn metadata_boost_profile_improves_comment_parent_context_but_has_a_body_heavy_limit() {
+        let index_root = temp_index_root("lexical-profile-comment-only");
+        let cases = [
+            ("ROLLBACK", "rollback recovery", "rollback recovery"),
+            ("CACHE", "cache replay", "cache replay"),
+            ("RACE", "publish race", "publish race"),
+            (
+                "REPEATED",
+                "generation recovery",
+                "generation recovery generation recovery",
+            ),
+        ];
+        let total = cases.len();
+        let sources = cases
+            .iter()
+            .flat_map(|(suffix, query, issue_body)| {
+                [
+                    profile_source(&format!("ISSUE_{suffix}"), "issue", issue_body, ""),
+                    profile_source(
+                        &format!("COMMENT_{suffix}"),
+                        "issue_comment",
+                        "The authoritative answer exists only in this comment.",
+                        query,
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let generation_path = rebuild(&index_root, 1, &sources).unwrap();
+        let mut v1_top1 = 0;
+        let mut metadata_top1 = 0;
+        for (suffix, query, _) in cases {
+            let gold_suffix = format!("COMMENT_{suffix}");
+            let comparison =
+                compare_lexical_profiles(&generation_path, query, &SearchFilters::default(), 6)
+                    .unwrap();
+            eprintln!(
+                "lexical_profile_case query={query:?} v1={:?} metadata={:?}",
+                ranked_sources(&comparison.v1),
+                ranked_sources(&comparison.metadata_boost_v1)
+            );
+            v1_top1 += usize::from(top_source_has_suffix(&comparison.v1, &gold_suffix));
+            metadata_top1 += usize::from(top_source_has_suffix(
+                &comparison.metadata_boost_v1,
+                &gold_suffix,
+            ));
+        }
+
+        eprintln!(
+            "lexical_profile_eval comment_only_top1 v1={v1_top1}/{total} metadata_boost_v1={metadata_top1}/{total}"
+        );
+        assert!(metadata_top1 > v1_top1);
+        assert_eq!(metadata_top1, total - 1);
+        let _ = fs::remove_dir_all(index_root);
+    }
+
+    #[test]
     fn label_filter_on_pre_label_exact_index_fails_with_actionable_resync_hint() {
         // Simulates an on-disk index built before label_exact existed
         // (pre-#55 schema): label filtering must not panic or surface a raw
@@ -658,6 +794,47 @@ mod tests {
             title: format!("Prefilter {node_id}"),
             body: body.to_string(),
             parent_issue_title: String::new(),
+            github_updated_at: "2026-01-01T00:00:00Z".to_string(),
+            indexed_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn source_ids(hits: &[SearchHit]) -> Vec<&str> {
+        hits.iter().map(|hit| hit.source_id.as_str()).collect()
+    }
+
+    fn top_source_has_suffix(hits: &[SearchHit], suffix: &str) -> bool {
+        hits.first()
+            .is_some_and(|hit| hit.source_id.ends_with(suffix))
+    }
+
+    fn ranked_sources(hits: &[SearchHit]) -> Vec<(&str, f32)> {
+        hits.iter()
+            .map(|hit| (hit.source_id.as_str(), hit.score))
+            .collect()
+    }
+
+    fn profile_source(
+        node_id: &str,
+        entity_type: &str,
+        body: &str,
+        parent_issue_title: &str,
+    ) -> IndexSource {
+        let source_kind = match entity_type {
+            "issue_comment" => "issue-comment",
+            other => other,
+        };
+        IndexSource {
+            source_id: format!("qgh://github.com/{source_kind}/{node_id}"),
+            entity_type: entity_type.to_string(),
+            repo: "owner/repo".to_string(),
+            issue_number: 47,
+            state: "open".to_string(),
+            labels: Vec::new(),
+            author: Some("alice".to_string()),
+            title: String::new(),
+            body: body.to_string(),
+            parent_issue_title: parent_issue_title.to_string(),
             github_updated_at: "2026-01-01T00:00:00Z".to_string(),
             indexed_at: "2026-01-01T00:00:00Z".to_string(),
         }

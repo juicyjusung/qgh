@@ -864,6 +864,313 @@ fn scoped_reconcile_does_not_probe_other_repos_without_all() {
             .all(|request| !request.contains("/repos/other/repo/")),
         "scoped reconciliation must not touch unrelated repos: {requests:?}"
     );
+    let other_get = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        [
+            "get",
+            "qgh://github.com/issue/I_POLICY_OTHER",
+            "--profile-id",
+            "work",
+            "--json",
+        ],
+    );
+    assert_success(&other_get);
+    assert_eq!(
+        stdout_json(&other_get)["data"]["source"]["repo"],
+        "other/repo"
+    );
+}
+
+#[test]
+fn sync_purges_repo_removed_from_profile_allowlist_and_preserves_other_repo() {
+    let fixture = TestFixture::new("explicit-allowlist-removal-purge");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    server.clear_requests();
+
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo"]);
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+
+    let removed_id = "qgh://github.com/issue/I_POLICY_OTHER";
+    let removed_get = fixture.qgh(["get", removed_id, "--json"]);
+    assert_eq!(removed_get.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&removed_get)["error"]["details"]["reason"],
+        "allowlist_removal"
+    );
+
+    let retained = fixture.qgh(["query", "shared repo policy tracer", "--json"]);
+    assert_success(&retained);
+    let retained_json = stdout_json(&retained);
+    let results = retained_json["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["repo"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results, ["owner/repo"]);
+    assert!(server
+        .requests()
+        .iter()
+        .all(|request| !request.contains("/repos/other/repo/")));
+}
+
+#[test]
+fn casing_only_profile_allowlist_change_preserves_github_repository() {
+    let fixture = TestFixture::new("allowlist-repo-casing-preserved");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    fixture.write_config_with_repos(&server.base_url, &["OWNER/REPO"]);
+    server.clear_requests();
+    let sync = fixture.qgh(["sync", "--if-stale", "--json"]);
+    assert_success(&sync);
+    assert_eq!(stdout_json(&sync)["data"]["sync_state"], "skipped_fresh");
+    assert!(server.requests().is_empty());
+
+    let retained = fixture.qgh(["get", "qgh://github.com/issue/I_POLICY_OWNER", "--json"]);
+    assert_success(&retained);
+    assert_eq!(
+        stdout_json(&retained)["data"]["source"]["repo"],
+        "owner/repo"
+    );
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["sources"]["tombstone_count"], 0);
+}
+
+#[test]
+fn purge_successor_snapshot_does_not_advance_remote_sync_freshness() {
+    let fixture = TestFixture::new("purge-successor-keeps-remote-freshness");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let before = stdout_json(&fixture.qgh(["status", "--json"]));
+    let remote_last_sync = before["data"]["sync"]["last_sync_at"].clone();
+    assert!(remote_last_sync.as_str().is_some());
+
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo"]);
+    server.clear_requests();
+    let purge = fixture.qgh(["sync", "--if-stale", "--json"]);
+    assert_success(&purge);
+    assert_eq!(stdout_json(&purge)["data"]["sync_state"], "skipped_fresh");
+    assert!(
+        server.requests().is_empty(),
+        "purge successor repair must not force or impersonate a remote sync"
+    );
+
+    let after = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(after["data"]["sync"]["last_sync_at"], remote_last_sync);
+    assert_eq!(after["data"]["purge"]["successor_repair_required"], false);
+    let removed = fixture.qgh(["get", "qgh://github.com/issue/I_POLICY_OTHER", "--json"]);
+    assert_eq!(removed.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&removed)["error"]["details"]["reason"],
+        "allowlist_removal"
+    );
+}
+
+#[test]
+fn purge_successor_remains_queryable_when_configured_embedding_refresh_fails() {
+    let fixture = TestFixture::new("purge-successor-embedding-fallback");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    fixture.write_config_with_repos_and_embedding(
+        &server.base_url,
+        &["owner/repo"],
+        r#"
+[embedding]
+provider = "local"
+model_path = "/definitely/not/a/model"
+file = "onnx/model.onnx"
+pooling = "cls"
+query_prefix = "query: "
+quantization = "none"
+"#,
+    );
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+    let sync_json = stdout_json(&sync);
+    assert!(warning_codes(&sync_json)
+        .iter()
+        .any(|code| code.starts_with("embedding.sync_") && code.ends_with("_failed")));
+    let reported_generation = sync_json["data"]["index"]["active_generation"]
+        .as_i64()
+        .unwrap();
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(
+        status["data"]["index"]["active_generation"],
+        reported_generation
+    );
+    assert_eq!(
+        fixture.active_retrieval_publication_generation(),
+        reported_generation
+    );
+
+    let query = fixture.qgh(["query", "shared repo policy tracer", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    let results = query_json["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["repo"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results, ["owner/repo"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_successor_publication_stays_blocked_until_preflight_repair_succeeds() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("purge-successor-repair-retry");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.clear_retrieval_publication();
+    fixture.mark_successor_repair_required();
+
+    let index_root = fixture.data_home.join("qgh/profiles/work/tantivy");
+    let saved_index_root = fixture
+        .data_home
+        .join("qgh/profiles/work/tantivy-before-repair");
+    fs::rename(&index_root, &saved_index_root).unwrap();
+    let invalid_index_root = fixture.root.join("invalid-repair-index-root");
+    fs::create_dir_all(&invalid_index_root).unwrap();
+    symlink(&invalid_index_root, &index_root).unwrap();
+    server.clear_requests();
+    let failed = fixture.qgh(["sync", "--json"]);
+
+    fs::remove_file(&index_root).unwrap();
+    fs::rename(&saved_index_root, &index_root).unwrap();
+
+    assert_eq!(failed.status.code(), Some(6));
+    assert!(server.requests().is_empty(), "repair must precede network");
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["pending_count"], 0);
+    assert_eq!(status["data"]["purge"]["successor_repair_required"], true);
+    assert_eq!(status["data"]["purge"]["retrieval_blocked"], true);
+    let doctor = stdout_json(&fixture.qgh(["doctor", "--json"]));
+    let purge_check = doctor["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "purge")
+        .unwrap();
+    assert_eq!(purge_check["ok"], false);
+
+    let query = fixture.qgh(["query", "shared repo policy tracer", "--json"]);
+    assert_eq!(query.status.code(), Some(6));
+    assert_eq!(
+        stdout_json(&query)["error"]["code"],
+        "purge.successor_repair_required"
+    );
+
+    fixture.write_config_with_repos("http://127.0.0.1:1", &["owner/repo"]);
+    let repaired_before_network_failure = fixture.qgh(["sync", "--json"]);
+    assert_eq!(repaired_before_network_failure.status.code(), Some(3));
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["successor_repair_required"], false);
+    assert_eq!(status["data"]["purge"]["retrieval_blocked"], false);
+    assert_success(&fixture.qgh(["query", "shared repo policy tracer", "--json"]));
+}
+
+#[test]
+fn never_synced_empty_store_does_not_require_synthetic_successor_snapshot() {
+    let fixture = TestFixture::new("purge-successor-empty-never-synced");
+    fixture.write_config_with_repos("http://127.0.0.1:1", &["owner/repo"]);
+
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["successor_repair_required"], false);
+    assert_eq!(status["data"]["purge"]["retrieval_blocked"], false);
+    let query = fixture.qgh(["query", "nothing indexed yet", "--json"]);
+    assert_success(&query);
+    assert!(stdout_json(&query)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_purge_is_retried_by_next_sync_without_touching_user_backup() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("pending-purge-report-and-retry");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let profile_dir = fixture.data_home.join("qgh/profiles/work");
+    let index_root = profile_dir.join("tantivy");
+    let saved_index_root = profile_dir.join("tantivy-before-purge");
+    fs::rename(&index_root, &saved_index_root).unwrap();
+    let user_backup = fixture.root.join("user-created-index-backup");
+    fs::create_dir_all(user_backup.join("generation-999")).unwrap();
+    let backup_marker = user_backup.join("generation-999/private-backup-marker");
+    fs::write(&backup_marker, "user-managed").unwrap();
+    symlink(&user_backup, &index_root).unwrap();
+
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo"]);
+    server.clear_requests();
+    let failed = fixture.qgh(["sync", "--json"]);
+    assert_eq!(failed.status.code(), Some(6));
+    assert_eq!(stdout_json(&failed)["error"]["code"], "purge.retry_failed");
+    assert!(
+        server.requests().is_empty(),
+        "purge preflight precedes network"
+    );
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["purge"]["pending_count"], 1);
+    assert_eq!(
+        status_json["data"]["purge"]["successor_repair_required"],
+        true
+    );
+    assert_eq!(status_json["data"]["purge"]["retrieval_blocked"], true);
+    assert_eq!(
+        status_json["data"]["purge"]["current_stages"],
+        json!(["tantivy"])
+    );
+
+    let doctor = fixture.qgh(["doctor", "--json"]);
+    assert_success(&doctor);
+    let doctor_json = stdout_json(&doctor);
+    assert_eq!(doctor_json["data"]["purge"]["pending_count"], 1);
+    assert_eq!(
+        doctor_json["data"]["purge"]["unmanaged_filesystem_backups"],
+        "not_deleted_by_qgh"
+    );
+    let purge_check = doctor_json["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "purge")
+        .unwrap();
+    assert_eq!(purge_check["ok"], false);
+
+    assert!(backup_marker.exists());
+
+    fs::remove_file(&index_root).unwrap();
+    fs::rename(&saved_index_root, &index_root).unwrap();
+    let retry = fixture.qgh(["sync", "--json"]);
+    assert_success(&retry);
+    assert!(backup_marker.exists());
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    assert_eq!(stdout_json(&status)["data"]["purge"]["pending_count"], 0);
+    assert_eq!(
+        stdout_json(&status)["data"]["purge"]["successor_repair_required"],
+        false
+    );
+    assert_success(&fixture.qgh(["query", "shared repo policy tracer", "--json"]));
 }
 
 #[test]
@@ -2020,15 +2327,16 @@ fn get_tombstones_unavailable_issue_and_filters_active_query() {
     let query_json = stdout_json(&query);
     assert_eq!(query_json["data"]["results"].as_array().unwrap().len(), 0);
     assert_eq!(
-        query_json["data"]["result_filtering"]["unresolvable_hits"],
-        1
+        query_json["data"]["result_filtering"]["unresolvable_hits"], 0,
+        "purge publishes a lexical successor without the removed source"
     );
 
     let status = fixture.qgh(["status", "--json"]);
     assert_success(&status);
     assert_eq!(
         stdout_json(&status)["data"]["sources"]["tombstone_count"],
-        1
+        2,
+        "confirmed issue deletion cascades to its comments"
     );
 }
 
@@ -2222,6 +2530,7 @@ fn status_shape_is_unchanged_without_embedding_config() {
             "paths".to_string(),
             "privacy".to_string(),
             "profile_id".to_string(),
+            "purge".to_string(),
             "reconciliation".to_string(),
             "resolution".to_string(),
             "sources".to_string(),
@@ -3407,6 +3716,89 @@ fn repo_listing_comments_upsert_issue_comments_and_skip_pull_request_comments() 
 }
 
 #[test]
+fn repo_listing_permission_evidence_is_pending_before_comment_upsert_failure() {
+    let fixture = TestFixture::new("repo-listing-permission-before-upsert");
+    let server = RepoCommentListingFakeGitHub::start();
+    fixture.write_config_repo_listing_comments(&server.base_url);
+    assert_success(&fixture.qgh(["status", "--json"]));
+    fixture.install_repo_comment_upsert_failure_trigger();
+    server.set_mode(REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE);
+
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_eq!(sync.status.code(), Some(6));
+    assert_eq!(stdout_json(&sync)["error"]["code"], "storage.failure");
+    let output = format!("{}{}", stdout_text(&sync), stderr_text(&sync));
+    assert!(!output.contains("repo listing pending evidence tracer"));
+    assert!(!output.contains("fixture-token"));
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["purge"]["pending_count"], 1);
+    assert_eq!(
+        status_json["data"]["purge"]["triggers"],
+        json!(["permission_loss"])
+    );
+    assert_eq!(status_json["data"]["purge"]["retrieval_blocked"], true);
+}
+
+#[test]
+fn repo_listing_permission_purge_recaptures_rows_processed_after_queue() {
+    let fixture = TestFixture::new("repo-listing-permission-recaptures-row");
+    let server = RepoCommentListingFakeGitHub::start();
+    fixture.write_config_repo_listing_comments(&server.base_url);
+    server.set_mode(REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE);
+
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+    let sync_json = stdout_json(&sync);
+    assert_eq!(sync_json["data"]["comments"]["upserted"], 1);
+
+    for source_id in [
+        "qgh://github.com/issue/I_REPO_LISTING_1",
+        "qgh://github.com/issue-comment/IC_REPO_LISTING_PENDING",
+    ] {
+        let get = fixture.qgh(["get", source_id, "--json"]);
+        assert_eq!(get.status.code(), Some(4));
+        assert_eq!(
+            stdout_json(&get)["error"]["details"]["reason"],
+            "permission_loss"
+        );
+    }
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["pending_count"], 0);
+    assert_eq!(status["data"]["purge"]["retrieval_blocked"], false);
+}
+
+#[test]
+fn repo_listing_permission_purge_canonicalizes_mixed_case_comment_repo() {
+    let fixture = TestFixture::new("repo-listing-permission-mixed-case");
+    let server = RepoCommentListingFakeGitHub::start();
+    fixture.write_config_repo_listing_comments(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.set_issue_metadata_repo_casing("qgh://github.com/issue/I_REPO_LISTING_1", "OWNER/REPO");
+
+    fixture.write_config_repo_listing_comments_with_repo(&server.base_url, "OWNER/REPO");
+    server.set_mode(REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE);
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+
+    let mixed_case_comment = fixture.qgh([
+        "get",
+        "qgh://github.com/issue-comment/IC_REPO_LISTING_PENDING",
+        "--json",
+    ]);
+    assert_eq!(mixed_case_comment.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&mixed_case_comment)["error"]["details"]["reason"],
+        "permission_loss"
+    );
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["pending_count"], 0);
+    assert_eq!(status["data"]["purge"]["retrieval_blocked"], false);
+}
+
+#[test]
 fn backfill_walks_history_and_completes_coverage() {
     let fixture = TestFixture::new("historical-backfill");
     let server = FakeGitHub::start(issue_payload_with_pr());
@@ -3721,6 +4113,7 @@ fn sync_resumes_from_last_committed_issue_page_after_mid_pagination_backoff() {
     assert_success(&limited_sync);
     let limited_json = stdout_json(&limited_sync);
     assert_eq!(limited_json["data"]["sync_state"], "backoff");
+    assert!(warning_codes(&limited_json).contains(&"publication.incomplete_snapshot_deferred"));
     assert_eq!(
         limited_json["data"]["backoff"]["reason"],
         "secondary_rate_limit"
@@ -3808,6 +4201,39 @@ fn sync_resumes_from_last_committed_issue_page_after_mid_pagination_backoff() {
         stdout_json(&query)["data"]["results"][0]["source_id"],
         resumed_id
     );
+}
+
+#[test]
+fn first_backfill_backoff_does_not_publish_or_fabricate_embedding_snapshot() {
+    let fixture = TestFixture::new("backfill-backoff-embedding-provenance");
+    let server = PaginatedBackoffFakeGitHub::start();
+    fixture.write_config_with_repos_and_embedding(
+        &server.base_url,
+        &["owner/repo"],
+        r#"
+[embedding]
+provider = "local"
+model_path = "/definitely/not/a/model"
+file = "onnx/model.onnx"
+pooling = "cls"
+query_prefix = "query: "
+quantization = "none"
+"#,
+    );
+
+    let backfill = fixture.qgh(["sync", "--backfill", "--json"]);
+    assert_success(&backfill);
+    let backfill_json = stdout_json(&backfill);
+    assert_eq!(backfill_json["data"]["sync_state"], "backoff");
+    assert!(warning_codes(&backfill_json).contains(&"publication.incomplete_snapshot_deferred"));
+    assert!(!warning_codes(&backfill_json)
+        .iter()
+        .any(|code| code.starts_with("embedding.sync_")));
+    assert_eq!(
+        fixture.embedding_sync_run_reference_count("embedding-sync"),
+        0
+    );
+    assert_eq!(fixture.active_retrieval_publication_count(), 0);
 }
 
 #[test]
@@ -5428,6 +5854,55 @@ fn incremental_sync_records_new_versions_and_uses_since_overlap_and_etag() {
 }
 
 #[test]
+fn completed_sync_publishes_new_lexical_snapshot_when_embedding_refresh_fails() {
+    let fixture = TestFixture::new("completed-sync-lexical-embedding-fallback");
+    let server = EditingFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    server.set_mode(TARGET_REFRESH_DIFF);
+    fixture.write_config_with_repos_and_embedding(
+        &server.base_url,
+        &["owner/repo"],
+        r#"
+[embedding]
+provider = "local"
+model_path = "/definitely/not/a/model"
+file = "onnx/model.onnx"
+pooling = "cls"
+query_prefix = "query: "
+quantization = "none"
+"#,
+    );
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+    let sync_json = stdout_json(&sync);
+    assert!(warning_codes(&sync_json)
+        .iter()
+        .any(|code| code.starts_with("embedding.sync_") && code.ends_with("_failed")));
+    let reported_generation = sync_json["data"]["index"]["active_generation"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        fixture.active_retrieval_publication_generation(),
+        reported_generation
+    );
+
+    let updated = fixture.qgh(["query", "updated issue body", "--json"]);
+    assert_success(&updated);
+    assert_eq!(
+        stdout_json(&updated)["data"]["results"][0]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+    let stale = fixture.qgh(["query", "round-trip through get before citation", "--json"]);
+    assert_success(&stale);
+    assert!(stdout_json(&stale)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn sync_issue_requires_single_target_repo_scope() {
     let fixture = TestFixture::new("targeted-refresh-repo-required");
     fixture.write_config_with_repos("http://127.0.0.1:1", &["owner/repo", "other/repo"]);
@@ -5522,6 +5997,63 @@ fn sync_issue_refreshes_target_issue_and_reconciles_comment_diff() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn sync_issue_marks_every_confirmed_missing_comment_pending_before_batch_failure() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("targeted-refresh-purge-batch-failure");
+    let server = TargetedRefreshFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let profile_dir = fixture.data_home.join("qgh/profiles/work");
+    let index_root = profile_dir.join("tantivy");
+    let saved_index_root = profile_dir.join("tantivy-before-batch-failure");
+    fs::rename(&index_root, &saved_index_root).unwrap();
+    let user_backup = fixture.root.join("user-created-batch-failure-backup");
+    fs::create_dir_all(user_backup.join("generation-999")).unwrap();
+    symlink(&user_backup, &index_root).unwrap();
+
+    server.set_mode(TARGET_REFRESH_EMPTY_COMMENTS);
+    let failed = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_eq!(failed.status.code(), Some(6));
+    let failed_stdout = stdout_text(&failed);
+    assert!(failed_stdout.contains("purge.retry_failed"));
+    for private_marker in [
+        "IC_TARGET_1",
+        "IC_TARGET_3",
+        "targeted refresh original comment",
+        "deleteonlysentinel",
+    ] {
+        assert!(
+            !failed_stdout.contains(private_marker),
+            "purge error exposed private marker `{private_marker}`"
+        );
+    }
+
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["pending_count"], 2);
+    assert_eq!(status["data"]["purge"]["target_kinds"], json!(["source"]));
+    for source_id in [
+        "qgh://github.com/issue-comment/IC_TARGET_1",
+        "qgh://github.com/issue-comment/IC_TARGET_3",
+    ] {
+        let get = fixture.qgh(["get", source_id, "--json"]);
+        assert_eq!(get.status.code(), Some(6));
+        assert_eq!(stdout_json(&get)["error"]["code"], "purge.read_fenced");
+    }
+
+    fs::remove_file(&index_root).unwrap();
+    fs::rename(&saved_index_root, &index_root).unwrap();
+    let retry = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_success(&retry);
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["pending_count"], 0);
+    fixture.assert_tombstone_reason("qgh://github.com/issue-comment/IC_TARGET_1", "deleted");
+    fixture.assert_tombstone_reason("qgh://github.com/issue-comment/IC_TARGET_3", "deleted");
+}
+
 #[test]
 fn sync_issue_human_output_reports_comment_diff_on_stdout_and_stderr() {
     let fixture = TestFixture::new("targeted-refresh-human-output");
@@ -5589,12 +6121,57 @@ fn sync_issue_marks_permission_loss_with_distinct_reason() {
     );
     assert_eq!(refresh_json["data"]["lifecycle"]["http_status"], 403);
     assert_eq!(refresh_json["data"]["issues"]["tombstoned"], 1);
+    fixture.assert_successful_sync_run(
+        refresh_json["data"]["sync_run_id"]
+            .as_str()
+            .expect("permission-loss sync_run_id"),
+        "purge_successor",
+    );
 
     let issue_get = fixture.qgh(["get", "qgh://github.com/issue/I_kwDOISSUE1", "--json"]);
     assert_eq!(issue_get.status.code(), Some(4));
     assert_eq!(
         stdout_json(&issue_get)["error"]["details"]["reason"],
         "permission_loss"
+    );
+}
+
+#[test]
+fn sync_issue_permission_loss_purges_entire_repo_and_preserves_unrelated_repo() {
+    let fixture = TestFixture::new("targeted-refresh-repo-permission");
+    let server = MultiRepoFakeGitHub::start();
+    server.set_mode(MULTI_REPO_OWNER_TWO_ISSUES);
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    server.set_mode(MULTI_REPO_OWNER_PERMISSION_LOSS);
+    let refresh = fixture.qgh(["sync", "issue", "42", "--repo", "owner/repo", "--json"]);
+    assert_success(&refresh);
+    let refresh_json = stdout_json(&refresh);
+    assert_eq!(
+        refresh_json["data"]["lifecycle"]["reason"],
+        "permission_loss"
+    );
+    assert_eq!(refresh_json["data"]["issues"]["tombstoned"], 2);
+    assert_eq!(refresh_json["data"]["comments"]["tombstoned"], 0);
+
+    for source_id in [
+        "qgh://github.com/issue/I_POLICY_OWNER",
+        "qgh://github.com/issue/I_POLICY_OWNER_SECOND",
+    ] {
+        let removed = fixture.qgh(["get", source_id, "--json"]);
+        assert_eq!(removed.status.code(), Some(4));
+        assert_eq!(
+            stdout_json(&removed)["error"]["details"]["reason"],
+            "permission_loss"
+        );
+    }
+
+    let unrelated = fixture.qgh(["get", "qgh://github.com/issue/I_POLICY_OTHER", "--json"]);
+    assert_success(&unrelated);
+    assert_eq!(
+        stdout_json(&unrelated)["data"]["source"]["repo"],
+        "other/repo"
     );
 }
 
@@ -5682,6 +6259,33 @@ fn sync_issue_follows_transfer_alias_and_tombstones_old_issue() {
         .unwrap()
         .iter()
         .any(|result| result["source_id"] == "qgh://github.com/issue/I_TARGET_TRANSFER"));
+}
+
+#[test]
+fn sync_issue_queues_confirmed_transition_before_comment_state_read_failure() {
+    let fixture = TestFixture::new("targeted-refresh-transition-before-read");
+    let server = TargetedRefreshFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+    server.set_mode(TARGET_REFRESH_INITIAL_WITH_TRANSFER_TARGET);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.corrupt_source_version_body_hash("qgh://github.com/issue-comment/IC_TARGET_TRANSFER");
+
+    server.set_mode(TARGET_REFRESH_TRANSFER);
+    let refresh = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_eq!(refresh.status.code(), Some(6));
+    assert_eq!(stdout_json(&refresh)["error"]["code"], "storage.failure");
+    let output = format!("{}{}", stdout_text(&refresh), stderr_text(&refresh));
+    assert!(!output.contains("transferredtargetsentinel"));
+    assert!(!output.contains("fixture-token"));
+
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["pending_count"], 1);
+    assert_eq!(status["data"]["purge"]["target_kinds"], json!(["issue"]));
+    assert_eq!(status["data"]["purge"]["retrieval_blocked"], true);
+
+    let query = fixture.qgh(["query", "local read must remain fenced", "--json"]);
+    assert_eq!(query.status.code(), Some(6));
+    assert_eq!(stdout_json(&query)["error"]["code"], "purge.read_fenced");
 }
 
 #[test]
@@ -5940,6 +6544,15 @@ env = "QGH_TEST_TOKEN"
     }
 
     fn write_config_with_repos(&self, api_base_url: &str, repos: &[&str]) {
+        self.write_config_with_repos_and_embedding(api_base_url, repos, "");
+    }
+
+    fn write_config_with_repos_and_embedding(
+        &self,
+        api_base_url: &str,
+        repos: &[&str],
+        embedding: &str,
+    ) {
         let repos = repos
             .iter()
             .map(|repo| format!(r#""{repo}""#))
@@ -5958,6 +6571,8 @@ repos = [{repos}]
 [profiles.work.token_source]
 type = "env"
 env = "QGH_TEST_TOKEN"
+
+{embedding}
 "#
         );
         fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
@@ -6099,6 +6714,10 @@ query_prefix = "query: "
     }
 
     fn write_config_repo_listing_comments(&self, api_base_url: &str) {
+        self.write_config_repo_listing_comments_with_repo(api_base_url, "owner/repo");
+    }
+
+    fn write_config_repo_listing_comments_with_repo(&self, api_base_url: &str, repo: &str) {
         let config = format!(
             r#"
 schema_version = "qgh.config.v1"
@@ -6107,7 +6726,7 @@ schema_version = "qgh.config.v1"
 host = "github.com"
 api_base_url = "{api_base_url}"
 web_base_url = "https://github.com"
-repos = ["owner/repo"]
+repos = ["{repo}"]
 comments_mode = "repo_listing"
 
 [profiles.work.token_source]
@@ -6934,6 +7553,137 @@ limit = 10
         assert_eq!(count, 0);
     }
 
+    fn install_repo_comment_upsert_failure_trigger(&self) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_repo_comment_upsert
+             BEFORE UPDATE ON sync_runs
+             WHEN NEW.fetched_comment_count > OLD.fetched_comment_count
+             BEGIN
+                 SELECT RAISE(ABORT, 'fixture repo-comment upsert failure');
+             END;",
+        )
+        .unwrap();
+    }
+
+    fn corrupt_source_version_body_hash(&self, source_id: &str) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE source_versions SET body_hash = X'80' WHERE source_id = ?1",
+            [source_id],
+        )
+        .unwrap();
+    }
+
+    fn set_issue_metadata_repo_casing(&self, source_id: &str, repo: &str) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE issue_metadata SET repo = ?2 WHERE source_id = ?1",
+            (source_id, repo),
+        )
+        .unwrap();
+    }
+
+    fn clear_retrieval_publication(&self) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute("DELETE FROM retrieval_publication_pointer", [])
+            .unwrap();
+        conn.execute("UPDATE retrieval_publications SET active = 0", [])
+            .unwrap();
+        conn.execute("UPDATE index_generations SET active = 0", [])
+            .unwrap();
+    }
+
+    fn mark_successor_repair_required(&self) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let epoch: String = conn
+            .query_row(
+                "SELECT value FROM profile_meta WHERE key = 'content_write_epoch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for (key, value) in [
+            ("successor_repair_required", "1"),
+            ("successor_repair_requested_epoch", epoch.as_str()),
+            ("successor_repair_reason", "purge"),
+        ] {
+            conn.execute(
+                "INSERT INTO profile_meta(key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            .unwrap();
+        }
+    }
+
+    fn assert_successful_sync_run(&self, sync_run_id: &str, expected_snapshot_kind: &str) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let (completed, snapshot_kind): (i64, String) = conn
+            .query_row(
+                "SELECT completed_successfully, snapshot_kind FROM sync_runs WHERE id = ?1",
+                [sync_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(completed, 1);
+        assert_eq!(snapshot_kind, expected_snapshot_kind);
+    }
+
+    fn active_retrieval_publication_generation(&self) -> i64 {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT rp.tantivy_generation
+             FROM retrieval_publication_pointer p
+             JOIN retrieval_publications rp ON rp.publication_id = p.publication_id
+             WHERE p.id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn active_retrieval_publication_count(&self) -> i64 {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT count(*) FROM retrieval_publication_pointer",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn embedding_sync_run_reference_count(&self, sync_run_id: &str) -> i64 {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'embedding_generations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if table_exists == 0 {
+            return 0;
+        }
+        conn.query_row(
+            "SELECT count(*) FROM embedding_generations
+             WHERE source_sync_run_id = ?1 OR source_snapshot_hash = ?1",
+            [sync_run_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     fn set_last_sync_age_seconds(&self, age_seconds: i64) {
         let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
         let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -7129,6 +7879,7 @@ impl Drop for FakeGitHub {
 
 struct MultiRepoFakeGitHub {
     base_url: String,
+    mode: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -7139,8 +7890,10 @@ impl MultiRepoFakeGitHub {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{}", addr);
+        let mode = Arc::new(AtomicUsize::new(MULTI_REPO_ACTIVE));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let thread_mode = Arc::clone(&mode);
         let thread_requests = Arc::clone(&requests);
         let thread_stop = Arc::clone(&stop);
 
@@ -7150,7 +7903,9 @@ impl MultiRepoFakeGitHub {
                     break;
                 }
                 match stream {
-                    Ok(stream) => handle_multi_repo_connection(stream, &thread_requests),
+                    Ok(stream) => {
+                        handle_multi_repo_connection(stream, &thread_mode, &thread_requests)
+                    }
                     Err(_) => break,
                 }
             }
@@ -7158,6 +7913,7 @@ impl MultiRepoFakeGitHub {
 
         Self {
             base_url,
+            mode,
             requests,
             stop,
             handle: Some(handle),
@@ -7171,6 +7927,10 @@ impl MultiRepoFakeGitHub {
     fn clear_requests(&self) {
         self.requests.lock().unwrap().clear();
     }
+
+    fn set_mode(&self, mode: usize) {
+        self.mode.store(mode, Ordering::SeqCst);
+    }
 }
 
 impl Drop for MultiRepoFakeGitHub {
@@ -7183,21 +7943,48 @@ impl Drop for MultiRepoFakeGitHub {
     }
 }
 
-fn handle_multi_repo_connection(mut stream: TcpStream, requests: &Arc<Mutex<Vec<String>>>) {
+const MULTI_REPO_ACTIVE: usize = 1;
+const MULTI_REPO_OWNER_TWO_ISSUES: usize = 2;
+const MULTI_REPO_OWNER_PERMISSION_LOSS: usize = 3;
+
+fn handle_multi_repo_connection(
+    mut stream: TcpStream,
+    mode: &Arc<AtomicUsize>,
+    requests: &Arc<Mutex<Vec<String>>>,
+) {
     let mut buffer = [0_u8; 8192];
     let bytes_read = stream.read(&mut buffer).unwrap_or(0);
     let request = String::from_utf8_lossy(&buffer[..bytes_read]);
     let request_line = request.lines().next().unwrap_or("").to_string();
     requests.lock().unwrap().push(request_line.clone());
+    let mode = mode.load(Ordering::SeqCst);
 
     let (status, body) = if request_line.starts_with("GET /repos/owner/repo/issues?")
         && request_line.contains("state=all")
     {
-        ("200 OK", multi_repo_owner_issue_payload())
+        if mode == MULTI_REPO_OWNER_TWO_ISSUES {
+            ("200 OK", multi_repo_owner_two_issue_payload())
+        } else {
+            ("200 OK", multi_repo_owner_issue_payload())
+        }
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?") {
         ("200 OK", "[]")
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42 ") {
-        ("200 OK", multi_repo_owner_issue_object_payload())
+        if mode == MULTI_REPO_OWNER_PERMISSION_LOSS {
+            ("403 Forbidden", r#"{"message":"resource not accessible"}"#)
+        } else {
+            ("200 OK", multi_repo_owner_issue_object_payload())
+        }
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/43/comments?") {
+        ("200 OK", "[]")
+    } else if request_line.starts_with("GET /repos/owner/repo/issues/43 ") {
+        ("200 OK", multi_repo_owner_second_issue_object_payload())
+    } else if request_line.starts_with("GET /repos/owner/repo ") {
+        if mode == MULTI_REPO_OWNER_PERMISSION_LOSS {
+            ("403 Forbidden", r#"{"message":"resource not accessible"}"#)
+        } else {
+            ("200 OK", r#"{"full_name":"owner/repo"}"#)
+        }
     } else if request_line.starts_with("GET /repos/other/repo/issues?")
         && request_line.contains("state=all")
     {
@@ -7206,6 +7993,8 @@ fn handle_multi_repo_connection(mut stream: TcpStream, requests: &Arc<Mutex<Vec<
         ("200 OK", "[]")
     } else if request_line.starts_with("GET /repos/other/repo/issues/7 ") {
         ("200 OK", multi_repo_other_issue_object_payload())
+    } else if request_line.starts_with("GET /repos/other/repo ") {
+        ("200 OK", r#"{"full_name":"other/repo"}"#)
     } else {
         ("404 Not Found", r#"{"message":"not found"}"#)
     };
@@ -7218,6 +8007,7 @@ fn handle_multi_repo_connection(mut stream: TcpStream, requests: &Arc<Mutex<Vec<
 
 struct RepoCommentListingFakeGitHub {
     base_url: String,
+    mode: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -7228,10 +8018,13 @@ impl RepoCommentListingFakeGitHub {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{}", addr);
+        let mode = Arc::new(AtomicUsize::new(REPO_COMMENT_LISTING_ACTIVE));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let thread_mode = Arc::clone(&mode);
         let thread_requests = Arc::clone(&requests);
         let thread_stop = Arc::clone(&stop);
+        let thread_base_url = base_url.clone();
 
         let handle = thread::spawn(move || {
             for stream in listener.incoming() {
@@ -7239,7 +8032,12 @@ impl RepoCommentListingFakeGitHub {
                     break;
                 }
                 match stream {
-                    Ok(stream) => handle_repo_comment_listing_connection(stream, &thread_requests),
+                    Ok(stream) => handle_repo_comment_listing_connection(
+                        stream,
+                        &thread_base_url,
+                        &thread_mode,
+                        &thread_requests,
+                    ),
                     Err(_) => break,
                 }
             }
@@ -7247,6 +8045,7 @@ impl RepoCommentListingFakeGitHub {
 
         Self {
             base_url,
+            mode,
             requests,
             stop,
             handle: Some(handle),
@@ -7255,6 +8054,10 @@ impl RepoCommentListingFakeGitHub {
 
     fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
+    }
+
+    fn set_mode(&self, mode: usize) {
+        self.mode.store(mode, Ordering::SeqCst);
     }
 }
 
@@ -7268,34 +8071,85 @@ impl Drop for RepoCommentListingFakeGitHub {
     }
 }
 
+const REPO_COMMENT_LISTING_ACTIVE: usize = 1;
+const REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE: usize = 2;
+
 fn handle_repo_comment_listing_connection(
     mut stream: TcpStream,
+    base_url: &str,
+    mode: &Arc<AtomicUsize>,
     requests: &Arc<Mutex<Vec<String>>>,
 ) {
     let mut buffer = [0_u8; 8192];
     let bytes_read = stream.read(&mut buffer).unwrap_or(0);
     let request = String::from_utf8_lossy(&buffer[..bytes_read]);
     let request_line = request.lines().next().unwrap_or("").to_string();
+    let request_line_lower = request_line.to_ascii_lowercase();
     requests.lock().unwrap().push(request_line.clone());
+    let mode = mode.load(Ordering::SeqCst);
 
-    let (status, body) = if request_line.starts_with("GET /repos/owner/repo/issues/comments?") {
-        ("200 OK", repo_listing_comments_payload())
-    } else if request_line.starts_with("GET /repos/owner/repo/issues?")
-        && request_line.contains("state=all")
+    let (status, body, extra_headers) = if request_line_lower
+        .starts_with("get /repos/owner/repo/issues/comments?")
     {
-        ("200 OK", repo_listing_issue_payload())
-    } else if request_line.starts_with("GET /repos/owner/repo/issues/2 ") {
-        ("200 OK", repo_listing_pull_request_object_payload())
-    } else if request_line.starts_with("GET /repos/owner/repo/issues/3 ") {
-        ("200 OK", repo_listing_unsynced_issue_object_payload())
-    } else if request_line.contains("/comments?") {
+        if mode == REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE
+            && request_line_lower.contains("page=2")
+        {
+            (
+                "403 Forbidden",
+                r#"{"message":"resource not accessible"}"#,
+                String::new(),
+            )
+        } else if mode == REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE {
+            (
+                "200 OK",
+                repo_listing_permission_page_payload(),
+                format!(
+                    "link: <{base_url}/repos/owner/repo/issues/comments?per_page=100&page=2>; rel=\"next\"\r\n"
+                ),
+            )
+        } else {
+            ("200 OK", repo_listing_comments_payload(), String::new())
+        }
+    } else if request_line_lower.starts_with("get /repos/owner/repo/issues?")
+        && request_line_lower.contains("state=all")
+    {
+        if mode == REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE
+            && request_line.contains("/repos/OWNER/REPO/")
+        {
+            ("304 Not Modified", "", String::new())
+        } else {
+            ("200 OK", repo_listing_issue_payload(), String::new())
+        }
+    } else if request_line_lower.starts_with("get /repos/owner/repo ") {
+        if mode == REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE {
+            (
+                "403 Forbidden",
+                r#"{"message":"resource not accessible"}"#,
+                String::new(),
+            )
+        } else {
+            ("200 OK", r#"{"full_name":"owner/repo"}"#, String::new())
+        }
+    } else if request_line_lower.starts_with("get /repos/owner/repo/issues/2 ") {
+        (
+            "200 OK",
+            repo_listing_pull_request_object_payload(),
+            String::new(),
+        )
+    } else if request_line_lower.starts_with("get /repos/owner/repo/issues/3 ") {
+        (
+            "200 OK",
+            repo_listing_unsynced_issue_object_payload(),
+            String::new(),
+        )
+    } else if request_line_lower.contains("/comments?") {
         // Per-issue comment endpoint must not be used in repo_listing mode.
-        ("200 OK", "[]")
+        ("200 OK", "[]", String::new())
     } else {
-        ("404 Not Found", r#"{"message":"not found"}"#)
+        ("404 Not Found", r#"{"message":"not found"}"#, String::new())
     };
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{extra_headers}x-ratelimit-remaining: 4999\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();
@@ -7355,6 +8209,21 @@ fn repo_listing_comments_payload() -> &'static str {
         "updated_at": "2026-01-03T00:00:00Z",
         "user": {"login": "carol"},
         "issue_url": "https://api.github.com/repos/owner/repo/issues/3"
+      }
+    ]"#
+}
+
+fn repo_listing_permission_page_payload() -> &'static str {
+    r#"[
+      {
+        "id": 9010,
+        "node_id": "IC_REPO_LISTING_PENDING",
+        "body": "repo listing pending evidence tracer.",
+        "html_url": "https://github.com/owner/repo/issues/1#issuecomment-9010",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-03T00:00:00Z",
+        "user": {"login": "alice"},
+        "issue_url": "https://api.github.com/repos/owner/repo/issues/1"
       }
     ]"#
 }
@@ -7425,6 +8294,47 @@ fn multi_repo_owner_issue_payload() -> &'static str {
     ]"#
 }
 
+fn multi_repo_owner_two_issue_payload() -> &'static str {
+    r#"[
+      {
+        "id": 3001,
+        "node_id": "I_POLICY_OWNER",
+        "number": 42,
+        "title": "Owner repo policy issue",
+        "body": "shared repo policy tracer from the owner repository.",
+        "state": "open",
+        "locked": false,
+        "comments": 0,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:05Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}],
+        "milestone": null,
+        "assignees": []
+      },
+      {
+        "id": 3003,
+        "node_id": "I_POLICY_OWNER_SECOND",
+        "number": 43,
+        "title": "Second owner repo policy issue",
+        "body": "second owner repository lifecycle tracer.",
+        "state": "open",
+        "locked": false,
+        "comments": 0,
+        "html_url": "https://github.com/owner/repo/issues/43",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:06Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}],
+        "milestone": null,
+        "assignees": []
+      }
+    ]"#
+}
+
 fn multi_repo_owner_issue_object_payload() -> &'static str {
     r#"{
         "id": 3001,
@@ -7438,6 +8348,27 @@ fn multi_repo_owner_issue_object_payload() -> &'static str {
         "html_url": "https://github.com/owner/repo/issues/42",
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": "2026-01-02T03:04:05Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}],
+        "milestone": null,
+        "assignees": []
+    }"#
+}
+
+fn multi_repo_owner_second_issue_object_payload() -> &'static str {
+    r#"{
+        "id": 3003,
+        "node_id": "I_POLICY_OWNER_SECOND",
+        "number": 43,
+        "title": "Second owner repo policy issue",
+        "body": "second owner repository lifecycle tracer.",
+        "state": "open",
+        "locked": false,
+        "comments": 0,
+        "html_url": "https://github.com/owner/repo/issues/43",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:06Z",
         "closed_at": null,
         "user": {"login": "bob"},
         "labels": [{"name": "bug"}],
@@ -7701,38 +8632,47 @@ fn handle_lifecycle_connection(
     requests.lock().unwrap().push(request_line.clone());
     let mode = mode.load(Ordering::SeqCst);
 
-    let (status, body) = if request_line.starts_with("GET /repos/owner/repo/issues?")
+    let (status, body, location) = if request_line.starts_with("GET /repos/owner/repo/issues?")
         && request_line.contains("state=all")
         && request_line.contains("per_page=100")
     {
-        ("200 OK", issue_payload_with_pr())
+        ("200 OK", issue_payload_with_pr(), None)
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?")
         && request_line.contains("per_page=100")
     {
         if mode == LIFECYCLE_DELETED_COMMENT {
-            ("200 OK", "[]")
+            ("200 OK", "[]", None)
         } else {
-            ("200 OK", issue_comments_payload())
+            ("200 OK", issue_comments_payload(), None)
         }
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42 ") {
         if mode == LIFECYCLE_UNAVAILABLE_ISSUE {
-            ("404 Not Found", r#"{"message":"not found"}"#)
+            ("404 Not Found", r#"{"message":"not found"}"#, None)
         } else if mode == LIFECYCLE_MOVED_ISSUE {
-            ("301 Moved Permanently", r#"{"message":"moved"}"#)
+            (
+                "301 Moved Permanently",
+                r#"{"message":"moved"}"#,
+                Some("/repos/owner/repo/issues/43"),
+            )
         } else {
-            ("200 OK", issue_object_payload())
+            ("200 OK", issue_object_payload(), None)
         }
     } else if request_line.starts_with("GET /repos/owner/repo/issues/comments/5001 ") {
         if mode == LIFECYCLE_DELETED_COMMENT {
-            ("404 Not Found", r#"{"message":"not found"}"#)
+            ("404 Not Found", r#"{"message":"not found"}"#, None)
         } else {
-            ("200 OK", issue_comment_object_payload())
+            ("200 OK", issue_comment_object_payload(), None)
         }
+    } else if request_line.starts_with("GET /repos/owner/repo ") {
+        ("200 OK", r#"{"full_name":"owner/repo"}"#, None)
     } else {
-        ("404 Not Found", r#"{"message":"not found"}"#)
+        ("404 Not Found", r#"{"message":"not found"}"#, None)
     };
+    let location_header = location
+        .map(|location| format!("location: {location}\r\n"))
+        .unwrap_or_default();
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{location_header}x-ratelimit-remaining: 4999\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();
@@ -8431,6 +9371,8 @@ const TARGET_REFRESH_TRANSFER: usize = 5;
 const TARGET_REFRESH_TRANSFER_CYCLE: usize = 6;
 const TARGET_REFRESH_AUTH_FAILED: usize = 7;
 const TARGET_REFRESH_SECONDARY_RATE_LIMIT_NO_RETRY_AFTER: usize = 8;
+const TARGET_REFRESH_EMPTY_COMMENTS: usize = 9;
+const TARGET_REFRESH_INITIAL_WITH_TRANSFER_TARGET: usize = 10;
 
 struct TargetedRefreshFakeGitHub {
     base_url: String,
@@ -8507,12 +9449,22 @@ fn handle_targeted_refresh_connection(
     let (status, body, location) = if request_line.starts_with("GET /repos/owner/repo/issues?")
         && request_line.contains("state=all")
     {
-        ("200 OK", targeted_initial_issue_list_payload(), None)
+        if mode == TARGET_REFRESH_INITIAL_WITH_TRANSFER_TARGET {
+            (
+                "200 OK",
+                targeted_initial_with_transfer_target_payload(),
+                None,
+            )
+        } else {
+            ("200 OK", targeted_initial_issue_list_payload(), None)
+        }
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?")
         && request_line.contains("per_page=100")
     {
         if mode == TARGET_REFRESH_DIFF {
             ("200 OK", targeted_refreshed_comments_payload(), None)
+        } else if mode == TARGET_REFRESH_EMPTY_COMMENTS {
+            ("200 OK", "[]", None)
         } else {
             ("200 OK", targeted_initial_comments_payload(), None)
         }
@@ -8589,6 +9541,16 @@ fn handle_targeted_refresh_connection(
             targeted_transferred_comment_object_payload(),
             None,
         )
+    } else if request_line.starts_with("GET /repos/owner/repo ") {
+        if mode == TARGET_REFRESH_PERMISSION_LOSS {
+            (
+                "403 Forbidden",
+                r#"{"message":"resource not accessible"}"#,
+                None,
+            )
+        } else {
+            ("200 OK", r#"{"full_name":"owner/repo"}"#, None)
+        }
     } else {
         ("404 Not Found", r#"{"message":"not found"}"#, None)
     };
@@ -8621,6 +9583,47 @@ fn targeted_initial_issue_list_payload() -> &'static str {
         "labels": [{"name": "bug"}, {"name": "mvp"}],
         "milestone": {"title": "MVP"},
         "assignees": [{"login": "alice"}]
+      }
+    ]"#
+}
+
+fn targeted_initial_with_transfer_target_payload() -> &'static str {
+    r#"[
+      {
+        "id": 1001,
+        "node_id": "I_kwDOISSUE1",
+        "number": 42,
+        "title": "Cache sync bug",
+        "body": "The BM25 issue body tracer must round-trip through get before citation.",
+        "state": "open",
+        "locked": false,
+        "comments": 2,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:05Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}, {"name": "mvp"}],
+        "milestone": {"title": "MVP"},
+        "assignees": [{"login": "alice"}]
+      },
+      {
+        "id": 1043,
+        "node_id": "I_TARGET_TRANSFER",
+        "number": 43,
+        "title": "Transferred issue target",
+        "body": "transferredtargetsentinel final issue body.",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://github.com/owner/repo/issues/43",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-04T00:00:00Z",
+        "closed_at": null,
+        "user": {"login": "carol"},
+        "labels": [],
+        "milestone": null,
+        "assignees": []
       }
     ]"#
 }

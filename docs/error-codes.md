@@ -9,12 +9,52 @@ Stable error families:
 - `freshness.*`: local snapshot freshness failures.
 - `auth.*`: token source failures.
 - `github.*`: GitHub request failures outside structured backoff state.
+- `sync.*`: sync page-commit and confirmed issue-transfer-chain failures.
+- `embedding.*`: local embedding preparation and source-snapshot failures.
 - `source.*`: missing or tombstoned source lookups.
+- `purge.*`: fail-closed purge, retry, publication, and read/write-fence failures.
+- `publication.*`: retrieval snapshot CAS, provenance, and artifact-readiness failures.
 - `storage.*`: SQLite or local filesystem storage failures.
 - `index.*`: Tantivy index failures.
 - `internal.*`: unexpected internal failures.
 
-Common codes include `config.no_matching_profile`, `config.ambiguous_profile`, `config.invalid_repo_policy`, `validation.cli`, `validation.mcp`, `validation.unsupported_filter`, `validation.batch_size`, `freshness.stale`, `auth.token_unavailable`, `source.not_found`, `source.tombstoned`, and `source.outside_effective_scope`.
+Common codes include `config.no_matching_profile`, `config.ambiguous_profile`,
+`config.invalid_repo_policy`, `validation.cli`, `validation.mcp`,
+`validation.unsupported_filter`, `validation.batch_size`, `freshness.stale`,
+`auth.token_unavailable`, `source.not_found`, `source.tombstoned`,
+`source.outside_effective_scope`, `purge.failed`, `purge.retry_failed`,
+`purge.read_fenced`, and `purge.write_fenced`.
+
+Typed GitHub lifecycle adapters may return `github.invalid_issue_json` or
+`github.invalid_comment_json` when a successful response cannot be decoded.
+`sync.commit_page_failed` and `validation.lifecycle_failed` are content-free
+fallbacks for local page-commit and lifecycle-candidate validation failures.
+Targeted issue refresh may return `sync.transfer_cycle` or
+`sync.transfer_chain_too_long`; confirmed transitions observed before either
+terminal failure are queued for purge before the error is surfaced. The
+`github.confirmed_lifecycle_requires_typed_handling` guard is reserved for
+internal legacy adapters and is not emitted by current CLI command paths.
+
+When a confirmed lifecycle or explicit allowlist-removal purge is incomplete,
+the affected source, issue, or repository remains fail closed. Retrieval may
+return `purge.read_fenced`, mutation may return `purge.write_fenced`, and the
+next otherwise-valid `sync` retries qgh-managed cleanup before any GitHub
+request. A retry that remains incomplete returns `purge.retry_failed` with only
+aggregate target/trigger kinds and coarse stage names; it does not include
+source bodies, queries, tokens, or raw transport errors. `purge.successor_*`
+codes mean qgh could not publish the required clean lexical successor snapshot.
+`purge.successor_repair_required` blocks query fallback from opening an old
+index after purge invalidated the publication pointer; the next valid `sync`
+repairs that pointer before token resolution or a GitHub request.
+Post-purge activation additionally requires the current durable
+`purge_successor` snapshot and a real validated Tantivy artifact; reserved-only,
+missing, stale-epoch, or corrupt generations remain unpublished and leave
+successor repair pending.
+
+`embed --force` returns `embedding.source_snapshot_missing` instead of creating
+a synthetic provenance id when no completed remote or purge-successor source
+snapshot exists. Run a successful `sync` first; the failed embed attempt does
+not publish vectors or a retrieval generation.
 
 `query`/`search` and `status` may return `freshness.stale` when the local
 snapshot violates a fail-mode freshness policy or `--require-fresh` is passed.
