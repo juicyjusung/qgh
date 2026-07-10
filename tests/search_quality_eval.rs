@@ -549,6 +549,10 @@ fn eval_case(
 struct EvalReport {
     class_totals: BTreeMap<QueryClass, usize>,
     class_hits: BTreeMap<QueryClass, usize>,
+    comment_only_total: usize,
+    comment_only_hits: usize,
+    identifier_total: usize,
+    identifier_hits: usize,
     round_trip_total: usize,
     round_trip_hits: usize,
     hard_filter_violations: usize,
@@ -563,6 +567,20 @@ impl EvalReport {
         *self.class_totals.entry(class).or_default() += 1;
         if passed {
             *self.class_hits.entry(class).or_default() += 1;
+        }
+    }
+
+    fn record_comment_only(&mut self, passed: bool) {
+        self.comment_only_total += 1;
+        if passed {
+            self.comment_only_hits += 1;
+        }
+    }
+
+    fn record_identifier(&mut self, passed: bool) {
+        self.identifier_total += 1;
+        if passed {
+            self.identifier_hits += 1;
         }
     }
 
@@ -591,8 +609,10 @@ impl EvalReport {
 
     fn meets_bm25_regression_targets(&self) -> bool {
         self.class_rate(QueryClass::Exact) >= 0.95
+            && self.identifier_rate() >= 0.95
             && self.class_rate(QueryClass::Keyword) >= 0.80
             && self.class_rate(QueryClass::CjkMixed) >= 0.70
+            && self.comment_only_rate() >= 0.80
             && self.class_rate(QueryClass::Negative) >= 0.80
     }
 
@@ -607,10 +627,12 @@ impl EvalReport {
 
     fn summary(&self, name: &str) -> String {
         format!(
-            "{name} search quality eval failed\nexact_top1={:.2}\nkeyword_top5={:.2}\ncjk_top5={:.2}\nsemantic_top5={:.2}\ncross_language_top5={:.2}\nnegative_abstention={:.2}\nhard_filter_violations={}\nget_round_trip={:.2}\nhybrid_ranked_results={}\nhybrid_path_queries={}/{}\nrecalibration_requires_prd_adr_update={}\ntop_failures={:#?}",
+            "{name} search quality eval failed\nexact_top1={:.2}\nidentifier_top1={:.2}\nkeyword_top5={:.2}\ncjk_top5={:.2}\ncomment_only_top5={:.2}\nsemantic_top5={:.2}\ncross_language_top5={:.2}\nnegative_abstention={:.2}\nhard_filter_violations={}\nget_round_trip={:.2}\nhybrid_ranked_results={}\nhybrid_path_queries={}/{}\nrecalibration_requires_prd_adr_update={}\ntop_failures={:#?}",
             self.class_rate(QueryClass::Exact),
+            self.identifier_rate(),
             self.class_rate(QueryClass::Keyword),
             self.class_rate(QueryClass::CjkMixed),
+            self.comment_only_rate(),
             self.class_rate(QueryClass::Semantic),
             self.class_rate(QueryClass::CrossLanguage),
             self.class_rate(QueryClass::Negative),
@@ -632,6 +654,14 @@ impl EvalReport {
             return 0.0;
         }
         *self.class_hits.get(&class).unwrap_or(&0) as f64 / total as f64
+    }
+
+    fn comment_only_rate(&self) -> f64 {
+        rate(self.comment_only_hits, self.comment_only_total)
+    }
+
+    fn identifier_rate(&self) -> f64 {
+        rate(self.identifier_hits, self.identifier_total)
     }
 
     fn round_trip_rate(&self) -> f64 {
@@ -664,6 +694,12 @@ fn run_eval_cases(
 
         let passed = case_passed(case, results);
         report.record_case(case.class, passed);
+        if case.is_comment_only() {
+            report.record_comment_only(passed);
+        }
+        if case.is_identifier() {
+            report.record_identifier(passed);
+        }
         if !passed {
             report.top_failures.push(format!(
                 "{} {} ({:?}) query `{}` returned {:?}, expected {:?}",
@@ -724,6 +760,18 @@ fn run_eval_cases(
 }
 
 impl EvalCase {
+    fn is_comment_only(&self) -> bool {
+        !self.gold_source_ids.is_empty()
+            && self
+                .gold_source_ids
+                .iter()
+                .all(|source_id| source_id.starts_with("qgh://github.com/issue-comment/"))
+    }
+
+    fn is_identifier(&self) -> bool {
+        self.class == QueryClass::Exact && is_exact_locator_query(self.query)
+    }
+
     fn requires_hybrid_path(&self) -> bool {
         match self.class {
             QueryClass::Negative => false,
@@ -743,6 +791,13 @@ fn is_exact_locator_query(query: &str) -> bool {
             .unwrap_or(query)
             .parse::<i64>()
             .is_ok()
+}
+
+fn rate(hits: usize, total: usize) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    hits as f64 / total as f64
 }
 
 fn case_passed(case: &EvalCase, results: &[Value]) -> bool {
@@ -838,14 +893,18 @@ fn ab_summary(
     let section_8_3_triggers =
         section_8_3_triggers(semantic_hybrid_rate, cross_language_hybrid_rate);
     format!(
-        "search_quality_eval_ab_report\nbm25_regression_exact_top1={:.2}\nbm25_regression_keyword_top5={:.2}\nbm25_regression_cjk_top5={:.2}\nbm25_regression_negative_abstention={:.2}\nhybrid_regression_exact_top1={:.2}\nhybrid_regression_keyword_top5={:.2}\nhybrid_regression_cjk_top5={:.2}\nhybrid_regression_negative_abstention={:.2}\nhybrid_regression_path_queries={}/{}\nsemantic_bm25_top5={:.2}\nsemantic_hybrid_top5={:.2}\nsemantic_hybrid_delta={:.2}\nsemantic_hybrid_target={:.2}\nsemantic_hybrid_path_queries={}/{}\ncross_language_bm25_top5={:.2}\ncross_language_hybrid_top5={:.2}\ncross_language_hybrid_delta={:.2}\ncross_language_hybrid_target={:.2}\nhard_filter_violations={}\nget_round_trip={:.2}\nsection_8_3_triggers={:?}",
+        "search_quality_eval_ab_report\nbm25_regression_exact_top1={:.2}\nbm25_regression_identifier_top1={:.2}\nbm25_regression_keyword_top5={:.2}\nbm25_regression_cjk_top5={:.2}\nbm25_regression_comment_only_top5={:.2}\nbm25_regression_negative_abstention={:.2}\nhybrid_regression_exact_top1={:.2}\nhybrid_regression_identifier_top1={:.2}\nhybrid_regression_keyword_top5={:.2}\nhybrid_regression_cjk_top5={:.2}\nhybrid_regression_comment_only_top5={:.2}\nhybrid_regression_negative_abstention={:.2}\nhybrid_regression_path_queries={}/{}\nsemantic_bm25_top5={:.2}\nsemantic_hybrid_top5={:.2}\nsemantic_hybrid_delta={:.2}\nsemantic_hybrid_target={:.2}\nsemantic_hybrid_path_queries={}/{}\ncross_language_bm25_top5={:.2}\ncross_language_hybrid_top5={:.2}\ncross_language_hybrid_delta={:.2}\ncross_language_hybrid_target={:.2}\nhard_filter_violations={}\nget_round_trip={:.2}\nsection_8_3_triggers={:?}",
         bm25_regression.class_rate(QueryClass::Exact),
+        bm25_regression.identifier_rate(),
         bm25_regression.class_rate(QueryClass::Keyword),
         bm25_regression.class_rate(QueryClass::CjkMixed),
+        bm25_regression.comment_only_rate(),
         bm25_regression.class_rate(QueryClass::Negative),
         hybrid_regression.class_rate(QueryClass::Exact),
+        hybrid_regression.identifier_rate(),
         hybrid_regression.class_rate(QueryClass::Keyword),
         hybrid_regression.class_rate(QueryClass::CjkMixed),
+        hybrid_regression.comment_only_rate(),
         hybrid_regression.class_rate(QueryClass::Negative),
         hybrid_regression.hybrid_path_query_hits,
         hybrid_regression.hybrid_path_query_total,

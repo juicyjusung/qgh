@@ -40,6 +40,8 @@ pub const MODEL_MANIFEST_SCHEMA_VERSION: &str = "qgh.model_manifest.v1";
 pub const CHUNKER_VERSION: &str = "qgh.chunker.v2";
 pub const SOURCE_SCHEMA_VERSION: &str = "qgh.source_schema.v1";
 pub const LOCAL_MODEL_REVISION: &str = "local_path";
+/// Exact metadata-context template persisted with an embedding generation.
+pub const METADATA_CONTEXT_TEMPLATE_VERSION: &str = "qgh.context.v1";
 
 const MODULES_FILE: &str = "modules.json";
 const DEFAULT_POOLING_CONFIG_FILE: &str = "1_Pooling/config.json";
@@ -54,6 +56,70 @@ const TOKENIZER_FILES: [&str; 4] = [
 pub struct TokenSpan {
     pub start: usize,
     pub end: usize,
+}
+
+/// Immutable source metadata allowed in contextual document embeddings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingSourceContext<'a> {
+    Issue {
+        repository: &'a str,
+        issue_number: i64,
+        title: &'a str,
+    },
+    Comment {
+        repository: &'a str,
+        parent_issue_number: i64,
+        parent_issue_title: &'a str,
+    },
+}
+
+/// Contextual text used only for embedding input and its generation hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedEmbeddingInput {
+    text: String,
+}
+
+impl PreparedEmbeddingInput {
+    pub fn context_template_version(&self) -> &'static str {
+        METADATA_CONTEXT_TEMPLATE_VERSION
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    pub fn context_hash(&self, model_manifest_hash: &str, chunker_fingerprint: &str) -> String {
+        crate::store::embedding_context_hash(
+            model_manifest_hash,
+            chunker_fingerprint,
+            self.context_template_version(),
+            self.as_str(),
+        )
+    }
+}
+
+/// Build the deterministic prefix without changing the authoritative chunk.
+pub fn prepare_embedding_input(
+    context: EmbeddingSourceContext<'_>,
+    chunk: &str,
+) -> PreparedEmbeddingInput {
+    let prefix = match context {
+        EmbeddingSourceContext::Issue {
+            repository,
+            issue_number,
+            title,
+        } => format!("Repository: {repository}\nIssue #{issue_number}: {title}"),
+        EmbeddingSourceContext::Comment {
+            repository,
+            parent_issue_number,
+            parent_issue_title,
+        } => format!(
+            "Repository: {repository}\nComment on issue #{parent_issue_number}: {parent_issue_title}"
+        ),
+    };
+    PreparedEmbeddingInput {
+        text: format!("{prefix}\n\n{chunk}"),
+    }
 }
 
 pub trait EmbeddingProvider: Send + Sync {
@@ -2537,6 +2603,116 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn issue_embedding_input_uses_exact_metadata_context_template() {
+        let prepared = prepare_embedding_input(
+            EmbeddingSourceContext::Issue {
+                repository: "github.com/owner/repo",
+                issue_number: 47,
+                title: "Harden retrieval publication",
+            },
+            "Authoritative issue chunk.",
+        );
+
+        assert_eq!(
+            prepared.context_template_version(),
+            METADATA_CONTEXT_TEMPLATE_VERSION
+        );
+        assert_eq!(
+            prepared.as_str(),
+            "Repository: github.com/owner/repo\nIssue #47: Harden retrieval publication\n\nAuthoritative issue chunk."
+        );
+    }
+
+    #[test]
+    fn comment_embedding_input_uses_exact_parent_issue_context_template() {
+        let prepared = prepare_embedding_input(
+            EmbeddingSourceContext::Comment {
+                repository: "github.com/owner/repo",
+                parent_issue_number: 47,
+                parent_issue_title: "Harden retrieval publication",
+            },
+            "Authoritative comment chunk.",
+        );
+
+        assert_eq!(
+            prepared.as_str(),
+            "Repository: github.com/owner/repo\nComment on issue #47: Harden retrieval publication\n\nAuthoritative comment chunk."
+        );
+    }
+
+    #[test]
+    fn metadata_context_output_and_hash_are_deterministic() {
+        let context = EmbeddingSourceContext::Issue {
+            repository: "github.com/owner/repo",
+            issue_number: 47,
+            title: "Harden retrieval publication",
+        };
+        let first = prepare_embedding_input(context, "Authoritative issue chunk.");
+        let second = prepare_embedding_input(context, "Authoritative issue chunk.");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first.context_hash("manifest-hash", "chunker-fingerprint"),
+            crate::store::embedding_context_hash(
+                "manifest-hash",
+                "chunker-fingerprint",
+                METADATA_CONTEXT_TEMPLATE_VERSION,
+                first.as_str(),
+            )
+        );
+        assert_eq!(
+            first.context_hash("manifest-hash", "chunker-fingerprint"),
+            second.context_hash("manifest-hash", "chunker-fingerprint")
+        );
+    }
+
+    #[test]
+    fn metadata_context_does_not_mutate_authoritative_text_or_include_mutable_fields() {
+        let authoritative_chunk = String::from("State: preserve these source bytes exactly.\r\n");
+        let original = authoritative_chunk.clone();
+        let prepared = prepare_embedding_input(
+            EmbeddingSourceContext::Issue {
+                repository: "github.com/owner/repo",
+                issue_number: 47,
+                title: "Harden retrieval publication",
+            },
+            &authoritative_chunk,
+        );
+
+        assert_eq!(authoritative_chunk.as_bytes(), original.as_bytes());
+        assert!(prepared.as_str().ends_with(&authoritative_chunk));
+        for mutable_metadata in ["Labels: release-blocker", "Author: alice", "State: closed"] {
+            assert!(!prepared.as_str().contains(mutable_metadata));
+        }
+    }
+
+    #[test]
+    fn parent_issue_title_change_invalidates_comment_context_hash() {
+        let before = prepare_embedding_input(
+            EmbeddingSourceContext::Comment {
+                repository: "github.com/owner/repo",
+                parent_issue_number: 47,
+                parent_issue_title: "Old title",
+            },
+            "Unchanged authoritative comment chunk.",
+        );
+        let after = prepare_embedding_input(
+            EmbeddingSourceContext::Comment {
+                repository: "github.com/owner/repo",
+                parent_issue_number: 47,
+                parent_issue_title: "New title",
+            },
+            "Unchanged authoritative comment chunk.",
+        );
+
+        assert_ne!(before.as_str(), after.as_str());
+        assert_ne!(
+            before.context_hash("manifest-hash", "chunker-fingerprint"),
+            after.context_hash("manifest-hash", "chunker-fingerprint")
+        );
+    }
 
     #[derive(Default)]
     struct RecordingEngine {
