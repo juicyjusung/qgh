@@ -27,16 +27,11 @@ pub struct SearchFilters {
 /// Versioned lexical ranking profiles are intentionally internal.  The
 /// production default remains `V1`; experiments can opt into a named profile
 /// without exposing arbitrary user-controlled boosts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LexicalRankingProfile {
+    #[default]
     V1,
     MetadataBoostV1,
-}
-
-impl Default for LexicalRankingProfile {
-    fn default() -> Self {
-        Self::V1
-    }
 }
 
 impl Default for SearchFilters {

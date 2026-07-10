@@ -89,11 +89,14 @@ compares model behavior without live model downloads. The default model remains
 `Snowflake/snowflake-arctic-embed-l-v2.0`; changing it still requires a
 PRD/ADR-backed human decision.
 
-The A/B path switches configured model fingerprints before each
-non-default candidate, verifies `embedding.fingerprint_mismatch` keeps
-BM25 fallback active, then runs `qgh embed --force --json` through the
-debug test embedding provider to replace the active fingerprint and
-document embeddings before rerunning the same hybrid eval.
+The A/B path gives every synthetic candidate an explicit immutable fixture
+revision, switches the configured model before each non-default candidate,
+and verifies `embedding.fingerprint_mismatch` keeps BM25 fallback active before
+query inference. It then runs `qgh embed --force --json` through the debug test
+embedding provider to atomically replace the active embedding generation and
+retrieval publication before rerunning the same hybrid eval. The quality gate
+asserts public `status`, `query`, and `get` behavior; generation row and pointer
+invariants remain covered by store-level tests.
 
 Current deterministic fixture result:
 

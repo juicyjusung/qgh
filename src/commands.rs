@@ -1593,11 +1593,7 @@ fn refresh_chunk_embeddings(
     }
     let dimension = embedding_dimension(&vectors)?;
     let fingerprint = fingerprint_seed.with_dimension(dimension);
-    let embeddings = chunks
-        .iter()
-        .zip(vectors)
-        .map(|(chunk, vector)| (chunk, vector))
-        .collect::<Vec<_>>();
+    let embeddings = chunks.iter().zip(vectors).collect::<Vec<_>>();
     let source_sync_run_id = store
         .latest_successful_sync_run_id()?
         .unwrap_or_else(|| "embedding-embed".to_string());
@@ -2823,6 +2819,32 @@ fn hybrid_vector_hits(
             ));
         }
     };
+    let publication = store.active_retrieval_publication()?;
+    let publication_matches_runtime = publication.as_ref().is_some_and(|publication| {
+        publication.output_dimension.is_some_and(|dimension| {
+            publication
+                .model_manifest_hash
+                .as_ref()
+                .is_some_and(|hash| {
+                    *hash
+                        == runtime
+                            .fingerprint_seed
+                            .clone()
+                            .with_dimension(dimension)
+                            .hash()
+                })
+        })
+    });
+    if !publication_matches_runtime {
+        return Ok((
+            None,
+            vec![json!({
+                "code": "embedding.fingerprint_mismatch",
+                "severity": "warn_strong",
+                "message": "Stored embeddings were created with a different embedding fingerprint and will not be used for vector search. BM25 results are still returned."
+            })],
+        ));
+    }
     let query_vector = match runtime.provider.embed_query(query_text) {
         Ok(vector) => vector,
         Err(_) => {
@@ -2835,6 +2857,18 @@ fn hybrid_vector_hits(
             ));
         }
     };
+    if publication
+        .and_then(|publication| publication.output_dimension)
+        .is_some_and(|dimension| dimension != query_vector.len())
+    {
+        return Ok((
+            None,
+            vec![embedding_warning(
+                "embedding.query_dimension_mismatch",
+                "Query embedding dimension did not match the active generation. BM25 results are still returned.",
+            )],
+        ));
+    }
     match store.generation_vector_search(
         &query_vector,
         &filters.vector_search_filters(),
@@ -2853,6 +2887,7 @@ fn hybrid_vector_hits(
 
 struct EmbeddingCoverageState {
     active_fingerprint: Option<EmbeddingFingerprint>,
+    generation_active: bool,
     active_matches_config: bool,
     artifact_corrupt: bool,
     total_chunks: i64,
@@ -2870,15 +2905,19 @@ impl EmbeddingCoverageState {
             return "fingerprint_mismatch";
         }
         match (
-            &self.active_fingerprint,
+            self.has_active_embedding(),
             self.active_matches_config,
             self.missing_chunks,
         ) {
-            (None, _, _) => "missing",
-            (Some(_), false, _) => "fingerprint_mismatch",
-            (Some(_), true, 0) => "complete",
-            (Some(_), true, _) => "partial",
+            (false, _, _) => "missing",
+            (true, false, _) => "fingerprint_mismatch",
+            (true, true, 0) => "complete",
+            (true, true, _) => "partial",
         }
+    }
+
+    fn has_active_embedding(&self) -> bool {
+        self.generation_active || self.active_fingerprint.is_some()
     }
 
     fn hybrid_ready(&self) -> bool {
@@ -2899,30 +2938,40 @@ fn embedding_coverage_state(
     if let Some((_generation_id, completed_chunks)) =
         store.active_embedding_generation_coverage()?
     {
-        let publication = store.active_retrieval_publication()?;
-        let expected = embedding_fingerprint_expectation(embedding);
-        let active_matches_config = publication
-            .as_ref()
-            .and_then(|publication| publication.output_dimension)
-            .zip(
-                publication
-                    .as_ref()
-                    .and_then(|publication| publication.model_manifest_hash.as_ref()),
-            )
-            .is_some_and(|(dimension, hash)| {
-                let seed = crate::embedding::EmbeddingFingerprintSeed {
-                    provider: expected.provider.clone(),
-                    model_id: expected.model_id.clone().unwrap_or_default(),
-                    model_revision: expected.model_revision.clone().unwrap_or_default(),
-                    pooling: expected
-                        .pooling
-                        .unwrap_or(crate::embedding::PoolingKind::Mean),
-                    query_prefix: expected.query_prefix.clone().unwrap_or_default(),
-                };
-                *hash == seed.with_dimension(dimension).hash()
+        // Publication validation proves structural coverage. When the config
+        // fully pins the fingerprint inputs, status can compare offline. A
+        // mutable revision remains structurally complete and is verified
+        // after the local runtime resolves it in `hybrid_vector_hits`.
+        let expectation = embedding_fingerprint_expectation(embedding);
+        let comparable_seed = expectation
+            .model_id
+            .zip(expectation.model_revision)
+            .zip(expectation.pooling)
+            .zip(expectation.query_prefix)
+            .map(|(((model_id, model_revision), pooling), query_prefix)| {
+                EmbeddingFingerprintSeed {
+                    provider: expectation.provider,
+                    model_id,
+                    model_revision,
+                    pooling,
+                    query_prefix,
+                }
             });
+        let active_matches_config = comparable_seed.is_none_or(|seed| {
+            store
+                .active_retrieval_publication()
+                .ok()
+                .flatten()
+                .and_then(|publication| {
+                    publication
+                        .output_dimension
+                        .zip(publication.model_manifest_hash)
+                })
+                .is_some_and(|(dimension, hash)| hash == seed.with_dimension(dimension).hash())
+        });
         return Ok(Some(EmbeddingCoverageState {
             active_fingerprint: None,
+            generation_active: true,
             active_matches_config,
             artifact_corrupt: false,
             total_chunks: completed_chunks,
@@ -2997,6 +3046,7 @@ fn embedding_coverage_state(
 
     Ok(Some(EmbeddingCoverageState {
         active_fingerprint,
+        generation_active: false,
         active_matches_config,
         artifact_corrupt: false,
         total_chunks,
@@ -3013,6 +3063,7 @@ fn corrupt_embedding_coverage(
 ) -> EmbeddingCoverageState {
     EmbeddingCoverageState {
         active_fingerprint,
+        generation_active: false,
         active_matches_config,
         artifact_corrupt: true,
         total_chunks,

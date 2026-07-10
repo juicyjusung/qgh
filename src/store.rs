@@ -1234,13 +1234,16 @@ impl Store {
         filters: &VectorSearchFilters,
         limit: usize,
     ) -> Result<Vec<VectorSearchHit>, QghError> {
+        if limit == 0 || query_vector.is_empty() || filters.source_types.is_empty() {
+            return Ok(Vec::new());
+        }
         let Some(generation_id) = self
             .active_retrieval_publication()?
             .and_then(|publication| publication.embedding_generation_id)
         else {
             return Ok(Vec::new());
         };
-        let mut stmt = self.conn.prepare(
+        let mut sql = String::from(
             "SELECT gc.vector_blob, gc.vector_dimension, c.id, c.source_id,
                     c.source_version_id, c.body, c.chunk_index, c.token_start,
                     c.token_end, c.byte_start, c.byte_end, c.chunker_version,
@@ -1249,10 +1252,15 @@ impl Store {
              JOIN chunks c ON c.id = gc.chunk_id
              JOIN source_versions sv ON sv.id = c.source_version_id
              JOIN source_entities se ON se.source_id = c.source_id
-             WHERE gc.generation_id = ?1 AND se.lifecycle_state = 'active'",
-        )?;
+             LEFT JOIN issue_metadata im ON im.source_id = c.source_id
+             LEFT JOIN comment_metadata cm ON cm.source_id = c.source_id
+             WHERE gc.generation_id = ? AND se.lifecycle_state = 'active'",
+        );
+        let mut params = vec![Value::Integer(generation_id)];
+        push_vector_filter_sql(filters, &mut sql, &mut params);
+        let mut stmt = self.conn.prepare(&sql)?;
         let mut candidates = Vec::new();
-        for row in stmt.query_map(params![generation_id], |row| {
+        for row in stmt.query_map(params_from_iter(params.iter()), |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, i64>(1)? as usize,
@@ -2325,6 +2333,13 @@ impl Store {
     }
 
     pub fn active_embedding_generation_coverage(&self) -> Result<Option<(i64, i64)>, QghError> {
+        if !table_exists(&self.conn, "embedding_generations")?
+            || !table_exists(&self.conn, "embedding_generation_chunks")?
+            || !table_exists(&self.conn, "retrieval_publications")?
+            || !table_exists(&self.conn, "retrieval_publication_pointer")?
+        {
+            return Ok(None);
+        }
         self.conn
             .query_row(
                 "SELECT eg.id, count(egc.chunk_id) FROM retrieval_publication_pointer p
