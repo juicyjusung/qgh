@@ -2,6 +2,7 @@ use crate::error::QghError;
 use crate::model::IndexSource;
 use crate::paths::{ensure_private_dir, set_private_dir, set_private_file};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -206,29 +207,127 @@ fn seal_owned_generation_directory(
     owner_token: &str,
 ) -> Result<(), QghError> {
     validate_owned_build_directory(path, generation, owner_token)?;
-    let seal_temp = path.join(INDEX_BUILD_MARKER_SEAL_TEMP);
-    if seal_temp.exists() {
-        return Err(index_build_collision_error());
+    write_owned_generation_seal(path, generation, owner_token)
+}
+
+pub(crate) fn adopt_legacy_generation_directory(
+    path: &Path,
+    generation: i64,
+    owner_token: &str,
+) -> Result<(), QghError> {
+    if validate_owned_generation_directory(path, generation, owner_token).is_ok() {
+        return Ok(());
     }
+    validate_legacy_build_directory(path)?;
+    validate_legacy_tantivy_file_inventory(path)?;
+    write_owned_generation_seal(path, generation, owner_token)?;
+    validate_owned_generation_directory(path, generation, owner_token)
+}
+
+fn write_owned_generation_seal(
+    path: &Path,
+    generation: i64,
+    owner_token: &str,
+) -> Result<(), QghError> {
+    let seal_temp = path.join(INDEX_BUILD_MARKER_SEAL_TEMP);
     let tree_digest = owned_generation_tree_digest(path)?;
-    let mut marker = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&seal_temp)
-        .map_err(|_| index_build_collision_error())?;
     let sealed = sealed_index_build_marker(generation, owner_token, &tree_digest);
-    if marker.write_all(sealed.as_bytes()).is_err()
-        || marker.sync_all().is_err()
-        || set_private_file(&seal_temp).is_err()
-    {
-        let _ = fs::remove_file(&seal_temp);
-        return Err(index_build_collision_error());
+    if seal_temp.exists() {
+        let metadata =
+            fs::symlink_metadata(&seal_temp).map_err(|_| index_build_collision_error())?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || fs::read_to_string(&seal_temp).map_err(|_| index_build_collision_error())? != sealed
+        {
+            return Err(index_build_collision_error());
+        }
+    } else {
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&seal_temp)
+            .map_err(|_| index_build_collision_error())?;
+        if marker.write_all(sealed.as_bytes()).is_err()
+            || marker.sync_all().is_err()
+            || set_private_file(&seal_temp).is_err()
+        {
+            let _ = fs::remove_file(&seal_temp);
+            return Err(index_build_collision_error());
+        }
     }
     fs::rename(&seal_temp, path.join(INDEX_BUILD_MARKER_FILE))
         .map_err(|_| index_build_collision_error())?;
     fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|_| index_build_collision_error())?;
+    Ok(())
+}
+
+fn validate_legacy_build_directory(path: &Path) -> Result<(), QghError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| index_build_collision_error())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(index_build_collision_error());
+    }
+    let marker_path = path.join(INDEX_BUILD_MARKER_FILE);
+    let marker_metadata =
+        fs::symlink_metadata(&marker_path).map_err(|_| index_build_collision_error())?;
+    if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+        return Err(index_build_collision_error());
+    }
+    let observed = fs::read_to_string(marker_path).map_err(|_| index_build_collision_error())?;
+    let Some(digest) = observed.strip_prefix("qgh.index-build-owner.v1:") else {
+        return Err(index_build_collision_error());
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(index_build_collision_error());
+    }
+    Ok(())
+}
+
+fn validate_legacy_tantivy_file_inventory(path: &Path) -> Result<(), QghError> {
+    let index = Index::open_in_dir(path).map_err(|_| index_build_collision_error())?;
+    if !index
+        .validate_checksum()
+        .map_err(|_| index_build_collision_error())?
+        .is_empty()
+    {
+        return Err(index_build_collision_error());
+    }
+    let managed = index.directory().list_managed_files();
+    if managed.iter().any(|file| file.components().count() != 1) {
+        return Err(index_build_collision_error());
+    }
+    let mut allowed = managed.iter().cloned().collect::<BTreeSet<_>>();
+    for internal in [
+        ".managed.json",
+        ".tantivy-meta.lock",
+        ".tantivy-writer.lock",
+        INDEX_BUILD_MARKER_FILE,
+        INDEX_BUILD_MARKER_SEAL_TEMP,
+    ] {
+        allowed.insert(PathBuf::from(internal));
+    }
+    for managed_path in &managed {
+        let metadata = fs::symlink_metadata(path.join(managed_path))
+            .map_err(|_| index_build_collision_error())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(index_build_collision_error());
+        }
+    }
+    for entry in fs::read_dir(path).map_err(|_| index_build_collision_error())? {
+        let entry = entry.map_err(|_| index_build_collision_error())?;
+        let relative = PathBuf::from(entry.file_name());
+        let metadata =
+            fs::symlink_metadata(entry.path()).map_err(|_| index_build_collision_error())?;
+        if !allowed.contains(&relative) || metadata.file_type().is_symlink() || !metadata.is_file()
+        {
+            return Err(index_build_collision_error());
+        }
+    }
     Ok(())
 }
 
@@ -355,7 +454,9 @@ fn collect_owned_generation_entries(
         let relative = path
             .strip_prefix(root)
             .map_err(|_| index_build_collision_error())?;
-        if relative == Path::new(INDEX_BUILD_MARKER_FILE) {
+        if relative == Path::new(INDEX_BUILD_MARKER_FILE)
+            || relative == Path::new(INDEX_BUILD_MARKER_SEAL_TEMP)
+        {
             continue;
         }
         let metadata = fs::symlink_metadata(&path).map_err(|_| index_build_collision_error())?;

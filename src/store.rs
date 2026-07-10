@@ -36,6 +36,8 @@ const CHUNK_EMBEDDING_VECTOR_CHUNKS_META_TABLE: &str = "chunk_embedding_vectors_
 const CHUNK_EMBEDDING_VECTOR_ROWIDS_TABLE: &str = "chunk_embedding_vectors_rowids";
 const CHUNK_EMBEDDING_VECTOR_CHUNKS_TABLE: &str = "chunk_embedding_vectors_vector_chunks00";
 const TANTIVY_COMMIT_INVENTORY_MIGRATION: &str = "qgh.tantivy.commit_inventory.v1";
+const TANTIVY_OWNERSHIP_MIGRATION: &str = "qgh.tantivy.ownership.v2";
+const TANTIVY_ADOPTION_OWNER_PID: i64 = -2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingGenerationSpec {
@@ -415,6 +417,7 @@ impl Store {
         conn.pragma_update(None, "secure_delete", "ON")?;
         let mut store = Self::from_connection(conn, paths);
         store.migrate()?;
+        store.reconcile_legacy_tantivy_ownership()?;
         store.detach_unbound_tantivy_publication()?;
         store.detach_legacy_embedding_publication_identity()?;
         store.enforce_pending_purge_guards()?;
@@ -487,6 +490,218 @@ impl Store {
                 "The local store schema is not initialized for read-only retrieval. Run `qgh sync` to migrate it.",
             ));
         }
+        Ok(())
+    }
+
+    fn reconcile_legacy_tantivy_ownership(&mut self) -> Result<(), QghError> {
+        type Candidate = (
+            i64,
+            String,
+            i64,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+        );
+        let candidates = {
+            let mut statement = self.conn.prepare(
+                "SELECT generation.generation, generation.path,
+                        generation.source_count, generation.source_inventory_hash,
+                        ownership.owner_pid, ownership.owner_token
+                 FROM index_generations generation
+                 LEFT JOIN index_build_leases ownership
+                   ON ownership.generation = generation.generation
+                 WHERE ownership.generation IS NULL
+                    OR ownership.owner_pid = ?1
+                 ORDER BY generation.generation",
+            )?;
+            let rows = statement
+                .query_map(params![TANTIVY_ADOPTION_OWNER_PID], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })?
+                .collect::<Result<Vec<Candidate>, _>>()?;
+            rows
+        };
+
+        for (generation, stored_path, source_count, inventory_hash, owner_pid, lease_token) in
+            candidates
+        {
+            let repair_token = self
+                .conn
+                .query_row(
+                    "SELECT owner_token FROM tantivy_ownership_repairs
+                     WHERE generation = ?1",
+                    params![generation],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let owner_token = lease_token
+                .or(repair_token)
+                .unwrap_or_else(|| format!("index-adoption-{generation}-{}", now_run_id_suffix()));
+            if owner_pid.is_none() {
+                let tx = self
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute(
+                    "INSERT INTO tantivy_ownership_repairs
+                        (generation, owner_token, state, failure_stage, updated_at)
+                     VALUES (?1, ?2, 'adopting', NULL, ?3)
+                     ON CONFLICT(generation) DO UPDATE SET
+                        owner_token = excluded.owner_token,
+                        state = 'adopting', failure_stage = NULL,
+                        updated_at = excluded.updated_at",
+                    params![generation, owner_token, now_rfc3339()],
+                )?;
+                tx.execute(
+                    "INSERT INTO index_build_leases
+                        (generation, write_epoch, owner_pid, owner_token, created_at,
+                         source_snapshot_sync_run_id, source_snapshot_epoch)
+                     SELECT generation, write_epoch, ?2, ?3, ?4,
+                            source_snapshot_sync_run_id, source_snapshot_epoch
+                     FROM index_generations WHERE generation = ?1",
+                    params![
+                        generation,
+                        TANTIVY_ADOPTION_OWNER_PID,
+                        owner_token,
+                        now_rfc3339()
+                    ],
+                )?;
+                tx.commit()?;
+            }
+
+            let expected_path = self.index_root.join(format!("generation-{generation}"));
+            let adoption = (|| -> Result<(), QghError> {
+                if Path::new(&stored_path) != expected_path {
+                    return Err(tantivy_artifact_not_ready_error());
+                }
+                let source_count = usize::try_from(source_count)
+                    .map_err(|_| tantivy_artifact_not_ready_error())?;
+                let inventory_hash = inventory_hash
+                    .as_deref()
+                    .ok_or_else(tantivy_artifact_not_ready_error)?;
+                validate_managed_tantivy_generation_path(
+                    &self.profile_dir,
+                    &self.index_root,
+                    generation,
+                    &expected_path,
+                )?;
+                validate_tantivy_generation_artifact(&expected_path, source_count, inventory_hash)?;
+                crate::index::adopt_legacy_generation_directory(
+                    &expected_path,
+                    generation,
+                    &owner_token,
+                )?;
+                Ok(())
+            })();
+            if adoption.is_err() {
+                self.mark_tantivy_ownership_retirement_required(generation, &owner_token)?;
+                continue;
+            }
+
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let adopted = tx.execute(
+                "UPDATE index_build_leases SET owner_pid = 0
+                 WHERE generation = ?1 AND owner_pid = ?2 AND owner_token = ?3",
+                params![generation, TANTIVY_ADOPTION_OWNER_PID, owner_token],
+            )?;
+            if adopted != 1 {
+                return Err(purge_error());
+            }
+            tx.execute(
+                "DELETE FROM tantivy_ownership_repairs WHERE generation = ?1",
+                params![generation],
+            )?;
+            tx.commit()?;
+        }
+
+        let unresolved: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tantivy_ownership_repairs)
+                 OR EXISTS(
+                    SELECT 1 FROM index_generations generation
+                    LEFT JOIN index_build_leases ownership
+                      ON ownership.generation = generation.generation
+                     AND ownership.owner_pid = 0
+                    WHERE ownership.generation IS NULL
+                 )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !unresolved {
+            record_schema_migration(&self.conn, TANTIVY_OWNERSHIP_MIGRATION)?;
+        }
+        Ok(())
+    }
+
+    fn mark_tantivy_ownership_retirement_required(
+        &mut self,
+        generation: i64,
+        owner_token: &str,
+    ) -> Result<(), QghError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM index_build_leases
+             WHERE generation = ?1 AND owner_pid = ?2 AND owner_token = ?3",
+            params![generation, TANTIVY_ADOPTION_OWNER_PID, owner_token],
+        )?;
+        tx.execute(
+            "INSERT INTO tantivy_ownership_repairs
+                (generation, owner_token, state, failure_stage, updated_at)
+             VALUES (?1, ?2, 'retirement_required', 'ownership_unverified', ?3)
+             ON CONFLICT(generation) DO UPDATE SET
+                owner_token = excluded.owner_token,
+                state = excluded.state,
+                failure_stage = excluded.failure_stage,
+                updated_at = excluded.updated_at",
+            params![generation, owner_token, now_rfc3339()],
+        )?;
+        let active_publication = tx
+            .query_row(
+                "SELECT rp.publication_id, rp.embedding_generation_id
+                 FROM retrieval_publication_pointer pointer
+                 JOIN retrieval_publications rp
+                   ON rp.publication_id = pointer.publication_id
+                 WHERE pointer.id = 1 AND rp.tantivy_generation = ?1",
+                params![generation],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?;
+        if let Some((publication_id, embedding_generation_id)) = active_publication {
+            tx.execute(
+                "DELETE FROM retrieval_publication_pointer
+                 WHERE id = 1 AND publication_id = ?1",
+                params![publication_id],
+            )?;
+            tx.execute(
+                "UPDATE retrieval_publications SET active = 0 WHERE publication_id = ?1",
+                params![publication_id],
+            )?;
+            if let Some(embedding_generation_id) = embedding_generation_id {
+                if table_exists(&tx, "embedding_generations")? {
+                    tx.execute(
+                        "UPDATE embedding_generations SET state = 'ready'
+                         WHERE id = ?1 AND state = 'active'",
+                        params![embedding_generation_id],
+                    )?;
+                }
+            }
+            let epoch = read_content_write_epoch(&tx)?;
+            mark_successor_repair_required(&tx, epoch)?;
+        }
+        tx.execute(
+            "UPDATE index_generations SET active = 0 WHERE generation = ?1",
+            params![generation],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -6967,6 +7182,14 @@ impl Store {
                 source_snapshot_epoch INTEGER
             );
 
+            CREATE TABLE IF NOT EXISTS tantivy_ownership_repairs (
+                generation INTEGER PRIMARY KEY,
+                owner_token TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('adopting', 'retirement_required')),
+                failure_stage TEXT,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS index_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id TEXT NOT NULL,
@@ -12625,6 +12848,297 @@ mod tests {
             })
             .unwrap();
         assert_eq!(ownership_count, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn legacy_active_and_previous_generations_are_adopted_then_purged() {
+        let paths = temp_profile_paths("legacy-tantivy-ownership-adoption");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_LEGACY_OWNERSHIP_ADOPTION";
+        store
+            .upsert_sources_for_run(
+                "sync-legacy-ownership-adoption",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "legacy-ownership-private-marker",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (first_generation, first_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, first_generation);
+        let first_publication = store
+            .activate_retrieval_publication(
+                "sync-legacy-ownership-adoption",
+                first_generation,
+                None,
+                None,
+            )
+            .unwrap();
+        let (second_generation, second_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, second_generation);
+        store
+            .activate_retrieval_publication(
+                "sync-legacy-ownership-adoption",
+                second_generation,
+                None,
+                Some(first_publication),
+            )
+            .unwrap();
+        for path in [&first_path, &second_path] {
+            let marker_path = path.join(".qgh-build-owner-v1");
+            let sealed = fs::read_to_string(&marker_path).unwrap();
+            let owner_digest = sealed
+                .strip_prefix("qgh.index-generation-owner.v1:")
+                .and_then(|value| value.split_once(':'))
+                .map(|(owner_digest, _)| owner_digest)
+                .unwrap();
+            fs::write(
+                marker_path,
+                format!("qgh.index-build-owner.v1:{owner_digest}"),
+            )
+            .unwrap();
+        }
+        store
+            .conn
+            .execute("DELETE FROM index_build_leases", [])
+            .unwrap();
+        drop(store);
+
+        let mut adopted = Store::open(&paths).unwrap();
+        let ownership_rows: i64 = adopted
+            .conn
+            .query_row(
+                "SELECT count(*) FROM index_build_leases WHERE owner_pid = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ownership_rows, 2);
+        for (generation, path) in [
+            (first_generation, &first_path),
+            (second_generation, &second_path),
+        ] {
+            let owner_token: String = adopted
+                .conn
+                .query_row(
+                    "SELECT owner_token FROM index_build_leases WHERE generation = ?1",
+                    params![generation],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            crate::index::validate_owned_generation_directory(path, generation, &owner_token)
+                .unwrap();
+        }
+
+        let outcome = adopted
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+        assert_eq!(outcome.discarded_tantivy_generations, 2);
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn legacy_generation_with_unknown_entry_requires_retirement_without_deleting_it() {
+        let paths = temp_profile_paths("legacy-tantivy-ownership-repair");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_LEGACY_OWNERSHIP_REPAIR";
+        store
+            .upsert_sources_for_run(
+                "sync-legacy-ownership-repair",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "legacy-ownership-repair-private-marker",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication("sync-legacy-ownership-repair", generation, None, None)
+            .unwrap();
+        let marker_path = generation_path.join(".qgh-build-owner-v1");
+        let sealed = fs::read_to_string(&marker_path).unwrap();
+        let owner_digest = sealed
+            .strip_prefix("qgh.index-generation-owner.v1:")
+            .and_then(|value| value.split_once(':'))
+            .map(|(owner_digest, _)| owner_digest)
+            .unwrap();
+        fs::write(
+            marker_path,
+            format!("qgh.index-build-owner.v1:{owner_digest}"),
+        )
+        .unwrap();
+        let foreign_entry = generation_path.join("foreign-backup-marker");
+        fs::write(&foreign_entry, b"preserve").unwrap();
+        store
+            .conn
+            .execute("DELETE FROM index_build_leases", [])
+            .unwrap();
+        drop(store);
+
+        let repaired = Store::open(&paths).unwrap();
+        let (state, failure_stage): (String, Option<String>) = repaired
+            .conn
+            .query_row(
+                "SELECT state, failure_stage FROM tantivy_ownership_repairs
+                 WHERE generation = ?1",
+                params![generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "retirement_required");
+        assert_eq!(failure_stage.as_deref(), Some("ownership_unverified"));
+        let ownership_rows: i64 = repaired
+            .conn
+            .query_row(
+                "SELECT count(*) FROM index_build_leases WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ownership_rows, 0);
+        let active_pointer: i64 = repaired
+            .conn
+            .query_row(
+                "SELECT count(*) FROM retrieval_publication_pointer",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_pointer, 0);
+        assert!(foreign_entry.exists());
+        assert!(generation_path.exists());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn legacy_generation_adoption_resumes_after_seal_temp_was_synced() {
+        let paths = temp_profile_paths("legacy-tantivy-ownership-adoption-resume");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_LEGACY_OWNERSHIP_ADOPTION_RESUME";
+        store
+            .upsert_sources_for_run(
+                "sync-legacy-ownership-adoption-resume",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "legacy-ownership-adoption-resume-private-marker",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication(
+                "sync-legacy-ownership-adoption-resume",
+                generation,
+                None,
+                None,
+            )
+            .unwrap();
+        let owner_token = format!("test-adoption-resume-{generation}");
+        let marker_path = generation_path.join(".qgh-build-owner-v1");
+        let sealed = fs::read_to_string(&marker_path).unwrap();
+        let owner_digest = sealed
+            .strip_prefix("qgh.index-generation-owner.v1:")
+            .and_then(|value| value.split_once(':'))
+            .map(|(owner_digest, _)| owner_digest)
+            .unwrap();
+        let legacy_marker = format!("qgh.index-build-owner.v1:{owner_digest}");
+        store
+            .conn
+            .execute("DELETE FROM index_build_leases", [])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO tantivy_ownership_repairs
+                    (generation, owner_token, state, failure_stage, updated_at)
+                 VALUES (?1, ?2, 'adopting', NULL, ?3)",
+                params![generation, owner_token, now_rfc3339()],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO index_build_leases
+                    (generation, write_epoch, owner_pid, owner_token, created_at,
+                     source_snapshot_sync_run_id, source_snapshot_epoch)
+                 SELECT generation, write_epoch, ?2, ?3, ?4,
+                        source_snapshot_sync_run_id, source_snapshot_epoch
+                 FROM index_generations WHERE generation = ?1",
+                params![
+                    generation,
+                    TANTIVY_ADOPTION_OWNER_PID,
+                    owner_token,
+                    now_rfc3339()
+                ],
+            )
+            .unwrap();
+        // Start the fresh adoption from the pre-ownership marker.
+        fs::write(&marker_path, &legacy_marker).unwrap();
+        crate::index::adopt_legacy_generation_directory(&generation_path, generation, &owner_token)
+            .unwrap();
+        let adoption_seal = fs::read_to_string(&marker_path).unwrap();
+        fs::write(
+            generation_path.join(".qgh-build-owner-v1.sealing"),
+            &adoption_seal,
+        )
+        .unwrap();
+        fs::write(&marker_path, legacy_marker).unwrap();
+        drop(store);
+
+        let resumed = Store::open(&paths).unwrap();
+        let owner_pid: i64 = resumed
+            .conn
+            .query_row(
+                "SELECT owner_pid FROM index_build_leases
+                 WHERE generation = ?1 AND owner_token = ?2",
+                params![generation, owner_token],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner_pid, 0);
+        assert!(!generation_path.join(".qgh-build-owner-v1.sealing").exists());
+        crate::index::validate_owned_generation_directory(
+            &generation_path,
+            generation,
+            &owner_token,
+        )
+        .unwrap();
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
