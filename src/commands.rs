@@ -3868,14 +3868,21 @@ fn hybrid_vector_hits(
         hybrid_candidate_limit(limit),
     ) {
         Ok(hits) => Ok((Some(hits), Vec::new())),
-        Err(_) => Ok((
-            None,
-            vec![embedding_warning(
-                "embedding.vector_search_failed",
-                "Local vector search failed. BM25 results are still returned.",
-            )],
-        )),
+        Err(error) => Ok((None, vec![vector_search_failure_warning(&error)])),
     }
+}
+
+fn vector_search_failure_warning(error: &QghError) -> Value {
+    if error.code == "embedding.generation_corrupt" {
+        return embedding_warning(
+            "embedding.vector_integrity_failed",
+            "Stored vector index bytes did not match the authoritative embedding generation. BM25 results are still returned.",
+        );
+    }
+    embedding_warning(
+        "embedding.vector_search_failed",
+        "Local vector search failed. BM25 results are still returned.",
+    )
 }
 
 struct EmbeddingCoverageState {
@@ -5980,6 +5987,23 @@ mod tests {
         let error = encode_hybrid_query(&runtime, Some(&publication), "query-not-logged")
             .expect_err("runtime mismatch must fail closed");
         assert_eq!(error, HybridQueryEncodingError::FingerprintMismatch);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn vector_integrity_failure_uses_content_free_bm25_fallback_warning() {
+        let private_marker = "PRIVATE_VECTOR_ROW_MARKER_59c2";
+        let error = QghError::validation("embedding.generation_corrupt", private_marker);
+
+        let warning = vector_search_failure_warning(&error);
+
+        assert_eq!(warning["code"], "embedding.vector_integrity_failed");
+        assert_eq!(warning["severity"], "warn");
+        assert!(warning["message"]
+            .as_str()
+            .unwrap()
+            .contains("BM25 results are still returned"));
+        assert!(!warning.to_string().contains(private_marker));
     }
 
     #[cfg(feature = "vector-search")]

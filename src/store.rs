@@ -3462,9 +3462,12 @@ impl Store {
                 "The published embedding generation vector index is missing.",
             ));
         }
-        let indexed_rows: i64 = self.conn.query_row(
+        let (indexed_rows, byte_identical_rows): (i64, i64) = self.conn.query_row(
             &format!(
-                "SELECT count(*) FROM {vector_table} v
+                "SELECT count(*),
+                        coalesce(sum(CASE WHEN v.embedding = gc.vector_blob
+                                          THEN 1 ELSE 0 END), 0)
+                 FROM {vector_table} v
                  JOIN embedding_generation_vector_rows m ON m.vector_rowid = v.rowid
                  JOIN embedding_generation_chunks gc
                    ON gc.generation_id = m.generation_id AND gc.chunk_id = m.chunk_id
@@ -3474,12 +3477,12 @@ impl Store {
                    AND m.vector_rowid = m.id"
             ),
             params![generation_id, output_dimension, vector_table],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        if indexed_rows != total_chunks {
+        if indexed_rows != total_chunks || byte_identical_rows != total_chunks {
             return Err(QghError::validation(
                 "embedding.generation_corrupt",
-                "The published embedding vector index coverage is incomplete.",
+                "The published embedding vector index does not match its authoritative generation.",
             ));
         }
         let candidate_limit = limit.saturating_mul(4).max(limit).max(1);
@@ -16654,6 +16657,90 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "embedding.generation_corrupt");
 
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn generation_vector_search_rejects_same_dimension_vec0_row_tamper() {
+        let (paths, store, _, generation_id, _) =
+            ready_generation_fixture("vector-search-row-tamper");
+        let (vector_table, vector_rowid): (String, i64) = store
+            .conn
+            .query_row(
+                "SELECT vector_table, vector_rowid
+                 FROM embedding_generation_vector_rows
+                 WHERE generation_id = ?1",
+                params![generation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                &format!("UPDATE {vector_table} SET embedding = ?1 WHERE rowid = ?2"),
+                params![encode_embedding_blob(&[9.0, 9.0]), vector_rowid],
+            )
+            .unwrap();
+
+        let error = store
+            .generation_vector_search(
+                generation_id,
+                &[1.0, 2.0],
+                &VectorSearchFilters::default(),
+                5,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "embedding.generation_corrupt");
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn generation_vector_search_rejects_tamper_moved_outside_candidate_window() {
+        let paths = temp_profile_paths("vector-search-moved-out-tamper");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let first_chunk = insert_test_issue_chunk(
+            &mut store,
+            "qgh://github.com/issue/I_VECTOR_TAMPER_FIRST",
+            "sync-vector-tamper-first",
+        );
+        let second_chunk = insert_test_issue_chunk(
+            &mut store,
+            "qgh://github.com/issue/I_VECTOR_TAMPER_SECOND",
+            "sync-vector-tamper-second",
+        );
+        let generation_id = stage_test_generation(
+            &mut store,
+            "manifest-vector-moved-out-tamper",
+            &[first_chunk, second_chunk],
+        );
+        let (vector_table, vector_rowid): (String, i64) = store
+            .conn
+            .query_row(
+                "SELECT vector_table, vector_rowid
+                 FROM embedding_generation_vector_rows
+                 WHERE generation_id = ?1 AND chunk_id = ?2",
+                params![generation_id, first_chunk],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                &format!("UPDATE {vector_table} SET embedding = ?1 WHERE rowid = ?2"),
+                params![encode_embedding_blob(&[10_000.0, 10_000.0]), vector_rowid],
+            )
+            .unwrap();
+        let query = [1.0 + first_chunk as f32, 2.0];
+
+        let error = store
+            .generation_vector_search(generation_id, &query, &VectorSearchFilters::default(), 1)
+            .unwrap_err();
+
+        assert_eq!(error.code, "embedding.generation_corrupt");
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
