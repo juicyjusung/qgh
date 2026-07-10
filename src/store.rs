@@ -36,7 +36,6 @@ pub struct EmbeddingGenerationSpec {
     pub context_template_version: String,
     pub output_dimension: usize,
     pub source_sync_run_id: String,
-    pub source_snapshot_hash: String,
     pub total_chunks: i64,
 }
 
@@ -60,12 +59,19 @@ pub struct EmbeddingGenerationChunkBlob {
 pub struct RetrievalPublicationView {
     pub publication_id: i64,
     pub source_snapshot_sync_run_id: String,
+    pub source_snapshot_epoch: i64,
     pub tantivy_generation: i64,
     pub embedding_generation_id: Option<i64>,
     pub model_manifest_hash: Option<String>,
     pub chunker_fingerprint: Option<String>,
     pub context_template_version: Option<String>,
     pub output_dimension: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSnapshotIdentity {
+    pub sync_run_id: String,
+    pub epoch: i64,
 }
 
 /// A qgh-managed lifecycle target. Source purges affect exactly one stable
@@ -222,6 +228,14 @@ pub struct ReadSnapshotFence {
 pub struct ContextualEmbeddingChunk {
     pub chunk: StoredChunk,
     pub prepared_input: PreparedEmbeddingInput,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetrievalBuildSnapshot {
+    pub identity: SourceSnapshotIdentity,
+    pub expected_publication_id: Option<i64>,
+    pub sources: Vec<IndexSource>,
+    pub embedding_chunks: Vec<ContextualEmbeddingChunk>,
 }
 
 pub struct Store {
@@ -509,6 +523,7 @@ impl Store {
                     [],
                 )
                 .map_err(|_| purge_error())?;
+            bump_source_snapshot_epoch(&self.conn).map_err(|_| purge_error())?;
             invalidate_publications_for_pending_purge(&self.conn).map_err(|_| purge_error())?;
             Ok((actionable.len(), content_write_epoch))
         })();
@@ -571,6 +586,7 @@ impl Store {
             ));
         }
         let current_epoch = read_content_write_epoch(&tx)?;
+        let source_snapshot_epoch = read_source_snapshot_epoch(&tx)?;
         if current_epoch != expected_epoch {
             return Err(write_fence_error());
         }
@@ -579,9 +595,10 @@ impl Store {
                 "SELECT id FROM sync_runs
                  WHERE snapshot_kind = 'purge_successor'
                    AND content_write_epoch = ?1
+                   AND source_snapshot_epoch = ?2
                    AND completed_successfully = 1
                  ORDER BY rowid DESC LIMIT 1",
-                params![current_epoch],
+                params![current_epoch, source_snapshot_epoch],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
@@ -597,9 +614,10 @@ impl Store {
                 (id, started_at, completed_at, completed_successfully,
                  fetched_issue_count, upserted_issue_count,
                  fetched_comment_count, upserted_comment_count,
-                 skipped_pull_request_count, snapshot_kind, content_write_epoch)
-             VALUES (?1, ?2, ?2, 1, 0, 0, 0, 0, 0, 'purge_successor', ?3)",
-            params![sync_run_id, now, current_epoch],
+                 skipped_pull_request_count, snapshot_kind, content_write_epoch,
+                 source_snapshot_epoch)
+             VALUES (?1, ?2, ?2, 1, 0, 0, 0, 0, 0, 'purge_successor', ?3, ?4)",
+            params![sync_run_id, now, current_epoch, source_snapshot_epoch],
         )?;
         tx.commit()?;
         Ok(Some(sync_run_id))
@@ -1774,6 +1792,7 @@ impl Store {
         } else {
             self.content_write_transaction()?
         };
+        let mut source_snapshot_changed = false;
         tx.execute(
             "INSERT INTO sync_runs
                 (id, started_at, completed_at, completed_successfully, fetched_issue_count, upserted_issue_count, fetched_comment_count, upserted_comment_count, skipped_pull_request_count)
@@ -1797,6 +1816,7 @@ impl Store {
 
         for issue in issues {
             let repo = canonical_repository_identity(&tx, &issue.repo)?;
+            source_snapshot_changed |= !authoritative_issue_matches(&tx, issue, &repo)?;
             let previous_title = tx
                 .query_row(
                     "SELECT title FROM issue_metadata WHERE source_id = ?1",
@@ -1927,6 +1947,7 @@ impl Store {
 
         for comment in comments {
             let repo = canonical_repository_identity(&tx, &comment.repo)?;
+            source_snapshot_changed |= !authoritative_comment_matches(&tx, comment, &repo)?;
             tx.execute(
                 "INSERT INTO source_entities
                     (source_id, entity_type, host, repo, node_id, github_id, lifecycle_state, created_at, updated_at, last_seen_at)
@@ -2030,6 +2051,10 @@ impl Store {
             }
         }
 
+        if source_snapshot_changed {
+            bump_source_snapshot_epoch(&tx)?;
+        }
+
         tx.commit()?;
         let cursor_views = cursor_updates
             .iter()
@@ -2054,19 +2079,29 @@ impl Store {
         })
     }
 
-    pub fn mark_sync_run_completed(&self, sync_run_id: &str) -> Result<(), QghError> {
-        let changed = self.conn.execute(
+    pub fn mark_sync_run_completed(
+        &mut self,
+        sync_run_id: &str,
+    ) -> Result<SourceSnapshotIdentity, QghError> {
+        let tx = self.content_write_transaction()?;
+        let source_snapshot_epoch = read_source_snapshot_epoch(&tx)?;
+        let changed = tx.execute(
             "UPDATE sync_runs
-             SET completed_at = ?1, completed_successfully = 1
+             SET completed_at = ?1, completed_successfully = 1,
+                 source_snapshot_epoch = ?3
              WHERE id = ?2",
-            params![now_rfc3339(), sync_run_id],
+            params![now_rfc3339(), sync_run_id, source_snapshot_epoch],
         )?;
         if changed == 0 {
             return Err(QghError::storage(format!(
                 "Cannot mark missing sync run `{sync_run_id}` completed."
             )));
         }
-        Ok(())
+        tx.commit()?;
+        Ok(SourceSnapshotIdentity {
+            sync_run_id: sync_run_id.to_string(),
+            epoch: source_snapshot_epoch,
+        })
     }
 
     pub fn upsert_target_issue_refresh(
@@ -2291,6 +2326,11 @@ impl Store {
             )));
         }
 
+        if stored_chunks_match(&tx, source_version_id, chunks)? {
+            tx.commit()?;
+            return self.chunks_for_source_version(source_version_id);
+        }
+
         tx.execute(
             "DELETE FROM chunks WHERE source_version_id = ?1",
             params![source_version_id],
@@ -2321,6 +2361,7 @@ impl Store {
                 ],
             )?;
         }
+        bump_source_snapshot_epoch(&tx)?;
         tx.commit()?;
         self.chunks_for_source_version(source_version_id)
     }
@@ -3232,7 +3273,14 @@ impl Store {
         reason: &str,
     ) -> Result<TombstoneView, QghError> {
         let observed_at = now_rfc3339();
-        let tx = self.conn.transaction()?;
+        let tx = self.content_write_transaction()?;
+        let previous_reason = tx
+            .query_row(
+                "SELECT reason FROM tombstones WHERE source_id = ?1",
+                params![source_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
         let changed = tx.execute(
             "UPDATE source_entities
              SET lifecycle_state = 'tombstoned'
@@ -3301,6 +3349,9 @@ impl Store {
                  VALUES (?1, 'delete', ?2, NULL)",
                 params![source_id, observed_at],
             )?;
+        }
+        if changed > 0 || previous_reason.as_deref() != Some(reason) {
+            bump_source_snapshot_epoch(&tx)?;
         }
         tx.commit()?;
         Ok(TombstoneView {
@@ -3709,6 +3760,54 @@ impl Store {
         index_root: &Path,
         source_count: usize,
     ) -> Result<(i64, PathBuf), QghError> {
+        let source_snapshot_epoch = read_source_snapshot_epoch(&self.conn)?;
+        let identity = self
+            .conn
+            .query_row(
+                "SELECT id, source_snapshot_epoch FROM sync_runs
+                 WHERE completed_successfully = 1
+                   AND source_snapshot_epoch = ?1
+                 ORDER BY rowid DESC LIMIT 1",
+                params![source_snapshot_epoch],
+                |row| {
+                    Ok(SourceSnapshotIdentity {
+                        sync_run_id: row.get(0)?,
+                        epoch: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        let expected_publication_id = self
+            .active_retrieval_publication()?
+            .map(|publication| publication.publication_id);
+        self.reserve_index_generation_bound(
+            index_root,
+            source_count,
+            identity.as_ref(),
+            expected_publication_id,
+        )
+    }
+
+    pub fn reserve_index_generation_for_snapshot(
+        &mut self,
+        index_root: &Path,
+        snapshot: &RetrievalBuildSnapshot,
+    ) -> Result<(i64, PathBuf), QghError> {
+        self.reserve_index_generation_bound(
+            index_root,
+            snapshot.sources.len(),
+            Some(&snapshot.identity),
+            snapshot.expected_publication_id,
+        )
+    }
+
+    fn reserve_index_generation_bound(
+        &mut self,
+        index_root: &Path,
+        source_count: usize,
+        identity: Option<&SourceSnapshotIdentity>,
+        expected_publication_id: Option<i64>,
+    ) -> Result<(i64, PathBuf), QghError> {
         if index_root != self.index_root {
             return Err(QghError::validation(
                 "purge.index_root_invalid",
@@ -3720,6 +3819,41 @@ impl Store {
         let write_epoch = self.content_write_epoch;
         let owner_pid = i64::from(std::process::id());
         let tx = self.content_write_transaction()?;
+        let source_snapshot_epoch = read_source_snapshot_epoch(&tx)?;
+        let current_publication_id = tx
+            .query_row(
+                "SELECT publication_id FROM retrieval_publication_pointer WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if current_publication_id != expected_publication_id {
+            return Err(QghError::validation(
+                "publication.cas_conflict",
+                "Retrieval publication changed before index generation reservation.",
+            ));
+        }
+        let identity_matches = identity.is_some_and(|identity| {
+            identity.epoch == source_snapshot_epoch
+                && tx
+                    .query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM sync_runs
+                             WHERE id = ?1 AND completed_successfully = 1
+                               AND source_snapshot_epoch = ?2
+                         )",
+                        params![identity.sync_run_id, identity.epoch],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false)
+        });
+        if source_count > 0 && !identity_matches {
+            return Err(incomplete_source_snapshot_error());
+        }
+        if identity.is_some() && !identity_matches {
+            return Err(changed_source_snapshot_error());
+        }
+        let source_snapshot_sync_run_id = identity.map(|identity| identity.sync_run_id.as_str());
         let generation = tx.query_row(
             "SELECT CAST(value AS INTEGER) FROM profile_meta
              WHERE key = 'next_index_generation'",
@@ -3738,21 +3872,35 @@ impl Store {
         let generation_path = index_root.join(format!("generation-{generation}"));
         tx.execute(
             "INSERT INTO index_generations
-                (generation, path, source_count, created_at, active, write_epoch)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                (generation, path, source_count, created_at, active, write_epoch,
+                 source_snapshot_sync_run_id, source_snapshot_epoch,
+                 expected_publication_id)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8)",
             params![
                 generation,
                 generation_path.to_string_lossy(),
                 source_count as i64,
                 now,
                 write_epoch,
+                source_snapshot_sync_run_id,
+                source_snapshot_epoch,
+                expected_publication_id,
             ],
         )?;
         tx.execute(
             "INSERT INTO index_build_leases
-                (generation, write_epoch, owner_pid, owner_token, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![generation, write_epoch, owner_pid, owner_token, now],
+                (generation, write_epoch, owner_pid, owner_token, created_at,
+                 source_snapshot_sync_run_id, source_snapshot_epoch)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                generation,
+                write_epoch,
+                owner_pid,
+                owner_token,
+                now,
+                source_snapshot_sync_run_id,
+                source_snapshot_epoch,
+            ],
         )?;
         tx.commit()?;
         self.index_build_tokens.insert(generation, owner_token);
@@ -3862,17 +4010,100 @@ impl Store {
     }
 
     pub fn latest_successful_sync_run_id(&self) -> Result<Option<String>, QghError> {
+        Ok(self
+            .latest_successful_source_snapshot()?
+            .map(|snapshot| snapshot.sync_run_id))
+    }
+
+    pub fn latest_successful_source_snapshot(
+        &self,
+    ) -> Result<Option<SourceSnapshotIdentity>, QghError> {
         self.conn
             .query_row(
-                "SELECT id FROM sync_runs
+                "SELECT id, source_snapshot_epoch FROM sync_runs
                  WHERE completed_successfully = 1
                    AND snapshot_kind = 'remote_sync'
+                   AND source_snapshot_epoch IS NOT NULL
                  ORDER BY completed_at DESC, id DESC LIMIT 1",
                 [],
-                |row| row.get(0),
+                |row| {
+                    Ok(SourceSnapshotIdentity {
+                        sync_run_id: row.get(0)?,
+                        epoch: row.get(1)?,
+                    })
+                },
             )
             .optional()
             .map_err(QghError::from)
+    }
+
+    pub fn capture_retrieval_build_snapshot(
+        &self,
+    ) -> Result<Option<RetrievalBuildSnapshot>, QghError> {
+        self.conn.execute_batch("BEGIN")?;
+        let captured = (|| -> Result<Option<RetrievalBuildSnapshot>, QghError> {
+            let pending: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM purge_requests WHERE purge_pending = 1)",
+                [],
+                |row| row.get(0),
+            )?;
+            if pending {
+                return Err(read_fence_error());
+            }
+            let epoch = read_source_snapshot_epoch(&self.conn)?;
+            let identity = self
+                .conn
+                .query_row(
+                    "SELECT id, source_snapshot_epoch FROM sync_runs
+                     WHERE completed_successfully = 1
+                       AND source_snapshot_epoch = ?1
+                     ORDER BY rowid DESC LIMIT 1",
+                    params![epoch],
+                    |row| {
+                        Ok(SourceSnapshotIdentity {
+                            sync_run_id: row.get(0)?,
+                            epoch: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(identity) = identity else {
+                let source_count: i64 = self.conn.query_row(
+                    "SELECT count(*) FROM source_entities WHERE lifecycle_state = 'active'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                return if source_count == 0 {
+                    Ok(None)
+                } else {
+                    Err(incomplete_source_snapshot_error())
+                };
+            };
+            let expected_publication_id = self
+                .conn
+                .query_row(
+                    "SELECT publication_id FROM retrieval_publication_pointer WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(Some(RetrievalBuildSnapshot {
+                identity,
+                expected_publication_id,
+                sources: self.active_index_sources()?,
+                embedding_chunks: self.active_contextual_embedding_chunks()?,
+            }))
+        })();
+        match captured {
+            Ok(snapshot) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(snapshot)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     pub fn source_version_hash(&self, source_version_id: i64) -> Result<Option<String>, QghError> {
@@ -3953,8 +4184,34 @@ impl Store {
                 "Embedding generation dimension and total chunk count must be positive.",
             ));
         }
+        if spec.context_template_version != crate::context::METADATA_CONTEXT_TEMPLATE_VERSION {
+            return Err(QghError::validation(
+                "embedding.context_template_unsupported",
+                "Embedding generations require the production metadata context template.",
+            ));
+        }
         let write_epoch = self.content_write_epoch;
         let tx = self.content_write_transaction()?;
+        let source_snapshot_epoch = read_source_snapshot_epoch(&tx)?;
+        let source_snapshot_valid = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sync_runs
+                 WHERE id = ?1 AND completed_successfully = 1
+                   AND source_snapshot_epoch = ?2
+             )",
+            params![spec.source_sync_run_id, source_snapshot_epoch],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !source_snapshot_valid {
+            return Err(QghError::validation(
+                "embedding.source_snapshot_incomplete",
+                "Embedding generation requires a completed source snapshot at the current epoch.",
+            ));
+        }
+        let source_snapshot_hash = source_snapshot_identity_hash(&SourceSnapshotIdentity {
+            sync_run_id: spec.source_sync_run_id.clone(),
+            epoch: source_snapshot_epoch,
+        });
         if let Some(id) = tx
             .query_row(
                 "SELECT id FROM embedding_generations
@@ -3966,6 +4223,8 @@ impl Store {
                    AND source_sync_run_id = ?5
                    AND source_snapshot_hash = ?6
                    AND write_epoch = ?7
+                   AND source_snapshot_epoch = ?8
+                   AND total_chunks = ?9
                  ORDER BY id DESC LIMIT 1",
                 params![
                     spec.model_manifest_hash,
@@ -3973,8 +4232,10 @@ impl Store {
                     spec.context_template_version,
                     spec.output_dimension as i64,
                     spec.source_sync_run_id,
-                    spec.source_snapshot_hash,
+                    source_snapshot_hash,
                     write_epoch,
+                    source_snapshot_epoch,
+                    spec.total_chunks,
                 ],
                 |row| row.get(0),
             )
@@ -3988,18 +4249,20 @@ impl Store {
             "INSERT INTO embedding_generations
                 (state, model_manifest_hash, chunker_fingerprint,
                  context_template_version, output_dimension, source_sync_run_id,
-                 source_snapshot_hash, total_chunks, created_at, updated_at, write_epoch)
-             VALUES ('building', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)",
+                 source_snapshot_hash, total_chunks, created_at, updated_at, write_epoch,
+                 source_snapshot_epoch)
+             VALUES ('building', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10)",
             params![
                 spec.model_manifest_hash,
                 spec.chunker_fingerprint,
                 spec.context_template_version,
                 spec.output_dimension as i64,
                 spec.source_sync_run_id,
-                spec.source_snapshot_hash,
+                source_snapshot_hash,
                 spec.total_chunks,
                 now,
                 write_epoch,
+                source_snapshot_epoch,
             ],
         )?;
         let generation_id = tx.last_insert_rowid();
@@ -4014,14 +4277,29 @@ impl Store {
     ) -> Result<usize, QghError> {
         let expected_epoch = self.content_write_epoch;
         let tx = self.content_write_transaction()?;
-        let (dimension, state, generation_epoch): (usize, String, i64) = tx.query_row(
-            "SELECT output_dimension, state, write_epoch
+        let (dimension, state, generation_epoch, generation_source_epoch): (
+            usize,
+            String,
+            i64,
+            i64,
+        ) = tx.query_row(
+            "SELECT output_dimension, state, write_epoch, source_snapshot_epoch
              FROM embedding_generations WHERE id = ?1",
             params![generation_id],
-            |row| Ok((row.get::<_, i64>(0)? as usize, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as usize,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                ))
+            },
         )?;
         if generation_epoch != expected_epoch {
             return Err(write_fence_error());
+        }
+        if generation_source_epoch != read_source_snapshot_epoch(&tx)? {
+            return Err(changed_source_snapshot_error());
         }
         if state != "building" {
             return Err(QghError::validation(
@@ -4171,10 +4449,26 @@ impl Store {
             chunker_fingerprint,
             context_template_version,
             generation_epoch,
-        ): (String, usize, i64, i64, String, String, String, i64) = tx.query_row(
+            source_sync_run_id,
+            source_snapshot_hash,
+            generation_source_epoch,
+        ): (
+            String,
+            usize,
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            i64,
+        ) = tx.query_row(
             "SELECT state, output_dimension, total_chunks, completed_chunks,
                         model_manifest_hash, chunker_fingerprint, context_template_version,
-                        write_epoch
+                        write_epoch, source_sync_run_id, source_snapshot_hash,
+                        source_snapshot_epoch
                  FROM embedding_generations WHERE id = ?1",
             params![generation_id],
             |row| {
@@ -4187,11 +4481,24 @@ impl Store {
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
                 ))
             },
         )?;
         if generation_epoch != expected_epoch {
             return Err(write_fence_error());
+        }
+        let current_source_epoch = read_source_snapshot_epoch(&tx)?;
+        let expected_source_hash = source_snapshot_identity_hash(&SourceSnapshotIdentity {
+            sync_run_id: source_sync_run_id,
+            epoch: generation_source_epoch,
+        });
+        if generation_source_epoch != current_source_epoch
+            || source_snapshot_hash != expected_source_hash
+        {
+            return Err(changed_source_snapshot_error());
         }
         if state != "building" || completed_chunks != total_chunks {
             tx.execute(
@@ -4417,11 +4724,13 @@ impl Store {
             self.cleanup_owned_index_generation(tantivy_generation)?;
             return Err(error);
         }
+        let current_source_snapshot_epoch = read_source_snapshot_epoch(&tx)?;
         let embedding_metadata = if let Some(generation_id) = embedding_generation_id {
             Some(tx.query_row(
                 "SELECT state, model_manifest_hash, chunker_fingerprint,
                         context_template_version, output_dimension, total_chunks,
-                        completed_chunks, write_epoch
+                        completed_chunks, write_epoch, source_sync_run_id,
+                        source_snapshot_hash, source_snapshot_epoch
                  FROM embedding_generations WHERE id = ?1",
                 params![generation_id],
                 |row| {
@@ -4434,14 +4743,28 @@ impl Store {
                         row.get::<_, i64>(5)?,
                         row.get::<_, i64>(6)?,
                         row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
                     ))
                 },
             )?)
         } else {
             None
         };
-        if let Some((state, _, _, _, _, total_chunks, completed_chunks, generation_epoch)) =
-            &embedding_metadata
+        if let Some((
+            state,
+            _,
+            _,
+            context_template_version,
+            _,
+            total_chunks,
+            completed_chunks,
+            generation_epoch,
+            generation_sync_run_id,
+            generation_snapshot_hash,
+            generation_source_epoch,
+        )) = &embedding_metadata
         {
             if *generation_epoch != expected_epoch {
                 drop(tx);
@@ -4456,6 +4779,24 @@ impl Store {
                     "Only a complete ready embedding generation can be published.",
                 ));
             }
+            let embedding_snapshot_matches = generation_source_epoch.is_some_and(|epoch| {
+                let expected_hash = source_snapshot_identity_hash(&SourceSnapshotIdentity {
+                    sync_run_id: generation_sync_run_id.clone(),
+                    epoch,
+                });
+                epoch == current_source_snapshot_epoch && generation_snapshot_hash == &expected_hash
+            });
+            if context_template_version != crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
+                || generation_sync_run_id != source_snapshot_sync_run_id
+                || !embedding_snapshot_matches
+            {
+                drop(tx);
+                self.cleanup_owned_index_generation(tantivy_generation)?;
+                return Err(QghError::validation(
+                    "publication.embedding_snapshot_mismatch",
+                    "Embedding and lexical generations do not share one source snapshot.",
+                ));
+            }
         }
         let current = tx
             .query_row(
@@ -4464,7 +4805,7 @@ impl Store {
                 |row| row.get::<_, i64>(0),
             )
             .optional()?;
-        if expected_publication_id.is_some() && current != expected_publication_id {
+        if current != expected_publication_id {
             drop(tx);
             self.cleanup_owned_index_generation(tantivy_generation)?;
             return Err(QghError::validation(
@@ -4474,7 +4815,9 @@ impl Store {
         }
         let index_state = tx
             .query_row(
-                "SELECT write_epoch, active, path, source_count
+                "SELECT write_epoch, active, path, source_count,
+                    source_snapshot_sync_run_id, source_snapshot_epoch,
+                    expected_publication_id
                  FROM index_generations WHERE generation = ?1",
                 params![tantivy_generation],
                 |row| {
@@ -4483,11 +4826,23 @@ impl Store {
                         row.get::<_, bool>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((index_epoch, index_active, index_path, source_count)) = index_state else {
+        let Some((
+            index_epoch,
+            index_active,
+            index_path,
+            source_count,
+            index_snapshot_sync_run_id,
+            index_snapshot_epoch,
+            index_expected_publication_id,
+        )) = index_state
+        else {
             drop(tx);
             self.cleanup_owned_index_generation(tantivy_generation)?;
             return Err(QghError::validation(
@@ -4499,6 +4854,32 @@ impl Store {
             drop(tx);
             self.cleanup_owned_index_generation(tantivy_generation)?;
             return Err(write_fence_error());
+        }
+        if index_expected_publication_id != expected_publication_id {
+            drop(tx);
+            self.cleanup_owned_index_generation(tantivy_generation)?;
+            return Err(QghError::validation(
+                "publication.cas_conflict",
+                "The index generation was reserved against a different retrieval publication.",
+            ));
+        }
+        let index_snapshot_matches = index_snapshot_sync_run_id.as_deref()
+            == Some(source_snapshot_sync_run_id)
+            && index_snapshot_epoch == Some(current_source_snapshot_epoch)
+            && tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sync_runs
+                     WHERE id = ?1
+                       AND completed_successfully = 1
+                       AND source_snapshot_epoch = ?2
+                 )",
+                params![source_snapshot_sync_run_id, current_source_snapshot_epoch],
+                |row| row.get::<_, bool>(0),
+            )?;
+        if !index_snapshot_matches {
+            drop(tx);
+            self.cleanup_owned_index_generation(tantivy_generation)?;
+            return Err(changed_source_snapshot_error());
         }
         let artifact_ready = Path::new(&index_path) == expected_generation_path
             && usize::try_from(source_count)
@@ -4554,22 +4935,24 @@ impl Store {
         let now = now_rfc3339();
         let (manifest, chunker, context, dimension) = embedding_metadata
             .as_ref()
-            .map(|(_, manifest, chunker, context, dimension, _, _, _)| {
-                (
-                    Some(manifest.as_str()),
-                    Some(chunker.as_str()),
-                    Some(context.as_str()),
-                    Some(*dimension as i64),
-                )
-            })
+            .map(
+                |(_, manifest, chunker, context, dimension, _, _, _, _, _, _)| {
+                    (
+                        Some(manifest.as_str()),
+                        Some(chunker.as_str()),
+                        Some(context.as_str()),
+                        Some(*dimension as i64),
+                    )
+                },
+            )
             .unwrap_or((None, None, None, None));
         tx.execute(
             "INSERT INTO retrieval_publications
                 (source_snapshot_sync_run_id, tantivy_generation,
                  embedding_generation_id, model_manifest_hash,
                  chunker_fingerprint, context_template_version,
-                 output_dimension, active, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8)",
+                 output_dimension, source_snapshot_epoch, active, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)",
             params![
                 source_snapshot_sync_run_id,
                 tantivy_generation,
@@ -4578,6 +4961,7 @@ impl Store {
                 chunker,
                 context,
                 dimension,
+                current_source_snapshot_epoch,
                 now
             ],
         )?;
@@ -4640,7 +5024,8 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT rp.publication_id, rp.source_snapshot_sync_run_id,
-                        rp.tantivy_generation, rp.embedding_generation_id,
+                        rp.source_snapshot_epoch, rp.tantivy_generation,
+                        rp.embedding_generation_id,
                         rp.model_manifest_hash, rp.chunker_fingerprint,
                         rp.context_template_version, rp.output_dimension
                  FROM retrieval_publication_pointer p
@@ -4651,17 +5036,142 @@ impl Store {
                     Ok(RetrievalPublicationView {
                         publication_id: row.get(0)?,
                         source_snapshot_sync_run_id: row.get(1)?,
-                        tantivy_generation: row.get(2)?,
-                        embedding_generation_id: row.get(3)?,
-                        model_manifest_hash: row.get(4)?,
-                        chunker_fingerprint: row.get(5)?,
-                        context_template_version: row.get(6)?,
-                        output_dimension: row.get::<_, Option<i64>>(7)?.map(|value| value as usize),
+                        source_snapshot_epoch: row.get(2)?,
+                        tantivy_generation: row.get(3)?,
+                        embedding_generation_id: row.get(4)?,
+                        model_manifest_hash: row.get(5)?,
+                        chunker_fingerprint: row.get(6)?,
+                        context_template_version: row.get(7)?,
+                        output_dimension: row.get::<_, Option<i64>>(8)?.map(|value| value as usize),
                     })
                 },
             )
             .optional()
             .map_err(QghError::from)
+    }
+
+    pub fn validate_query_publication_snapshot(
+        &self,
+        publication: Option<&RetrievalPublicationView>,
+    ) -> Result<(), QghError> {
+        let current_epoch = read_source_snapshot_epoch(&self.conn)?;
+        let active_source_count: i64 = self.conn.query_row(
+            "SELECT count(*) FROM source_entities WHERE lifecycle_state = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        let Some(publication) = publication else {
+            return if active_source_count == 0 {
+                Ok(())
+            } else {
+                Err(incomplete_source_snapshot_error())
+            };
+        };
+        if publication.source_snapshot_epoch != current_epoch {
+            return Err(changed_source_snapshot_error());
+        }
+        let source_snapshot_valid = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sync_runs
+                 WHERE id = ?1 AND completed_successfully = 1
+                   AND source_snapshot_epoch = ?2
+             )",
+            params![publication.source_snapshot_sync_run_id, current_epoch],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !source_snapshot_valid {
+            return Err(changed_source_snapshot_error());
+        }
+        let index_snapshot = self
+            .conn
+            .query_row(
+                "SELECT source_snapshot_sync_run_id, source_snapshot_epoch
+                 FROM index_generations WHERE generation = ?1",
+                params![publication.tantivy_generation],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if !index_snapshot.is_some_and(|(sync_run_id, epoch)| {
+            sync_run_id.as_deref() == Some(publication.source_snapshot_sync_run_id.as_str())
+                && epoch == Some(current_epoch)
+        }) {
+            return Err(changed_source_snapshot_error());
+        }
+        let Some(embedding_generation_id) = publication.embedding_generation_id else {
+            if publication.model_manifest_hash.is_some()
+                || publication.chunker_fingerprint.is_some()
+                || publication.context_template_version.is_some()
+                || publication.output_dimension.is_some()
+            {
+                return Err(embedding_snapshot_mismatch_error());
+            }
+            return Ok(());
+        };
+        if !table_exists(&self.conn, "embedding_generations")? {
+            return Err(embedding_snapshot_mismatch_error());
+        }
+        let embedding = self
+            .conn
+            .query_row(
+                "SELECT state, model_manifest_hash, chunker_fingerprint,
+                        context_template_version, output_dimension,
+                        source_sync_run_id, source_snapshot_hash,
+                        source_snapshot_epoch, total_chunks, completed_chunks
+                 FROM embedding_generations WHERE id = ?1",
+                params![embedding_generation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)? as usize,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let expected_snapshot_hash = source_snapshot_identity_hash(&SourceSnapshotIdentity {
+            sync_run_id: publication.source_snapshot_sync_run_id.clone(),
+            epoch: current_epoch,
+        });
+        if !embedding.is_some_and(
+            |(
+                state,
+                manifest,
+                chunker,
+                context,
+                dimension,
+                sync_run_id,
+                snapshot_hash,
+                epoch,
+                total_chunks,
+                completed_chunks,
+            )| {
+                state == "active"
+                    && manifest.as_str() == publication.model_manifest_hash.as_deref().unwrap_or("")
+                    && chunker.as_str() == publication.chunker_fingerprint.as_deref().unwrap_or("")
+                    && context == crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
+                    && publication.context_template_version.as_deref() == Some(context.as_str())
+                    && publication.output_dimension == Some(dimension)
+                    && sync_run_id == publication.source_snapshot_sync_run_id
+                    && snapshot_hash == expected_snapshot_hash
+                    && epoch == Some(current_epoch)
+                    && total_chunks == completed_chunks
+            },
+        ) {
+            return Err(embedding_snapshot_mismatch_error());
+        }
+        Ok(())
     }
 
     pub fn cleanup_embedding_generations(
@@ -4880,7 +5390,8 @@ impl Store {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 failure_code TEXT,
-                write_epoch INTEGER NOT NULL DEFAULT 0
+                write_epoch INTEGER NOT NULL DEFAULT 0,
+                source_snapshot_epoch INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS embedding_generation_chunks (
@@ -4917,6 +5428,7 @@ impl Store {
                 chunker_fingerprint TEXT,
                 context_template_version TEXT,
                 output_dimension INTEGER,
+                source_snapshot_epoch INTEGER,
                 active INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
@@ -4938,6 +5450,18 @@ impl Store {
             "embedding_generations",
             "write_epoch",
             "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &self.conn,
+            "embedding_generations",
+            "source_snapshot_epoch",
+            "INTEGER",
+        )?;
+        ensure_column(
+            &self.conn,
+            "retrieval_publications",
+            "source_snapshot_epoch",
+            "INTEGER",
         )?;
         Ok(())
     }
@@ -4969,6 +5493,9 @@ impl Store {
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
             INSERT INTO profile_meta (key, value)
                 VALUES ('content_write_epoch', '0')
+                ON CONFLICT(key) DO NOTHING;
+            INSERT INTO profile_meta (key, value)
+                VALUES ('source_snapshot_epoch', '0')
                 ON CONFLICT(key) DO NOTHING;
 
             CREATE TABLE IF NOT EXISTS repositories (
@@ -5054,7 +5581,8 @@ impl Store {
                 upserted_comment_count INTEGER NOT NULL DEFAULT 0,
                 skipped_pull_request_count INTEGER NOT NULL,
                 snapshot_kind TEXT NOT NULL DEFAULT 'remote_sync',
-                content_write_epoch INTEGER
+                content_write_epoch INTEGER,
+                source_snapshot_epoch INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS sync_cursors (
@@ -5144,7 +5672,10 @@ impl Store {
                 source_count INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 active INTEGER NOT NULL,
-                write_epoch INTEGER NOT NULL DEFAULT 0
+                write_epoch INTEGER NOT NULL DEFAULT 0,
+                source_snapshot_sync_run_id TEXT,
+                source_snapshot_epoch INTEGER,
+                expected_publication_id INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS index_build_leases (
@@ -5152,7 +5683,9 @@ impl Store {
                 write_epoch INTEGER NOT NULL,
                 owner_pid INTEGER NOT NULL,
                 owner_token TEXT NOT NULL UNIQUE,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                source_snapshot_sync_run_id TEXT,
+                source_snapshot_epoch INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS index_tasks (
@@ -5172,6 +5705,7 @@ impl Store {
                 chunker_fingerprint TEXT,
                 context_template_version TEXT,
                 output_dimension INTEGER,
+                source_snapshot_epoch INTEGER,
                 active INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
@@ -5325,11 +5859,48 @@ impl Store {
             "TEXT NOT NULL DEFAULT 'remote_sync'",
         )?;
         ensure_column(&self.conn, "sync_runs", "content_write_epoch", "INTEGER")?;
+        ensure_column(&self.conn, "sync_runs", "source_snapshot_epoch", "INTEGER")?;
         ensure_column(
             &self.conn,
             "index_generations",
             "write_epoch",
             "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &self.conn,
+            "index_generations",
+            "source_snapshot_sync_run_id",
+            "TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "index_generations",
+            "source_snapshot_epoch",
+            "INTEGER",
+        )?;
+        ensure_column(
+            &self.conn,
+            "index_generations",
+            "expected_publication_id",
+            "INTEGER",
+        )?;
+        ensure_column(
+            &self.conn,
+            "index_build_leases",
+            "source_snapshot_sync_run_id",
+            "TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "index_build_leases",
+            "source_snapshot_epoch",
+            "INTEGER",
+        )?;
+        ensure_column(
+            &self.conn,
+            "retrieval_publications",
+            "source_snapshot_epoch",
+            "INTEGER",
         )?;
         self.conn.execute(
             "INSERT INTO profile_meta (key, value)
@@ -6218,6 +6789,40 @@ fn read_content_write_epoch(conn: &Connection) -> Result<i64, QghError> {
     .map_err(QghError::from)
 }
 
+fn read_source_snapshot_epoch(conn: &Connection) -> Result<i64, QghError> {
+    conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM profile_meta
+         WHERE key = 'source_snapshot_epoch'",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(QghError::from)
+}
+
+fn bump_source_snapshot_epoch(conn: &Connection) -> Result<i64, QghError> {
+    conn.execute(
+        "UPDATE profile_meta
+         SET value = CAST(value AS INTEGER) + 1
+         WHERE key = 'source_snapshot_epoch'",
+        [],
+    )?;
+    read_source_snapshot_epoch(conn)
+}
+
+fn source_snapshot_identity_hash(identity: &SourceSnapshotIdentity) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"qgh.source_snapshot.v1");
+    hasher.update([0]);
+    hasher.update(identity.sync_run_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(identity.epoch.to_le_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn read_successor_repair_required(conn: &Connection) -> Result<bool, QghError> {
     let value = conn
         .query_row(
@@ -6289,6 +6894,30 @@ fn write_fence_error() -> QghError {
     QghError::new(
         "purge.write_fenced",
         "Content write was fenced by lifecycle purge state.",
+        6,
+    )
+}
+
+fn incomplete_source_snapshot_error() -> QghError {
+    QghError::new(
+        "publication.source_snapshot_incomplete",
+        "A retrieval build requires a completed source snapshot at the current source epoch.",
+        6,
+    )
+}
+
+fn changed_source_snapshot_error() -> QghError {
+    QghError::new(
+        "publication.source_snapshot_changed",
+        "The authoritative source snapshot changed before retrieval publication activation.",
+        6,
+    )
+}
+
+fn embedding_snapshot_mismatch_error() -> QghError {
+    QghError::new(
+        "publication.embedding_snapshot_mismatch",
+        "Embedding and lexical generations do not share one validated source snapshot.",
         6,
     )
 }
@@ -6385,6 +7014,108 @@ fn upsert_source_version(
     )
 }
 
+fn authoritative_issue_matches(
+    conn: &Connection,
+    issue: &IssueRecord,
+    canonical_repo: &str,
+) -> Result<bool, QghError> {
+    let labels_json = serde_json::to_string(&issue.labels)
+        .map_err(|_| QghError::storage("Failed to compare issue metadata."))?;
+    let assignees_json = serde_json::to_string(&issue.assignees)
+        .map_err(|_| QghError::storage("Failed to compare issue metadata."))?;
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM source_entities se
+             JOIN issue_metadata im ON im.source_id = se.source_id
+             JOIN source_versions sv ON sv.id = im.latest_version_id
+             WHERE se.source_id = ?1
+               AND se.entity_type = 'issue'
+               AND se.host = ?2 AND se.repo = ?3
+               AND se.node_id = ?4 AND se.github_id = ?5
+               AND se.lifecycle_state = 'active'
+               AND se.created_at = ?6 AND se.updated_at = ?7
+               AND im.repo = ?3 AND im.issue_number = ?8
+               AND im.title = ?9 AND im.body = ?10 AND im.state = ?11
+               AND im.labels_json = ?12 AND im.milestone IS ?13
+               AND im.assignees_json = ?14 AND im.author IS ?15
+               AND im.created_at = ?6 AND im.updated_at = ?7
+               AND im.closed_at IS ?16 AND im.canonical_url = ?17
+               AND sv.body_hash = ?18 AND sv.github_updated_at = ?7
+         )",
+        params![
+            issue.source_id,
+            issue.host,
+            canonical_repo,
+            issue.node_id,
+            issue.github_id,
+            issue.created_at,
+            issue.updated_at,
+            issue.number,
+            issue.title,
+            issue.body,
+            issue.state,
+            labels_json,
+            issue.milestone,
+            assignees_json,
+            issue.author,
+            issue.closed_at,
+            issue.canonical_url,
+            issue.body_hash,
+        ],
+        |row| row.get(0),
+    )
+    .map_err(QghError::from)
+}
+
+fn authoritative_comment_matches(
+    conn: &Connection,
+    comment: &CommentRecord,
+    canonical_repo: &str,
+) -> Result<bool, QghError> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM source_entities se
+             JOIN comment_metadata cm ON cm.source_id = se.source_id
+             JOIN source_versions sv ON sv.id = cm.latest_version_id
+             WHERE se.source_id = ?1
+               AND se.entity_type = 'issue_comment'
+               AND se.host = ?2 AND se.repo = ?3
+               AND se.node_id = ?4 AND se.github_id = ?5
+               AND se.lifecycle_state = 'active'
+               AND se.created_at = ?6 AND se.updated_at = ?7
+               AND cm.repo = ?3 AND cm.issue_number = ?8
+               AND cm.body = ?9 AND cm.author IS ?10
+               AND cm.created_at = ?6 AND cm.updated_at = ?7
+               AND cm.canonical_url = ?11
+               AND cm.parent_issue_source_id = ?12
+               AND cm.parent_issue_title = ?13
+               AND cm.parent_issue_canonical_url = ?14
+               AND sv.body_hash = ?15 AND sv.github_updated_at = ?7
+         )",
+        params![
+            comment.source_id,
+            comment.host,
+            canonical_repo,
+            comment.node_id,
+            comment.github_id,
+            comment.created_at,
+            comment.updated_at,
+            comment.parent_issue_number,
+            comment.body,
+            comment.author,
+            comment.canonical_url,
+            comment.parent_issue_source_id,
+            comment.parent_issue_title,
+            comment.parent_issue_canonical_url,
+            comment.body_hash,
+        ],
+        |row| row.get(0),
+    )
+    .map_err(QghError::from)
+}
+
 fn issue_repo_from_cursor_endpoint(endpoint: &str) -> Option<&str> {
     endpoint.strip_prefix("issues:")
 }
@@ -6406,6 +7137,36 @@ fn stored_chunk_from_row(row: &rusqlite::Row<'_>) -> Result<StoredChunk, rusqlit
         chunker_fingerprint: row.get(10)?,
         heading_path,
     })
+}
+
+fn stored_chunks_match(
+    conn: &Connection,
+    source_version_id: i64,
+    expected: &[MarkdownChunk],
+) -> Result<bool, QghError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, source_id, source_version_id, body, chunk_index, token_start,
+                token_end, byte_start, byte_end, chunker_version,
+                chunker_fingerprint, heading_path_json
+         FROM chunks WHERE source_version_id = ?1 ORDER BY chunk_index, id",
+    )?;
+    let stored = stmt
+        .query_map(params![source_version_id], stored_chunk_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    if stored.len() != expected.len() {
+        return Ok(false);
+    }
+    Ok(stored.iter().zip(expected).all(|(stored, expected)| {
+        stored.body == expected.body
+            && stored.chunk_index == expected.chunk_index
+            && stored.token_start == expected.token_start
+            && stored.token_end == expected.token_end
+            && stored.byte_start == expected.byte_start
+            && stored.byte_end == expected.byte_end
+            && stored.chunker_version == expected.chunker_version
+            && stored.chunker_fingerprint == expected.chunker_fingerprint
+            && stored.heading_path == expected.heading_path
+    }))
 }
 
 fn contextual_embedding_chunk_from_row(
@@ -6557,12 +7318,15 @@ mod tests {
         let paths = temp_profile_paths("successor-repair-fresh-empty");
         let mut store = Store::open(&paths).unwrap();
         assert!(!store.successor_repair_required().unwrap());
+        assert!(store.capture_retrieval_build_snapshot().unwrap().is_none());
+        store.validate_query_publication_snapshot(None).unwrap();
         assert!(store.record_purge_successor_snapshot().unwrap().is_none());
         assert!(store.latest_successful_sync_run_id().unwrap().is_none());
         store
             .conn
             .execute(
-                "DELETE FROM profile_meta WHERE key = 'successor_repair_required'",
+                "DELETE FROM profile_meta
+                 WHERE key IN ('successor_repair_required', 'source_snapshot_epoch')",
                 [],
             )
             .unwrap();
@@ -6570,6 +7334,11 @@ mod tests {
 
         let mut reopened = Store::open(&paths).unwrap();
         assert!(!reopened.successor_repair_required().unwrap());
+        assert!(reopened
+            .capture_retrieval_build_snapshot()
+            .unwrap()
+            .is_none());
+        reopened.validate_query_publication_snapshot(None).unwrap();
         assert!(reopened
             .record_purge_successor_snapshot()
             .unwrap()
@@ -6689,7 +7458,7 @@ mod tests {
         let old_error = store
             .activate_retrieval_publication(old_sync_run_id, old_generation, None, None)
             .unwrap_err();
-        assert_eq!(old_error.code, "publication.successor_snapshot_required");
+        assert_eq!(old_error.code, "publication.source_snapshot_changed");
         assert!(store.successor_repair_required().unwrap());
 
         store
@@ -6707,7 +7476,7 @@ mod tests {
         let stale_error = store
             .activate_retrieval_publication(&first_snapshot, stale_generation, None, None)
             .unwrap_err();
-        assert_eq!(stale_error.code, "publication.successor_snapshot_required");
+        assert_eq!(stale_error.code, "publication.source_snapshot_changed");
         assert!(store.successor_repair_required().unwrap());
 
         let current_snapshot = store
@@ -6847,6 +7616,7 @@ mod tests {
                 &[],
             )
             .unwrap();
+        seal_latest_test_sync(&mut store);
         let (generation, _) = store
             .reserve_index_generation(&paths.index_root, 2)
             .unwrap();
@@ -7083,6 +7853,7 @@ mod tests {
                 &[],
             )
             .unwrap();
+        seal_latest_test_sync(&mut store);
         let (generation, _) = store
             .reserve_index_generation(&paths.index_root, 2)
             .unwrap();
@@ -7191,6 +7962,7 @@ mod tests {
                 &[],
             )
             .unwrap();
+        seal_latest_test_sync(&mut store);
         let (generation, _) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
@@ -7246,14 +8018,14 @@ mod tests {
         store
             .purge(target.clone(), PurgeTrigger::ConfirmedDelete)
             .unwrap();
-        let (generation, _) = store
-            .reserve_index_generation(&paths.index_root, 0)
-            .unwrap();
-        rebuild_reserved_generation(&store, &paths, generation);
         let snapshot = store
             .record_purge_successor_snapshot()
             .unwrap()
             .expect("completed purge successor snapshot");
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
         let publication = store
             .activate_retrieval_publication(&snapshot, generation, None, None)
             .unwrap();
@@ -7995,6 +8767,7 @@ mod tests {
                 &[],
             )
             .unwrap();
+        seal_latest_test_sync(&mut store);
         let (generation, _) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
@@ -8169,6 +8942,7 @@ mod tests {
                 &[],
             )
             .unwrap();
+        seal_latest_test_sync(&mut stale_builder);
         let (generation, generation_path) = stale_builder
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
@@ -8211,6 +8985,7 @@ mod tests {
                 &[],
             )
             .unwrap();
+        seal_latest_test_sync(&mut builder);
         let (generation, generation_path) = builder
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
@@ -8278,6 +9053,7 @@ mod tests {
                 &[],
             )
             .unwrap();
+        seal_latest_test_sync(&mut store);
         let (generation, generation_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
@@ -8329,6 +9105,7 @@ mod tests {
                 &[],
             )
             .unwrap();
+        seal_latest_test_sync(&mut stale_builder);
         let (generation, generation_path) = stale_builder
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
@@ -8471,6 +9248,9 @@ mod tests {
             )
             .unwrap();
         let retained_chunk = insert_chunk(&mut builder, retained_id, "retained chunk");
+        builder
+            .mark_sync_run_completed("sync-stale-embedding-builder")
+            .unwrap();
         let retained_version = builder
             .latest_source_version_id(retained_id)
             .unwrap()
@@ -8483,7 +9263,6 @@ mod tests {
                     .to_string(),
                 output_dimension: 2,
                 source_sync_run_id: "sync-stale-embedding-builder".to_string(),
-                source_snapshot_hash: "snapshot-stale-builder".to_string(),
                 total_chunks: 1,
             })
             .unwrap();
@@ -8539,6 +9318,7 @@ mod tests {
             )
             .unwrap();
         let chunk_id = insert_chunk(&mut builder, retained_id, "validate retained chunk");
+        seal_latest_test_sync(&mut builder);
         let source_version_id = builder
             .latest_source_version_id(retained_id)
             .unwrap()
@@ -8556,7 +9336,6 @@ mod tests {
                     .to_string(),
                 output_dimension: 2,
                 source_sync_run_id: "sync-stale-embedding-validation".to_string(),
-                source_snapshot_hash: "snapshot-stale-validation".to_string(),
                 total_chunks: 1,
             })
             .unwrap();
@@ -9176,27 +9955,28 @@ mod tests {
                 &[],
             )
             .unwrap();
+        seal_latest_test_sync(&mut store);
         let (first_generation, first_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
-        let (second_generation, second_path) = store
-            .reserve_index_generation(&paths.index_root, 1)
-            .unwrap();
         rebuild_reserved_generation(&store, &paths, first_generation);
-        rebuild_reserved_generation(&store, &paths, second_generation);
         fs::create_dir_all(&paths.index_active).unwrap();
         let backup_path = paths.index_root.join("user-backup-1");
         fs::create_dir_all(&backup_path).unwrap();
         let model_artifact = paths.cache_dir.join("models/model.onnx");
         fs::create_dir_all(model_artifact.parent().unwrap()).unwrap();
         fs::write(first_path.join("segment"), "tantivy-private-marker").unwrap();
-        fs::write(second_path.join("segment"), "tantivy-private-marker").unwrap();
         fs::write(paths.index_active.join("segment"), "tantivy-private-marker").unwrap();
         fs::write(backup_path.join("keep"), "user-owned-backup").unwrap();
         fs::write(&model_artifact, "model-artifact").unwrap();
         let first_publication = store
             .activate_retrieval_publication("sync-purge-tantivy", first_generation, None, None)
             .unwrap();
+        let (second_generation, second_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, second_generation);
+        fs::write(second_path.join("segment"), "tantivy-private-marker").unwrap();
         store
             .activate_retrieval_publication(
                 "sync-purge-tantivy",
@@ -9248,6 +10028,7 @@ mod tests {
                 &[],
             )
             .unwrap();
+        seal_latest_test_sync(&mut store);
         let (generation, generation_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
@@ -9983,14 +10764,14 @@ mod tests {
                 PurgeTrigger::AllowlistRemoval,
             )
             .unwrap();
-        let (generation, _) = store
-            .reserve_index_generation(&paths.index_root, 1)
-            .unwrap();
-        rebuild_reserved_generation(&store, &paths, generation);
         let successor_snapshot = store
             .record_purge_successor_snapshot()
             .unwrap()
             .expect("repository purge successor snapshot");
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
         let publication = store
             .activate_retrieval_publication(&successor_snapshot, generation, None, None)
             .unwrap();
@@ -10140,15 +10921,15 @@ mod tests {
                     },
                 )
                 .unwrap();
+        let successor_snapshot = store
+            .record_purge_successor_snapshot()
+            .unwrap()
+            .expect("source purge successor snapshot");
         let (generation, generation_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
         rebuild_reserved_generation(&store, &paths, generation);
         fs::write(generation_path.join("segment"), "other-only").unwrap();
-        let successor_snapshot = store
-            .record_purge_successor_snapshot()
-            .unwrap()
-            .expect("source purge successor snapshot");
         let publication = store
             .activate_retrieval_publication(&successor_snapshot, generation, None, None)
             .unwrap();
@@ -10270,6 +11051,7 @@ mod tests {
                 &[],
             )
             .unwrap();
+        seal_latest_test_sync(&mut store);
         let (generation, generation_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
@@ -10335,15 +11117,15 @@ mod tests {
                 PurgeTrigger::ConfirmedDelete,
             )
             .unwrap();
+        let successor_snapshot = store
+            .record_purge_successor_snapshot()
+            .unwrap()
+            .expect("issue purge successor snapshot");
         let (generation, generation_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
         rebuild_reserved_generation(&store, &paths, generation);
         fs::write(generation_path.join("segment"), "other-issue-only").unwrap();
-        let successor_snapshot = store
-            .record_purge_successor_snapshot()
-            .unwrap()
-            .expect("issue purge successor snapshot");
         let publication = store
             .activate_retrieval_publication(&successor_snapshot, generation, None, None)
             .unwrap();
@@ -10419,6 +11201,7 @@ mod tests {
                 &[],
             )
             .unwrap();
+        seal_latest_test_sync(&mut store);
 
         let (first_generation, first_path) = store
             .reserve_index_generation(&paths.index_root, 2)
@@ -10480,6 +11263,9 @@ mod tests {
                 &[],
             )
             .unwrap();
+        store
+            .mark_sync_run_completed("sync-generation-never-reused")
+            .unwrap();
         let (first_generation, first_path) = store
             .reserve_index_generation(&paths.index_root, 2)
             .unwrap();
@@ -10500,6 +11286,10 @@ mod tests {
                 PurgeTrigger::ConfirmedDelete,
             )
             .unwrap();
+        store
+            .record_purge_successor_snapshot()
+            .unwrap()
+            .expect("post-purge source snapshot");
 
         let (second_generation, second_path) = store
             .reserve_index_generation(&paths.index_root, 1)
@@ -11017,10 +11807,16 @@ mod tests {
             context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
             output_dimension: 2,
             source_sync_run_id: "generation-sync".to_string(),
-            source_snapshot_hash: "snapshot-a".to_string(),
             total_chunks: 1,
         };
         let generation_id = store.begin_embedding_generation(&spec).unwrap();
+        let resized_generation_id = store
+            .begin_embedding_generation(&EmbeddingGenerationSpec {
+                total_chunks: 2,
+                ..spec.clone()
+            })
+            .unwrap();
+        assert_ne!(resized_generation_id, generation_id);
         store
             .stage_embedding_generation_batch(
                 generation_id,
@@ -11188,9 +11984,80 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_edit_during_build_rejects_activation_and_preserves_previous_publication() {
+        let paths = temp_profile_paths("publication-source-epoch-drift");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_SOURCE_EPOCH_DRIFT";
+        let first_issue = test_issue(source_id, "owner/repo", "first");
+        store
+            .upsert_sources_for_run(
+                "sync-source-first",
+                std::slice::from_ref(&first_issue),
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store.mark_sync_run_completed("sync-source-first").unwrap();
+        let (first_generation, _) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, first_generation);
+        let first_publication = store
+            .activate_retrieval_publication("sync-source-first", first_generation, None, None)
+            .unwrap();
+
+        let mut built_issue = first_issue.clone();
+        built_issue.title = "Title built snapshot".to_string();
+        built_issue.updated_at = "2026-01-03T00:00:00Z".to_string();
+        built_issue.indexed_at = "2026-01-03T00:00:01Z".to_string();
+        store
+            .upsert_sources_for_run("sync-source-built", &[built_issue.clone()], &[], 0, &[])
+            .unwrap();
+        store.mark_sync_run_completed("sync-source-built").unwrap();
+        let (stale_generation, _) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, stale_generation);
+
+        let mut concurrent_edit = built_issue;
+        concurrent_edit.body = "Body changed while index build was in flight".to_string();
+        concurrent_edit.body_hash = "body-hash-concurrent-edit".to_string();
+        concurrent_edit.updated_at = "2026-01-04T00:00:00Z".to_string();
+        concurrent_edit.indexed_at = "2026-01-04T00:00:01Z".to_string();
+        store
+            .upsert_sources_for_run("sync-source-concurrent", &[concurrent_edit], &[], 0, &[])
+            .unwrap();
+
+        let error = store
+            .activate_retrieval_publication(
+                "sync-source-built",
+                stale_generation,
+                None,
+                Some(first_publication),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "publication.source_snapshot_changed");
+        let active = store.active_retrieval_publication().unwrap().unwrap();
+        assert_eq!(active.publication_id, first_publication);
+        assert_eq!(active.tantivy_generation, first_generation);
+        let query_error = store
+            .validate_query_publication_snapshot(Some(&active))
+            .unwrap_err();
+        assert_eq!(query_error.code, "publication.source_snapshot_changed");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
     fn retrieval_publication_cas_keeps_bm25_embedding_null_and_rolls_back_conflicts() {
         let paths = temp_profile_paths("publication-cas");
         let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run("sync-one", &[], &[], 0, &[])
+            .unwrap();
+        store.mark_sync_run_completed("sync-one").unwrap();
         let (first_generation, _) = store
             .reserve_index_generation(&paths.index_root, 0)
             .unwrap();
@@ -11202,6 +12069,10 @@ mod tests {
         assert_eq!(active.publication_id, first);
         assert_eq!(active.embedding_generation_id, None);
         assert_eq!(active.tantivy_generation, first_generation);
+        store
+            .upsert_sources_for_run("sync-two", &[], &[], 0, &[])
+            .unwrap();
+        store.mark_sync_run_completed("sync-two").unwrap();
         let (second_generation, _) = store
             .reserve_index_generation(&paths.index_root, 0)
             .unwrap();
@@ -11210,6 +12081,10 @@ mod tests {
             .activate_retrieval_publication("sync-two", second_generation, None, Some(first))
             .unwrap();
         assert_ne!(first, second);
+        store
+            .upsert_sources_for_run("sync-three", &[], &[], 0, &[])
+            .unwrap();
+        store.mark_sync_run_completed("sync-three").unwrap();
         let (third_generation, _) = store
             .reserve_index_generation(&paths.index_root, 0)
             .unwrap();
@@ -11229,6 +12104,336 @@ mod tests {
                 .publication_id,
             second
         );
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn first_publication_absent_to_present_cas_rejects_second_builder() {
+        let paths = temp_profile_paths("publication-first-cas");
+        let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run("sync-first-cas", &[], &[], 0, &[])
+            .unwrap();
+        store.mark_sync_run_completed("sync-first-cas").unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        assert_eq!(snapshot.expected_publication_id, None);
+        let (first_generation, _) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        let (second_generation, _) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, first_generation, &snapshot.sources).unwrap();
+        crate::index::rebuild(&paths.index_root, second_generation, &snapshot.sources).unwrap();
+        let publication = store
+            .activate_retrieval_publication(
+                &snapshot.identity.sync_run_id,
+                first_generation,
+                None,
+                snapshot.expected_publication_id,
+            )
+            .unwrap();
+
+        let error = store
+            .activate_retrieval_publication(
+                &snapshot.identity.sync_run_id,
+                second_generation,
+                None,
+                snapshot.expected_publication_id,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "publication.cas_conflict");
+        assert_eq!(
+            store
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            publication
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn later_page_at_new_epoch_blocks_capture_until_sync_completion() {
+        let paths = temp_profile_paths("publication-incomplete-page");
+        let mut store = Store::open(&paths).unwrap();
+        store
+            .upsert_sources_for_run(
+                "sync-paged",
+                &[test_issue(
+                    "qgh://github.com/issue/I_PAGE_ONE",
+                    "owner/repo",
+                    "page-one",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store.mark_sync_run_completed("sync-paged").unwrap();
+        assert!(store.capture_retrieval_build_snapshot().unwrap().is_some());
+        store
+            .upsert_sources_for_run(
+                "sync-paged",
+                &[test_issue(
+                    "qgh://github.com/issue/I_PAGE_TWO",
+                    "owner/repo",
+                    "page-two",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+
+        let error = store.capture_retrieval_build_snapshot().unwrap_err();
+        assert_eq!(error.code, "publication.source_snapshot_incomplete");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn query_read_transaction_keeps_one_publication_during_concurrent_sync() {
+        let paths = temp_profile_paths("publication-query-sync-coherence");
+        let mut writer = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_QUERY_SYNC_COHERENCE";
+        let first_issue = test_issue(source_id, "owner/repo", "first-snapshot");
+        writer
+            .upsert_sources_for_run(
+                "sync-query-first",
+                std::slice::from_ref(&first_issue),
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        writer.mark_sync_run_completed("sync-query-first").unwrap();
+        let first_snapshot = writer.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (first_generation, _) = writer
+            .reserve_index_generation_for_snapshot(&paths.index_root, &first_snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, first_generation, &first_snapshot.sources)
+            .unwrap();
+        let first_publication = writer
+            .activate_retrieval_publication(
+                &first_snapshot.identity.sync_run_id,
+                first_generation,
+                None,
+                first_snapshot.expected_publication_id,
+            )
+            .unwrap();
+
+        let reader = Store::open(&paths).unwrap();
+        let fence = reader.begin_read_snapshot().unwrap();
+        let captured_publication = reader.active_retrieval_publication().unwrap().unwrap();
+        reader
+            .validate_query_publication_snapshot(Some(&captured_publication))
+            .unwrap();
+        assert_eq!(captured_publication.publication_id, first_publication);
+
+        let mut second_issue = first_issue;
+        second_issue.title = "second snapshot".to_string();
+        second_issue.updated_at = "2026-01-03T00:00:00Z".to_string();
+        second_issue.indexed_at = "2026-01-03T00:00:01Z".to_string();
+        writer
+            .upsert_sources_for_run("sync-query-second", &[second_issue], &[], 0, &[])
+            .unwrap();
+        writer.mark_sync_run_completed("sync-query-second").unwrap();
+        let second_snapshot = writer.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (second_generation, _) = writer
+            .reserve_index_generation_for_snapshot(&paths.index_root, &second_snapshot)
+            .unwrap();
+        crate::index::rebuild(
+            &paths.index_root,
+            second_generation,
+            &second_snapshot.sources,
+        )
+        .unwrap();
+        let second_publication = writer
+            .activate_retrieval_publication(
+                &second_snapshot.identity.sync_run_id,
+                second_generation,
+                None,
+                second_snapshot.expected_publication_id,
+            )
+            .unwrap();
+
+        let still_captured = reader.active_retrieval_publication().unwrap().unwrap();
+        assert_eq!(still_captured.publication_id, first_publication);
+        reader
+            .validate_query_publication_snapshot(Some(&still_captured))
+            .unwrap();
+        reader.end_read_snapshot_and_validate(fence).unwrap();
+        assert_eq!(
+            reader
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            second_publication
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn mixed_embedding_and_tantivy_identity_fails_activation_and_query_validation() {
+        let paths = temp_profile_paths("publication-mixed-identity");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        store
+            .upsert_sources_for_run("sync-embedding-a", &[], &[], 0, &[])
+            .unwrap();
+        let embedding_identity = store.mark_sync_run_completed("sync-embedding-a").unwrap();
+        store
+            .upsert_sources_for_run("sync-lexical-b", &[], &[], 0, &[])
+            .unwrap();
+        store.mark_sync_run_completed("sync-lexical-b").unwrap();
+        let embedding_generation_id = store
+            .begin_embedding_generation(&EmbeddingGenerationSpec {
+                model_manifest_hash: "manifest-mixed".to_string(),
+                chunker_fingerprint: "chunker-mixed".to_string(),
+                context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION
+                    .to_string(),
+                output_dimension: 2,
+                source_sync_run_id: embedding_identity.sync_run_id,
+                total_chunks: 0,
+            })
+            .unwrap();
+        store
+            .validate_embedding_generation(embedding_generation_id)
+            .unwrap();
+        let lexical_snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (mixed_generation, _) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &lexical_snapshot)
+            .unwrap();
+        crate::index::rebuild(
+            &paths.index_root,
+            mixed_generation,
+            &lexical_snapshot.sources,
+        )
+        .unwrap();
+        let activation_error = store
+            .activate_retrieval_publication(
+                &lexical_snapshot.identity.sync_run_id,
+                mixed_generation,
+                Some(embedding_generation_id),
+                lexical_snapshot.expected_publication_id,
+            )
+            .unwrap_err();
+        assert_eq!(
+            activation_error.code,
+            "publication.embedding_snapshot_mismatch"
+        );
+
+        let (lexical_generation, _) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &lexical_snapshot)
+            .unwrap();
+        crate::index::rebuild(
+            &paths.index_root,
+            lexical_generation,
+            &lexical_snapshot.sources,
+        )
+        .unwrap();
+        store
+            .activate_retrieval_publication(
+                &lexical_snapshot.identity.sync_run_id,
+                lexical_generation,
+                None,
+                lexical_snapshot.expected_publication_id,
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_generations SET state = 'active' WHERE id = ?1",
+                params![embedding_generation_id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE retrieval_publications
+                 SET embedding_generation_id = ?1,
+                     model_manifest_hash = 'manifest-mixed',
+                     chunker_fingerprint = 'chunker-mixed',
+                     context_template_version = ?2,
+                     output_dimension = 2
+                 WHERE active = 1",
+                params![
+                    embedding_generation_id,
+                    crate::context::METADATA_CONTEXT_TEMPLATE_VERSION,
+                ],
+            )
+            .unwrap();
+        let publication = store.active_retrieval_publication().unwrap().unwrap();
+        let query_error = store
+            .validate_query_publication_snapshot(Some(&publication))
+            .unwrap_err();
+        assert_eq!(query_error.code, "publication.embedding_snapshot_mismatch");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn unsupported_zero_row_embedding_activation_returns_structured_snapshot_mismatch() {
+        let paths = temp_profile_paths("unsupported-zero-row-embedding");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        store
+            .upsert_sources_for_run("sync-zero-row", &[], &[], 0, &[])
+            .unwrap();
+        let identity = store.mark_sync_run_completed("sync-zero-row").unwrap();
+        let begin_error = store
+            .begin_embedding_generation(&EmbeddingGenerationSpec {
+                model_manifest_hash: "manifest-zero-row".to_string(),
+                chunker_fingerprint: "chunker-zero-row".to_string(),
+                context_template_version: "qgh.context.legacy".to_string(),
+                output_dimension: 2,
+                source_sync_run_id: identity.sync_run_id.clone(),
+                total_chunks: 0,
+            })
+            .unwrap_err();
+        assert_eq!(begin_error.code, "embedding.context_template_unsupported");
+        store
+            .conn
+            .execute(
+                "INSERT INTO embedding_generations
+                    (state, model_manifest_hash, chunker_fingerprint,
+                     context_template_version, output_dimension, source_sync_run_id,
+                     source_snapshot_hash, total_chunks, completed_chunks,
+                     created_at, updated_at, write_epoch, source_snapshot_epoch)
+                 VALUES ('ready', 'manifest-zero-row', 'chunker-zero-row',
+                         'qgh.context.legacy', 2, ?1, ?2, 0, 0, ?3, ?3, ?4, NULL)",
+                params![
+                    identity.sync_run_id,
+                    source_snapshot_identity_hash(&identity),
+                    now_rfc3339(),
+                    store.content_write_epoch,
+                ],
+            )
+            .unwrap();
+        let embedding_generation_id = store.conn.last_insert_rowid();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let (tantivy_generation, _) = store
+            .reserve_index_generation_for_snapshot(&paths.index_root, &snapshot)
+            .unwrap();
+        crate::index::rebuild(&paths.index_root, tantivy_generation, &snapshot.sources).unwrap();
+
+        let error = store
+            .activate_retrieval_publication(
+                &identity.sync_run_id,
+                tantivy_generation,
+                Some(embedding_generation_id),
+                snapshot.expected_publication_id,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "publication.embedding_snapshot_mismatch");
+
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
@@ -11256,7 +12461,6 @@ mod tests {
                     .to_string(),
                 output_dimension: 2,
                 source_sync_run_id: "generation-bad-sync".to_string(),
-                source_snapshot_hash: "snapshot-bad".to_string(),
                 total_chunks: 1,
             })
             .unwrap();
@@ -11307,6 +12511,10 @@ mod tests {
         let paths = temp_profile_paths("generation-retention");
         let mut store = Store::open(&paths).unwrap();
         store.enable_vector().unwrap();
+        store
+            .upsert_sources_for_run("sync-retention", &[], &[], 0, &[])
+            .unwrap();
+        store.mark_sync_run_completed("sync-retention").unwrap();
         let generation_id = store
             .begin_embedding_generation(&EmbeddingGenerationSpec {
                 model_manifest_hash: "manifest-retention".to_string(),
@@ -11315,7 +12523,6 @@ mod tests {
                     .to_string(),
                 output_dimension: 2,
                 source_sync_run_id: "sync-retention".to_string(),
-                source_snapshot_hash: "snapshot-retention".to_string(),
                 total_chunks: 0,
             })
             .unwrap();
@@ -11362,6 +12569,9 @@ mod tests {
             )
             .unwrap()[0]
             .chunk_id;
+        store
+            .mark_sync_run_completed("sync-parent-context-original")
+            .unwrap();
         let before = store
             .active_contextual_embedding_chunks()
             .unwrap()
@@ -11375,7 +12585,6 @@ mod tests {
                     .to_string(),
                 output_dimension: 2,
                 source_sync_run_id: "sync-parent-context-original".to_string(),
-                source_snapshot_hash: "snapshot-parent-context-original".to_string(),
                 total_chunks: 1,
             })
             .unwrap();
@@ -11429,7 +12638,7 @@ mod tests {
         let error = store
             .validate_embedding_generation(generation_id)
             .unwrap_err();
-        assert_eq!(error.code, "embedding.generation_validation_failed");
+        assert_eq!(error.code, "publication.source_snapshot_changed");
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -11527,13 +12736,13 @@ mod tests {
 
     #[cfg(feature = "vector-search")]
     fn stage_test_generation(store: &mut Store, manifest: &str, chunk_ids: &[i64]) -> i64 {
+        let source_sync_run_id = seal_latest_test_sync(store);
         let spec = EmbeddingGenerationSpec {
             model_manifest_hash: manifest.to_string(),
             chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
             context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
             output_dimension: 2,
-            source_sync_run_id: "sync-purge-generation".to_string(),
-            source_snapshot_hash: format!("snapshot-{manifest}"),
+            source_sync_run_id,
             total_chunks: chunk_ids.len() as i64,
         };
         let generation_id = store.begin_embedding_generation(&spec).unwrap();
@@ -11571,6 +12780,19 @@ mod tests {
             .unwrap();
         store.validate_embedding_generation(generation_id).unwrap();
         generation_id
+    }
+
+    fn seal_latest_test_sync(store: &mut Store) -> String {
+        let sync_run_id = store
+            .conn
+            .query_row(
+                "SELECT id FROM sync_runs ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        store.mark_sync_run_completed(&sync_run_id).unwrap();
+        sync_run_id
     }
 
     #[cfg(feature = "vector-search")]
@@ -11612,10 +12834,12 @@ mod tests {
             chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
             heading_path: Vec::new(),
         }];
-        store
+        let chunk_id = store
             .replace_chunks_for_source_version(source_id, source_version_id, &chunks)
             .unwrap()[0]
-            .chunk_id
+            .chunk_id;
+        store.mark_sync_run_completed(sync_run_id).unwrap();
+        chunk_id
     }
 
     fn table_names(conn: &Connection) -> Vec<String> {

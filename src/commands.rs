@@ -17,6 +17,7 @@ use crate::embedding::{
 use crate::embedding::{
     default_prepared_model_store, validate_batch_comparability, FastembedEngine,
     FastembedTokenizer, LocalEmbeddingProvider, ModelSourceV1, PreparedModelSnapshot,
+    PreparedModelStore,
 };
 #[cfg(debug_assertions)]
 use crate::embedding::{PoolingKind, TokenSpan, DEFAULT_QUERY_PREFIX};
@@ -30,7 +31,10 @@ use crate::model::{
 };
 use crate::paths::ProfilePaths;
 use crate::resolution::ResolvedRepoScope;
-use crate::store::{PendingPurgeView, PurgeTarget, PurgeTrigger, RetrievalPublicationView, Store};
+use crate::store::{
+    PendingPurgeView, PurgeTarget, PurgeTrigger, RetrievalBuildSnapshot, RetrievalPublicationView,
+    Store,
+};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -137,8 +141,6 @@ pub async fn sync(
                 progress.line(format_args!(
                     "qgh sync: skipped, snapshot fresh age={snapshot_age_seconds}s max_age={max_age_seconds}s"
                 ));
-                let (warnings, _) =
-                    refresh_embedding_for_sync_if_enabled(&profile, &mut store, &progress);
                 return Ok(local_read_outcome(
                     json!({
                         "profile_id": profile.id,
@@ -149,7 +151,7 @@ pub async fn sync(
                             "max_age_seconds": max_age_seconds
                         }
                     }),
-                    warnings,
+                    Vec::new(),
                 ));
             }
         }
@@ -1074,25 +1076,57 @@ fn rebuild_bm25_index(
             warnings: vec![incomplete_snapshot_publication_warning()],
         });
     };
-    let (mut warnings, embedding_generation_id) =
-        refresh_embedding_for_sync_if_enabled(profile, store, progress);
-    let sources = store.active_index_sources()?;
+    let (mut warnings, embedding_prepared) =
+        prepare_embedding_chunks_for_sync_if_enabled(profile, store, progress);
+    store.mark_sync_run_completed(&source_snapshot_sync_run_id)?;
+    let Some(snapshot) = store.capture_retrieval_build_snapshot()? else {
+        let status = store.status()?;
+        return Ok(IndexRebuildOutcome {
+            generation: status.active_generation,
+            dirty_task_count: status.dirty_task_count,
+            warnings: vec![incomplete_snapshot_publication_warning()],
+        });
+    };
+    let embedding_generation_id = if embedding_prepared {
+        match refresh_incremental_chunk_embeddings_for_snapshot(
+            store,
+            profile
+                .embedding
+                .as_ref()
+                .expect("prepared embedding config"),
+            &snapshot,
+        ) {
+            Ok((embedded_chunks, generation_id)) => {
+                progress.line(format_args!(
+                    "qgh sync: refreshed chunk embeddings embedded={embedded_chunks}"
+                ));
+                generation_id
+            }
+            Err(_) => {
+                warnings.push(embedding_sync_warning(
+                    "embedding.sync_refresh_failed",
+                    "Embedding refresh failed during sync. BM25 index refresh remains available.",
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let sources = &snapshot.sources;
     progress.line(format_args!(
         "qgh sync: rebuilding BM25 index sources={}",
         sources.len()
     ));
     let (generation, reserved_generation_path) =
-        store.reserve_index_generation(&profile.paths.index_root, sources.len())?;
-    let generation_path = index::rebuild(&profile.paths.index_root, generation, &sources)?;
+        store.reserve_index_generation_for_snapshot(&profile.paths.index_root, &snapshot)?;
+    let generation_path = index::rebuild(&profile.paths.index_root, generation, sources)?;
     debug_assert_eq!(generation_path, reserved_generation_path);
-    let expected_publication_id = store
-        .active_retrieval_publication()?
-        .map(|publication| publication.publication_id);
     match store.activate_retrieval_publication(
-        &source_snapshot_sync_run_id,
+        &snapshot.identity.sync_run_id,
         generation,
         embedding_generation_id,
-        expected_publication_id,
+        snapshot.expected_publication_id,
     ) {
         Ok(_) if embedding_generation_id.is_some() => {
             match cleanup_old_embedding_generations(store) {
@@ -1137,6 +1171,14 @@ fn incomplete_snapshot_publication_warning() -> Value {
     )
 }
 
+fn incomplete_source_snapshot_error_for_command() -> QghError {
+    QghError::new(
+        "publication.source_snapshot_incomplete",
+        "A retrieval build requires a completed source snapshot at the current epoch.",
+        6,
+    )
+}
+
 /// Publishes a source-safe lexical successor after destructive lifecycle
 /// cleanup. This path never initializes embedding/model/vector capability and
 /// supports an empty authoritative corpus.
@@ -1171,19 +1213,22 @@ fn repair_lexical_successor_if_required(
                 6,
             )
         })?;
-    let sources = store.active_index_sources()?;
+    let snapshot = store
+        .capture_retrieval_build_snapshot()?
+        .ok_or_else(incomplete_source_snapshot_error_for_command)?;
+    if snapshot.identity.sync_run_id != source_snapshot_sync_run_id {
+        return Err(incomplete_source_snapshot_error_for_command());
+    }
+    let sources = &snapshot.sources;
     let (generation, reserved_generation_path) =
-        store.reserve_index_generation(&profile.paths.index_root, sources.len())?;
-    let generation_path = index::rebuild(&profile.paths.index_root, generation, &sources)?;
+        store.reserve_index_generation_for_snapshot(&profile.paths.index_root, &snapshot)?;
+    let generation_path = index::rebuild(&profile.paths.index_root, generation, sources)?;
     debug_assert_eq!(generation_path, reserved_generation_path);
-    let expected_publication_id = store
-        .active_retrieval_publication()?
-        .map(|publication| publication.publication_id);
     store.activate_retrieval_publication(
         &source_snapshot_sync_run_id,
         generation,
         None,
-        expected_publication_id,
+        snapshot.expected_publication_id,
     )?;
     Ok(SuccessorRepairOutcome::Repaired {
         generation,
@@ -1224,9 +1269,9 @@ fn run_sync_purge_preflight(profile: &Profile, store: &mut Store) -> Result<(), 
             )
         })
         .collect::<Vec<_>>();
-    if store.queue_purges(&removed_repositories).is_err() {
-        failed = true;
-    } else if !failed && store.retry_pending_purges().is_err() {
+    if store.queue_purges(&removed_repositories).is_err()
+        || (!failed && store.retry_pending_purges().is_err())
+    {
         failed = true;
     }
 
@@ -1636,13 +1681,13 @@ struct ChunkRefreshStats {
     skipped_sources: usize,
 }
 
-fn refresh_embedding_for_sync_if_enabled(
+fn prepare_embedding_chunks_for_sync_if_enabled(
     profile: &Profile,
     store: &mut Store,
     progress: &StderrSyncProgress,
-) -> (Vec<Value>, Option<i64>) {
+) -> (Vec<Value>, bool) {
     let Some(embedding) = profile.embedding.as_ref() else {
-        return (Vec::new(), None);
+        return (Vec::new(), false);
     };
 
     let mut warnings = Vec::new();
@@ -1651,7 +1696,7 @@ fn refresh_embedding_for_sync_if_enabled(
             "embedding.sync_vector_init_failed",
             "Local vector storage initialization failed during sync. BM25 index refresh remains available.",
         ));
-        return (warnings, None);
+        return (warnings, false);
     }
     match store.cleanup_tombstoned_embedding_artifacts() {
         Ok(cleaned_chunks) if cleaned_chunks > 0 => progress.line(format_args!(
@@ -1670,7 +1715,7 @@ fn refresh_embedding_for_sync_if_enabled(
                 "embedding.sync_tokenizer_failed",
                 "Prepared embedding model acquisition or tokenizer initialization failed during sync. BM25 index refresh remains available.",
             ));
-            return (warnings, None);
+            return (warnings, false);
         }
     };
     if refresh_embedding_chunks(store, tokenizer.as_ref(), progress).is_err() {
@@ -1678,26 +1723,9 @@ fn refresh_embedding_for_sync_if_enabled(
             "embedding.sync_chunking_failed",
             "Embedding chunk refresh failed during sync. BM25 index refresh remains available.",
         ));
-        return (warnings, None);
+        return (warnings, false);
     }
-
-    let generation_id = match refresh_incremental_chunk_embeddings_with_generation(store, embedding)
-    {
-        Ok((embedded_chunks, generation_id)) => {
-            progress.line(format_args!(
-                "qgh sync: refreshed chunk embeddings embedded={embedded_chunks}"
-            ));
-            generation_id
-        }
-        Err(_) => {
-            warnings.push(embedding_sync_warning(
-                "embedding.sync_refresh_failed",
-                "Embedding refresh failed during sync. BM25 index refresh remains available.",
-            ));
-            None
-        }
-    };
-    (warnings, generation_id)
+    (warnings, true)
 }
 
 fn refresh_embedding_chunks(
@@ -1747,6 +1775,17 @@ fn refresh_incremental_chunk_embeddings_with_generation(
     store: &mut Store,
     embedding: &EmbeddingConfig,
 ) -> Result<(usize, Option<i64>), QghError> {
+    let Some(snapshot) = store.capture_retrieval_build_snapshot()? else {
+        return Ok((0, None));
+    };
+    refresh_incremental_chunk_embeddings_for_snapshot(store, embedding, &snapshot)
+}
+
+fn refresh_incremental_chunk_embeddings_for_snapshot(
+    store: &mut Store,
+    embedding: &EmbeddingConfig,
+    snapshot: &RetrievalBuildSnapshot,
+) -> Result<(usize, Option<i64>), QghError> {
     let runtime = embedding_runtime_local_only(embedding, None)?;
     let expectation = embedding_fingerprint_expectation(embedding);
     refresh_incremental_chunk_embeddings_with_provider_and_generation(
@@ -1754,6 +1793,7 @@ fn refresh_incremental_chunk_embeddings_with_generation(
         runtime.provider.as_ref(),
         runtime.fingerprint_seed.clone(),
         &expectation,
+        snapshot,
     )
 }
 
@@ -1763,12 +1803,16 @@ fn refresh_incremental_chunk_embeddings_with_provider(
     fingerprint_seed: EmbeddingFingerprintSeed,
     expectation: &EmbeddingFingerprintExpectation,
 ) -> Result<usize, QghError> {
+    let Some(snapshot) = store.capture_retrieval_build_snapshot()? else {
+        return Ok(0);
+    };
     Ok(
         refresh_incremental_chunk_embeddings_with_provider_and_generation(
             store,
             provider,
             fingerprint_seed,
             expectation,
+            &snapshot,
         )?
         .0,
     )
@@ -1779,8 +1823,9 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
     provider: &dyn EmbeddingProvider,
     fingerprint_seed: EmbeddingFingerprintSeed,
     _expectation: &EmbeddingFingerprintExpectation,
+    snapshot: &RetrievalBuildSnapshot,
 ) -> Result<(usize, Option<i64>), QghError> {
-    let chunks = store.active_contextual_embedding_chunks()?;
+    let chunks = &snapshot.embedding_chunks;
     if chunks.is_empty() {
         return Ok((0, None));
     }
@@ -1802,13 +1847,7 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
     }
     let dimension = embedding_dimension(&vectors)?;
     let fingerprint = fingerprint_seed.with_dimension(dimension);
-    let source_sync_run_id = store.latest_successful_sync_run_id()?.ok_or_else(|| {
-        QghError::new(
-            "embedding.source_snapshot_missing",
-            "Embedding refresh requires a completed remote source snapshot.",
-            6,
-        )
-    })?;
+    let source_sync_run_id = snapshot.identity.sync_run_id.clone();
     let model_manifest_hash = fingerprint.hash();
     let context_template_version = crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string();
     let spec = crate::store::EmbeddingGenerationSpec {
@@ -1820,7 +1859,6 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
         context_template_version: context_template_version.clone(),
         output_dimension: dimension,
         source_sync_run_id: source_sync_run_id.clone(),
-        source_snapshot_hash: source_sync_run_id,
         total_chunks: chunks.len() as i64,
     };
     let generation_id = store.begin_embedding_generation(&spec)?;
@@ -2021,11 +2059,19 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
     let runtime = embedding_runtime_for_acquisition(embedding)?;
     let progress = StderrSyncProgress::new(false);
     let chunk_stats = refresh_embedding_chunks(&mut store, runtime.tokenizer.as_ref(), &progress)?;
+    let source_sync_run_id = store
+        .latest_successful_sync_run_id()?
+        .ok_or_else(incomplete_source_snapshot_error_for_command)?;
+    store.mark_sync_run_completed(&source_sync_run_id)?;
+    let snapshot = store
+        .capture_retrieval_build_snapshot()?
+        .ok_or_else(incomplete_source_snapshot_error_for_command)?;
     let data = refresh_chunk_embeddings(
         &mut store,
-        &profile.id,
+        &profile.paths,
         runtime.provider.as_ref(),
         runtime.fingerprint_seed.clone(),
+        &snapshot,
     )?;
     let mut warnings = Vec::new();
     let publication_activated = store
@@ -2346,11 +2392,12 @@ fn prepared_model_id(snapshot: &PreparedModelSnapshot) -> String {
 
 fn refresh_chunk_embeddings(
     store: &mut Store,
-    profile_id: &str,
+    paths: &ProfilePaths,
     provider: &dyn EmbeddingProvider,
     fingerprint_seed: EmbeddingFingerprintSeed,
+    snapshot: &RetrievalBuildSnapshot,
 ) -> Result<Value, QghError> {
-    let chunks = store.active_contextual_embedding_chunks()?;
+    let chunks = &snapshot.embedding_chunks;
     if chunks.is_empty() {
         return Err(QghError::validation(
             "embedding.no_chunks",
@@ -2377,22 +2424,7 @@ fn refresh_chunk_embeddings(
     let dimension = embedding_dimension(&vectors)?;
     let fingerprint = fingerprint_seed.with_dimension(dimension);
     let embeddings = chunks.iter().zip(vectors).collect::<Vec<_>>();
-    let source_sync_run_id = store
-        .active_retrieval_publication()?
-        .map(|publication| publication.source_snapshot_sync_run_id)
-        .or(store.latest_successful_sync_run_id()?)
-        .ok_or_else(|| {
-            QghError::new(
-                "embedding.source_snapshot_missing",
-                "Embedding refresh requires a completed source snapshot.",
-                6,
-            )
-            .with_details(json!({
-                "profile_id": profile_id,
-                "successful_snapshot_available": false
-            }))
-            .with_hint("Run qgh sync successfully before qgh embed --force.")
-        })?;
+    let source_sync_run_id = snapshot.identity.sync_run_id.clone();
     let model_manifest_hash = fingerprint.hash();
     let context_template_version = crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string();
     let spec = crate::store::EmbeddingGenerationSpec {
@@ -2404,7 +2436,6 @@ fn refresh_chunk_embeddings(
         context_template_version: context_template_version.clone(),
         output_dimension: dimension,
         source_sync_run_id: source_sync_run_id.clone(),
-        source_snapshot_hash: source_sync_run_id.clone(),
         total_chunks: chunks.len() as i64,
     };
     let generation_id = store.begin_embedding_generation(&spec)?;
@@ -2428,21 +2459,16 @@ fn refresh_chunk_embeddings(
         store.stage_embedding_generation_batch(generation_id, &staged)?;
     }
     store.validate_embedding_generation(generation_id)?;
-    if let Some(publication) = store.active_retrieval_publication()? {
-        store.activate_retrieval_publication(
-            &publication.source_snapshot_sync_run_id,
-            publication.tantivy_generation,
-            Some(generation_id),
-            Some(publication.publication_id),
-        )?;
-    } else if let Some(tantivy_generation) = store.active_index_generation()? {
-        store.activate_retrieval_publication(
-            &source_sync_run_id,
-            tantivy_generation,
-            Some(generation_id),
-            None,
-        )?;
-    }
+    let (tantivy_generation, reserved_path) =
+        store.reserve_index_generation_for_snapshot(&paths.index_root, snapshot)?;
+    let built_path = index::rebuild(&paths.index_root, tantivy_generation, &snapshot.sources)?;
+    debug_assert_eq!(reserved_path, built_path);
+    store.activate_retrieval_publication(
+        &source_sync_run_id,
+        tantivy_generation,
+        Some(generation_id),
+        snapshot.expected_publication_id,
+    )?;
     let embedded_chunks = embeddings.len();
     let usable_embeddings = embedded_chunks;
     Ok(json!({
@@ -4255,7 +4281,15 @@ fn configured_hf_model_reference(
 #[cfg(feature = "fastembed-provider")]
 fn configured_prepared_snapshot(embedding: &EmbeddingConfig) -> Option<PreparedModelSnapshot> {
     let store = default_prepared_model_store().ok()?;
-    store.load(&embedding.fastembed_options()).ok()
+    let options = embedding.fastembed_options();
+    match store.load(&options) {
+        Ok(snapshot) => Some(snapshot),
+        Err(_) => options.manifest_path.as_deref().and_then(|manifest_path| {
+            PreparedModelStore::new(PathBuf::new())
+                .load_manifest(manifest_path)
+                .ok()
+        }),
+    }
 }
 
 fn embedding_provider_name(provider: EmbeddingProviderKind) -> &'static str {
@@ -4895,12 +4929,12 @@ fn publication_index_path(
 
 fn ensure_query_publication_is_safe(
     store: &Store,
-    _publication: Option<&RetrievalPublicationView>,
+    publication: Option<&RetrievalPublicationView>,
 ) -> Result<(), QghError> {
     if store.successor_repair_required()? {
         return Err(successor_repair_required_error());
     }
-    Ok(())
+    store.validate_query_publication_snapshot(publication)
 }
 
 fn successor_repair_required_error() -> QghError {
@@ -5469,6 +5503,7 @@ mod tests {
                 &[test_chunk("unchanged authoritative chunk".to_string())],
             )
             .unwrap();
+        store.mark_sync_run_completed("sync-context").unwrap();
         let provider = RecordingEmbeddingProvider::default();
         let seed = EmbeddingFingerprintSeed {
             provider: "local".to_string(),
@@ -5553,6 +5588,8 @@ mod tests {
                 &[test_chunk("unchanged comment chunk".to_string())],
             )
             .unwrap();
+        store.mark_sync_run_completed("sync-force-context").unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
         let provider = RecordingEmbeddingProvider::default();
         let seed = EmbeddingFingerprintSeed {
             provider: "local".to_string(),
@@ -5562,7 +5599,7 @@ mod tests {
             query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
         };
 
-        refresh_chunk_embeddings(&mut store, "work", &provider, seed).unwrap();
+        refresh_chunk_embeddings(&mut store, &paths, &provider, seed, &snapshot).unwrap();
 
         let expected_input = "Repository: github.com/owner/repo\nComment on issue #48: Vector smoke I_CONTEXT_FORCE\n\nunchanged comment chunk";
         assert_eq!(
@@ -5787,28 +5824,31 @@ mod tests {
             query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
         };
 
-        let missing_snapshot =
-            refresh_chunk_embeddings(&mut store, "work", &MockEmbeddingProvider, seed.clone())
-                .unwrap_err();
-        assert_eq!(missing_snapshot.code, "embedding.source_snapshot_missing");
+        let missing_snapshot = store.capture_retrieval_build_snapshot().unwrap_err();
+        assert_eq!(
+            missing_snapshot.code,
+            "publication.source_snapshot_incomplete"
+        );
         store.mark_sync_run_completed("sync-command-embed").unwrap();
-
+        let first_snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
         let (generation, reserved_path) = store
-            .reserve_index_generation(&paths.index_root, 1)
+            .reserve_index_generation_for_snapshot(&paths.index_root, &first_snapshot)
             .unwrap();
-        let generation_path = index::rebuild(
-            &paths.index_root,
-            generation,
-            &store.active_index_sources().unwrap(),
-        )
-        .unwrap();
+        let generation_path =
+            index::rebuild(&paths.index_root, generation, &first_snapshot.sources).unwrap();
         assert_eq!(generation_path, reserved_path);
         store
             .activate_retrieval_publication("sync-command-embed", generation, None, None)
             .unwrap();
-
-        let outcome =
-            refresh_chunk_embeddings(&mut store, "work", &MockEmbeddingProvider, seed).unwrap();
+        let force_snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let outcome = refresh_chunk_embeddings(
+            &mut store,
+            &paths,
+            &MockEmbeddingProvider,
+            seed,
+            &force_snapshot,
+        )
+        .unwrap();
 
         assert_eq!(outcome["embedded_chunks"], 2);
         assert_eq!(outcome["usable_embeddings"], 2);
@@ -5895,6 +5935,9 @@ mod tests {
                     },
                 ],
             )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-incremental-embed")
             .unwrap();
         let seed = EmbeddingFingerprintSeed {
             provider: "local".to_string(),
