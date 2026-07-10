@@ -2866,6 +2866,9 @@ impl EmbeddingCoverageState {
         if self.artifact_corrupt {
             return "corrupt";
         }
+        if !self.active_matches_config && self.mismatched_chunks > 0 {
+            return "fingerprint_mismatch";
+        }
         match (
             &self.active_fingerprint,
             self.active_matches_config,

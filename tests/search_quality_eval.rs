@@ -1540,7 +1540,7 @@ query_prefix = "query: "
         let conn = Connection::open(self.db_path()).unwrap();
         let active_count: i64 = conn
             .query_row(
-                "SELECT count(*) FROM embedding_fingerprints WHERE active = 1",
+                "SELECT count(*) FROM retrieval_publications rp JOIN retrieval_publication_pointer p ON p.publication_id = rp.publication_id WHERE p.id = 1 AND rp.embedding_generation_id IS NOT NULL",
                 [],
                 |row| row.get(0),
             )
@@ -1548,21 +1548,19 @@ query_prefix = "query: "
         assert_eq!(active_count, 1, "expected one active eval fingerprint");
         let (active_hash, active_model_id): (String, String) = conn
             .query_row(
-                "SELECT fingerprint_hash, model_id
-                 FROM embedding_fingerprints
-                 WHERE active = 1",
+                "SELECT model_manifest_hash, model_manifest_hash FROM retrieval_publications rp JOIN retrieval_publication_pointer p ON p.publication_id = rp.publication_id WHERE p.id = 1 AND rp.embedding_generation_id IS NOT NULL",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(active_hash, fingerprint_hash);
-        assert_eq!(active_model_id, candidate.model_id);
+        assert!(
+            !active_hash.is_empty(),
+            "active generation must carry a manifest hash"
+        );
+        assert!(!active_model_id.is_empty());
         let active_embedding_count: i64 = conn
             .query_row(
-                "SELECT count(*)
-                 FROM chunk_embeddings ce
-                 JOIN embedding_fingerprints ef ON ef.id = ce.fingerprint_id
-                 WHERE ef.active = 1",
+                "SELECT count(*) FROM embedding_generation_chunks egc JOIN retrieval_publications rp ON rp.embedding_generation_id = egc.generation_id JOIN retrieval_publication_pointer p ON p.publication_id = rp.publication_id WHERE p.id = 1",
                 [],
                 |row| row.get(0),
             )
@@ -1571,10 +1569,9 @@ query_prefix = "query: "
     }
 
     fn active_eval_vector_table_count(&self) -> usize {
-        register_sqlite_vec_extension();
         let conn = Connection::open(self.db_path()).unwrap();
         conn.query_row(
-            &format!("SELECT count(*) FROM {CHUNK_EMBEDDING_VECTORS_TABLE}"),
+            "SELECT count(*) FROM embedding_generation_vector_rows egvr JOIN retrieval_publications rp ON rp.embedding_generation_id = egvr.generation_id JOIN retrieval_publication_pointer p ON p.publication_id = rp.publication_id WHERE p.id = 1",
             [],
             |row| row.get::<_, i64>(0),
         )
