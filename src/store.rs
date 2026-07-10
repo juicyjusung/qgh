@@ -1,8 +1,9 @@
 mod purge_fs;
 
 use self::purge_fs::{
-    filesystem_identity, filesystem_identity_from_file, open_anchored_directory,
-    remove_anchored_directory_contents, sync_directory, FilesystemIdentity,
+    anchored_file_names, anchored_regular_file_fingerprint, filesystem_identity,
+    filesystem_identity_from_file, open_anchored_directory, remove_anchored_empty_directory,
+    sync_directory, unlink_anchored_regular_file, AnchoredFileFingerprint,
 };
 use crate::chunking::MarkdownChunk;
 use crate::context::{prepare_embedding_input, EmbeddingSourceContext, PreparedEmbeddingInput};
@@ -23,6 +24,7 @@ use rusqlite::{
     params, params_from_iter, Connection, OpenFlags, OptionalExtension, Transaction,
     TransactionBehavior,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -38,6 +40,69 @@ const CHUNK_EMBEDDING_VECTOR_CHUNKS_TABLE: &str = "chunk_embedding_vectors_vecto
 const TANTIVY_COMMIT_INVENTORY_MIGRATION: &str = "qgh.tantivy.commit_inventory.v1";
 const TANTIVY_OWNERSHIP_MIGRATION: &str = "qgh.tantivy.ownership.v2";
 const TANTIVY_ADOPTION_OWNER_PID: i64 = -2;
+const TANTIVY_OWNER_MARKER_FILE: &str = ".qgh-build-owner-v1";
+const TANTIVY_MANAGED_MANIFEST_FILE: &str = ".managed.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TantivyPurgeFile {
+    name: String,
+    byte_len: u64,
+    sha256: String,
+}
+
+impl TantivyPurgeFile {
+    fn fingerprint(&self) -> AnchoredFileFingerprint {
+        AnchoredFileFingerprint {
+            byte_len: self.byte_len,
+            sha256: self.sha256.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TantivyPurgePhase {
+    Verified,
+    PayloadDeleted,
+    ManifestDeleted,
+    MarkerDeleted,
+}
+
+impl TantivyPurgePhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::PayloadDeleted => "payload_deleted",
+            Self::ManifestDeleted => "manifest_deleted",
+            Self::MarkerDeleted => "marker_deleted",
+        }
+    }
+
+    fn from_stored(value: &str) -> Result<Self, QghError> {
+        match value {
+            "verified" => Ok(Self::Verified),
+            "payload_deleted" => Ok(Self::PayloadDeleted),
+            "manifest_deleted" => Ok(Self::ManifestDeleted),
+            "marker_deleted" => Ok(Self::MarkerDeleted),
+            _ => Err(purge_error()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TantivyPurgeDeletion {
+    owner_token: String,
+    quarantine_path: String,
+    filesystem_identity: String,
+    phase: TantivyPurgePhase,
+    files: Vec<TantivyPurgeFile>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TantivyPurgeFailurePoint {
+    AfterMarkerUnlink,
+    AfterRootRemove,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingGenerationSpec {
@@ -309,6 +374,10 @@ pub struct Store {
     #[cfg(test)]
     purge_swap_quarantine_after_open: Option<i64>,
     #[cfg(test)]
+    purge_unlink_failure_after: Option<usize>,
+    #[cfg(test)]
+    purge_filesystem_failure_point: Option<TantivyPurgeFailurePoint>,
+    #[cfg(test)]
     activation_failure: Option<QghError>,
 }
 
@@ -414,6 +483,7 @@ impl Store {
         set_private_file(&paths.db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "secure_delete", "ON")?;
         let mut store = Self::from_connection(conn, paths);
         store.migrate()?;
@@ -471,6 +541,10 @@ impl Store {
             purge_swap_generation_after_validation: None,
             #[cfg(test)]
             purge_swap_quarantine_after_open: None,
+            #[cfg(test)]
+            purge_unlink_failure_after: None,
+            #[cfg(test)]
+            purge_filesystem_failure_point: None,
             #[cfg(test)]
             activation_failure: None,
         }
@@ -1621,6 +1695,37 @@ impl Store {
     }
 
     #[cfg(test)]
+    fn fail_tantivy_purge_after_unlinks(&mut self, count: usize) {
+        self.purge_unlink_failure_after = Some(count);
+    }
+
+    #[cfg(test)]
+    fn fail_tantivy_purge_at_filesystem_point(&mut self, point: TantivyPurgeFailurePoint) {
+        self.purge_filesystem_failure_point = Some(point);
+    }
+
+    #[cfg(test)]
+    fn should_fail_tantivy_purge_after_unlink(&mut self, completed: usize) -> bool {
+        if self.purge_unlink_failure_after == Some(completed) {
+            self.purge_unlink_failure_after = None;
+            return true;
+        }
+        false
+    }
+
+    #[cfg(test)]
+    fn should_fail_tantivy_purge_filesystem_point(
+        &mut self,
+        point: TantivyPurgeFailurePoint,
+    ) -> bool {
+        if self.purge_filesystem_failure_point == Some(point) {
+            self.purge_filesystem_failure_point = None;
+            return true;
+        }
+        false
+    }
+
+    #[cfg(test)]
     fn inject_generation_swap_after_validation(
         &mut self,
         generation: i64,
@@ -2252,27 +2357,51 @@ impl Store {
             };
             let quarantine_path =
                 tantivy_purge_quarantine_path(&self.index_root, *generation, owner_token);
+            let deletion = self.tantivy_purge_deletion(*generation)?;
+            if let Some(deletion) = deletion.as_ref() {
+                self.validate_tantivy_purge_deletion(deletion, owner_token, &quarantine_path)?;
+            }
             match (expected_path.exists(), quarantine_path.exists()) {
-                (false, false) => continue,
+                (false, false) => {
+                    if let Some(deletion) = deletion {
+                        if deletion.phase != TantivyPurgePhase::MarkerDeleted {
+                            return Err(purge_error());
+                        }
+                        self.finish_missing_tantivy_purge_deletion(*generation, &deletion)?;
+                    }
+                    continue;
+                }
                 (true, true) => return Err(purge_error()),
                 (false, true) => {
-                    validate_quarantined_tantivy_generation(
-                        &quarantine_path,
-                        *generation,
-                        owner_token,
-                        source_count,
-                        source_inventory_hash,
-                    )?;
-                    let identity = filesystem_identity(&quarantine_path)?;
+                    let deletion = match deletion {
+                        Some(deletion) => deletion,
+                        None => {
+                            validate_quarantined_tantivy_generation(
+                                &quarantine_path,
+                                *generation,
+                                owner_token,
+                                source_count,
+                                source_inventory_hash,
+                            )?;
+                            self.register_tantivy_purge_deletion(
+                                *generation,
+                                owner_token,
+                                &quarantine_path,
+                            )?
+                        }
+                    };
                     self.remove_quarantined_tantivy_generation(
                         *generation,
-                        owner_token,
                         &quarantine_path,
-                        identity,
+                        deletion,
                     )?;
                     continue;
                 }
-                (true, false) => {}
+                (true, false) => {
+                    if deletion.is_some() {
+                        return Err(purge_error());
+                    }
+                }
             }
             validate_managed_tantivy_generation_path(
                 &self.profile_dir,
@@ -2316,23 +2445,120 @@ impl Store {
                 let _ = sync_directory(&self.index_root);
                 return Err(purge_error());
             }
-            self.remove_quarantined_tantivy_generation(
-                *generation,
-                owner_token,
-                &quarantine_path,
-                expected_identity,
-            )?;
+            let deletion =
+                self.register_tantivy_purge_deletion(*generation, owner_token, &quarantine_path)?;
+            self.remove_quarantined_tantivy_generation(*generation, &quarantine_path, deletion)?;
         }
         Ok(())
+    }
+
+    fn tantivy_purge_deletion(
+        &self,
+        generation: i64,
+    ) -> Result<Option<TantivyPurgeDeletion>, QghError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT owner_token, quarantine_path, filesystem_identity,
+                        phase, file_inventory_json
+                 FROM tantivy_purge_deletions WHERE generation = ?1",
+                params![generation],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((owner_token, quarantine_path, filesystem_identity, phase, inventory)) = row
+        else {
+            return Ok(None);
+        };
+        let files =
+            serde_json::from_str::<Vec<TantivyPurgeFile>>(&inventory).map_err(|_| purge_error())?;
+        validate_tantivy_purge_file_inventory(&files)?;
+        Ok(Some(TantivyPurgeDeletion {
+            owner_token,
+            quarantine_path,
+            filesystem_identity,
+            phase: TantivyPurgePhase::from_stored(&phase)?,
+            files,
+        }))
+    }
+
+    fn validate_tantivy_purge_deletion(
+        &self,
+        deletion: &TantivyPurgeDeletion,
+        owner_token: &str,
+        quarantine_path: &Path,
+    ) -> Result<(), QghError> {
+        if deletion.owner_token != owner_token
+            || Path::new(&deletion.quarantine_path) != quarantine_path
+        {
+            return Err(purge_error());
+        }
+        Ok(())
+    }
+
+    fn register_tantivy_purge_deletion(
+        &mut self,
+        generation: i64,
+        owner_token: &str,
+        quarantine_path: &Path,
+    ) -> Result<TantivyPurgeDeletion, QghError> {
+        let expected_identity = filesystem_identity(quarantine_path)?;
+        let directory = open_anchored_directory(quarantine_path)?;
+        if filesystem_identity_from_file(&directory)? != expected_identity
+            || filesystem_identity(quarantine_path)? != expected_identity
+        {
+            return Err(purge_error());
+        }
+        let files = capture_tantivy_purge_file_inventory(&directory)?;
+        validate_tantivy_purge_file_inventory(&files)?;
+        let inventory = serde_json::to_string(&files).map_err(|_| purge_error())?;
+        let identity = expected_identity.durable_key();
+        let quarantine_path = quarantine_path
+            .to_str()
+            .ok_or_else(purge_error)?
+            .to_string();
+        self.conn.execute(
+            "INSERT INTO tantivy_purge_deletions
+                (generation, owner_token, quarantine_path, filesystem_identity,
+                 phase, file_inventory_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'verified', ?5, ?6)",
+            params![
+                generation,
+                owner_token,
+                quarantine_path,
+                identity,
+                inventory,
+                now_rfc3339()
+            ],
+        )?;
+        self.tantivy_purge_deletion(generation)?
+            .ok_or_else(purge_error)
     }
 
     fn remove_quarantined_tantivy_generation(
         &mut self,
         generation: i64,
-        owner_token: &str,
         quarantine_path: &Path,
-        expected_identity: FilesystemIdentity,
+        mut deletion: TantivyPurgeDeletion,
     ) -> Result<(), QghError> {
+        if !quarantine_path.exists() {
+            if deletion.phase == TantivyPurgePhase::MarkerDeleted {
+                return self.finish_missing_tantivy_purge_deletion(generation, &deletion);
+            }
+            return Err(purge_error());
+        }
+        let expected_identity = filesystem_identity(quarantine_path)?;
+        if expected_identity.durable_key() != deletion.filesystem_identity {
+            return Err(purge_error());
+        }
         let directory = open_anchored_directory(quarantine_path)?;
         if filesystem_identity_from_file(&directory)? != expected_identity {
             return Err(purge_error());
@@ -2342,17 +2568,160 @@ impl Store {
         if filesystem_identity(quarantine_path)? != expected_identity {
             return Err(purge_error());
         }
-        crate::index::validate_owned_generation_directory(quarantine_path, generation, owner_token)
-            .map_err(|_| purge_error())?;
+
+        if deletion.phase == TantivyPurgePhase::Verified {
+            let remaining = validate_remaining_tantivy_purge_files(&directory, &deletion)?;
+            #[cfg(test)]
+            let mut completed = 0_usize;
+            for file in deletion.files.iter().filter(|file| {
+                file.name != TANTIVY_OWNER_MARKER_FILE && file.name != TANTIVY_MANAGED_MANIFEST_FILE
+            }) {
+                if !remaining.contains(&file.name) {
+                    continue;
+                }
+                unlink_anchored_regular_file(
+                    &directory,
+                    std::ffi::OsStr::new(&file.name),
+                    &file.fingerprint(),
+                )?;
+                #[cfg(test)]
+                {
+                    completed += 1;
+                    if self.should_fail_tantivy_purge_after_unlink(completed) {
+                        return Err(purge_error());
+                    }
+                }
+            }
+            let remaining = validate_remaining_tantivy_purge_files(&directory, &deletion)?;
+            if remaining.iter().any(|name| {
+                name != TANTIVY_OWNER_MARKER_FILE && name != TANTIVY_MANAGED_MANIFEST_FILE
+            }) {
+                return Err(purge_error());
+            }
+            self.advance_tantivy_purge_phase(
+                generation,
+                &deletion,
+                TantivyPurgePhase::PayloadDeleted,
+            )?;
+            deletion.phase = TantivyPurgePhase::PayloadDeleted;
+        }
+
+        if deletion.phase == TantivyPurgePhase::PayloadDeleted {
+            let remaining = validate_remaining_tantivy_purge_files(&directory, &deletion)?;
+            if remaining.contains(TANTIVY_MANAGED_MANIFEST_FILE) {
+                let manifest = deletion
+                    .files
+                    .iter()
+                    .find(|file| file.name == TANTIVY_MANAGED_MANIFEST_FILE)
+                    .ok_or_else(purge_error)?;
+                unlink_anchored_regular_file(
+                    &directory,
+                    std::ffi::OsStr::new(TANTIVY_MANAGED_MANIFEST_FILE),
+                    &manifest.fingerprint(),
+                )?;
+            }
+            self.advance_tantivy_purge_phase(
+                generation,
+                &deletion,
+                TantivyPurgePhase::ManifestDeleted,
+            )?;
+            deletion.phase = TantivyPurgePhase::ManifestDeleted;
+        }
+
+        if deletion.phase == TantivyPurgePhase::ManifestDeleted {
+            let remaining = validate_remaining_tantivy_purge_files(&directory, &deletion)?;
+            if remaining.contains(TANTIVY_OWNER_MARKER_FILE) {
+                let marker = deletion
+                    .files
+                    .iter()
+                    .find(|file| file.name == TANTIVY_OWNER_MARKER_FILE)
+                    .ok_or_else(purge_error)?;
+                unlink_anchored_regular_file(
+                    &directory,
+                    std::ffi::OsStr::new(TANTIVY_OWNER_MARKER_FILE),
+                    &marker.fingerprint(),
+                )?;
+                #[cfg(test)]
+                if self.should_fail_tantivy_purge_filesystem_point(
+                    TantivyPurgeFailurePoint::AfterMarkerUnlink,
+                ) {
+                    return Err(purge_error());
+                }
+            }
+            self.advance_tantivy_purge_phase(
+                generation,
+                &deletion,
+                TantivyPurgePhase::MarkerDeleted,
+            )?;
+            deletion.phase = TantivyPurgePhase::MarkerDeleted;
+        }
+
+        let remaining = validate_remaining_tantivy_purge_files(&directory, &deletion)?;
+        if !remaining.is_empty() {
+            return Err(purge_error());
+        }
         if filesystem_identity(quarantine_path)? != expected_identity {
             return Err(purge_error());
         }
-        remove_anchored_directory_contents(&directory)?;
-        if filesystem_identity(quarantine_path)? != expected_identity {
+        let parent = open_anchored_directory(&self.index_root)?;
+        let name = quarantine_path.file_name().ok_or_else(purge_error)?;
+        remove_anchored_empty_directory(&parent, name, &expected_identity)?;
+        #[cfg(test)]
+        if self
+            .should_fail_tantivy_purge_filesystem_point(TantivyPurgeFailurePoint::AfterRootRemove)
+        {
             return Err(purge_error());
         }
-        fs::remove_dir(quarantine_path).map_err(|_| purge_error())?;
-        sync_directory(&self.index_root)
+        self.finish_missing_tantivy_purge_deletion(generation, &deletion)
+    }
+
+    fn advance_tantivy_purge_phase(
+        &self,
+        generation: i64,
+        deletion: &TantivyPurgeDeletion,
+        next: TantivyPurgePhase,
+    ) -> Result<(), QghError> {
+        let changed = self.conn.execute(
+            "UPDATE tantivy_purge_deletions SET phase = ?1, updated_at = ?2
+             WHERE generation = ?3 AND owner_token = ?4
+               AND filesystem_identity = ?5 AND phase = ?6",
+            params![
+                next.as_str(),
+                now_rfc3339(),
+                generation,
+                deletion.owner_token,
+                deletion.filesystem_identity,
+                deletion.phase.as_str()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(purge_error());
+        }
+        Ok(())
+    }
+
+    fn finish_missing_tantivy_purge_deletion(
+        &self,
+        generation: i64,
+        deletion: &TantivyPurgeDeletion,
+    ) -> Result<(), QghError> {
+        if deletion.phase != TantivyPurgePhase::MarkerDeleted {
+            return Err(purge_error());
+        }
+        let changed = self.conn.execute(
+            "DELETE FROM tantivy_purge_deletions
+             WHERE generation = ?1 AND owner_token = ?2
+               AND filesystem_identity = ?3 AND phase = 'marker_deleted'",
+            params![
+                generation,
+                deletion.owner_token,
+                deletion.filesystem_identity
+            ],
+        )?;
+        if changed != 1 {
+            return Err(purge_error());
+        }
+        Ok(())
     }
 
     fn validate_index_root_confinement(&self) -> Result<(), QghError> {
@@ -7190,6 +7559,18 @@ impl Store {
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS tantivy_purge_deletions (
+                generation INTEGER PRIMARY KEY,
+                owner_token TEXT NOT NULL,
+                quarantine_path TEXT NOT NULL,
+                filesystem_identity TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK (
+                    phase IN ('verified', 'payload_deleted', 'manifest_deleted', 'marker_deleted')
+                ),
+                file_inventory_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS index_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id TEXT NOT NULL,
@@ -7972,6 +8353,83 @@ fn validate_quarantined_tantivy_generation(
         expected_source_inventory_hash,
     )
     .map_err(|_| purge_error())
+}
+
+fn capture_tantivy_purge_file_inventory(
+    directory: &fs::File,
+) -> Result<Vec<TantivyPurgeFile>, QghError> {
+    let mut files = Vec::new();
+    for name in anchored_file_names(directory)? {
+        let name = name.into_string().map_err(|_| purge_error())?;
+        let fingerprint =
+            anchored_regular_file_fingerprint(directory, std::ffi::OsStr::new(&name))?;
+        files.push(TantivyPurgeFile {
+            name,
+            byte_len: fingerprint.byte_len,
+            sha256: fingerprint.sha256,
+        });
+    }
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(files)
+}
+
+fn validate_tantivy_purge_file_inventory(files: &[TantivyPurgeFile]) -> Result<(), QghError> {
+    let mut names = BTreeSet::new();
+    for file in files {
+        let path = Path::new(&file.name);
+        if file.name.is_empty()
+            || path.components().count() != 1
+            || path.file_name().and_then(|name| name.to_str()) != Some(file.name.as_str())
+            || file.sha256.len() != 64
+            || !file
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !names.insert(file.name.as_str())
+        {
+            return Err(purge_error());
+        }
+    }
+    if !names.contains(TANTIVY_OWNER_MARKER_FILE) || !names.contains(TANTIVY_MANAGED_MANIFEST_FILE)
+    {
+        return Err(purge_error());
+    }
+    Ok(())
+}
+
+fn validate_remaining_tantivy_purge_files(
+    directory: &fs::File,
+    deletion: &TantivyPurgeDeletion,
+) -> Result<BTreeSet<String>, QghError> {
+    let expected = deletion
+        .files
+        .iter()
+        .map(|file| (file.name.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
+    let mut remaining = BTreeSet::new();
+    for name in anchored_file_names(directory)? {
+        let name = name.into_string().map_err(|_| purge_error())?;
+        let file = expected.get(name.as_str()).ok_or_else(purge_error)?;
+        if anchored_regular_file_fingerprint(directory, std::ffi::OsStr::new(&name))?
+            != file.fingerprint()
+            || !remaining.insert(name)
+        {
+            return Err(purge_error());
+        }
+    }
+    let has_payload = remaining
+        .iter()
+        .any(|name| name != TANTIVY_OWNER_MARKER_FILE && name != TANTIVY_MANAGED_MANIFEST_FILE);
+    let has_manifest = remaining.contains(TANTIVY_MANAGED_MANIFEST_FILE);
+    let has_marker = remaining.contains(TANTIVY_OWNER_MARKER_FILE);
+    match deletion.phase {
+        TantivyPurgePhase::Verified if has_manifest && has_marker => {}
+        TantivyPurgePhase::PayloadDeleted if !has_payload && has_marker => {}
+        TantivyPurgePhase::ManifestDeleted if !has_payload && !has_manifest => {}
+        TantivyPurgePhase::MarkerDeleted if remaining.is_empty() => {}
+        _ => return Err(purge_error()),
+    }
+    Ok(remaining)
 }
 
 fn tantivy_artifact_not_ready_error() -> QghError {
@@ -12848,6 +13306,330 @@ mod tests {
             })
             .unwrap();
         assert_eq!(ownership_count, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_resumes_after_partial_payload_unlink_with_marker_and_manifest_intact() {
+        let paths = temp_profile_paths("purge-tantivy-partial-payload-resume");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_PARTIAL_PAYLOAD_RESUME";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-partial-payload-resume",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "private-partial-payload-resume-marker",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication(
+                "sync-purge-partial-payload-resume",
+                generation,
+                None,
+                None,
+            )
+            .unwrap();
+        let owner_token: String = store
+            .conn
+            .query_row(
+                "SELECT owner_token FROM index_build_leases WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let quarantine_path =
+            tantivy_purge_quarantine_path(&paths.index_root, generation, &owner_token);
+        store.fail_tantivy_purge_after_unlinks(1);
+
+        let error = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "purge.failed");
+        assert!(!generation_path.exists());
+        assert!(quarantine_path.join(TANTIVY_OWNER_MARKER_FILE).exists());
+        assert!(quarantine_path.join(TANTIVY_MANAGED_MANIFEST_FILE).exists());
+        let (phase, inventory): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT phase, file_inventory_json FROM tantivy_purge_deletions
+                 WHERE generation = ?1",
+                params![generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "verified");
+        let original_count = serde_json::from_str::<Vec<TantivyPurgeFile>>(&inventory)
+            .unwrap()
+            .len();
+        assert!(fs::read_dir(&quarantine_path).unwrap().count() < original_count);
+        drop(store);
+
+        let mut resumed = Store::open(&paths).unwrap();
+        let outcome = resumed
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+        assert_eq!(outcome.discarded_tantivy_generations, 1);
+        assert!(!quarantine_path.exists());
+        assert!(resumed.pending_purges().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_resumes_when_crash_happens_after_owner_marker_unlink() {
+        let paths = temp_profile_paths("purge-tantivy-marker-unlink-resume");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_MARKER_UNLINK_RESUME";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-marker-unlink-resume",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "private-marker-unlink-resume",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication(
+                "sync-purge-marker-unlink-resume",
+                generation,
+                None,
+                None,
+            )
+            .unwrap();
+        let owner_token: String = store
+            .conn
+            .query_row(
+                "SELECT owner_token FROM index_build_leases WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let quarantine_path =
+            tantivy_purge_quarantine_path(&paths.index_root, generation, &owner_token);
+        store.fail_tantivy_purge_at_filesystem_point(TantivyPurgeFailurePoint::AfterMarkerUnlink);
+
+        store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        let phase: String = store
+            .conn
+            .query_row(
+                "SELECT phase FROM tantivy_purge_deletions WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "manifest_deleted");
+        assert!(quarantine_path.exists());
+        assert!(!quarantine_path.join(TANTIVY_OWNER_MARKER_FILE).exists());
+        let outcome = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+        assert_eq!(outcome.discarded_tantivy_generations, 1);
+        assert!(!quarantine_path.exists());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_resumes_when_crash_happens_after_quarantine_root_removal() {
+        let paths = temp_profile_paths("purge-tantivy-root-remove-resume");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_ROOT_REMOVE_RESUME";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-root-remove-resume",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "private-root-remove-resume",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication("sync-purge-root-remove-resume", generation, None, None)
+            .unwrap();
+        let owner_token: String = store
+            .conn
+            .query_row(
+                "SELECT owner_token FROM index_build_leases WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let quarantine_path =
+            tantivy_purge_quarantine_path(&paths.index_root, generation, &owner_token);
+        store.fail_tantivy_purge_at_filesystem_point(TantivyPurgeFailurePoint::AfterRootRemove);
+
+        store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        let phase: String = store
+            .conn
+            .query_row(
+                "SELECT phase FROM tantivy_purge_deletions WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "marker_deleted");
+        assert!(!quarantine_path.exists());
+        let outcome = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+        assert_eq!(outcome.discarded_tantivy_generations, 1);
+        let deletion_rows: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM tantivy_purge_deletions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(deletion_rows, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn partial_purge_preserves_unknown_entry_and_retries_after_manual_removal() {
+        let paths = temp_profile_paths("purge-tantivy-partial-unknown-entry");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_PARTIAL_UNKNOWN_ENTRY";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-partial-unknown-entry",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "private-partial-unknown-entry",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication(
+                "sync-purge-partial-unknown-entry",
+                generation,
+                None,
+                None,
+            )
+            .unwrap();
+        let owner_token: String = store
+            .conn
+            .query_row(
+                "SELECT owner_token FROM index_build_leases WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let quarantine_path =
+            tantivy_purge_quarantine_path(&paths.index_root, generation, &owner_token);
+        store.fail_tantivy_purge_after_unlinks(1);
+        store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+        let foreign = quarantine_path.join("foreign-backup-marker");
+        fs::write(&foreign, b"preserve").unwrap();
+
+        let error = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "purge.failed");
+        assert!(foreign.exists());
+        assert_eq!(
+            store.pending_purges().unwrap()[0].failure_stage,
+            Some(PurgeFailureStage::Tantivy)
+        );
+        fs::remove_file(foreign).unwrap();
+        let outcome = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+        assert_eq!(outcome.discarded_tantivy_generations, 1);
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }

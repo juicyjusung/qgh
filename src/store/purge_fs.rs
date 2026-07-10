@@ -1,7 +1,15 @@
 use super::purge_error;
 use crate::error::QghError;
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AnchoredFileFingerprint {
+    pub byte_len: u64,
+    pub sha256: String,
+}
 
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +48,13 @@ pub(super) fn filesystem_identity_from_file(
     })
 }
 
+#[cfg(unix)]
+impl FilesystemIdentity {
+    pub(super) fn durable_key(&self) -> String {
+        format!("unix:{}:{}", self.device, self.inode)
+    }
+}
+
 #[cfg(not(unix))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FilesystemIdentity {
@@ -71,6 +86,18 @@ pub(super) fn filesystem_identity_from_file(
         created: metadata.created().ok(),
         modified: metadata.modified().ok(),
     })
+}
+
+#[cfg(not(unix))]
+impl FilesystemIdentity {
+    pub(super) fn durable_key(&self) -> String {
+        fn nanos(value: Option<std::time::SystemTime>) -> u128 {
+            value
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_nanos())
+        }
+        format!("portable:{}:{}", nanos(self.created), nanos(self.modified))
+    }
 }
 
 // FD-anchored purge safety invariants (macOS/Linux):
@@ -159,37 +186,138 @@ fn platform_open_entry_flags() -> std::os::raw::c_int {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(super) fn remove_anchored_directory_contents(directory: &fs::File) -> Result<(), QghError> {
+pub(super) fn anchored_file_names(
+    directory: &fs::File,
+) -> Result<Vec<std::ffi::OsString>, QghError> {
     use std::os::fd::AsRawFd;
 
-    let directory_fd = directory.as_raw_fd();
-    for name in anchored_directory_entry_names(directory_fd)? {
-        let entry = open_anchored_entry(directory_fd, &name)?;
-        let metadata = entry.metadata().map_err(|_| purge_error())?;
-        let identity = anchored_entry_identity(&metadata);
-        if metadata.is_dir() {
-            remove_anchored_directory_contents(&entry)?;
-            if current_anchored_entry_identity(directory_fd, &name)? != identity {
-                return Err(purge_error());
-            }
-            unlink_anchored_entry(directory_fd, &name, true)?;
-        } else if metadata.is_file() {
-            if current_anchored_entry_identity(directory_fd, &name)? != identity {
-                return Err(purge_error());
-            }
-            unlink_anchored_entry(directory_fd, &name, false)?;
-        } else {
-            return Err(purge_error());
-        }
-    }
-    if !anchored_directory_entry_names(directory_fd)?.is_empty() {
-        return Err(purge_error());
-    }
-    Ok(())
+    anchored_directory_entry_names(directory.as_raw_fd())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub(super) fn remove_anchored_directory_contents(_directory: &fs::File) -> Result<(), QghError> {
+pub(super) fn anchored_file_names(
+    _directory: &fs::File,
+) -> Result<Vec<std::ffi::OsString>, QghError> {
+    Err(purge_error())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) fn anchored_regular_file_fingerprint(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+) -> Result<AnchoredFileFingerprint, QghError> {
+    use std::os::fd::AsRawFd;
+
+    let directory_fd = directory.as_raw_fd();
+    let mut entry = open_anchored_entry(directory_fd, name)?;
+    let metadata = entry.metadata().map_err(|_| purge_error())?;
+    if !metadata.is_file() {
+        return Err(purge_error());
+    }
+    let identity = anchored_entry_identity(&metadata);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = entry.read(&mut buffer).map_err(|_| purge_error())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if current_anchored_entry_identity(directory_fd, name)? != identity {
+        return Err(purge_error());
+    }
+    Ok(AnchoredFileFingerprint {
+        byte_len: metadata.len(),
+        sha256: format!("{:x}", hasher.finalize()),
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(super) fn anchored_regular_file_fingerprint(
+    _directory: &fs::File,
+    _name: &std::ffi::OsStr,
+) -> Result<AnchoredFileFingerprint, QghError> {
+    Err(purge_error())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) fn unlink_anchored_regular_file(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+    expected: &AnchoredFileFingerprint,
+) -> Result<(), QghError> {
+    use std::os::fd::AsRawFd;
+
+    let directory_fd = directory.as_raw_fd();
+    let mut entry = open_anchored_entry(directory_fd, name)?;
+    let metadata = entry.metadata().map_err(|_| purge_error())?;
+    if !metadata.is_file() {
+        return Err(purge_error());
+    }
+    let identity = anchored_entry_identity(&metadata);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = entry.read(&mut buffer).map_err(|_| purge_error())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let observed = AnchoredFileFingerprint {
+        byte_len: metadata.len(),
+        sha256: format!("{:x}", hasher.finalize()),
+    };
+    if observed != *expected {
+        return Err(purge_error());
+    }
+    if current_anchored_entry_identity(directory_fd, name)? != identity {
+        return Err(purge_error());
+    }
+    unlink_anchored_entry(directory_fd, name, false)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) fn remove_anchored_empty_directory(
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+    expected_identity: &FilesystemIdentity,
+) -> Result<(), QghError> {
+    use std::os::fd::AsRawFd;
+
+    let parent_fd = parent.as_raw_fd();
+    let entry = open_anchored_entry(parent_fd, name)?;
+    if filesystem_identity_from_file(&entry)? != *expected_identity {
+        return Err(purge_error());
+    }
+    if !anchored_directory_entry_names(entry.as_raw_fd())?.is_empty() {
+        return Err(purge_error());
+    }
+    let metadata = entry.metadata().map_err(|_| purge_error())?;
+    let identity = anchored_entry_identity(&metadata);
+    if current_anchored_entry_identity(parent_fd, name)? != identity {
+        return Err(purge_error());
+    }
+    unlink_anchored_entry(parent_fd, name, true)?;
+    parent.sync_all().map_err(|_| purge_error())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(super) fn remove_anchored_empty_directory(
+    _parent: &fs::File,
+    _name: &std::ffi::OsStr,
+    _expected_identity: &FilesystemIdentity,
+) -> Result<(), QghError> {
+    Err(purge_error())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(super) fn unlink_anchored_regular_file(
+    _directory: &fs::File,
+    _name: &std::ffi::OsStr,
+    _expected: &AnchoredFileFingerprint,
+) -> Result<(), QghError> {
     Err(purge_error())
 }
 
@@ -290,6 +418,7 @@ fn anchored_directory_entry_names(
     unsafe extern "C" {
         fn dup(fd: std::os::raw::c_int) -> std::os::raw::c_int;
         fn close(fd: std::os::raw::c_int) -> std::os::raw::c_int;
+        fn lseek(fd: std::os::raw::c_int, offset: i64, whence: std::os::raw::c_int) -> i64;
         fn fdopendir(fd: std::os::raw::c_int) -> *mut std::ffi::c_void;
         fn readdir(directory: *mut std::ffi::c_void) -> *mut PlatformDirent;
         fn closedir(directory: *mut std::ffi::c_void) -> std::os::raw::c_int;
@@ -299,6 +428,14 @@ fn anchored_directory_entry_names(
     // ownership only of the duplicate descriptor.
     let duplicate = unsafe { dup(directory_fd) };
     if duplicate < 0 {
+        return Err(purge_error());
+    }
+    // `dup` shares the directory cursor with the original descriptor. Reset
+    // it before every inventory pass so repeated crash-recovery validation
+    // cannot mistake an exhausted cursor for an empty directory.
+    const SEEK_SET: std::os::raw::c_int = 0;
+    if unsafe { lseek(duplicate, 0, SEEK_SET) } < 0 {
+        unsafe { close(duplicate) };
         return Err(purge_error());
     }
     // SAFETY: the duplicate is a valid open directory descriptor.
