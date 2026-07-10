@@ -63,9 +63,12 @@ pub enum FetchOutcome {
     Backoff(BackoffPlan),
 }
 
-pub enum ClassifiedFetchOutcome {
-    Fetched(FetchResult),
-    Interrupted(LifecycleInterruption),
+pub struct ClassifiedFetchOutcome {
+    /// All counters and confirmed lifecycle evidence accumulated before the
+    /// optional interruption. Callers must persist/queue this evidence before
+    /// surfacing the interruption.
+    pub result: FetchResult,
+    pub interruption: Option<LifecycleInterruption>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +83,7 @@ pub struct TargetIssueFetch {
     pub issue: IssueRecord,
     pub comments: Vec<CommentRecord>,
     pub lifecycle: TargetIssueLifecycle,
+    pub confirmed_transition: Option<ConfirmedRemoteState>,
 }
 
 pub enum TargetIssueFetchOutcome {
@@ -88,7 +92,15 @@ pub enum TargetIssueFetchOutcome {
     Backoff(BackoffPlan),
 }
 
-pub enum ClassifiedTargetIssueFetchOutcome {
+pub struct ClassifiedTargetIssueFetchOutcome {
+    /// Every canonical permanent redirect confirmed before the terminal result.
+    /// Callers must queue these explicit source identities before handling an
+    /// interruption or a second confirmed lifecycle state.
+    pub confirmed_transitions: Vec<ConfirmedIssueTransition>,
+    pub terminal: ClassifiedTargetIssueTerminal,
+}
+
+pub enum ClassifiedTargetIssueTerminal {
     Fetched(Box<TargetIssueFetch>),
     Confirmed {
         state: ConfirmedRemoteState,
@@ -100,6 +112,16 @@ pub enum ClassifiedTargetIssueFetchOutcome {
     Backoff(BackoffPlan),
     Transient(GitHubTransientKind),
     AmbiguousForbidden,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedIssueTransition {
+    pub source_repo: String,
+    pub source_issue_number: i64,
+    pub target_repo: String,
+    pub target_issue_number: i64,
+    pub state: ConfirmedRemoteState,
+    pub http_status: u16,
 }
 
 pub struct TargetIssueLifecycle {
@@ -288,17 +310,15 @@ pub async fn fetch_issues(
 }
 
 fn legacy_fetch_outcome(outcome: ClassifiedFetchOutcome) -> Result<FetchOutcome, QghError> {
-    Ok(match outcome {
-        ClassifiedFetchOutcome::Fetched(fetched) => FetchOutcome::Fetched(fetched),
-        ClassifiedFetchOutcome::Interrupted(LifecycleInterruption::Backoff(plan)) => {
-            FetchOutcome::Backoff(plan)
-        }
-        ClassifiedFetchOutcome::Interrupted(LifecycleInterruption::AuthenticationFailed) => {
+    Ok(match outcome.interruption {
+        None => FetchOutcome::Fetched(outcome.result),
+        Some(LifecycleInterruption::Backoff(plan)) => FetchOutcome::Backoff(plan),
+        Some(LifecycleInterruption::AuthenticationFailed) => {
             return Err(authentication_failure());
         }
-        ClassifiedFetchOutcome::Interrupted(
-            LifecycleInterruption::Transient(_) | LifecycleInterruption::AmbiguousForbidden,
-        ) => return Err(github_unavailable()),
+        Some(LifecycleInterruption::Transient(_) | LifecycleInterruption::AmbiguousForbidden) => {
+            return Err(github_unavailable())
+        }
     })
 }
 
@@ -311,12 +331,49 @@ pub async fn fetch_issues_classified(
     commit_page: &mut dyn FnMut(FetchPage) -> Result<(), QghError>,
 ) -> Result<ClassifiedFetchOutcome, QghError> {
     let client = lifecycle_client()?;
+    fetch_issues_classified_with_client(
+        &client,
+        profile,
+        token,
+        cursors,
+        fetch_comments,
+        progress,
+        commit_page,
+    )
+    .await
+}
+
+async fn fetch_issues_classified_with_client(
+    client: &reqwest::Client,
+    profile: &Profile,
+    token: &str,
+    cursors: &[StoredCursor],
+    fetch_comments: bool,
+    progress: Option<&dyn ProgressReporter>,
+    commit_page: &mut dyn FnMut(FetchPage) -> Result<(), QghError>,
+) -> Result<ClassifiedFetchOutcome, QghError> {
     let cursor_map = cursor_map(cursors);
     let mut total_issues = 0;
     let mut total_comments = 0;
     let mut total_skipped_pull_requests = 0;
     let mut confirmed_permission_lost_repos = BTreeMap::new();
     let mut confirmed_source_deletions = BTreeMap::new();
+    macro_rules! finish_fetch {
+        ($interruption:expr) => {
+            return Ok(ClassifiedFetchOutcome {
+                result: FetchResult {
+                    issues: total_issues,
+                    comments: total_comments,
+                    skipped_pull_requests: total_skipped_pull_requests,
+                    confirmed_permission_lost_repos: confirmed_permission_lost_repos
+                        .into_values()
+                        .collect(),
+                    confirmed_source_deletions: confirmed_source_deletions.into_values().collect(),
+                },
+                interruption: $interruption,
+            })
+        };
+    }
 
     for repo in &profile.repos {
         let repo_name = repo.full_name();
@@ -336,16 +393,16 @@ pub async fn fetch_issues_classified(
         let mut repo_skipped_pull_requests = 0;
         let mut last_progress_issue_count = 0;
         'repo_pages: while let Some(url) = next_url.take() {
-            let mut request = github_get(&client, &url, token);
+            let mut request = github_get(client, &url, token);
             if let Some(etag) = stored_cursor.and_then(|cursor| cursor.etag.as_ref()) {
                 request = request.header(IF_NONE_MATCH, etag);
             }
             let response = match request.send().await {
                 Ok(response) => response,
                 Err(error) => {
-                    return Ok(ClassifiedFetchOutcome::Interrupted(
-                        LifecycleInterruption::Transient(classify_transport_failure(&error)),
-                    ));
+                    finish_fetch!(Some(LifecycleInterruption::Transient(
+                        classify_transport_failure(&error)
+                    )));
                 }
             };
             let status = response.status();
@@ -353,9 +410,7 @@ pub async fn fetch_issues_classified(
             if let Some(backoff) = backoff_from_response(status, &headers, &endpoint) {
                 emit_backoff(progress, &backoff);
                 wait_for_backoff(&backoff);
-                return Ok(ClassifiedFetchOutcome::Interrupted(
-                    LifecycleInterruption::Backoff(backoff),
-                ));
+                finish_fetch!(Some(LifecycleInterruption::Backoff(backoff)));
             }
             if status == StatusCode::NO_CONTENT {
                 commit_page(FetchPage {
@@ -406,7 +461,7 @@ pub async fn fetch_issues_classified(
                 );
                 if matches!(disposition, ResponseDisposition::PermissionCandidate { .. }) {
                     match confirm_repository_after_prior_denial(
-                        &client, profile, token, repo, progress,
+                        client, profile, token, repo, progress,
                     )
                     .await
                     {
@@ -418,35 +473,25 @@ pub async fn fetch_issues_classified(
                         }
                         RepositoryAccessOutcome::Backoff(plan) => {
                             wait_for_backoff(&plan);
-                            return Ok(ClassifiedFetchOutcome::Interrupted(
-                                LifecycleInterruption::Backoff(plan),
-                            ));
+                            finish_fetch!(Some(LifecycleInterruption::Backoff(plan)));
                         }
                         RepositoryAccessOutcome::AuthenticationFailed => {
-                            return Ok(ClassifiedFetchOutcome::Interrupted(
-                                LifecycleInterruption::AuthenticationFailed,
-                            ));
+                            finish_fetch!(Some(LifecycleInterruption::AuthenticationFailed));
                         }
                         RepositoryAccessOutcome::Accessible => {
-                            return Ok(ClassifiedFetchOutcome::Interrupted(
-                                LifecycleInterruption::Transient(
-                                    GitHubTransientKind::UnexpectedResponse,
-                                ),
-                            ));
+                            finish_fetch!(Some(LifecycleInterruption::Transient(
+                                GitHubTransientKind::UnexpectedResponse,
+                            )));
                         }
                         RepositoryAccessOutcome::Transient(kind) => {
-                            return Ok(ClassifiedFetchOutcome::Interrupted(
-                                LifecycleInterruption::Transient(kind),
-                            ));
+                            finish_fetch!(Some(LifecycleInterruption::Transient(kind)));
                         }
                         RepositoryAccessOutcome::AmbiguousForbidden => {
-                            return Ok(ClassifiedFetchOutcome::Interrupted(
-                                LifecycleInterruption::AmbiguousForbidden,
-                            ));
+                            finish_fetch!(Some(LifecycleInterruption::AmbiguousForbidden));
                         }
                     }
                 }
-                return Ok(ClassifiedFetchOutcome::Interrupted(match disposition {
+                let interruption = match disposition {
                     ResponseDisposition::AuthenticationFailed => {
                         LifecycleInterruption::AuthenticationFailed
                     }
@@ -463,7 +508,8 @@ pub async fn fetch_issues_classified(
                     }
                     ResponseDisposition::Success
                     | ResponseDisposition::PermissionCandidate { .. } => unreachable!(),
-                }));
+                };
+                finish_fetch!(Some(interruption));
             }
             if let Some(etag) = header_string(&headers, ETAG) {
                 response_etag = Some(etag);
@@ -495,7 +541,7 @@ pub async fn fetch_issues_classified(
                 let issue = item.into_record(profile, repo, &indexed_at);
                 if fetch_comments {
                     match fetch_issue_comments(
-                        &client,
+                        client,
                         profile,
                         token,
                         &cursor_map,
@@ -513,9 +559,7 @@ pub async fn fetch_issues_classified(
                         }
                         CommentFetchOutcome::Backoff(backoff) => {
                             wait_for_backoff(&backoff);
-                            return Ok(ClassifiedFetchOutcome::Interrupted(
-                                LifecycleInterruption::Backoff(backoff),
-                            ));
+                            finish_fetch!(Some(LifecycleInterruption::Backoff(backoff)));
                         }
                         CommentFetchOutcome::ConfirmedRepositoryPermissionLoss(confirmed) => {
                             confirmed_permission_lost_repos
@@ -536,19 +580,13 @@ pub async fn fetch_issues_classified(
                             break 'repo_pages;
                         }
                         CommentFetchOutcome::AuthenticationFailed => {
-                            return Ok(ClassifiedFetchOutcome::Interrupted(
-                                LifecycleInterruption::AuthenticationFailed,
-                            ));
+                            finish_fetch!(Some(LifecycleInterruption::AuthenticationFailed));
                         }
                         CommentFetchOutcome::Transient(kind) => {
-                            return Ok(ClassifiedFetchOutcome::Interrupted(
-                                LifecycleInterruption::Transient(kind),
-                            ));
+                            finish_fetch!(Some(LifecycleInterruption::Transient(kind)));
                         }
                         CommentFetchOutcome::AmbiguousForbidden => {
-                            return Ok(ClassifiedFetchOutcome::Interrupted(
-                                LifecycleInterruption::AmbiguousForbidden,
-                            ));
+                            finish_fetch!(Some(LifecycleInterruption::AmbiguousForbidden));
                         }
                     }
                 }
@@ -595,13 +633,7 @@ pub async fn fetch_issues_classified(
         }
     }
 
-    Ok(ClassifiedFetchOutcome::Fetched(FetchResult {
-        issues: total_issues,
-        comments: total_comments,
-        skipped_pull_requests: total_skipped_pull_requests,
-        confirmed_permission_lost_repos: confirmed_permission_lost_repos.into_values().collect(),
-        confirmed_source_deletions: confirmed_source_deletions.into_values().collect(),
-    }))
+    finish_fetch!(None);
 }
 
 pub struct BackfillOutcome {
@@ -948,25 +980,25 @@ pub async fn fetch_target_issue(
 fn legacy_target_issue_outcome(
     outcome: ClassifiedTargetIssueFetchOutcome,
 ) -> Result<TargetIssueFetchOutcome, QghError> {
-    Ok(match outcome {
-        ClassifiedTargetIssueFetchOutcome::Fetched(fetched) => {
+    Ok(match outcome.terminal {
+        ClassifiedTargetIssueTerminal::Fetched(fetched) => {
             TargetIssueFetchOutcome::Fetched(fetched)
         }
-        ClassifiedTargetIssueFetchOutcome::Confirmed {
+        ClassifiedTargetIssueTerminal::Confirmed {
             state: ConfirmedRemoteState::SourceDeleted | ConfirmedRemoteState::SourceTransferred,
             lifecycle,
             ..
         } => TargetIssueFetchOutcome::Unavailable(lifecycle),
-        ClassifiedTargetIssueFetchOutcome::Confirmed {
+        ClassifiedTargetIssueTerminal::Confirmed {
             state: ConfirmedRemoteState::RepositoryPermissionLoss,
             ..
         } => return Err(repository_permission_loss_requires_typed_handling()),
-        ClassifiedTargetIssueFetchOutcome::Backoff(plan) => TargetIssueFetchOutcome::Backoff(plan),
-        ClassifiedTargetIssueFetchOutcome::AuthenticationFailed => {
+        ClassifiedTargetIssueTerminal::Backoff(plan) => TargetIssueFetchOutcome::Backoff(plan),
+        ClassifiedTargetIssueTerminal::AuthenticationFailed => {
             return Err(authentication_failure());
         }
-        ClassifiedTargetIssueFetchOutcome::Transient(_)
-        | ClassifiedTargetIssueFetchOutcome::AmbiguousForbidden => {
+        ClassifiedTargetIssueTerminal::Transient(_)
+        | ClassifiedTargetIssueTerminal::AmbiguousForbidden => {
             return Err(github_unavailable());
         }
     })
@@ -979,13 +1011,36 @@ pub async fn fetch_target_issue_classified(
     issue_number: i64,
     progress: Option<&dyn ProgressReporter>,
 ) -> Result<ClassifiedTargetIssueFetchOutcome, QghError> {
+    let client = lifecycle_client()?;
+    fetch_target_issue_classified_with_client(&client, profile, token, repo, issue_number, progress)
+        .await
+}
+
+async fn fetch_target_issue_classified_with_client(
+    client: &reqwest::Client,
+    profile: &Profile,
+    token: &str,
+    repo: &RepoRef,
+    issue_number: i64,
+    progress: Option<&dyn ProgressReporter>,
+) -> Result<ClassifiedTargetIssueFetchOutcome, QghError> {
     const TRANSFER_FOLLOW_LIMIT: usize = 8;
 
-    let client = lifecycle_client()?;
     let mut current_repo = repo.clone();
     let mut current_issue_number = issue_number;
     let mut alias_chain = Vec::new();
     let mut visited = BTreeSet::new();
+    let mut confirmed_transition = None;
+    let mut confirmed_transition_http_status = None;
+    let mut confirmed_transitions = Vec::new();
+    macro_rules! finish_target {
+        ($terminal:expr) => {
+            return Ok(ClassifiedTargetIssueFetchOutcome {
+                confirmed_transitions,
+                terminal: $terminal,
+            })
+        };
+    }
 
     loop {
         let url = issue_object_url(profile, &current_repo, current_issue_number);
@@ -1015,11 +1070,11 @@ pub async fn fetch_target_issue_classified(
             .with_hint("Run targeted refresh for the final issue location directly."));
         }
 
-        let response = match github_get(&client, &url, token).send().await {
+        let response = match github_get(client, &url, token).send().await {
             Ok(response) => response,
             Err(error) => {
-                return Ok(ClassifiedTargetIssueFetchOutcome::Transient(
-                    classify_transport_failure(&error),
+                finish_target!(ClassifiedTargetIssueTerminal::Transient(
+                    classify_transport_failure(&error)
                 ));
             }
         };
@@ -1033,7 +1088,7 @@ pub async fn fetch_target_issue_classified(
         if let Some(backoff) = targeted_backoff_from_response(status, &headers, &scope) {
             emit_backoff(progress, &backoff);
             wait_for_backoff(&backoff);
-            return Ok(ClassifiedTargetIssueFetchOutcome::Backoff(backoff));
+            finish_target!(ClassifiedTargetIssueTerminal::Backoff(backoff));
         }
 
         match status {
@@ -1058,7 +1113,7 @@ pub async fn fetch_target_issue_classified(
                 let mut cursor_updates = Vec::new();
                 let empty_cursors = BTreeMap::new();
                 let comments = match fetch_issue_comments(
-                    &client,
+                    client,
                     profile,
                     token,
                     &empty_cursors,
@@ -1072,10 +1127,10 @@ pub async fn fetch_target_issue_classified(
                     CommentFetchOutcome::Fetched(comments) => comments,
                     CommentFetchOutcome::Backoff(backoff) => {
                         wait_for_backoff(&backoff);
-                        return Ok(ClassifiedTargetIssueFetchOutcome::Backoff(backoff));
+                        finish_target!(ClassifiedTargetIssueTerminal::Backoff(backoff));
                     }
                     CommentFetchOutcome::ConfirmedRepositoryPermissionLoss(confirmed) => {
-                        return Ok(target_outcome_from_lifecycle_check(
+                        finish_target!(target_terminal_from_lifecycle_check(
                             ClassifiedLifecycleCheck::Confirmed {
                                 state: ConfirmedRemoteState::RepositoryPermissionLoss,
                                 http_status: confirmed.http_status,
@@ -1086,7 +1141,7 @@ pub async fn fetch_target_issue_classified(
                         ));
                     }
                     CommentFetchOutcome::SourceDeleted { http_status } => {
-                        return Ok(target_outcome_from_lifecycle_check(
+                        finish_target!(target_terminal_from_lifecycle_check(
                             ClassifiedLifecycleCheck::Confirmed {
                                 state: ConfirmedRemoteState::SourceDeleted,
                                 http_status,
@@ -1097,16 +1152,16 @@ pub async fn fetch_target_issue_classified(
                         ));
                     }
                     CommentFetchOutcome::AuthenticationFailed => {
-                        return Ok(ClassifiedTargetIssueFetchOutcome::AuthenticationFailed);
+                        finish_target!(ClassifiedTargetIssueTerminal::AuthenticationFailed);
                     }
                     CommentFetchOutcome::Transient(kind) => {
-                        return Ok(ClassifiedTargetIssueFetchOutcome::Transient(kind));
+                        finish_target!(ClassifiedTargetIssueTerminal::Transient(kind));
                     }
                     CommentFetchOutcome::AmbiguousForbidden => {
-                        return Ok(ClassifiedTargetIssueFetchOutcome::AmbiguousForbidden);
+                        finish_target!(ClassifiedTargetIssueTerminal::AmbiguousForbidden);
                     }
                 };
-                let lifecycle = if alias_chain.is_empty() {
+                let lifecycle = if confirmed_transition.is_none() {
                     TargetIssueLifecycle {
                         status: "active".to_string(),
                         reason: None,
@@ -1117,42 +1172,44 @@ pub async fn fetch_target_issue_classified(
                     TargetIssueLifecycle {
                         status: "transferred".to_string(),
                         reason: Some("transferred".to_string()),
-                        http_status: Some(301),
+                        http_status: confirmed_transition_http_status,
                         alias_chain,
                     }
                 };
-                return Ok(ClassifiedTargetIssueFetchOutcome::Fetched(Box::new(
+                finish_target!(ClassifiedTargetIssueTerminal::Fetched(Box::new(
                     TargetIssueFetch {
                         issue,
                         comments,
                         lifecycle,
+                        confirmed_transition,
                     },
                 )));
             }
-            StatusCode::MOVED_PERMANENTLY
-            | StatusCode::FOUND
-            | StatusCode::TEMPORARY_REDIRECT
-            | StatusCode::PERMANENT_REDIRECT => {
+            StatusCode::MOVED_PERMANENTLY | StatusCode::PERMANENT_REDIRECT => {
                 let Some(location) = header_string(&headers, LOCATION) else {
-                    return Ok(ClassifiedTargetIssueFetchOutcome::Confirmed {
-                        state: ConfirmedRemoteState::SourceTransferred,
-                        repo: current_repo.full_name(),
-                        issue_number: current_issue_number,
-                        lifecycle: unavailable_lifecycle("transferred", status, alias_chain),
-                    });
+                    finish_target!(ClassifiedTargetIssueTerminal::Transient(
+                        GitHubTransientKind::UnexpectedResponse,
+                    ));
                 };
-                alias_chain.push(location.clone());
                 let Some((next_repo, next_issue_number)) = parse_issue_location(profile, &location)
                 else {
-                    return Ok(ClassifiedTargetIssueFetchOutcome::Confirmed {
-                        state: ConfirmedRemoteState::SourceTransferred,
-                        repo: current_repo.full_name(),
-                        issue_number: current_issue_number,
-                        lifecycle: unavailable_lifecycle("transferred", status, alias_chain),
-                    });
+                    finish_target!(ClassifiedTargetIssueTerminal::Transient(
+                        GitHubTransientKind::UnexpectedResponse,
+                    ));
                 };
+                alias_chain.push(location);
+                confirmed_transition = Some(ConfirmedRemoteState::SourceTransferred);
+                confirmed_transition_http_status.get_or_insert(status.as_u16());
+                confirmed_transitions.push(ConfirmedIssueTransition {
+                    source_repo: current_repo.full_name(),
+                    source_issue_number: current_issue_number,
+                    target_repo: next_repo.full_name(),
+                    target_issue_number: next_issue_number,
+                    state: ConfirmedRemoteState::SourceTransferred,
+                    http_status: status.as_u16(),
+                });
                 if !profile.allows_repo(&next_repo.full_name()) {
-                    return Ok(ClassifiedTargetIssueFetchOutcome::Confirmed {
+                    finish_target!(ClassifiedTargetIssueTerminal::Confirmed {
                         state: ConfirmedRemoteState::SourceTransferred,
                         repo: current_repo.full_name(),
                         issue_number: current_issue_number,
@@ -1161,6 +1218,11 @@ pub async fn fetch_target_issue_classified(
                 }
                 current_repo = next_repo;
                 current_issue_number = next_issue_number;
+            }
+            StatusCode::FOUND | StatusCode::TEMPORARY_REDIRECT => {
+                finish_target!(ClassifiedTargetIssueTerminal::Transient(
+                    GitHubTransientKind::UnexpectedResponse,
+                ));
             }
             StatusCode::NOT_FOUND | StatusCode::GONE => {
                 let first = if status == StatusCode::GONE {
@@ -1173,7 +1235,7 @@ pub async fn fetch_target_issue_classified(
                     }
                 };
                 let confirmation = confirm_source_denial_with_repository(
-                    &client,
+                    client,
                     profile,
                     token,
                     &current_repo,
@@ -1181,7 +1243,7 @@ pub async fn fetch_target_issue_classified(
                     progress,
                 )
                 .await;
-                return Ok(target_outcome_from_lifecycle_check(
+                finish_target!(target_terminal_from_lifecycle_check(
                     confirmation,
                     &current_repo,
                     current_issue_number,
@@ -1189,20 +1251,20 @@ pub async fn fetch_target_issue_classified(
                 ));
             }
             StatusCode::UNAUTHORIZED => {
-                return Ok(ClassifiedTargetIssueFetchOutcome::AuthenticationFailed);
+                finish_target!(ClassifiedTargetIssueTerminal::AuthenticationFailed);
             }
             StatusCode::FORBIDDEN => {
                 let body = response.text().await.unwrap_or_default();
                 let disposition =
                     classify_response(status, &headers, &body, &scope, ResponseTarget::Source);
-                return Ok(match disposition {
+                let terminal = match disposition {
                     ResponseDisposition::Backoff(plan) => {
                         emit_backoff(progress, &plan);
-                        ClassifiedTargetIssueFetchOutcome::Backoff(plan)
+                        ClassifiedTargetIssueTerminal::Backoff(plan)
                     }
                     ResponseDisposition::PermissionCandidate { http_status } => {
                         let confirmation = confirm_source_denial_with_repository(
-                            &client,
+                            client,
                             profile,
                             token,
                             &current_repo,
@@ -1210,7 +1272,7 @@ pub async fn fetch_target_issue_classified(
                             progress,
                         )
                         .await;
-                        target_outcome_from_lifecycle_check(
+                        target_terminal_from_lifecycle_check(
                             confirmation,
                             &current_repo,
                             current_issue_number,
@@ -1218,25 +1280,26 @@ pub async fn fetch_target_issue_classified(
                         )
                     }
                     ResponseDisposition::AmbiguousForbidden => {
-                        ClassifiedTargetIssueFetchOutcome::AmbiguousForbidden
+                        ClassifiedTargetIssueTerminal::AmbiguousForbidden
                     }
-                    _ => ClassifiedTargetIssueFetchOutcome::Transient(
+                    _ => ClassifiedTargetIssueTerminal::Transient(
                         GitHubTransientKind::UnexpectedResponse,
                     ),
-                });
+                };
+                finish_target!(terminal);
             }
             status if status.is_success() => {
-                return Ok(ClassifiedTargetIssueFetchOutcome::Transient(
+                finish_target!(ClassifiedTargetIssueTerminal::Transient(
                     GitHubTransientKind::UnexpectedResponse,
                 ));
             }
             status if status.is_server_error() => {
-                return Ok(ClassifiedTargetIssueFetchOutcome::Transient(
+                finish_target!(ClassifiedTargetIssueTerminal::Transient(
                     GitHubTransientKind::Server,
                 ));
             }
             _ => {
-                return Ok(ClassifiedTargetIssueFetchOutcome::Transient(
+                finish_target!(ClassifiedTargetIssueTerminal::Transient(
                     GitHubTransientKind::UnexpectedResponse,
                 ));
             }
@@ -2208,16 +2271,16 @@ fn unavailable_lifecycle(
     }
 }
 
-fn target_outcome_from_lifecycle_check(
+fn target_terminal_from_lifecycle_check(
     check: ClassifiedLifecycleCheck,
     repo: &RepoRef,
     issue_number: i64,
     alias_chain: Vec<String>,
-) -> ClassifiedTargetIssueFetchOutcome {
+) -> ClassifiedTargetIssueTerminal {
     match check {
         ClassifiedLifecycleCheck::Confirmed { state, http_status } => {
             let reason = state.reason().to_string();
-            ClassifiedTargetIssueFetchOutcome::Confirmed {
+            ClassifiedTargetIssueTerminal::Confirmed {
                 state,
                 repo: repo.full_name(),
                 issue_number,
@@ -2230,17 +2293,15 @@ fn target_outcome_from_lifecycle_check(
             }
         }
         ClassifiedLifecycleCheck::AuthenticationFailed => {
-            ClassifiedTargetIssueFetchOutcome::AuthenticationFailed
+            ClassifiedTargetIssueTerminal::AuthenticationFailed
         }
-        ClassifiedLifecycleCheck::Backoff(plan) => ClassifiedTargetIssueFetchOutcome::Backoff(plan),
-        ClassifiedLifecycleCheck::Transient(kind) => {
-            ClassifiedTargetIssueFetchOutcome::Transient(kind)
-        }
+        ClassifiedLifecycleCheck::Backoff(plan) => ClassifiedTargetIssueTerminal::Backoff(plan),
+        ClassifiedLifecycleCheck::Transient(kind) => ClassifiedTargetIssueTerminal::Transient(kind),
         ClassifiedLifecycleCheck::AmbiguousForbidden => {
-            ClassifiedTargetIssueFetchOutcome::AmbiguousForbidden
+            ClassifiedTargetIssueTerminal::AmbiguousForbidden
         }
         ClassifiedLifecycleCheck::Active => {
-            ClassifiedTargetIssueFetchOutcome::Transient(GitHubTransientKind::UnexpectedResponse)
+            ClassifiedTargetIssueTerminal::Transient(GitHubTransientKind::UnexpectedResponse)
         }
     }
 }
@@ -2283,10 +2344,24 @@ async fn check_candidate_lifecycle_classified(
     };
     let disposition = classify_response(status, &headers, &body, &scope, ResponseTarget::Source);
     if disposition == ResponseDisposition::Redirect {
-        return Ok(ClassifiedLifecycleCheck::Confirmed {
-            state: ConfirmedRemoteState::SourceTransferred,
-            http_status: status.as_u16(),
-        });
+        return Ok(
+            if matches!(
+                status,
+                StatusCode::MOVED_PERMANENTLY | StatusCode::PERMANENT_REDIRECT
+            ) && candidate.entity_type == "issue"
+                && header_string(&headers, LOCATION)
+                    .as_deref()
+                    .and_then(|location| parse_issue_location(profile, location))
+                    .is_some()
+            {
+                ClassifiedLifecycleCheck::Confirmed {
+                    state: ConfirmedRemoteState::SourceTransferred,
+                    http_status: status.as_u16(),
+                }
+            } else {
+                ClassifiedLifecycleCheck::Transient(GitHubTransientKind::UnexpectedResponse)
+            },
+        );
     }
     if let Some(first) = permission_evidence(&disposition) {
         let repo = candidate_repo(candidate)?;
@@ -2382,14 +2457,38 @@ fn parse_issue_location(profile: &Profile, location: &str) -> Option<(RepoRef, i
     let url = reqwest::Url::parse(location)
         .ok()
         .or_else(|| base.join(location).ok())?;
+    if url.origin() != base.origin() || url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
     let segments = url.path_segments()?.collect::<Vec<_>>();
     let repos_index = segments.iter().position(|segment| *segment == "repos")?;
+    let base_prefix = base
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let location_prefix = &segments[..repos_index];
+    if !location_prefix.is_empty() && location_prefix != base_prefix {
+        return None;
+    }
+    if segments.len() != repos_index + 5 {
+        return None;
+    }
     let owner = segments.get(repos_index + 1)?;
     let name = segments.get(repos_index + 2)?;
     if segments.get(repos_index + 3) != Some(&"issues") {
         return None;
     }
     let issue_number = segments.get(repos_index + 4)?.parse::<i64>().ok()?;
+    if issue_number <= 0
+        || [owner, name].into_iter().any(|part| {
+            part.is_empty()
+                || part.contains('%')
+                || part.chars().any(char::is_whitespace)
+                || part.chars().any(char::is_control)
+        })
+    {
+        return None;
+    }
     Some((
         RepoRef {
             owner: owner.to_string(),
@@ -2698,6 +2797,54 @@ mod permission_classification_tests {
         (format!("http://{address}"), count, handle)
     }
 
+    fn spawn_confirm_then_timeout() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let count = Arc::new(AtomicUsize::new(0));
+        let thread_count = Arc::clone(&count);
+        let handle = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept confirmation request");
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request);
+                thread_count.fetch_add(1, Ordering::SeqCst);
+                stream
+                    .write_all(NOT_FOUND_RESPONSE.as_bytes())
+                    .expect("write confirmation response");
+            }
+            let (mut stream, _) = listener.accept().expect("accept timeout request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            thread_count.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(StdDuration::from_millis(100));
+        });
+        (format!("http://{address}"), count, handle)
+    }
+
+    fn spawn_redirect_then_timeout() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let count = Arc::new(AtomicUsize::new(0));
+        let thread_count = Arc::clone(&count);
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept redirect request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            thread_count.fetch_add(1, Ordering::SeqCst);
+            stream
+                .write_all(
+                    b"HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/b/issues/2\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                )
+                .expect("write redirect response");
+            let (mut stream, _) = listener.accept().expect("accept timeout request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            thread_count.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(StdDuration::from_millis(100));
+        });
+        (format!("http://{address}"), count, handle)
+    }
+
     fn json_response(status: &str, extra_headers: &str, body: &str) -> String {
         format!(
             "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{extra_headers}\r\n{body}",
@@ -2713,13 +2860,17 @@ mod permission_classification_tests {
     }
 
     fn test_profile(api_base_url: &str) -> Profile {
+        test_profile_with_repos(api_base_url, vec![test_repo()])
+    }
+
+    fn test_profile_with_repos(api_base_url: &str, repos: Vec<RepoRef>) -> Profile {
         let root = PathBuf::from("/tmp/qgh-github-classification-test");
         Profile {
             id: "test".to_string(),
             host: "example.test".to_string(),
             api_base_url: api_base_url.to_string(),
             web_base_url: "https://example.test".to_string(),
-            repos: vec![test_repo()],
+            repos,
             embedding: None,
             reconcile_after_seconds: None,
             freshness: FreshnessSettings {
@@ -2747,6 +2898,29 @@ mod permission_classification_tests {
         }
     }
 
+    fn two_repo_profile(api_base_url: &str) -> Profile {
+        test_profile_with_repos(
+            api_base_url,
+            vec![
+                RepoRef {
+                    owner: "owner".to_string(),
+                    name: "a".to_string(),
+                },
+                RepoRef {
+                    owner: "owner".to_string(),
+                    name: "b".to_string(),
+                },
+            ],
+        )
+    }
+
+    fn repo_a() -> RepoRef {
+        RepoRef {
+            owner: "owner".to_string(),
+            name: "a".to_string(),
+        }
+    }
+
     fn disposition(status: StatusCode, body: &str) -> ResponseDisposition {
         classify_response(
             status,
@@ -2755,6 +2929,25 @@ mod permission_classification_tests {
             "test-scope",
             ResponseTarget::Source,
         )
+    }
+
+    fn empty_fetch_result() -> FetchResult {
+        FetchResult {
+            issues: 0,
+            comments: 0,
+            skipped_pull_requests: 0,
+            confirmed_permission_lost_repos: Vec::new(),
+            confirmed_source_deletions: Vec::new(),
+        }
+    }
+
+    fn target_outcome_for_test(
+        terminal: ClassifiedTargetIssueTerminal,
+    ) -> ClassifiedTargetIssueFetchOutcome {
+        ClassifiedTargetIssueFetchOutcome {
+            confirmed_transitions: Vec::new(),
+            terminal,
+        }
     }
 
     #[test]
@@ -2944,22 +3137,23 @@ mod permission_classification_tests {
         );
 
         for outcome in [
-            ClassifiedTargetIssueFetchOutcome::AuthenticationFailed,
-            ClassifiedTargetIssueFetchOutcome::Transient(GitHubTransientKind::Timeout),
-            ClassifiedTargetIssueFetchOutcome::Transient(GitHubTransientKind::Network),
-            ClassifiedTargetIssueFetchOutcome::Transient(GitHubTransientKind::Server),
-            ClassifiedTargetIssueFetchOutcome::AmbiguousForbidden,
+            ClassifiedTargetIssueTerminal::AuthenticationFailed,
+            ClassifiedTargetIssueTerminal::Transient(GitHubTransientKind::Timeout),
+            ClassifiedTargetIssueTerminal::Transient(GitHubTransientKind::Network),
+            ClassifiedTargetIssueTerminal::Transient(GitHubTransientKind::Server),
+            ClassifiedTargetIssueTerminal::AmbiguousForbidden,
         ] {
-            assert!(legacy_target_issue_outcome(outcome).is_err());
+            assert!(legacy_target_issue_outcome(target_outcome_for_test(outcome)).is_err());
         }
-        let backoff =
-            legacy_target_issue_outcome(ClassifiedTargetIssueFetchOutcome::Backoff(BackoffPlan {
+        let backoff = legacy_target_issue_outcome(target_outcome_for_test(
+            ClassifiedTargetIssueTerminal::Backoff(BackoffPlan {
                 reason: "secondary_rate_limit".to_string(),
                 scope: "content-free".to_string(),
                 retry_after_seconds: 1,
                 reset_at: None,
-            }))
-            .unwrap();
+            }),
+        ))
+        .unwrap();
         assert!(matches!(backoff, TargetIssueFetchOutcome::Backoff(_)));
 
         for interruption in [
@@ -2969,18 +3163,21 @@ mod permission_classification_tests {
             LifecycleInterruption::Transient(GitHubTransientKind::Server),
             LifecycleInterruption::AmbiguousForbidden,
         ] {
-            assert!(
-                legacy_fetch_outcome(ClassifiedFetchOutcome::Interrupted(interruption)).is_err()
-            );
+            assert!(legacy_fetch_outcome(ClassifiedFetchOutcome {
+                result: empty_fetch_result(),
+                interruption: Some(interruption),
+            })
+            .is_err());
         }
-        let fetch_backoff = legacy_fetch_outcome(ClassifiedFetchOutcome::Interrupted(
-            LifecycleInterruption::Backoff(BackoffPlan {
+        let fetch_backoff = legacy_fetch_outcome(ClassifiedFetchOutcome {
+            result: empty_fetch_result(),
+            interruption: Some(LifecycleInterruption::Backoff(BackoffPlan {
                 reason: "primary_rate_limit".to_string(),
                 scope: "content-free".to_string(),
                 retry_after_seconds: 1,
                 reset_at: None,
-            }),
-        ))
+            })),
+        })
         .unwrap();
         assert!(matches!(fetch_backoff, FetchOutcome::Backoff(_)));
     }
@@ -2994,17 +3191,19 @@ mod permission_classification_tests {
         .unwrap();
         assert!(matches!(lifecycle, LifecycleCheck::Unavailable { .. }));
 
-        let target = legacy_target_issue_outcome(ClassifiedTargetIssueFetchOutcome::Confirmed {
-            state: ConfirmedRemoteState::SourceDeleted,
-            repo: "owner/repo".to_string(),
-            issue_number: 42,
-            lifecycle: TargetIssueLifecycle {
-                status: "deleted".to_string(),
-                reason: Some("deleted".to_string()),
-                http_status: Some(404),
-                alias_chain: Vec::new(),
+        let target = legacy_target_issue_outcome(target_outcome_for_test(
+            ClassifiedTargetIssueTerminal::Confirmed {
+                state: ConfirmedRemoteState::SourceDeleted,
+                repo: "owner/repo".to_string(),
+                issue_number: 42,
+                lifecycle: TargetIssueLifecycle {
+                    status: "deleted".to_string(),
+                    reason: Some("deleted".to_string()),
+                    http_status: Some(404),
+                    alias_chain: Vec::new(),
+                },
             },
-        })
+        ))
         .unwrap();
         assert!(matches!(target, TargetIssueFetchOutcome::Unavailable(_)));
 
@@ -3019,8 +3218,8 @@ mod permission_classification_tests {
             "github.repository_permission_loss_requires_typed_handling"
         );
 
-        let Err(target_error) =
-            legacy_target_issue_outcome(ClassifiedTargetIssueFetchOutcome::Confirmed {
+        let Err(target_error) = legacy_target_issue_outcome(target_outcome_for_test(
+            ClassifiedTargetIssueTerminal::Confirmed {
                 state: ConfirmedRemoteState::RepositoryPermissionLoss,
                 repo: "owner/repo".to_string(),
                 issue_number: 42,
@@ -3030,8 +3229,8 @@ mod permission_classification_tests {
                     http_status: Some(404),
                     alias_chain: Vec::new(),
                 },
-            })
-        else {
+            },
+        )) else {
             panic!("repository loss must not become source unavailable");
         };
         assert_eq!(
@@ -3046,13 +3245,16 @@ mod permission_classification_tests {
             repo: "owner/repo".to_string(),
             http_status: 404,
         };
-        let fetched = legacy_fetch_outcome(ClassifiedFetchOutcome::Fetched(FetchResult {
-            issues: 0,
-            comments: 0,
-            skipped_pull_requests: 0,
-            confirmed_permission_lost_repos: vec![confirmed.clone()],
-            confirmed_source_deletions: Vec::new(),
-        }))
+        let fetched = legacy_fetch_outcome(ClassifiedFetchOutcome {
+            result: FetchResult {
+                issues: 0,
+                comments: 0,
+                skipped_pull_requests: 0,
+                confirmed_permission_lost_repos: vec![confirmed.clone()],
+                confirmed_source_deletions: Vec::new(),
+            },
+            interruption: None,
+        })
         .unwrap();
         let FetchOutcome::Fetched(fetched) = fetched else {
             panic!("confirmed evidence must remain a fetched payload");
@@ -3167,9 +3369,8 @@ mod permission_classification_tests {
                 .await
                 .unwrap();
         handle.join().unwrap();
-        let ClassifiedFetchOutcome::Fetched(fetched) = outcome else {
-            panic!("confirmed repo loss must be preserved in fetched evidence");
-        };
+        assert!(outcome.interruption.is_none());
+        let fetched = outcome.result;
         assert_eq!(fetched.confirmed_permission_lost_repos.len(), 1);
         assert_eq!(
             fetched.confirmed_permission_lost_repos[0].repo,
@@ -3193,9 +3394,8 @@ mod permission_classification_tests {
             .await
             .unwrap();
         handle.join().unwrap();
-        let ClassifiedFetchOutcome::Fetched(fetched) = outcome else {
-            panic!("confirmed source deletion must remain typed");
-        };
+        assert!(outcome.interruption.is_none());
+        let fetched = outcome.result;
         assert_eq!(fetched.issues, 0);
         assert_eq!(fetched.confirmed_source_deletions.len(), 1);
         let deletion = &fetched.confirmed_source_deletions[0];
@@ -3208,6 +3408,386 @@ mod permission_classification_tests {
     }
 
     #[tokio::test]
+    async fn full_fetch_retains_prior_confirmation_with_later_interruption() {
+        let cases = [
+            (
+                json_response("500 Internal Server Error", "", "{}"),
+                LifecycleInterruption::Transient(GitHubTransientKind::Server),
+            ),
+            (
+                json_response("429 Too Many Requests", "retry-after: 0\r\n", "{}"),
+                LifecycleInterruption::Backoff(BackoffPlan {
+                    reason: "secondary_rate_limit".to_string(),
+                    scope: "issues:owner/b".to_string(),
+                    retry_after_seconds: 0,
+                    reset_at: None,
+                }),
+            ),
+            (
+                json_response("401 Unauthorized", "", "{}"),
+                LifecycleInterruption::AuthenticationFailed,
+            ),
+        ];
+        for (later_response, expected_interruption) in cases {
+            let (base_url, request_count, handle) = spawn_owned_responses(vec![
+                NOT_FOUND_RESPONSE.to_string(),
+                NOT_FOUND_RESPONSE.to_string(),
+                later_response,
+            ]);
+            let profile = two_repo_profile(&base_url);
+            let mut commit = |_page: FetchPage| Ok(());
+
+            let outcome =
+                fetch_issues_classified(&profile, "test-token", &[], false, None, &mut commit)
+                    .await
+                    .unwrap();
+
+            handle.join().unwrap();
+            assert_eq!(request_count.load(Ordering::SeqCst), 3);
+            assert_eq!(outcome.interruption, Some(expected_interruption));
+            assert_eq!(outcome.result.confirmed_permission_lost_repos.len(), 1);
+            assert_eq!(
+                outcome.result.confirmed_permission_lost_repos[0].repo,
+                "owner/a"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_fetch_retains_prior_confirmation_with_later_timeout() {
+        let (base_url, request_count, handle) = spawn_confirm_then_timeout();
+        let profile = two_repo_profile(&base_url);
+        let client = lifecycle_client_with_timeout(StdDuration::from_millis(10)).unwrap();
+        let mut commit = |_page: FetchPage| Ok(());
+
+        let outcome = fetch_issues_classified_with_client(
+            &client,
+            &profile,
+            "test-token",
+            &[],
+            false,
+            None,
+            &mut commit,
+        )
+        .await
+        .unwrap();
+
+        handle.join().unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            outcome.interruption,
+            Some(LifecycleInterruption::Transient(
+                GitHubTransientKind::Timeout
+            ))
+        );
+        assert_eq!(outcome.result.confirmed_permission_lost_repos.len(), 1);
+        assert_eq!(
+            outcome.result.confirmed_permission_lost_repos[0].repo,
+            "owner/a"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_fetch_retains_prior_source_deletion_with_later_server_failure() {
+        const ISSUE_PAGE: &str = r#"[{"id":1,"node_id":"I_A","number":1,"title":"Public title","body":"Public body","state":"open","labels":[],"milestone":null,"assignees":[],"user":{"login":"alice"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","closed_at":null,"html_url":"https://example.test/owner/a/issues/1"}]"#;
+        let responses = vec![
+            json_response("200 OK", "", ISSUE_PAGE),
+            json_response("404 Not Found", "", "{}"),
+            json_response("200 OK", "", "{}"),
+            json_response("500 Internal Server Error", "", "{}"),
+        ];
+        let (base_url, request_count, handle) = spawn_owned_responses(responses);
+        let profile = two_repo_profile(&base_url);
+        let mut commit = |_page: FetchPage| Ok(());
+
+        let outcome = fetch_issues_classified(&profile, "test-token", &[], true, None, &mut commit)
+            .await
+            .unwrap();
+
+        handle.join().unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            outcome.interruption,
+            Some(LifecycleInterruption::Transient(
+                GitHubTransientKind::Server
+            ))
+        );
+        assert_eq!(outcome.result.confirmed_source_deletions.len(), 1);
+        assert_eq!(
+            outcome.result.confirmed_source_deletions[0].source_id,
+            "qgh://example.test/issue/I_A"
+        );
+    }
+
+    #[tokio::test]
+    async fn temporary_or_invalid_redirect_never_confirms_transfer() {
+        let responses = [
+            "HTTP/1.1 302 Found\r\nlocation: /repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: /repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 301 Moved Permanently\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 308 Permanent Redirect\r\nlocation: not a url\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/repo/pulls/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 308 Permanent Redirect\r\nlocation: https://other.example/repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+        ];
+        for response in responses {
+            let (base_url, request_count, handle) = spawn_responses(vec![response]);
+            let profile = test_profile(&base_url);
+
+            let outcome =
+                fetch_target_issue_classified(&profile, "test-token", &test_repo(), 42, None)
+                    .await
+                    .unwrap();
+
+            handle.join().unwrap();
+            assert!(matches!(
+                outcome.terminal,
+                ClassifiedTargetIssueTerminal::Transient(GitHubTransientKind::UnexpectedResponse)
+            ));
+            assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn followed_permanent_transfer_carries_typed_transition() {
+        const REDIRECT: &str = "HTTP/1.1 308 Permanent Redirect\r\nlocation: /repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+        let issue = r#"{"id":99,"node_id":"I_MOVED","number":99,"title":"Moved","body":"Public","state":"open","labels":[],"milestone":null,"assignees":[],"user":{"login":"alice"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","closed_at":null,"html_url":"https://example.test/owner/repo/issues/99"}"#;
+        let responses = vec![
+            REDIRECT.to_string(),
+            json_response("200 OK", "", issue),
+            json_response("200 OK", "", "[]"),
+        ];
+        let (base_url, request_count, handle) = spawn_owned_responses(responses);
+        let profile = test_profile(&base_url);
+
+        let outcome = fetch_target_issue_classified(&profile, "test-token", &test_repo(), 42, None)
+            .await
+            .unwrap();
+
+        handle.join().unwrap();
+        assert_eq!(outcome.confirmed_transitions.len(), 1);
+        let ClassifiedTargetIssueTerminal::Fetched(fetched) = outcome.terminal else {
+            panic!("permanent in-scope transfer should be followed");
+        };
+        assert_eq!(
+            fetched.confirmed_transition,
+            Some(ConfirmedRemoteState::SourceTransferred)
+        );
+        assert_eq!(fetched.lifecycle.status, "transferred");
+        assert_eq!(fetched.lifecycle.http_status, Some(308));
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn followed_transfer_preserves_transition_with_final_delete_or_repo_loss() {
+        const REDIRECT: &str = "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/b/issues/2\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+        for (confirmation, expected_state) in [
+            (OK_RESPONSE, ConfirmedRemoteState::SourceDeleted),
+            (
+                NOT_FOUND_RESPONSE,
+                ConfirmedRemoteState::RepositoryPermissionLoss,
+            ),
+        ] {
+            let (base_url, _, handle) =
+                spawn_responses(vec![REDIRECT, NOT_FOUND_RESPONSE, confirmation]);
+            let profile = two_repo_profile(&base_url);
+
+            let outcome = fetch_target_issue_classified(&profile, "test-token", &repo_a(), 1, None)
+                .await
+                .unwrap();
+
+            handle.join().unwrap();
+            assert_eq!(outcome.confirmed_transitions.len(), 1);
+            assert_eq!(
+                outcome.confirmed_transitions[0],
+                ConfirmedIssueTransition {
+                    source_repo: "owner/a".to_string(),
+                    source_issue_number: 1,
+                    target_repo: "owner/b".to_string(),
+                    target_issue_number: 2,
+                    state: ConfirmedRemoteState::SourceTransferred,
+                    http_status: 301,
+                }
+            );
+            let ClassifiedTargetIssueTerminal::Confirmed { state, repo, .. } = outcome.terminal
+            else {
+                panic!("final denial must stay typed");
+            };
+            assert_eq!(state, expected_state);
+            assert_eq!(repo, "owner/b");
+        }
+    }
+
+    #[tokio::test]
+    async fn followed_transfer_preserves_transition_with_comment_repo_loss() {
+        const REDIRECT: &str = "HTTP/1.1 308 Permanent Redirect\r\nlocation: /repos/owner/b/issues/2\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+        let issue = r#"{"id":2,"node_id":"I_B","number":2,"title":"Moved","body":"Public","state":"open","labels":[],"milestone":null,"assignees":[],"user":{"login":"alice"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","closed_at":null,"html_url":"https://example.test/owner/b/issues/2"}"#;
+        let responses = vec![
+            REDIRECT.to_string(),
+            json_response("200 OK", "", issue),
+            json_response("404 Not Found", "", "{}"),
+            json_response("404 Not Found", "", "{}"),
+        ];
+        let (base_url, _, handle) = spawn_owned_responses(responses);
+        let profile = two_repo_profile(&base_url);
+
+        let outcome = fetch_target_issue_classified(&profile, "test-token", &repo_a(), 1, None)
+            .await
+            .unwrap();
+
+        handle.join().unwrap();
+        assert_eq!(outcome.confirmed_transitions.len(), 1);
+        assert_eq!(outcome.confirmed_transitions[0].source_repo, "owner/a");
+        assert_eq!(outcome.confirmed_transitions[0].target_repo, "owner/b");
+        assert!(matches!(
+            outcome.terminal,
+            ClassifiedTargetIssueTerminal::Confirmed {
+                state: ConfirmedRemoteState::RepositoryPermissionLoss,
+                ref repo,
+                ..
+            } if repo == "owner/b"
+        ));
+    }
+
+    #[tokio::test]
+    async fn followed_transfer_preserves_transition_before_timeout_or_backoff() {
+        let (base_url, request_count, handle) = spawn_redirect_then_timeout();
+        let profile = two_repo_profile(&base_url);
+        let client = lifecycle_client_with_timeout(StdDuration::from_millis(10)).unwrap();
+
+        let timeout = fetch_target_issue_classified_with_client(
+            &client,
+            &profile,
+            "test-token",
+            &repo_a(),
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+
+        handle.join().unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(timeout.confirmed_transitions.len(), 1);
+        assert!(matches!(
+            timeout.terminal,
+            ClassifiedTargetIssueTerminal::Transient(GitHubTransientKind::Timeout)
+        ));
+
+        let responses = vec![
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/b/issues/2\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}".to_string(),
+            "HTTP/1.1 308 Permanent Redirect\r\nlocation: /repos/owner/b/issues/3\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}".to_string(),
+            json_response("429 Too Many Requests", "retry-after: 0\r\n", "{}"),
+        ];
+        let (base_url, _, handle) = spawn_owned_responses(responses);
+        let profile = two_repo_profile(&base_url);
+        let backoff = fetch_target_issue_classified(&profile, "test-token", &repo_a(), 1, None)
+            .await
+            .unwrap();
+        handle.join().unwrap();
+        assert_eq!(backoff.confirmed_transitions.len(), 2);
+        assert_eq!(backoff.confirmed_transitions[0].source_issue_number, 1);
+        assert_eq!(backoff.confirmed_transitions[0].target_issue_number, 2);
+        assert_eq!(backoff.confirmed_transitions[1].source_issue_number, 2);
+        assert_eq!(backoff.confirmed_transitions[1].target_issue_number, 3);
+        assert!(matches!(
+            backoff.terminal,
+            ClassifiedTargetIssueTerminal::Backoff(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_active_fetch_has_no_confirmed_transition() {
+        let issue = r#"{"id":42,"node_id":"I_ACTIVE","number":42,"title":"Active","body":"Public","state":"open","labels":[],"milestone":null,"assignees":[],"user":{"login":"alice"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","closed_at":null,"html_url":"https://example.test/owner/repo/issues/42"}"#;
+        let (base_url, _, handle) = spawn_owned_responses(vec![
+            json_response("200 OK", "", issue),
+            json_response("200 OK", "", "[]"),
+        ]);
+        let profile = test_profile(&base_url);
+
+        let outcome = fetch_target_issue_classified(&profile, "test-token", &test_repo(), 42, None)
+            .await
+            .unwrap();
+
+        handle.join().unwrap();
+        assert!(outcome.confirmed_transitions.is_empty());
+        let ClassifiedTargetIssueTerminal::Fetched(fetched) = outcome.terminal else {
+            panic!("active issue should be fetched");
+        };
+        assert_eq!(fetched.confirmed_transition, None);
+        assert_eq!(fetched.lifecycle.status, "active");
+    }
+
+    #[tokio::test]
+    async fn reconciliation_requires_permanent_canonical_issue_redirect() {
+        let candidate = ReconciliationCandidate {
+            source_id: "qgh://example.test/issue/I_REDIRECT".to_string(),
+            entity_type: "issue".to_string(),
+            repo: "owner/repo".to_string(),
+            issue_number: 42,
+            github_id: 42,
+        };
+        for response in [
+            "HTTP/1.1 302 Found\r\nlocation: /repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: https://other.example/repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+        ] {
+            let (base_url, _, handle) = spawn_responses(vec![response]);
+            let profile = test_profile(&base_url);
+            let outcome = check_source_lifecycle_classified(
+                &profile,
+                "test-token",
+                &candidate,
+                None,
+            )
+            .await
+            .unwrap();
+            handle.join().unwrap();
+            assert_eq!(
+                outcome,
+                ClassifiedLifecycleCheck::Transient(
+                    GitHubTransientKind::UnexpectedResponse
+                )
+            );
+        }
+
+        let comment_candidate = ReconciliationCandidate {
+            source_id: "qgh://example.test/issue-comment/IC_REDIRECT".to_string(),
+            entity_type: "issue_comment".to_string(),
+            repo: "owner/repo".to_string(),
+            issue_number: 42,
+            github_id: 420,
+        };
+        let (base_url, _, handle) = spawn_responses(vec![
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+        ]);
+        let profile = test_profile(&base_url);
+        let comment_outcome =
+            check_source_lifecycle_classified(&profile, "test-token", &comment_candidate, None)
+                .await
+                .unwrap();
+        handle.join().unwrap();
+        assert_eq!(
+            comment_outcome,
+            ClassifiedLifecycleCheck::Transient(GitHubTransientKind::UnexpectedResponse)
+        );
+
+        let (base_url, _, handle) = spawn_responses(vec![
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+        ]);
+        let profile = test_profile(&base_url);
+        let outcome = check_source_lifecycle_classified(&profile, "test-token", &candidate, None)
+            .await
+            .unwrap();
+        handle.join().unwrap();
+        assert_eq!(
+            outcome,
+            ClassifiedLifecycleCheck::Confirmed {
+                state: ConfirmedRemoteState::SourceTransferred,
+                http_status: 301,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn transfer_outside_allowlist_is_confirmed_without_following_target() {
         const OUTSIDE_REDIRECT: &str = "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/outside/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
         let (base_url, request_count, handle) = spawn_responses(vec![OUTSIDE_REDIRECT]);
@@ -3216,12 +3796,13 @@ mod permission_classification_tests {
             .await
             .unwrap();
         handle.join().unwrap();
-        let ClassifiedTargetIssueFetchOutcome::Confirmed {
+        assert_eq!(outcome.confirmed_transitions.len(), 1);
+        let ClassifiedTargetIssueTerminal::Confirmed {
             state,
             repo,
             issue_number,
             lifecycle,
-        } = outcome
+        } = outcome.terminal
         else {
             panic!("outside-allowlist transfer must be confirmed");
         };
