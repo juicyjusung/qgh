@@ -672,7 +672,7 @@ struct VerifiedRuntimeArtifact {
 #[cfg(feature = "fastembed-provider")]
 struct VerifiedRuntimeState {
     artifacts: Vec<VerifiedRuntimeArtifact>,
-    payload: Option<PreparedRuntimePayload>,
+    loaded_artifacts: BTreeMap<ArtifactRole, Vec<PreparedRuntimeArtifact>>,
     tokenizer: Option<tokenizers::Tokenizer>,
     consumed: bool,
 }
@@ -710,7 +710,7 @@ impl PreparedModelSnapshot {
             .runtime_state
             .lock()
             .expect("prepared runtime state mutex poisoned");
-        ensure_runtime_payload(&mut state)?;
+        ensure_runtime_tokenizer(&mut state)?;
         state.tokenizer.clone().ok_or_else(runtime_payload_error)
     }
 
@@ -720,8 +720,24 @@ impl PreparedModelSnapshot {
             .runtime_state
             .lock()
             .expect("prepared runtime state mutex poisoned");
-        ensure_runtime_payload(&mut state)?;
-        let payload = state.payload.take().ok_or_else(runtime_payload_error)?;
+        if state.consumed {
+            return Err(runtime_payload_error());
+        }
+        ensure_runtime_tokenizer(&mut state)?;
+        checked_runtime_payload_size(
+            state
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.expected_byte_size),
+        )?;
+        for index in 0..state.artifacts.len() {
+            if !runtime_artifact_is_loaded(&state, index) {
+                load_runtime_artifact(&mut state, index)?;
+            }
+        }
+        let payload = PreparedRuntimePayload {
+            artifacts: std::mem::take(&mut state.loaded_artifacts),
+        };
         state.consumed = true;
         Ok(payload)
     }
@@ -774,32 +790,25 @@ impl PreparedRuntimePayload {
 }
 
 #[cfg(feature = "fastembed-provider")]
-fn ensure_runtime_payload(state: &mut VerifiedRuntimeState) -> Result<(), EmbeddingProviderError> {
-    if state.payload.is_some() {
+fn ensure_runtime_tokenizer(
+    state: &mut VerifiedRuntimeState,
+) -> Result<(), EmbeddingProviderError> {
+    if state.tokenizer.is_some() {
         return Ok(());
     }
     if state.consumed {
         return Err(runtime_payload_error());
     }
-    checked_runtime_payload_size(
-        state
-            .artifacts
-            .iter()
-            .map(|artifact| artifact.expected_byte_size),
-    )?;
-
-    let mut artifacts = BTreeMap::<ArtifactRole, Vec<PreparedRuntimeArtifact>>::new();
-    for artifact in &mut state.artifacts {
-        let bytes = read_verified_runtime_artifact(artifact)?;
-        artifacts
-            .entry(artifact.role)
-            .or_default()
-            .push(PreparedRuntimeArtifact {
-                relative_path: artifact.relative_path.clone(),
-                bytes,
-            });
+    let tokenizer_index = state
+        .artifacts
+        .iter()
+        .position(|artifact| artifact.role == ArtifactRole::Tokenizer)
+        .ok_or_else(runtime_payload_error)?;
+    if !runtime_artifact_is_loaded(state, tokenizer_index) {
+        load_runtime_artifact(state, tokenizer_index)?;
     }
-    let tokenizer_bytes = artifacts
+    let tokenizer_bytes = state
+        .loaded_artifacts
         .get(&ArtifactRole::Tokenizer)
         .and_then(|artifacts| artifacts.first())
         .map(|artifact| artifact.bytes.as_slice())
@@ -818,7 +827,43 @@ fn ensure_runtime_payload(state: &mut VerifiedRuntimeState) -> Result<(), Embedd
         .with_details(json!({ "role": ArtifactRole::Tokenizer }))
     })?;
     state.tokenizer = Some(tokenizer);
-    state.payload = Some(PreparedRuntimePayload { artifacts });
+    Ok(())
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn runtime_artifact_is_loaded(state: &VerifiedRuntimeState, index: usize) -> bool {
+    let artifact = &state.artifacts[index];
+    state
+        .loaded_artifacts
+        .get(&artifact.role)
+        .is_some_and(|loaded| {
+            loaded
+                .iter()
+                .any(|loaded| loaded.relative_path == artifact.relative_path)
+        })
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn load_runtime_artifact(
+    state: &mut VerifiedRuntimeState,
+    index: usize,
+) -> Result<(), EmbeddingProviderError> {
+    let (role, relative_path, bytes) = {
+        let artifact = &mut state.artifacts[index];
+        (
+            artifact.role,
+            artifact.relative_path.clone(),
+            read_verified_runtime_artifact(artifact)?,
+        )
+    };
+    state
+        .loaded_artifacts
+        .entry(role)
+        .or_default()
+        .push(PreparedRuntimeArtifact {
+            relative_path,
+            bytes,
+        });
     Ok(())
 }
 
@@ -1258,7 +1303,7 @@ impl PreparedModelStore {
             #[cfg(feature = "fastembed-provider")]
             runtime_state: Arc::new(Mutex::new(VerifiedRuntimeState {
                 artifacts: runtime_artifacts,
-                payload: None,
+                loaded_artifacts: BTreeMap::new(),
                 tokenizer: None,
                 consumed: false,
             })),
@@ -3582,9 +3627,17 @@ mod tests {
             fs::write(&outside, b"replacement-outside-bytes").unwrap();
             symlink(&outside, &artifact_path).unwrap();
 
-            let error = match FastembedTokenizer::from_prepared_snapshot(&snapshot) {
-                Ok(_) => panic!("swapped runtime artifact must fail closed"),
-                Err(error) => error,
+            let error = match relative_path {
+                "tokenizer.json" => match FastembedTokenizer::from_prepared_snapshot(&snapshot) {
+                    Ok(_) => panic!("swapped tokenizer must fail closed before parsing"),
+                    Err(error) => error,
+                },
+                _ => {
+                    FastembedTokenizer::from_prepared_snapshot(&snapshot)
+                        .expect("tokenizer-only use must not read model artifacts");
+                    fastembed_user_defined_model(&snapshot)
+                        .expect_err("swapped model artifact must fail closed before ORT")
+                }
             };
             assert!(matches!(
                 error.code(),
