@@ -156,13 +156,19 @@ env = "QGH_RELEASE_CONTRACT_TOKEN"
     .unwrap();
 
     let initialized = Command::new(binary())
-        .args(["--profile", "work", "status", "--json"])
+        .args(["--profile", "work", "sync", "--json"])
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_DATA_HOME", &data_home)
-        .env("QGH_RELEASE_CONTRACT_TOKEN", "not-a-real-token")
+        .env_remove("QGH_RELEASE_CONTRACT_TOKEN")
         .output()
         .unwrap();
-    assert_success(&initialized);
+    assert_eq!(initialized.status.code(), Some(3));
+    assert!(stderr_text(&initialized).is_empty());
+    let initialization_error: Value = serde_json::from_slice(&initialized.stdout).unwrap();
+    assert_eq!(
+        initialization_error["error"]["code"],
+        "auth.token_unavailable"
+    );
     let connection = Connection::open(data_home.join("qgh/profiles/work/qgh.sqlite3")).unwrap();
     connection
         .execute_batch(
