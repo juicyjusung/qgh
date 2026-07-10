@@ -1,0 +1,36 @@
+{
+  "acquisition": {
+    "authentication": "none",
+    "method": "unauthenticated GitHub REST API",
+    "raw_response_committed": false
+  },
+  "adjudication": {
+    "ambiguous_candidate_policy": "second adjudication or exclusion",
+    "method": "manual source-body review",
+    "title_only_paraphrases_allowed": false
+  },
+  "corpus_sha256": "8333e4a5291d911fcafcf23319b30445e18e526c93f0a929ef898240131c5df1",
+  "dev_query_count": 40,
+  "exclusions": [
+    "pull requests returned by the Issues endpoint",
+    "qgh operational loop state/run-log issues #18 and #19",
+    "records with empty bodies",
+    "records matching secret-like payload patterns",
+    "ambiguous query candidates without a second adjudication"
+  ],
+  "qrels_dev_sha256": "7f56373c239c3fe37d04edb90cecc4b13972209dc168c2b515b5b4a10b3efecc",
+  "qrels_test_sha256": "1fd49bc903cb6c0287ef3627993b05eda9eeccad09ec1b1ca0e8281c0ca5299d",
+  "repositories": [
+    {
+      "issues_api": "https://api.github.com/repos/juicyjusung/qgh/issues?state=all&per_page=100",
+      "license": "NOASSERTION",
+      "repo": "juicyjusung/qgh",
+      "repo_url": "https://github.com/juicyjusung/qgh",
+      "source_count": 156,
+      "visibility": "public"
+    }
+  ],
+  "schema_version": "qgh.live_model_provenance.v1",
+  "snapshot_at": "2026-07-10T08:20:22Z",
+  "test_query_count": 80
+}
