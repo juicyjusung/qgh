@@ -1,8 +1,10 @@
 use crate::error::QghError;
 use crate::model::IndexSource;
-use crate::paths::{ensure_private_dir, set_private_dir};
+use crate::paths::{ensure_private_dir, set_private_dir, set_private_file};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
@@ -10,6 +12,7 @@ use tantivy::schema::{Field, IndexRecordOption, Schema, Value, STORED, STRING, T
 use tantivy::{Index, TantivyDocument, Term};
 
 const SOURCE_INVENTORY_COMMIT_PREFIX: &str = "qgh.source_inventory.v1:";
+const INDEX_BUILD_MARKER_FILE: &str = ".qgh-build-owner-v1";
 
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -88,16 +91,80 @@ pub fn rebuild(
     ensure_private_dir(index_root)?;
     let shadow_path = index_root.join(format!("shadow-{generation}"));
     let generation_path = index_root.join(format!("generation-{generation}"));
-    if shadow_path.exists() {
-        fs::remove_dir_all(&shadow_path)?;
-    }
     if generation_path.exists() {
-        fs::remove_dir_all(&generation_path)?;
+        return Err(index_build_collision_error());
     }
-    ensure_private_dir(&shadow_path)?;
+    if shadow_path.exists() {
+        validate_build_marker_format(&shadow_path)?;
+    } else {
+        ensure_private_dir(&shadow_path)?;
+    }
+    rebuild_in_shadow(&shadow_path, &generation_path, sources)?;
+    Ok(generation_path)
+}
+
+pub(crate) fn prepare_owned_rebuild(
+    index_root: &Path,
+    generation: i64,
+    owner_token: &str,
+) -> Result<(), QghError> {
+    ensure_private_dir(index_root)?;
+    let shadow_path = index_root.join(format!("shadow-{generation}"));
+    let generation_path = index_root.join(format!("generation-{generation}"));
+    if shadow_path.exists() || generation_path.exists() {
+        return Err(index_build_collision_error());
+    }
+    fs::create_dir(&shadow_path).map_err(|_| index_build_collision_error())?;
+    set_private_dir(&shadow_path)?;
+    let marker_path = shadow_path.join(INDEX_BUILD_MARKER_FILE);
+    let marker_result = (|| -> Result<(), QghError> {
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker_path)
+            .map_err(|_| index_build_collision_error())?;
+        marker
+            .write_all(index_build_marker(generation, owner_token).as_bytes())
+            .map_err(|_| index_build_collision_error())?;
+        marker
+            .sync_all()
+            .map_err(|_| index_build_collision_error())?;
+        set_private_file(&marker_path)?;
+        Ok(())
+    })();
+    if marker_result.is_err() {
+        let _ = fs::remove_file(&marker_path);
+        let _ = fs::remove_dir(&shadow_path);
+    }
+    marker_result
+}
+
+pub(crate) fn rebuild_owned(
+    index_root: &Path,
+    generation: i64,
+    owner_token: &str,
+    sources: &[IndexSource],
+) -> Result<PathBuf, QghError> {
+    ensure_private_dir(index_root)?;
+    let shadow_path = index_root.join(format!("shadow-{generation}"));
+    let generation_path = index_root.join(format!("generation-{generation}"));
+    if generation_path.exists() {
+        return Err(index_build_collision_error());
+    }
+    validate_owned_build_directory(&shadow_path, generation, owner_token)?;
+    rebuild_in_shadow(&shadow_path, &generation_path, sources)?;
+    validate_owned_build_directory(&generation_path, generation, owner_token)?;
+    Ok(generation_path)
+}
+
+fn rebuild_in_shadow(
+    shadow_path: &Path,
+    generation_path: &Path,
+    sources: &[IndexSource],
+) -> Result<(), QghError> {
     let (schema, fields) = schema();
     let index =
-        Index::create_in_dir(&shadow_path, schema).map_err(|e| QghError::index(e.to_string()))?;
+        Index::create_in_dir(shadow_path, schema).map_err(|e| QghError::index(e.to_string()))?;
     let mut writer = index
         .writer(50_000_000)
         .map_err(|e| QghError::index(e.to_string()))?;
@@ -119,9 +186,132 @@ pub fn rebuild(
     writer
         .wait_merging_threads()
         .map_err(|e| QghError::index(e.to_string()))?;
-    fs::rename(&shadow_path, &generation_path)?;
-    set_private_dir(&generation_path)?;
-    Ok(generation_path)
+    if generation_path.exists() {
+        return Err(index_build_collision_error());
+    }
+    rename_without_replacement(shadow_path, generation_path)?;
+    set_private_dir(generation_path)?;
+    Ok(())
+}
+
+pub(crate) fn validate_owned_build_directory(
+    path: &Path,
+    generation: i64,
+    owner_token: &str,
+) -> Result<(), QghError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| index_build_collision_error())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(index_build_collision_error());
+    }
+    let marker_path = path.join(INDEX_BUILD_MARKER_FILE);
+    let marker_metadata =
+        fs::symlink_metadata(&marker_path).map_err(|_| index_build_collision_error())?;
+    if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+        return Err(index_build_collision_error());
+    }
+    let observed = fs::read_to_string(marker_path).map_err(|_| index_build_collision_error())?;
+    if observed != index_build_marker(generation, owner_token) {
+        return Err(index_build_collision_error());
+    }
+    Ok(())
+}
+
+fn index_build_marker(generation: i64, owner_token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"qgh.index-build-owner.v1");
+    hasher.update(generation.to_le_bytes());
+    hasher.update(owner_token.as_bytes());
+    format!("qgh.index-build-owner.v1:{}", digest_hex(hasher))
+}
+
+fn validate_build_marker_format(path: &Path) -> Result<(), QghError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| index_build_collision_error())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(index_build_collision_error());
+    }
+    let marker_path = path.join(INDEX_BUILD_MARKER_FILE);
+    let marker_metadata =
+        fs::symlink_metadata(&marker_path).map_err(|_| index_build_collision_error())?;
+    if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+        return Err(index_build_collision_error());
+    }
+    let observed = fs::read_to_string(marker_path).map_err(|_| index_build_collision_error())?;
+    let Some(digest) = observed.strip_prefix("qgh.index-build-owner.v1:") else {
+        return Err(index_build_collision_error());
+    };
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(index_build_collision_error());
+    }
+    Ok(())
+}
+
+fn index_build_collision_error() -> QghError {
+    QghError::validation(
+        "publication.tantivy_artifact_not_ready",
+        "The reserved Tantivy generation is unavailable.",
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rename_without_replacement(from: &Path, to: &Path) -> Result<(), QghError> {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int, c_uint};
+    use std::os::unix::ffi::OsStrExt;
+
+    let from =
+        CString::new(from.as_os_str().as_bytes()).map_err(|_| index_build_collision_error())?;
+    let to = CString::new(to.as_os_str().as_bytes()).map_err(|_| index_build_collision_error())?;
+
+    #[cfg(target_os = "macos")]
+    let result = {
+        unsafe extern "C" {
+            fn renamex_np(from: *const c_char, to: *const c_char, flags: c_uint) -> c_int;
+        }
+        const RENAME_EXCL: c_uint = 0x0000_0004;
+        // SAFETY: both arguments are owned, NUL-terminated path buffers and
+        // remain alive for the duration of the syscall.
+        unsafe { renamex_np(from.as_ptr(), to.as_ptr(), RENAME_EXCL) }
+    };
+
+    #[cfg(target_os = "linux")]
+    let result = {
+        unsafe extern "C" {
+            fn renameat2(
+                olddirfd: c_int,
+                oldpath: *const c_char,
+                newdirfd: c_int,
+                newpath: *const c_char,
+                flags: c_uint,
+            ) -> c_int;
+        }
+        const AT_FDCWD: c_int = -100;
+        const RENAME_NOREPLACE: c_uint = 1;
+        // SAFETY: both arguments are owned, NUL-terminated path buffers and
+        // remain alive for the duration of the syscall.
+        unsafe {
+            renameat2(
+                AT_FDCWD,
+                from.as_ptr(),
+                AT_FDCWD,
+                to.as_ptr(),
+                RENAME_NOREPLACE,
+            )
+        }
+    };
+
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(index_build_collision_error())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_without_replacement(from: &Path, to: &Path) -> Result<(), QghError> {
+    if to.exists() {
+        return Err(index_build_collision_error());
+    }
+    fs::rename(from, to).map_err(|_| index_build_collision_error())
 }
 
 pub(crate) fn source_inventory_digest(sources: &[IndexSource]) -> String {
@@ -633,6 +823,38 @@ mod tests {
             "BM25 warm p95 exceeded 500ms: {p95:?}"
         );
 
+        let _ = fs::remove_dir_all(index_root);
+    }
+
+    #[test]
+    fn rebuild_fails_closed_without_deleting_a_preexisting_shadow() {
+        let index_root = temp_index_root("foreign-shadow-collision");
+        let shadow_path = index_root.join("shadow-1");
+        fs::create_dir_all(&shadow_path).unwrap();
+        let sentinel = shadow_path.join("user-backup");
+        fs::write(&sentinel, "preserve").unwrap();
+
+        let error = rebuild(&index_root, 1, &[]).unwrap_err();
+
+        assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
+        assert!(sentinel.exists());
+        assert!(!index_root.join("generation-1").exists());
+        let _ = fs::remove_dir_all(index_root);
+    }
+
+    #[test]
+    fn rebuild_fails_closed_without_deleting_a_preexisting_generation() {
+        let index_root = temp_index_root("foreign-generation-collision");
+        let generation_path = index_root.join("generation-2");
+        fs::create_dir_all(&generation_path).unwrap();
+        let sentinel = generation_path.join("user-backup");
+        fs::write(&sentinel, "preserve").unwrap();
+
+        let error = rebuild(&index_root, 2, &[]).unwrap_err();
+
+        assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
+        assert!(sentinel.exists());
+        assert!(!index_root.join("shadow-2").exists());
         let _ = fs::remove_dir_all(index_root);
     }
 

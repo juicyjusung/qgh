@@ -1222,7 +1222,7 @@ impl Store {
             self.record_purge_failure(&target, PurgeFailureStage::Tantivy)?;
             return Err(purge_error());
         }
-        let (discarded_tantivy_generations, tantivy_cleanup_required) =
+        let (discarded_tantivy_generations, _tantivy_cleanup_required) =
             match self.purge_tantivy_generations(&target) {
                 Ok(result) => result,
                 Err(_) => {
@@ -1251,13 +1251,6 @@ impl Store {
                     return Err(purge_error());
                 }
             };
-        if tantivy_cleanup_required {
-            self.set_purge_stage(&target, PurgeFailureStage::Tantivy)?;
-            if self.remove_all_managed_tantivy_files().is_err() {
-                self.record_purge_failure(&target, PurgeFailureStage::Tantivy)?;
-                return Err(purge_error());
-            }
-        }
         self.set_purge_stage(&target, PurgeFailureStage::WalCheckpoint)?;
         if self.should_fail_purge_stage(PurgeFailureStage::WalCheckpoint)
             || self.checkpoint_and_truncate_wal().is_err()
@@ -1818,23 +1811,23 @@ impl Store {
             return Ok((0, false));
         }
         let generations = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT generation, path FROM index_generations ORDER BY generation")?;
+            let mut stmt = self.conn.prepare(
+                "SELECT generation, path, source_count, source_inventory_hash
+                     FROM index_generations ORDER BY generation",
+            )?;
             let rows = stmt
                 .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         };
-        for (generation, stored_path) in &generations {
-            let expected = self.index_root.join(format!("generation-{generation}"));
-            if Path::new(stored_path) != expected {
-                return Err(purge_error());
-            }
-        }
-        self.remove_all_managed_tantivy_files()?;
+        self.remove_registered_tantivy_generations(&generations)?;
 
         let tx = self.conn.transaction()?;
         if table_exists(&tx, "embedding_generations")? {
@@ -1878,7 +1871,10 @@ impl Store {
         Ok(())
     }
 
-    fn remove_all_managed_tantivy_files(&self) -> Result<(), QghError> {
+    fn remove_registered_tantivy_generations(
+        &self,
+        generations: &[(i64, String, i64, Option<String>)],
+    ) -> Result<(), QghError> {
         self.validate_index_root_confinement()?;
         if !self.index_root.exists() {
             return Ok(());
@@ -1890,21 +1886,34 @@ impl Store {
         {
             return Err(purge_error());
         }
-        for entry in fs::read_dir(&self.index_root).map_err(|_| purge_error())? {
-            let entry = entry.map_err(|_| purge_error())?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
+        for (generation, stored_path, source_count, source_inventory_hash) in generations {
+            let expected_path = self.index_root.join(format!("generation-{generation}"));
+            if Path::new(stored_path) != expected_path {
+                return Err(purge_error());
+            }
+            let Some(source_count) = usize::try_from(*source_count).ok() else {
+                return Err(purge_error());
             };
-            if !is_managed_tantivy_generation_name(name) {
+            let Some(source_inventory_hash) = source_inventory_hash.as_deref() else {
+                return Err(purge_error());
+            };
+            if !expected_path.exists() {
                 continue;
             }
-            let file_type = entry.file_type().map_err(|_| purge_error())?;
-            if file_type.is_dir() && !file_type.is_symlink() {
-                fs::remove_dir_all(entry.path()).map_err(|_| purge_error())?;
-            } else {
-                fs::remove_file(entry.path()).map_err(|_| purge_error())?;
-            }
+            validate_managed_tantivy_generation_path(
+                &self.profile_dir,
+                &self.index_root,
+                *generation,
+                &expected_path,
+            )
+            .map_err(|_| purge_error())?;
+            validate_tantivy_generation_artifact(
+                &expected_path,
+                source_count,
+                source_inventory_hash,
+            )
+            .map_err(|_| purge_error())?;
+            fs::remove_dir_all(expected_path).map_err(|_| purge_error())?;
         }
         Ok(())
     }
@@ -1965,20 +1974,56 @@ impl Store {
             return Ok(false);
         }
         let expected_path = self.index_root.join(format!("generation-{generation}"));
-        let stored_path = tx
+        let generation_state = tx
             .query_row(
-                "SELECT path FROM index_generations WHERE generation = ?1",
+                "SELECT path, source_count, source_inventory_hash
+                 FROM index_generations WHERE generation = ?1",
                 params![generation],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        if stored_path
-            .as_deref()
-            .is_some_and(|path| Path::new(path) != expected_path)
-        {
+        let Some((stored_path, source_count, source_inventory_hash)) = generation_state else {
+            return Err(purge_error());
+        };
+        if Path::new(&stored_path) != expected_path {
             return Err(purge_error());
         }
-        remove_index_generation_path_at(&self.index_root, generation)?;
+        let shadow_path = self.index_root.join(format!("shadow-{generation}"));
+        if shadow_path.exists() {
+            crate::index::validate_owned_build_directory(&shadow_path, generation, owner_token)
+                .map_err(|_| purge_error())?;
+        }
+        if expected_path.exists() {
+            let source_count = usize::try_from(source_count).map_err(|_| purge_error())?;
+            let source_inventory_hash = source_inventory_hash.ok_or_else(purge_error)?;
+            validate_managed_tantivy_generation_path(
+                &self.profile_dir,
+                &self.index_root,
+                generation,
+                &expected_path,
+            )
+            .map_err(|_| purge_error())?;
+            crate::index::validate_owned_build_directory(&expected_path, generation, owner_token)
+                .map_err(|_| purge_error())?;
+            validate_tantivy_generation_artifact(
+                &expected_path,
+                source_count,
+                &source_inventory_hash,
+            )
+            .map_err(|_| purge_error())?;
+        }
+        if shadow_path.exists() {
+            fs::remove_dir_all(&shadow_path).map_err(|_| purge_error())?;
+        }
+        if expected_path.exists() {
+            fs::remove_dir_all(&expected_path).map_err(|_| purge_error())?;
+        }
         tx.execute(
             "DELETE FROM retrieval_publication_pointer
              WHERE publication_id IN (
@@ -3961,7 +4006,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Err(error) = ensure_content_write_allowed(&tx, expected_epoch) {
             drop(tx);
-            self.cleanup_owned_index_generation(generation)?;
+            let _ = self.cleanup_owned_index_generation(generation);
             return Err(error);
         }
         let generation_state = tx
@@ -3974,17 +4019,17 @@ impl Store {
             .optional()?;
         let Some((generation_epoch, source_inventory_hash)) = generation_state else {
             drop(tx);
-            self.cleanup_owned_index_generation(generation)?;
+            let _ = self.cleanup_owned_index_generation(generation);
             return Err(write_fence_error());
         };
         if generation_epoch != expected_epoch {
             drop(tx);
-            self.cleanup_owned_index_generation(generation)?;
+            let _ = self.cleanup_owned_index_generation(generation);
             return Err(write_fence_error());
         }
         let Some(source_inventory_hash) = source_inventory_hash else {
             drop(tx);
-            self.cleanup_owned_index_generation(generation)?;
+            let _ = self.cleanup_owned_index_generation(generation);
             return Err(source_inventory_mismatch_error());
         };
         if let Err(error) = validate_managed_tantivy_generation_path(
@@ -3994,7 +4039,7 @@ impl Store {
             Path::new(path),
         ) {
             drop(tx);
-            self.cleanup_owned_index_generation(generation)?;
+            let _ = self.cleanup_owned_index_generation(generation);
             return Err(error);
         }
         if let Err(error) = validate_tantivy_generation_artifact(
@@ -4003,7 +4048,7 @@ impl Store {
             &source_inventory_hash,
         ) {
             drop(tx);
-            self.cleanup_owned_index_generation(generation)?;
+            let _ = self.cleanup_owned_index_generation(generation);
             return Err(error);
         }
         let lease_matches = if let Some(owner_token) = owner_token.as_deref() {
@@ -4020,7 +4065,7 @@ impl Store {
         };
         if !lease_matches {
             drop(tx);
-            self.cleanup_owned_index_generation(generation)?;
+            let _ = self.cleanup_owned_index_generation(generation);
             return Err(write_fence_error());
         }
         tx.execute("UPDATE index_generations SET active = 0", [])?;
@@ -4316,8 +4361,50 @@ impl Store {
             ],
         )?;
         tx.commit()?;
+        if let Err(error) =
+            crate::index::prepare_owned_rebuild(index_root, generation, &owner_token)
+        {
+            let cleanup = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            cleanup.execute(
+                "DELETE FROM index_build_leases
+                 WHERE generation = ?1 AND owner_token = ?2",
+                params![generation, owner_token],
+            )?;
+            cleanup.execute(
+                "DELETE FROM index_generations
+                 WHERE generation = ?1 AND active = 0",
+                params![generation],
+            )?;
+            cleanup.commit()?;
+            return Err(error);
+        }
         self.index_build_tokens.insert(generation, owner_token);
         Ok((generation, generation_path))
+    }
+
+    pub(crate) fn rebuild_reserved_index_generation(
+        &self,
+        generation: i64,
+        sources: &[IndexSource],
+    ) -> Result<PathBuf, QghError> {
+        let owner_token = self
+            .index_build_tokens
+            .get(&generation)
+            .ok_or_else(write_fence_error)?;
+        let lease_matches = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM index_build_leases
+                 WHERE generation = ?1 AND owner_token = ?2
+             )",
+            params![generation, owner_token],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !lease_matches {
+            return Err(write_fence_error());
+        }
+        crate::index::rebuild_owned(&self.index_root, generation, owner_token, sources)
     }
 
     pub fn status(&self) -> Result<StatusSnapshot, QghError> {
@@ -5261,7 +5348,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Err(error) = ensure_content_write_allowed(&tx, expected_epoch) {
             drop(tx);
-            self.cleanup_owned_index_generation(tantivy_generation)?;
+            let _ = self.cleanup_owned_index_generation(tantivy_generation);
             return Err(error);
         }
         let current_source_snapshot_epoch = read_source_snapshot_epoch(&tx)?;
@@ -5312,7 +5399,7 @@ impl Store {
             )) = raw_metadata
             else {
                 drop(tx);
-                self.cleanup_owned_index_generation(tantivy_generation)?;
+                let _ = self.cleanup_owned_index_generation(tantivy_generation);
                 return Err(embedding_snapshot_mismatch_error());
             };
             let Some(dimension) = usize::try_from(stored_dimension)
@@ -5320,7 +5407,7 @@ impl Store {
                 .filter(|dimension| *dimension > 0)
             else {
                 drop(tx);
-                self.cleanup_owned_index_generation(tantivy_generation)?;
+                let _ = self.cleanup_owned_index_generation(tantivy_generation);
                 return Err(embedding_snapshot_mismatch_error());
             };
             Some((
@@ -5359,12 +5446,12 @@ impl Store {
         {
             if *generation_epoch != expected_epoch {
                 drop(tx);
-                self.cleanup_owned_index_generation(tantivy_generation)?;
+                let _ = self.cleanup_owned_index_generation(tantivy_generation);
                 return Err(write_fence_error());
             }
             if state != "ready" || total_chunks != completed_chunks {
                 drop(tx);
-                self.cleanup_owned_index_generation(tantivy_generation)?;
+                let _ = self.cleanup_owned_index_generation(tantivy_generation);
                 return Err(QghError::validation(
                     "publication.embedding_not_ready",
                     "Only a complete ready embedding generation can be published.",
@@ -5389,7 +5476,7 @@ impl Store {
                     != Some(authoritative_embedding_inventory_hash.as_str())
             {
                 drop(tx);
-                self.cleanup_owned_index_generation(tantivy_generation)?;
+                let _ = self.cleanup_owned_index_generation(tantivy_generation);
                 return Err(QghError::validation(
                     "publication.embedding_snapshot_mismatch",
                     "Embedding and lexical generations do not share one source snapshot.",
@@ -5402,7 +5489,7 @@ impl Store {
                 *total_chunks,
             ) {
                 drop(tx);
-                self.cleanup_owned_index_generation(tantivy_generation)?;
+                let _ = self.cleanup_owned_index_generation(tantivy_generation);
                 return Err(error);
             }
         }
@@ -5415,7 +5502,7 @@ impl Store {
             .optional()?;
         if current != expected_publication_id {
             drop(tx);
-            self.cleanup_owned_index_generation(tantivy_generation)?;
+            let _ = self.cleanup_owned_index_generation(tantivy_generation);
             return Err(QghError::validation(
                 "publication.cas_conflict",
                 "Retrieval publication changed before activation.",
@@ -5454,7 +5541,7 @@ impl Store {
         )) = index_state
         else {
             drop(tx);
-            self.cleanup_owned_index_generation(tantivy_generation)?;
+            let _ = self.cleanup_owned_index_generation(tantivy_generation);
             return Err(QghError::validation(
                 "publication.tantivy_generation_missing",
                 "The retrieval publication references a missing Tantivy generation.",
@@ -5462,12 +5549,12 @@ impl Store {
         };
         if index_epoch != expected_epoch {
             drop(tx);
-            self.cleanup_owned_index_generation(tantivy_generation)?;
+            let _ = self.cleanup_owned_index_generation(tantivy_generation);
             return Err(write_fence_error());
         }
         if index_expected_publication_id != expected_publication_id {
             drop(tx);
-            self.cleanup_owned_index_generation(tantivy_generation)?;
+            let _ = self.cleanup_owned_index_generation(tantivy_generation);
             return Err(QghError::validation(
                 "publication.cas_conflict",
                 "The index generation was reserved against a different retrieval publication.",
@@ -5488,7 +5575,7 @@ impl Store {
             )?;
         if !index_snapshot_matches {
             drop(tx);
-            self.cleanup_owned_index_generation(tantivy_generation)?;
+            let _ = self.cleanup_owned_index_generation(tantivy_generation);
             return Err(changed_source_snapshot_error());
         }
         if usize::try_from(source_count).ok() != Some(authoritative_sources.len())
@@ -5496,17 +5583,17 @@ impl Store {
                 != Some(authoritative_source_inventory_hash.as_str())
         {
             drop(tx);
-            self.cleanup_owned_index_generation(tantivy_generation)?;
+            let _ = self.cleanup_owned_index_generation(tantivy_generation);
             return Err(source_inventory_mismatch_error());
         }
         if Path::new(&index_path) != expected_generation_path {
             drop(tx);
-            self.cleanup_owned_index_generation(tantivy_generation)?;
+            let _ = self.cleanup_owned_index_generation(tantivy_generation);
             return Err(tantivy_artifact_not_ready_error());
         }
         let Some(source_count) = usize::try_from(source_count).ok() else {
             drop(tx);
-            self.cleanup_owned_index_generation(tantivy_generation)?;
+            let _ = self.cleanup_owned_index_generation(tantivy_generation);
             return Err(tantivy_artifact_not_ready_error());
         };
         if let Err(error) = validate_managed_tantivy_generation_path(
@@ -5516,7 +5603,20 @@ impl Store {
             Path::new(&index_path),
         ) {
             drop(tx);
-            self.cleanup_owned_index_generation(tantivy_generation)?;
+            let _ = self.cleanup_owned_index_generation(tantivy_generation);
+            return Err(error);
+        }
+        let Some(owner_token) = owner_token.as_deref() else {
+            drop(tx);
+            return Err(write_fence_error());
+        };
+        if let Err(error) = crate::index::validate_owned_build_directory(
+            &expected_generation_path,
+            tantivy_generation,
+            owner_token,
+        ) {
+            drop(tx);
+            let _ = self.cleanup_owned_index_generation(tantivy_generation);
             return Err(error);
         }
         if let Err(error) = validate_tantivy_generation_artifact(
@@ -5525,24 +5625,21 @@ impl Store {
             &authoritative_source_inventory_hash,
         ) {
             drop(tx);
-            self.cleanup_owned_index_generation(tantivy_generation)?;
+            let _ = self.cleanup_owned_index_generation(tantivy_generation);
             return Err(error);
         }
-        let lease_matches = if let Some(owner_token) = owner_token.as_deref() {
-            tx.query_row(
+        let lease_matches = tx
+            .query_row(
                 "SELECT 1 FROM index_build_leases
                  WHERE generation = ?1 AND write_epoch = ?2 AND owner_token = ?3",
                 params![tantivy_generation, expected_epoch, owner_token],
                 |_| Ok(()),
             )
             .optional()?
-            .is_some()
-        } else {
-            false
-        };
-        if (!index_active && !lease_matches) || (index_active && owner_token.is_some()) {
+            .is_some();
+        if index_active || !lease_matches {
             drop(tx);
-            self.cleanup_owned_index_generation(tantivy_generation)?;
+            let _ = self.cleanup_owned_index_generation(tantivy_generation);
             return Err(write_fence_error());
         }
         let successor_repair_required = read_successor_repair_required(&tx)?;
@@ -5560,7 +5657,7 @@ impl Store {
             )?;
             if !authoritative_snapshot {
                 drop(tx);
-                self.cleanup_owned_index_generation(tantivy_generation)?;
+                let _ = self.cleanup_owned_index_generation(tantivy_generation);
                 return Err(QghError::validation(
                     "publication.successor_snapshot_required",
                     "A post-purge publication requires the persisted successor snapshot for the current write epoch.",
@@ -5641,13 +5738,11 @@ impl Store {
                 )?;
             }
         }
-        if let Some(owner_token) = owner_token.as_deref() {
-            tx.execute(
-                "DELETE FROM index_build_leases
-                 WHERE generation = ?1 AND owner_token = ?2",
-                params![tantivy_generation, owner_token],
-            )?;
-        }
+        tx.execute(
+            "DELETE FROM index_build_leases
+             WHERE generation = ?1 AND owner_token = ?2",
+            params![tantivy_generation, owner_token],
+        )?;
         if successor_repair_required {
             clear_successor_repair_required(&tx)?;
         }
@@ -7424,16 +7519,6 @@ fn purge_tombstone_reason(
     Ok(trigger.tombstone_reason().to_string())
 }
 
-fn is_managed_tantivy_generation_name(name: &str) -> bool {
-    if name == "active" {
-        return true;
-    }
-    ["generation-", "shadow-"].iter().any(|prefix| {
-        name.strip_prefix(prefix)
-            .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
-    })
-}
-
 /// Unix can distinguish an abandoned builder without a TTL. Permission errors
 /// and unknown OS failures are treated as live. Other platforms conservatively
 /// keep every positive-PID lease live until its owner explicitly releases it.
@@ -7458,29 +7543,6 @@ fn index_builder_process_is_live(owner_pid: i64) -> bool {
 #[cfg(not(unix))]
 fn index_builder_process_is_live(owner_pid: i64) -> bool {
     owner_pid > 0
-}
-
-fn remove_index_generation_path_at(index_root: &Path, generation: i64) -> Result<(), QghError> {
-    if !index_root.exists() {
-        return Ok(());
-    }
-    if fs::symlink_metadata(index_root)
-        .map_err(|_| purge_error())?
-        .file_type()
-        .is_symlink()
-    {
-        return Err(purge_error());
-    }
-    let path = index_root.join(format!("generation-{generation}"));
-    let Ok(metadata) = fs::symlink_metadata(&path) else {
-        return Ok(());
-    };
-    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-        fs::remove_dir_all(path).map_err(|_| purge_error())?;
-    } else {
-        fs::remove_file(path).map_err(|_| purge_error())?;
-    }
-    Ok(())
 }
 
 #[cfg(feature = "vector-search")]
@@ -9102,8 +9164,9 @@ mod tests {
         let (deleted_generation, _) = reopened
             .reserve_index_generation(&paths.index_root, 0)
             .unwrap();
-        let deleted_path =
-            crate::index::rebuild(&paths.index_root, deleted_generation, &[]).unwrap();
+        let deleted_path = reopened
+            .rebuild_reserved_index_generation(deleted_generation, &[])
+            .unwrap();
         fs::remove_dir_all(deleted_path).unwrap();
         let error = reopened
             .activate_retrieval_publication(&snapshot, deleted_generation, None, None)
@@ -9114,7 +9177,9 @@ mod tests {
         let (generation, _) = reopened
             .reserve_index_generation(&paths.index_root, 0)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, generation, &[]).unwrap();
+        reopened
+            .rebuild_reserved_index_generation(generation, &[])
+            .unwrap();
         reopened
             .activate_retrieval_publication(&snapshot, generation, None, None)
             .unwrap();
@@ -9159,7 +9224,9 @@ mod tests {
         let (old_generation, _) = store
             .reserve_index_generation(&paths.index_root, 0)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, old_generation, &[]).unwrap();
+        store
+            .rebuild_reserved_index_generation(old_generation, &[])
+            .unwrap();
         let old_error = store
             .activate_retrieval_publication(old_sync_run_id, old_generation, None, None)
             .unwrap_err();
@@ -9177,7 +9244,9 @@ mod tests {
         let (stale_generation, _) = store
             .reserve_index_generation(&paths.index_root, 0)
             .unwrap();
-        crate::index::rebuild(&paths.index_root, stale_generation, &[]).unwrap();
+        store
+            .rebuild_reserved_index_generation(stale_generation, &[])
+            .unwrap();
         let stale_error = store
             .activate_retrieval_publication(&first_snapshot, stale_generation, None, None)
             .unwrap_err();
@@ -10651,6 +10720,12 @@ mod tests {
         let (generation, generation_path) = stale_builder
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
+        stale_builder
+            .rebuild_reserved_index_generation(
+                generation,
+                &stale_builder.active_index_sources().unwrap(),
+            )
+            .unwrap();
         let purge_error = purger
             .purge(
                 PurgeTarget::Source {
@@ -10660,7 +10735,6 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(purge_error.code, "purge.failed");
-        fs::create_dir_all(&generation_path).unwrap();
         fs::write(generation_path.join("segment"), "late-tantivy-marker").unwrap();
 
         let error = stale_builder
@@ -10694,7 +10768,9 @@ mod tests {
         let (generation, generation_path) = builder
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
-        fs::create_dir_all(&generation_path).unwrap();
+        builder
+            .rebuild_reserved_index_generation(generation, &builder.active_index_sources().unwrap())
+            .unwrap();
         fs::write(generation_path.join("segment"), "live-index-private").unwrap();
         let mut purger = Store::open(&paths).unwrap();
 
@@ -10762,7 +10838,9 @@ mod tests {
         let (generation, generation_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
-        fs::create_dir_all(&generation_path).unwrap();
+        store
+            .rebuild_reserved_index_generation(generation, &store.active_index_sources().unwrap())
+            .unwrap();
         fs::write(generation_path.join("segment"), "dead-index-private").unwrap();
         store.index_build_tokens.remove(&generation);
         store
@@ -10795,6 +10873,71 @@ mod tests {
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn purge_keeps_pending_when_owned_shadow_is_swapped_for_foreign_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let paths = temp_profile_paths("purge-shadow-symlink-swap");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_SHADOW_SWAP";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-shadow-swap",
+                &[test_issue(source_id, "owner/repo", "private-shadow-swap")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        let shadow_path = paths.index_root.join(format!("shadow-{generation}"));
+        fs::remove_dir_all(&shadow_path).unwrap();
+        let external = paths.profile_dir.join("foreign-backup");
+        fs::create_dir_all(&external).unwrap();
+        let sentinel = external.join("preserve");
+        fs::write(&sentinel, "foreign-content").unwrap();
+        symlink(&external, &shadow_path).unwrap();
+        store.index_build_tokens.remove(&generation);
+        store
+            .conn
+            .execute(
+                "UPDATE index_build_leases SET owner_pid = -1 WHERE generation = ?1",
+                params![generation],
+            )
+            .unwrap();
+
+        let error = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "purge.failed");
+        assert!(!error
+            .message
+            .contains(&external.to_string_lossy().to_string()));
+        assert!(sentinel.exists());
+        assert!(fs::symlink_metadata(&shadow_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!generation_path.exists());
+        assert_eq!(
+            store.pending_purges().unwrap()[0].failure_stage,
+            Some(PurgeFailureStage::Tantivy)
+        );
+
+        fs::remove_file(&shadow_path).unwrap();
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
     #[test]
     fn purge_fences_legacy_index_publish_and_removes_orphan() {
         let paths = temp_profile_paths("purge-stale-legacy-index-publish");
@@ -10814,6 +10957,12 @@ mod tests {
         let (generation, generation_path) = stale_builder
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
+        stale_builder
+            .rebuild_reserved_index_generation(
+                generation,
+                &stale_builder.active_index_sources().unwrap(),
+            )
+            .unwrap();
         purger
             .purge(
                 PurgeTarget::Source {
@@ -10822,8 +10971,6 @@ mod tests {
                 PurgeTrigger::ConfirmedDelete,
             )
             .unwrap_err();
-        fs::create_dir_all(&generation_path).unwrap();
-
         let error = stale_builder
             .mark_index_published(generation, &generation_path.to_string_lossy(), 1)
             .unwrap_err();
@@ -11996,12 +12143,18 @@ mod tests {
         rebuild_reserved_generation(&store, &paths, first_generation);
         fs::create_dir_all(&paths.index_active).unwrap();
         let backup_path = paths.index_root.join("user-backup-1");
+        let generation_backup_path = paths.index_root.join("generation-9001");
+        let shadow_backup_path = paths.index_root.join("shadow-9002");
         fs::create_dir_all(&backup_path).unwrap();
+        fs::create_dir_all(&generation_backup_path).unwrap();
+        fs::create_dir_all(&shadow_backup_path).unwrap();
         let model_artifact = paths.cache_dir.join("models/model.onnx");
         fs::create_dir_all(model_artifact.parent().unwrap()).unwrap();
         fs::write(first_path.join("segment"), "tantivy-private-marker").unwrap();
         fs::write(paths.index_active.join("segment"), "tantivy-private-marker").unwrap();
         fs::write(backup_path.join("keep"), "user-owned-backup").unwrap();
+        fs::write(generation_backup_path.join("keep"), "user-owned-backup").unwrap();
+        fs::write(shadow_backup_path.join("keep"), "user-owned-backup").unwrap();
         fs::write(&model_artifact, "model-artifact").unwrap();
         let first_publication = store
             .activate_retrieval_publication("sync-purge-tantivy", first_generation, None, None)
@@ -12033,8 +12186,10 @@ mod tests {
         assert_eq!(outcome.purged_sources, 1);
         assert!(!first_path.exists());
         assert!(!second_path.exists());
-        assert!(!paths.index_active.exists());
+        assert!(paths.index_active.exists());
         assert!(backup_path.exists());
+        assert!(generation_backup_path.exists());
+        assert!(shadow_backup_path.exists());
         assert!(model_artifact.exists());
         assert!(store.active_index_generation().unwrap().is_none());
         assert!(store.active_retrieval_publication().unwrap().is_none());
@@ -12043,6 +12198,58 @@ mod tests {
         assert!(store.get_source(source_id).unwrap().is_none());
         assert!(store.latest_source_version_id(source_id).unwrap().is_none());
         assert!(!embedding_schema_exists(&store.conn).unwrap());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn purge_keeps_pending_when_registered_generation_commit_ownership_mismatches() {
+        let paths = temp_profile_paths("purge-tantivy-commit-mismatch");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_COMMIT_MISMATCH";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-commit-mismatch",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "private-commit-mismatch",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        seal_latest_test_sync(&mut store);
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        let index = tantivy::Index::open_in_dir(&generation_path).unwrap();
+        let mut writer = index
+            .writer::<tantivy::TantivyDocument>(50_000_000)
+            .unwrap();
+        let mut commit = writer.prepare_commit().unwrap();
+        commit.set_payload("not-qgh-owned");
+        commit.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+
+        let error = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "purge.failed");
+        assert!(!error.message.contains("private-commit-mismatch"));
+        assert!(generation_path.exists());
+        assert_eq!(
+            store.pending_purges().unwrap()[0].failure_stage,
+            Some(PurgeFailureStage::Tantivy)
+        );
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -13280,6 +13487,37 @@ mod tests {
     }
 
     #[test]
+    fn reservation_collision_preserves_foreign_shadow_and_rolls_back_ownership_rows() {
+        let paths = temp_profile_paths("index-reservation-foreign-shadow");
+        let mut store = Store::open(&paths).unwrap();
+        fs::create_dir_all(&paths.index_root).unwrap();
+        let foreign_shadow = paths.index_root.join("shadow-1");
+        fs::create_dir_all(&foreign_shadow).unwrap();
+        let sentinel = foreign_shadow.join("user-backup");
+        fs::write(&sentinel, "preserve").unwrap();
+
+        let error = store
+            .reserve_index_generation(&paths.index_root, 0)
+            .unwrap_err();
+
+        assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
+        assert!(sentinel.exists());
+        let ownership_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM index_generations) +
+                    (SELECT count(*) FROM index_build_leases)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ownership_rows, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
     fn index_generation_identity_is_never_reused_after_purge() {
         let paths = temp_profile_paths("index-generation-never-reused");
         let mut store = Store::open(&paths).unwrap();
@@ -13376,7 +13614,9 @@ mod tests {
         let (generation, generation_path) = builder
             .reserve_index_generation(&paths.index_root, 0)
             .unwrap();
-        fs::create_dir_all(&generation_path).unwrap();
+        builder
+            .rebuild_reserved_index_generation(generation, &[])
+            .unwrap();
         fs::write(generation_path.join("segment"), "abandoned-build").unwrap();
 
         drop(builder);
@@ -14799,8 +15039,6 @@ mod tests {
             .unwrap();
         assert!(migration_recorded);
 
-        let sources = reopened.active_index_sources().unwrap();
-        crate::index::rebuild(&paths.index_root, generation, &sources).unwrap();
         let index =
             tantivy::Index::open_in_dir(paths.index_root.join(format!("generation-{generation}")))
                 .unwrap();
@@ -15548,6 +15786,7 @@ mod tests {
         let mut substituted = snapshot.sources().to_vec();
         substituted[0].title = "same-count-substitution".to_string();
         substituted[0].body = "same-count-substitution".to_string();
+        fs::remove_dir_all(paths.index_root.join(format!("generation-{generation}"))).unwrap();
         crate::index::rebuild(&paths.index_root, generation, &substituted).unwrap();
 
         let error = store.resolve_active_tantivy_artifact().unwrap_err();
@@ -17303,7 +17542,7 @@ mod tests {
 
     fn rebuild_reserved_generation(
         store: &Store,
-        paths: &ProfilePaths,
+        _paths: &ProfilePaths,
         generation: i64,
     ) -> PathBuf {
         let expected_source_count: i64 = store
@@ -17316,7 +17555,9 @@ mod tests {
             .unwrap();
         let sources = store.active_index_sources().unwrap();
         assert_eq!(sources.len(), expected_source_count as usize);
-        crate::index::rebuild(&paths.index_root, generation, &sources).unwrap()
+        store
+            .rebuild_reserved_index_generation(generation, &sources)
+            .unwrap()
     }
 
     fn temp_profile_paths(name: &str) -> ProfilePaths {

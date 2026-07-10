@@ -1139,7 +1139,7 @@ fn rebuild_bm25_index(
     ));
     let (generation, reserved_generation_path) =
         store.reserve_index_generation_for_snapshot(&profile.paths.index_root, &snapshot)?;
-    let generation_path = index::rebuild(&profile.paths.index_root, generation, sources)?;
+    let generation_path = store.rebuild_reserved_index_generation(generation, sources)?;
     debug_assert_eq!(generation_path, reserved_generation_path);
     match store.activate_retrieval_publication(
         snapshot.identity().sync_run_id(),
@@ -1254,7 +1254,7 @@ fn repair_lexical_successor_if_required(
     let sources = snapshot.sources();
     let (generation, reserved_generation_path) =
         store.reserve_index_generation_for_snapshot(&profile.paths.index_root, &snapshot)?;
-    let generation_path = index::rebuild(&profile.paths.index_root, generation, sources)?;
+    let generation_path = store.rebuild_reserved_index_generation(generation, sources)?;
     debug_assert_eq!(generation_path, reserved_generation_path);
     store.activate_retrieval_publication(
         &source_snapshot_sync_run_id,
@@ -2559,7 +2559,8 @@ fn refresh_chunk_embeddings(
     store.validate_embedding_generation(generation_id)?;
     let (tantivy_generation, reserved_path) =
         store.reserve_index_generation_for_snapshot(&paths.index_root, snapshot)?;
-    let built_path = index::rebuild(&paths.index_root, tantivy_generation, snapshot.sources())?;
+    let built_path =
+        store.rebuild_reserved_index_generation(tantivy_generation, snapshot.sources())?;
     debug_assert_eq!(reserved_path, built_path);
     store.activate_retrieval_publication(
         &source_sync_run_id,
