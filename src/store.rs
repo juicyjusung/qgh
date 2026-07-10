@@ -200,6 +200,8 @@ pub struct PendingPurgeView {
 pub struct PurgeOutcome {
     pub target: PurgeTarget,
     pub purged_sources: usize,
+    pub purged_issues: usize,
+    pub purged_comments: usize,
     pub discarded_embedding_generations: usize,
     pub discarded_tantivy_generations: usize,
     /// True once WAL frames that could contain purged content were checkpointed
@@ -349,6 +351,8 @@ impl Store {
             return Ok(PurgeOutcome {
                 target,
                 purged_sources: 0,
+                purged_issues: 0,
+                purged_comments: 0,
                 discarded_embedding_generations: 0,
                 discarded_tantivy_generations: 0,
                 sensitive_wal_truncated: false,
@@ -367,24 +371,7 @@ impl Store {
         &mut self,
         requests: &[(PurgeTarget, PurgeTrigger)],
     ) -> Result<usize, QghError> {
-        let mut deduplicated = BTreeMap::new();
-        for (target, trigger) in requests {
-            validate_purge_target(target)?;
-            let (kind, value) = target.kind_and_value();
-            let key = (kind.to_string(), value);
-            if let Some((_, existing_trigger)) = deduplicated.get(&key) {
-                if existing_trigger != trigger {
-                    return Err(conflicting_purge_trigger_error(
-                        target.kind(),
-                        *existing_trigger,
-                        *trigger,
-                    ));
-                }
-                continue;
-            }
-            deduplicated.insert(key, (target.clone(), *trigger));
-        }
-        if deduplicated.is_empty() {
+        if requests.is_empty() {
             return Ok(0);
         }
 
@@ -395,8 +382,52 @@ impl Store {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|_| purge_error())?;
         let result = (|| -> Result<(usize, i64), QghError> {
+            let mut deduplicated = BTreeMap::new();
+            for (target, trigger) in requests {
+                validate_purge_target(target)?;
+                let target = canonicalize_purge_target_identity(&self.conn, target)?;
+                let (kind, value) = target.kind_and_value();
+                let key = (kind.to_string(), value);
+                if let Some((_, existing_trigger)) = deduplicated.get(&key) {
+                    if existing_trigger != trigger {
+                        return Err(conflicting_purge_trigger_error(
+                            target.kind(),
+                            *existing_trigger,
+                            *trigger,
+                        ));
+                    }
+                    continue;
+                }
+                deduplicated.insert(key, (target, *trigger));
+            }
+            let repository_targets = deduplicated
+                .values()
+                .filter_map(|(target, _)| match target {
+                    PurgeTarget::Repository { repo } => Some(repo.to_ascii_lowercase()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            let issue_targets = deduplicated
+                .values()
+                .filter_map(|(target, _)| match target {
+                    PurgeTarget::Issue { repo, issue_number } => {
+                        Some((repo.to_ascii_lowercase(), *issue_number))
+                    }
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
             let mut actionable = Vec::new();
             for ((kind, value), (target, trigger)) in deduplicated {
+                if purge_target_is_subsumed(
+                    &self.conn,
+                    &target,
+                    &repository_targets,
+                    &issue_targets,
+                )
+                .map_err(|_| purge_error())?
+                {
+                    continue;
+                }
                 if self.purge_is_noop(&target).map_err(|_| purge_error())? {
                     continue;
                 }
@@ -507,7 +538,10 @@ impl Store {
             }
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
-                if error.code == "purge.conflicting_triggers" {
+                if matches!(
+                    error.code.as_str(),
+                    "purge.conflicting_triggers" | "purge.invalid_target"
+                ) {
                     Err(error)
                 } else {
                     Err(purge_error())
@@ -847,6 +881,13 @@ impl Store {
             self.record_purge_failure(&target, PurgeFailureStage::Storage)?;
             return Err(purge_error());
         }
+        let (purged_issues, purged_comments) = match self.purge_target_entity_counts(&target) {
+            Ok(counts) => counts,
+            Err(_) => {
+                self.record_purge_failure(&target, PurgeFailureStage::Storage)?;
+                return Err(purge_error());
+            }
+        };
         let (purged_sources, discarded_embedding_generations) =
             match self.purge_sensitive_storage(&target, trigger) {
                 Ok(counts) => counts,
@@ -887,6 +928,8 @@ impl Store {
         Ok(PurgeOutcome {
             target,
             purged_sources,
+            purged_issues,
+            purged_comments,
             discarded_embedding_generations,
             discarded_tantivy_generations,
             sensitive_wal_truncated: true,
@@ -1072,6 +1115,19 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_content_write_allowed(&tx, expected_epoch)?;
+        Ok(tx)
+    }
+
+    fn content_write_transaction_with_pending_purge(
+        &mut self,
+    ) -> Result<Transaction<'_>, QghError> {
+        let expected_epoch = self.content_write_epoch;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if read_content_write_epoch(&tx)? != expected_epoch {
+            return Err(write_fence_error());
+        }
         Ok(tx)
     }
 
@@ -1619,6 +1675,31 @@ impl Store {
         Ok(source_ids)
     }
 
+    fn purge_target_entity_counts(&self, target: &PurgeTarget) -> Result<(usize, usize), QghError> {
+        let (kind, value) = target.kind_and_value();
+        let mut stmt = self.conn.prepare(
+            "SELECT se.entity_type, count(DISTINCT pts.source_id)
+             FROM purge_target_sources pts
+             JOIN source_entities se ON se.source_id = pts.source_id
+             WHERE pts.target_kind = ?1 AND pts.target_value = ?2
+             GROUP BY se.entity_type",
+        )?;
+        let rows = stmt.query_map(params![kind, value], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut issues = 0usize;
+        let mut comments = 0usize;
+        for row in rows {
+            let (entity_type, count) = row?;
+            match entity_type.as_str() {
+                "issue" => issues += count as usize,
+                "issue_comment" => comments += count as usize,
+                _ => return Err(purge_error()),
+            }
+        }
+        Ok((issues, comments))
+    }
+
     #[cfg(not(feature = "vector-search"))]
     pub fn enable_vector(&mut self) -> Result<(), QghError> {
         Err(QghError::validation(
@@ -1654,8 +1735,53 @@ impl Store {
         skipped_pull_requests: usize,
         cursor_updates: &[CursorUpdate],
     ) -> Result<SyncSummary, QghError> {
+        self.upsert_sources_for_run_with_pending_guard(
+            sync_run_id,
+            issues,
+            comments,
+            skipped_pull_requests,
+            cursor_updates,
+            false,
+        )
+    }
+
+    /// Continues a fetched page after confirmed purge evidence is durable.
+    /// Matching source/repository writes remain `purge_pending`; callers must
+    /// refresh the queued target mapping before finishing the purge batch.
+    pub fn upsert_sources_for_run_under_pending_purge(
+        &mut self,
+        sync_run_id: &str,
+        issues: &[IssueRecord],
+        comments: &[CommentRecord],
+        skipped_pull_requests: usize,
+        cursor_updates: &[CursorUpdate],
+    ) -> Result<SyncSummary, QghError> {
+        self.upsert_sources_for_run_with_pending_guard(
+            sync_run_id,
+            issues,
+            comments,
+            skipped_pull_requests,
+            cursor_updates,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_sources_for_run_with_pending_guard(
+        &mut self,
+        sync_run_id: &str,
+        issues: &[IssueRecord],
+        comments: &[CommentRecord],
+        skipped_pull_requests: usize,
+        cursor_updates: &[CursorUpdate],
+        allow_pending_purge: bool,
+    ) -> Result<SyncSummary, QghError> {
         let now = now_rfc3339();
-        let tx = self.content_write_transaction()?;
+        let tx = if allow_pending_purge {
+            self.content_write_transaction_with_pending_purge()?
+        } else {
+            self.content_write_transaction()?
+        };
         tx.execute(
             "INSERT INTO sync_runs
                 (id, started_at, completed_at, completed_successfully, fetched_issue_count, upserted_issue_count, fetched_comment_count, upserted_comment_count, skipped_pull_request_count)
@@ -5350,6 +5476,73 @@ fn capture_purge_target_sources(
     Ok(())
 }
 
+fn purge_target_is_subsumed(
+    conn: &Connection,
+    target: &PurgeTarget,
+    repository_targets: &BTreeSet<String>,
+    issue_targets: &BTreeSet<(String, i64)>,
+) -> Result<bool, QghError> {
+    match target {
+        PurgeTarget::Repository { .. } => Ok(false),
+        PurgeTarget::Issue { repo, .. } => {
+            Ok(repository_targets.contains(&repo.to_ascii_lowercase()))
+        }
+        PurgeTarget::Source { source_id } => {
+            let scope = conn
+                .query_row(
+                    "SELECT se.repo, coalesce(im.issue_number, cm.issue_number)
+                     FROM source_entities se
+                     LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+                     LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+                     WHERE se.source_id = ?1",
+                    params![source_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )
+                .optional()?;
+            Ok(scope.is_some_and(|(repo, issue_number)| {
+                let repo = repo.to_ascii_lowercase();
+                repository_targets.contains(&repo)
+                    || issue_number.is_some_and(|number| issue_targets.contains(&(repo, number)))
+            }))
+        }
+    }
+}
+
+fn canonicalize_purge_target_identity(
+    conn: &Connection,
+    target: &PurgeTarget,
+) -> Result<PurgeTarget, QghError> {
+    let canonical_repo = |repo: &str| -> Result<String, QghError> {
+        Ok(conn
+            .query_row(
+                "SELECT repo FROM (
+                     SELECT repo, 1 AS priority FROM repositories
+                     UNION ALL
+                     SELECT repo, 2 AS priority FROM source_entities
+                     UNION ALL
+                     SELECT repo, 3 AS priority FROM repository_sync_state
+                 )
+                 WHERE lower(repo) = lower(?1)
+                 ORDER BY priority, repo
+                 LIMIT 1",
+                params![repo],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| repo.to_string()))
+    };
+    Ok(match target {
+        PurgeTarget::Source { .. } => target.clone(),
+        PurgeTarget::Issue { repo, issue_number } => PurgeTarget::Issue {
+            repo: canonical_repo(repo)?,
+            issue_number: *issue_number,
+        },
+        PurgeTarget::Repository { repo } => PurgeTarget::Repository {
+            repo: canonical_repo(repo)?,
+        },
+    })
+}
+
 fn conflicting_purge_trigger_error(
     target_kind: &str,
     existing: PurgeTrigger,
@@ -6574,6 +6767,56 @@ mod tests {
                 .unwrap();
             assert_eq!(body_count, 1, "queue must not destroy content");
         }
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn repository_queue_subsumes_overlapping_source_and_counts_each_entity_once() {
+        let paths = temp_profile_paths("purge-queue-subsumes-source");
+        let mut store = Store::open(&paths).unwrap();
+        let issue_id = "qgh://github.com/issue/I_QUEUE_SUBSUME";
+        let comment_id = "qgh://github.com/issue-comment/IC_QUEUE_SUBSUME";
+        store
+            .upsert_sources_for_run(
+                "sync-purge-queue-subsumes-source",
+                &[test_issue(issue_id, "owner/repo", "issue-sensitive")],
+                &[test_comment(
+                    comment_id,
+                    issue_id,
+                    "owner/repo",
+                    "comment-sensitive",
+                )],
+                0,
+                &[],
+            )
+            .unwrap();
+
+        let queued = store
+            .queue_purges(&[
+                (
+                    PurgeTarget::Source {
+                        source_id: comment_id.to_string(),
+                    },
+                    PurgeTrigger::ConfirmedDelete,
+                ),
+                (
+                    PurgeTarget::Repository {
+                        repo: "OWNER/REPO".to_string(),
+                    },
+                    PurgeTrigger::PermissionLoss,
+                ),
+            ])
+            .unwrap();
+        assert_eq!(queued, 1);
+        assert_eq!(store.pending_purges().unwrap().len(), 1);
+
+        let outcomes = store.retry_pending_purges().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].purged_sources, 2);
+        assert_eq!(outcomes[0].purged_issues, 1);
+        assert_eq!(outcomes[0].purged_comments, 1);
+        assert!(store.known_repositories().unwrap().is_empty());
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -8246,6 +8489,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.purged_sources, 2);
+        assert_eq!(outcome.purged_issues, 1);
+        assert_eq!(outcome.purged_comments, 1);
         assert!(outcome.sensitive_wal_truncated);
         assert!(store.get_source(source_id).unwrap().is_none());
         assert!(store.get_source(comment_id).unwrap().is_none());
@@ -9360,6 +9605,8 @@ mod tests {
         );
         let outcomes = store.retry_pending_purges().unwrap();
         assert_eq!(outcomes[0].purged_sources, 3);
+        assert_eq!(outcomes[0].purged_issues, 1);
+        assert_eq!(outcomes[0].purged_comments, 2);
         for source_id in [issue_id, first_comment_id, second_comment_id] {
             assert!(store.get_source(source_id).unwrap().is_none());
             assert_eq!(

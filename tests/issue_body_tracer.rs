@@ -918,6 +918,30 @@ fn sync_purges_repo_removed_from_profile_allowlist_and_preserves_other_repo() {
 }
 
 #[test]
+fn casing_only_profile_allowlist_change_preserves_github_repository() {
+    let fixture = TestFixture::new("allowlist-repo-casing-preserved");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    fixture.write_config_with_repos(&server.base_url, &["OWNER/REPO"]);
+    server.clear_requests();
+    let sync = fixture.qgh(["sync", "--if-stale", "--json"]);
+    assert_success(&sync);
+    assert_eq!(stdout_json(&sync)["data"]["sync_state"], "skipped_fresh");
+    assert!(server.requests().is_empty());
+
+    let retained = fixture.qgh(["get", "qgh://github.com/issue/I_POLICY_OWNER", "--json"]);
+    assert_success(&retained);
+    assert_eq!(
+        stdout_json(&retained)["data"]["source"]["repo"],
+        "owner/repo"
+    );
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["sources"]["tombstone_count"], 0);
+}
+
+#[test]
 fn purge_successor_snapshot_does_not_advance_remote_sync_freshness() {
     let fixture = TestFixture::new("purge-successor-keeps-remote-freshness");
     let server = MultiRepoFakeGitHub::start();
@@ -3692,6 +3716,61 @@ fn repo_listing_comments_upsert_issue_comments_and_skip_pull_request_comments() 
 }
 
 #[test]
+fn repo_listing_permission_evidence_is_pending_before_comment_upsert_failure() {
+    let fixture = TestFixture::new("repo-listing-permission-before-upsert");
+    let server = RepoCommentListingFakeGitHub::start();
+    fixture.write_config_repo_listing_comments(&server.base_url);
+    assert_success(&fixture.qgh(["status", "--json"]));
+    fixture.install_repo_comment_upsert_failure_trigger();
+    server.set_mode(REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE);
+
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_eq!(sync.status.code(), Some(6));
+    assert_eq!(stdout_json(&sync)["error"]["code"], "storage.failure");
+    let output = format!("{}{}", stdout_text(&sync), stderr_text(&sync));
+    assert!(!output.contains("repo listing pending evidence tracer"));
+    assert!(!output.contains("fixture-token"));
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["purge"]["pending_count"], 1);
+    assert_eq!(
+        status_json["data"]["purge"]["triggers"],
+        json!(["permission_loss"])
+    );
+    assert_eq!(status_json["data"]["purge"]["retrieval_blocked"], true);
+}
+
+#[test]
+fn repo_listing_permission_purge_recaptures_rows_processed_after_queue() {
+    let fixture = TestFixture::new("repo-listing-permission-recaptures-row");
+    let server = RepoCommentListingFakeGitHub::start();
+    fixture.write_config_repo_listing_comments(&server.base_url);
+    server.set_mode(REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE);
+
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+    let sync_json = stdout_json(&sync);
+    assert_eq!(sync_json["data"]["comments"]["upserted"], 1);
+
+    for source_id in [
+        "qgh://github.com/issue/I_REPO_LISTING_1",
+        "qgh://github.com/issue-comment/IC_REPO_LISTING_PENDING",
+    ] {
+        let get = fixture.qgh(["get", source_id, "--json"]);
+        assert_eq!(get.status.code(), Some(4));
+        assert_eq!(
+            stdout_json(&get)["error"]["details"]["reason"],
+            "permission_loss"
+        );
+    }
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["pending_count"], 0);
+    assert_eq!(status["data"]["purge"]["retrieval_blocked"], false);
+}
+
+#[test]
 fn backfill_walks_history_and_completes_coverage() {
     let fixture = TestFixture::new("historical-backfill");
     let server = FakeGitHub::start(issue_payload_with_pr());
@@ -6155,6 +6234,33 @@ fn sync_issue_follows_transfer_alias_and_tombstones_old_issue() {
 }
 
 #[test]
+fn sync_issue_queues_confirmed_transition_before_comment_state_read_failure() {
+    let fixture = TestFixture::new("targeted-refresh-transition-before-read");
+    let server = TargetedRefreshFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+    server.set_mode(TARGET_REFRESH_INITIAL_WITH_TRANSFER_TARGET);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.corrupt_source_version_body_hash("qgh://github.com/issue-comment/IC_TARGET_TRANSFER");
+
+    server.set_mode(TARGET_REFRESH_TRANSFER);
+    let refresh = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_eq!(refresh.status.code(), Some(6));
+    assert_eq!(stdout_json(&refresh)["error"]["code"], "storage.failure");
+    let output = format!("{}{}", stdout_text(&refresh), stderr_text(&refresh));
+    assert!(!output.contains("transferredtargetsentinel"));
+    assert!(!output.contains("fixture-token"));
+
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["purge"]["pending_count"], 1);
+    assert_eq!(status["data"]["purge"]["target_kinds"], json!(["issue"]));
+    assert_eq!(status["data"]["purge"]["retrieval_blocked"], true);
+
+    let query = fixture.qgh(["query", "local read must remain fenced", "--json"]);
+    assert_eq!(query.status.code(), Some(6));
+    assert_eq!(stdout_json(&query)["error"]["code"], "purge.read_fenced");
+}
+
+#[test]
 fn sync_issue_transfer_alias_cycle_is_guarded() {
     let fixture = TestFixture::new("targeted-refresh-transfer-cycle");
     let server = TargetedRefreshFakeGitHub::start();
@@ -7415,6 +7521,30 @@ limit = 10
         assert_eq!(count, 0);
     }
 
+    fn install_repo_comment_upsert_failure_trigger(&self) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_repo_comment_upsert
+             BEFORE UPDATE ON sync_runs
+             WHEN NEW.fetched_comment_count > OLD.fetched_comment_count
+             BEGIN
+                 SELECT RAISE(ABORT, 'fixture repo-comment upsert failure');
+             END;",
+        )
+        .unwrap();
+    }
+
+    fn corrupt_source_version_body_hash(&self, source_id: &str) {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE source_versions SET body_hash = X'80' WHERE source_id = ?1",
+            [source_id],
+        )
+        .unwrap();
+    }
+
     fn clear_retrieval_publication(&self) {
         let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
         let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -7835,6 +7965,7 @@ fn handle_multi_repo_connection(
 
 struct RepoCommentListingFakeGitHub {
     base_url: String,
+    mode: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -7845,10 +7976,13 @@ impl RepoCommentListingFakeGitHub {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{}", addr);
+        let mode = Arc::new(AtomicUsize::new(REPO_COMMENT_LISTING_ACTIVE));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let thread_mode = Arc::clone(&mode);
         let thread_requests = Arc::clone(&requests);
         let thread_stop = Arc::clone(&stop);
+        let thread_base_url = base_url.clone();
 
         let handle = thread::spawn(move || {
             for stream in listener.incoming() {
@@ -7856,7 +7990,12 @@ impl RepoCommentListingFakeGitHub {
                     break;
                 }
                 match stream {
-                    Ok(stream) => handle_repo_comment_listing_connection(stream, &thread_requests),
+                    Ok(stream) => handle_repo_comment_listing_connection(
+                        stream,
+                        &thread_base_url,
+                        &thread_mode,
+                        &thread_requests,
+                    ),
                     Err(_) => break,
                 }
             }
@@ -7864,6 +8003,7 @@ impl RepoCommentListingFakeGitHub {
 
         Self {
             base_url,
+            mode,
             requests,
             stop,
             handle: Some(handle),
@@ -7872,6 +8012,10 @@ impl RepoCommentListingFakeGitHub {
 
     fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
+    }
+
+    fn set_mode(&self, mode: usize) {
+        self.mode.store(mode, Ordering::SeqCst);
     }
 }
 
@@ -7885,8 +8029,13 @@ impl Drop for RepoCommentListingFakeGitHub {
     }
 }
 
+const REPO_COMMENT_LISTING_ACTIVE: usize = 1;
+const REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE: usize = 2;
+
 fn handle_repo_comment_listing_connection(
     mut stream: TcpStream,
+    base_url: &str,
+    mode: &Arc<AtomicUsize>,
     requests: &Arc<Mutex<Vec<String>>>,
 ) {
     let mut buffer = [0_u8; 8192];
@@ -7894,25 +8043,62 @@ fn handle_repo_comment_listing_connection(
     let request = String::from_utf8_lossy(&buffer[..bytes_read]);
     let request_line = request.lines().next().unwrap_or("").to_string();
     requests.lock().unwrap().push(request_line.clone());
+    let mode = mode.load(Ordering::SeqCst);
 
-    let (status, body) = if request_line.starts_with("GET /repos/owner/repo/issues/comments?") {
-        ("200 OK", repo_listing_comments_payload())
+    let (status, body, extra_headers) = if request_line
+        .starts_with("GET /repos/owner/repo/issues/comments?")
+    {
+        if mode == REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE && request_line.contains("page=2") {
+            (
+                "403 Forbidden",
+                r#"{"message":"resource not accessible"}"#,
+                String::new(),
+            )
+        } else if mode == REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE {
+            (
+                "200 OK",
+                repo_listing_permission_page_payload(),
+                format!(
+                    "link: <{base_url}/repos/owner/repo/issues/comments?per_page=100&page=2>; rel=\"next\"\r\n"
+                ),
+            )
+        } else {
+            ("200 OK", repo_listing_comments_payload(), String::new())
+        }
     } else if request_line.starts_with("GET /repos/owner/repo/issues?")
         && request_line.contains("state=all")
     {
-        ("200 OK", repo_listing_issue_payload())
+        ("200 OK", repo_listing_issue_payload(), String::new())
+    } else if request_line.starts_with("GET /repos/owner/repo ") {
+        if mode == REPO_COMMENT_LISTING_PERMISSION_AFTER_PAGE {
+            (
+                "403 Forbidden",
+                r#"{"message":"resource not accessible"}"#,
+                String::new(),
+            )
+        } else {
+            ("200 OK", r#"{"full_name":"owner/repo"}"#, String::new())
+        }
     } else if request_line.starts_with("GET /repos/owner/repo/issues/2 ") {
-        ("200 OK", repo_listing_pull_request_object_payload())
+        (
+            "200 OK",
+            repo_listing_pull_request_object_payload(),
+            String::new(),
+        )
     } else if request_line.starts_with("GET /repos/owner/repo/issues/3 ") {
-        ("200 OK", repo_listing_unsynced_issue_object_payload())
+        (
+            "200 OK",
+            repo_listing_unsynced_issue_object_payload(),
+            String::new(),
+        )
     } else if request_line.contains("/comments?") {
         // Per-issue comment endpoint must not be used in repo_listing mode.
-        ("200 OK", "[]")
+        ("200 OK", "[]", String::new())
     } else {
-        ("404 Not Found", r#"{"message":"not found"}"#)
+        ("404 Not Found", r#"{"message":"not found"}"#, String::new())
     };
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{extra_headers}x-ratelimit-remaining: 4999\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();
@@ -7972,6 +8158,21 @@ fn repo_listing_comments_payload() -> &'static str {
         "updated_at": "2026-01-03T00:00:00Z",
         "user": {"login": "carol"},
         "issue_url": "https://api.github.com/repos/owner/repo/issues/3"
+      }
+    ]"#
+}
+
+fn repo_listing_permission_page_payload() -> &'static str {
+    r#"[
+      {
+        "id": 9010,
+        "node_id": "IC_REPO_LISTING_PENDING",
+        "body": "repo listing pending evidence tracer.",
+        "html_url": "https://github.com/owner/repo/issues/1#issuecomment-9010",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-03T00:00:00Z",
+        "user": {"login": "alice"},
+        "issue_url": "https://api.github.com/repos/owner/repo/issues/1"
       }
     ]"#
 }
@@ -9120,6 +9321,7 @@ const TARGET_REFRESH_TRANSFER_CYCLE: usize = 6;
 const TARGET_REFRESH_AUTH_FAILED: usize = 7;
 const TARGET_REFRESH_SECONDARY_RATE_LIMIT_NO_RETRY_AFTER: usize = 8;
 const TARGET_REFRESH_EMPTY_COMMENTS: usize = 9;
+const TARGET_REFRESH_INITIAL_WITH_TRANSFER_TARGET: usize = 10;
 
 struct TargetedRefreshFakeGitHub {
     base_url: String,
@@ -9196,7 +9398,15 @@ fn handle_targeted_refresh_connection(
     let (status, body, location) = if request_line.starts_with("GET /repos/owner/repo/issues?")
         && request_line.contains("state=all")
     {
-        ("200 OK", targeted_initial_issue_list_payload(), None)
+        if mode == TARGET_REFRESH_INITIAL_WITH_TRANSFER_TARGET {
+            (
+                "200 OK",
+                targeted_initial_with_transfer_target_payload(),
+                None,
+            )
+        } else {
+            ("200 OK", targeted_initial_issue_list_payload(), None)
+        }
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?")
         && request_line.contains("per_page=100")
     {
@@ -9322,6 +9532,47 @@ fn targeted_initial_issue_list_payload() -> &'static str {
         "labels": [{"name": "bug"}, {"name": "mvp"}],
         "milestone": {"title": "MVP"},
         "assignees": [{"login": "alice"}]
+      }
+    ]"#
+}
+
+fn targeted_initial_with_transfer_target_payload() -> &'static str {
+    r#"[
+      {
+        "id": 1001,
+        "node_id": "I_kwDOISSUE1",
+        "number": 42,
+        "title": "Cache sync bug",
+        "body": "The BM25 issue body tracer must round-trip through get before citation.",
+        "state": "open",
+        "locked": false,
+        "comments": 2,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:05Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}, {"name": "mvp"}],
+        "milestone": {"title": "MVP"},
+        "assignees": [{"login": "alice"}]
+      },
+      {
+        "id": 1043,
+        "node_id": "I_TARGET_TRANSFER",
+        "number": 43,
+        "title": "Transferred issue target",
+        "body": "transferredtargetsentinel final issue body.",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://github.com/owner/repo/issues/43",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-04T00:00:00Z",
+        "closed_at": null,
+        "user": {"login": "carol"},
+        "labels": [],
+        "milestone": null,
+        "assignees": []
       }
     ]"#
 }
