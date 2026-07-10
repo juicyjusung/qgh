@@ -829,6 +829,8 @@ struct FrozenLexicalProfile {
     active_tantivy_generation: i64,
     active_tantivy_path: PathBuf,
     tantivy_schema_fingerprint: String,
+    tantivy_generation_files_sha256: String,
+    tantivy_generation_files: Vec<SnapshotFileDigest>,
     heldout_confirmation_required: bool,
     heldout_fallback_profile: FrozenLexicalProfileName,
 }
@@ -847,6 +849,8 @@ struct LexicalProfileAbReport {
     qrels_dev_sha256: String,
     active_tantivy_generation: i64,
     tantivy_schema_fingerprint: String,
+    tantivy_generation_files_sha256: String,
+    tantivy_generation_file_count: usize,
     production_v1: RetrievalMetrics,
     metadata_boost_v1: RetrievalMetrics,
     selection: LexicalProfileSelection,
@@ -878,6 +882,12 @@ pub(super) fn lexical_profile_freeze_for_test() -> Value {
         active_tantivy_generation: 7,
         active_tantivy_path: PathBuf::from("/frozen/tantivy/generation-7"),
         tantivy_schema_fingerprint: "schema-sha256".to_string(),
+        tantivy_generation_files_sha256: "files-sha256".to_string(),
+        tantivy_generation_files: vec![SnapshotFileDigest {
+            relative_path: "meta.json".to_string(),
+            byte_size: 42,
+            sha256: "meta-sha256".to_string(),
+        }],
         heldout_confirmation_required: false,
         heldout_fallback_profile: FrozenLexicalProfileName::ProductionV1,
     })
@@ -1153,7 +1163,7 @@ fn confirm_lexical_profile_heldout(
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotFileDigest {
     relative_path: String,
     byte_size: u64,
@@ -1359,6 +1369,58 @@ struct QueryEvidence {
     hybrid_required: bool,
     hybrid_expected_queries: usize,
     hybrid_path_queries: usize,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct GetRoundTripEvidence {
+    total: usize,
+    success: usize,
+    stale: usize,
+}
+
+impl GetRoundTripEvidence {
+    fn observe(&mut self, response: &Value, expected_source_id: &str) -> Result<(), DynError> {
+        self.total += 1;
+        match structured_tool_content(response)? {
+            StructuredToolContent::Success(content)
+                if content["data"]["source"]["source_id"].as_str() == Some(expected_source_id) =>
+            {
+                self.success += 1;
+            }
+            StructuredToolContent::ToolError {
+                code: "source.tombstoned",
+            } => {
+                self.stale += 1;
+            }
+            StructuredToolContent::Success(_) | StructuredToolContent::ToolError { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+fn get_round_trip_quality_failures(evidence: &GetRoundTripEvidence) -> Vec<String> {
+    let mut failures = Vec::new();
+    if evidence.total != 0 && evidence.success != evidence.total {
+        failures.push("get_round_trip".to_string());
+    }
+    if evidence.stale != 0 {
+        failures.push("unexpected_tombstone_during_get".to_string());
+    }
+    failures
+}
+
+pub(super) fn get_round_trip_evidence_for_test(
+    response: Value,
+    expected_source_id: &str,
+) -> Result<Value, DynError> {
+    let mut evidence = GetRoundTripEvidence::default();
+    evidence.observe(&response, expected_source_id)?;
+    Ok(json!({
+        "total": evidence.total,
+        "success": evidence.success,
+        "stale": evidence.stale,
+        "quality_gate_failures": get_round_trip_quality_failures(&evidence),
+    }))
 }
 
 struct DevRunEvidence {
@@ -2912,6 +2974,10 @@ pub(super) fn run(
             generation: frozen_lexical_profile.active_tantivy_generation,
             path: frozen_lexical_profile.active_tantivy_path.clone(),
             tantivy_schema_fingerprint: frozen_lexical_profile.tantivy_schema_fingerprint.clone(),
+            generation_files_sha256: frozen_lexical_profile
+                .tantivy_generation_files_sha256
+                .clone(),
+            generation_files: frozen_lexical_profile.tantivy_generation_files.clone(),
         },
     };
 
@@ -4100,6 +4166,8 @@ struct ActiveTantivySnapshot {
     generation: i64,
     path: PathBuf,
     tantivy_schema_fingerprint: String,
+    generation_files_sha256: String,
+    generation_files: Vec<SnapshotFileDigest>,
 }
 
 fn load_active_tantivy_snapshot(db_path: &Path) -> Result<ActiveTantivySnapshot, DynError> {
@@ -4117,12 +4185,27 @@ fn load_active_tantivy_snapshot(db_path: &Path) -> Result<ActiveTantivySnapshot,
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let path = PathBuf::from(path)
+    let raw_path = PathBuf::from(path);
+    let raw_metadata = fs::symlink_metadata(&raw_path)
+        .map_err(|_| "active publication Tantivy generation is unavailable")?;
+    if raw_metadata.file_type().is_symlink() || !raw_metadata.is_dir() {
+        return Err("active publication Tantivy generation must be a regular directory".into());
+    }
+    let path = raw_path
         .canonicalize()
         .map_err(|_| "active publication Tantivy generation is unavailable")?;
-    if !path.is_dir() {
-        return Err("active publication Tantivy generation is unavailable".into());
+    let profile_root = db_path
+        .parent()
+        .ok_or("live-eval database parent is unavailable")?
+        .canonicalize()?;
+    if !path.starts_with(&profile_root) {
+        return Err("active publication Tantivy generation path escapes the profile".into());
     }
+    let generation_files = regular_snapshot_file_manifest(&path)?;
+    let generation_files_sha256 = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&generation_files)?)
+    );
     let metadata: Value = serde_json::from_slice(&fs::read(path.join("meta.json"))?)?;
     let schema = metadata
         .get("schema")
@@ -4131,6 +4214,8 @@ fn load_active_tantivy_snapshot(db_path: &Path) -> Result<ActiveTantivySnapshot,
         generation,
         path,
         tantivy_schema_fingerprint: digest_hex(&serde_json::to_string(schema)?),
+        generation_files_sha256,
+        generation_files,
     })
 }
 
@@ -4162,24 +4247,13 @@ fn verify_rankings_with_get(
     rankings: &BTreeMap<String, Vec<String>>,
 ) -> Result<(usize, usize, usize), DynError> {
     let mut client = McpClient::start(fixture)?;
-    let mut total = 0usize;
-    let mut success = 0usize;
-    let mut stale = 0usize;
+    let mut evidence = GetRoundTripEvidence::default();
     for source_id in rankings.values().flat_map(|ranked| ranked.iter()) {
-        total += 1;
         let response = client.call_tool("get", json!({ "source_id": source_id }))?;
-        match structured_content(&response) {
-            Ok(get) if get["data"]["source"]["source_id"].as_str() == Some(source_id) => {
-                success += 1;
-            }
-            Ok(get) => {
-                stale += usize::from(get["error"]["code"].as_str() == Some("source.tombstoned"));
-            }
-            Err(_) => {}
-        }
+        evidence.observe(&response, source_id)?;
     }
     let _ = client.finish()?;
-    Ok((total, success, stale))
+    Ok((evidence.total, evidence.success, evidence.stale))
 }
 
 fn run_lexical_profile_pass(
@@ -4321,6 +4395,8 @@ fn run_lexical_profile_dev_ab(
         qrels_dev_sha256: qrels_dev_sha256.to_string(),
         active_tantivy_generation: production_snapshot.generation,
         tantivy_schema_fingerprint: tantivy_schema_fingerprint.to_string(),
+        tantivy_generation_files_sha256: production_snapshot.generation_files_sha256.clone(),
+        tantivy_generation_file_count: production_snapshot.generation_files.len(),
         production_v1,
         metadata_boost_v1,
         selection,
@@ -4347,6 +4423,8 @@ fn run_lexical_profile_dev_ab(
         active_tantivy_generation: production_snapshot.generation,
         active_tantivy_path: production_snapshot.path.clone(),
         tantivy_schema_fingerprint: production_snapshot.tantivy_schema_fingerprint.clone(),
+        tantivy_generation_files_sha256: production_snapshot.generation_files_sha256.clone(),
+        tantivy_generation_files: production_snapshot.generation_files.clone(),
         heldout_confirmation_required: report.selection.selected_profile
             == FrozenLexicalProfileName::MetadataBoostV1,
         heldout_fallback_profile: FrozenLexicalProfileName::ProductionV1,
@@ -4410,9 +4488,7 @@ fn query_pass(
     let mut rankings = BTreeMap::new();
     let mut branch_observations = BTreeMap::new();
     let mut latencies = Vec::with_capacity(qrels.len());
-    let mut get_total = 0usize;
-    let mut get_success = 0usize;
-    let mut stale_failures = 0usize;
+    let mut get_evidence = GetRoundTripEvidence::default();
     let mut hybrid_expected_queries = 0usize;
     let mut hybrid_path_queries = 0usize;
     for qrel in qrels {
@@ -4461,18 +4537,8 @@ fn query_pass(
             .collect::<Vec<_>>();
         if verify_get {
             for source_id in &ranked {
-                get_total += 1;
                 let get_response = client.call_tool("get", json!({ "source_id": source_id }))?;
-                match structured_content(&get_response) {
-                    Ok(get) if get["data"]["source"]["source_id"].as_str() == Some(source_id) => {
-                        get_success += 1;
-                    }
-                    Ok(get) => {
-                        stale_failures +=
-                            usize::from(get["error"]["code"].as_str() == Some("source.tombstoned"));
-                    }
-                    Err(_) => {}
-                }
+                get_evidence.observe(&get_response, source_id)?;
             }
         }
         rankings.insert(qrel.query_id.clone(), ranked);
@@ -4482,9 +4548,9 @@ fn query_pass(
         QueryEvidence {
             rankings,
             branch_observations,
-            get_total,
-            get_success,
-            stale_failures,
+            get_total: get_evidence.total,
+            get_success: get_evidence.success,
+            stale_failures: get_evidence.stale,
             hybrid_required: expect_hybrid,
             hybrid_expected_queries,
             hybrid_path_queries,
@@ -4747,12 +4813,11 @@ fn evaluate_rankings(
     if hard_filter_violations != 0 {
         quality_gate_failures.push("hard_filter_violations".to_string());
     }
-    if get_round_trip < 1.0 {
-        quality_gate_failures.push("get_round_trip".to_string());
-    }
-    if evidence.stale_failures != 0 {
-        quality_gate_failures.push("unexpected_tombstone_during_get".to_string());
-    }
+    quality_gate_failures.extend(get_round_trip_quality_failures(&GetRoundTripEvidence {
+        total: evidence.get_total,
+        success: evidence.get_success,
+        stale: evidence.stale_failures,
+    }));
     if evidence.hybrid_required
         && !hybrid_gate_for_test(
             evidence.hybrid_expected_queries,
@@ -5453,16 +5518,32 @@ impl McpClient {
     }
 }
 
-fn structured_content(response: &Value) -> Result<&Value, DynError> {
+enum StructuredToolContent<'a> {
+    Success(&'a Value),
+    ToolError { code: &'a str },
+}
+
+fn structured_tool_content(response: &Value) -> Result<StructuredToolContent<'_>, DynError> {
     if response.get("error").is_some() {
         return Err("MCP transport error".into());
     }
     let structured = &response["result"]["structuredContent"];
-    if structured["ok"].as_bool() != Some(true) {
-        let code = structured["error"]["code"].as_str().unwrap_or("unknown");
-        return Err(format!("MCP tool failed with code {code}").into());
+    match structured["ok"].as_bool() {
+        Some(true) => Ok(StructuredToolContent::Success(structured)),
+        Some(false) => Ok(StructuredToolContent::ToolError {
+            code: structured["error"]["code"].as_str().unwrap_or("unknown"),
+        }),
+        None => Err("MCP tool returned an invalid structured envelope".into()),
     }
-    Ok(structured)
+}
+
+fn structured_content(response: &Value) -> Result<&Value, DynError> {
+    match structured_tool_content(response)? {
+        StructuredToolContent::Success(structured) => Ok(structured),
+        StructuredToolContent::ToolError { code } => {
+            Err(format!("MCP tool failed with code {code}").into())
+        }
+    }
 }
 
 struct PublicSnapshotServer {
@@ -5734,17 +5815,22 @@ fn directory_bytes(path: &Path) -> Result<u64, DynError> {
     Ok(prepared_snapshot_digest(path)?.bytes)
 }
 
-fn prepared_snapshot_digest(root: &Path) -> Result<PreparedSnapshotDigest, DynError> {
+fn regular_snapshot_file_manifest(root: &Path) -> Result<Vec<SnapshotFileDigest>, DynError> {
     let root_metadata = fs::symlink_metadata(root)?;
     if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return Err("prepared model snapshot root must be a regular directory".into());
+        return Err("snapshot root must be a regular directory".into());
     }
     let mut files = Vec::new();
-    collect_snapshot_file_digests(root, root, &mut files)?;
+    collect_regular_file_digests(root, root, &mut files)?;
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     if files.is_empty() {
-        return Err("prepared model snapshot contains no regular files".into());
+        return Err("snapshot contains no regular files".into());
     }
+    Ok(files)
+}
+
+fn prepared_snapshot_digest(root: &Path) -> Result<PreparedSnapshotDigest, DynError> {
+    let files = regular_snapshot_file_manifest(root)?;
     let bytes = files.iter().map(|file| file.byte_size).sum();
     let canonical = serde_json::to_vec(&files)?;
     Ok(PreparedSnapshotDigest {
@@ -5754,7 +5840,7 @@ fn prepared_snapshot_digest(root: &Path) -> Result<PreparedSnapshotDigest, DynEr
     })
 }
 
-fn collect_snapshot_file_digests(
+fn collect_regular_file_digests(
     root: &Path,
     current: &Path,
     files: &mut Vec<SnapshotFileDigest>,
@@ -5765,19 +5851,27 @@ fn collect_snapshot_file_digests(
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
-            return Err("prepared model snapshot contains a symbolic link".into());
+            return Err("snapshot contains a symbolic link".into());
         }
         if metadata.is_dir() {
-            collect_snapshot_file_digests(root, &path, files)?;
+            collect_regular_file_digests(root, &path, files)?;
             continue;
         }
         if !metadata.is_file() {
-            return Err("prepared model snapshot contains a non-regular entry".into());
+            return Err("snapshot contains a non-regular entry".into());
         }
-        let relative = path
-            .strip_prefix(root)?
+        let relative_path = path.strip_prefix(root)?;
+        if relative_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            )
+        }) {
+            return Err("snapshot path escapes its root".into());
+        }
+        let relative = relative_path
             .to_str()
-            .ok_or("prepared model snapshot path is not UTF-8")?
+            .ok_or("snapshot path is not UTF-8")?
             .replace(std::path::MAIN_SEPARATOR, "/");
         files.push(SnapshotFileDigest {
             relative_path: relative,

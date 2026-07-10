@@ -324,6 +324,45 @@ fn normal_query_events_redact_raw_query_and_body() {
     );
 }
 
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn mcp_get_tombstone_envelope_counts_as_stale_round_trip_failure() {
+    let private_message = "PRIVATE BODY MUST NOT ESCAPE";
+    let evidence = live_model_eval_runtime::get_round_trip_evidence_for_test(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {
+                "structuredContent": {
+                    "ok": false,
+                    "error": {
+                        "code": "source.tombstoned",
+                        "message": private_message,
+                    },
+                },
+            },
+        }),
+        "qgh://github.com/issue/EXPECTED",
+    )
+    .expect("typed get error envelope is evidence, not a transport failure");
+
+    assert_eq!(
+        evidence,
+        json!({
+            "total": 1,
+            "success": 0,
+            "stale": 1,
+            "quality_gate_failures": [
+                "get_round_trip",
+                "unexpected_tombstone_during_get",
+            ],
+        })
+    );
+    assert!(!serde_json::to_string(&evidence)
+        .unwrap()
+        .contains(private_message));
+}
+
 #[test]
 fn resource_gate_reports_each_blocking_dimension() {
     let light = ResourceMetrics {
@@ -535,6 +574,12 @@ fn lexical_profile_freeze_contains_a_selected_profile_and_dev_report_binding() {
             "active_tantivy_generation": 7,
             "active_tantivy_path": "/frozen/tantivy/generation-7",
             "tantivy_schema_fingerprint": "schema-sha256",
+            "tantivy_generation_files_sha256": "files-sha256",
+            "tantivy_generation_files": [{
+                "relative_path": "meta.json",
+                "byte_size": 42,
+                "sha256": "meta-sha256",
+            }],
             "heldout_confirmation_required": false,
             "heldout_fallback_profile": "production_v1",
         })
@@ -1240,6 +1285,146 @@ fn frozen_bm25_snapshot_rejects_an_active_publication_pointer_switch() {
     let error = live_model_eval_runtime::revalidate_tantivy_snapshot_for_test(&db_path, frozen)
         .expect_err("schema change within the same generation must invalidate the frozen run");
     assert_eq!(error.to_string(), "eval.frozen_identity_changed");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn frozen_bm25_snapshot_rejects_same_generation_valid_index_replacement() {
+    let root = std::env::temp_dir().join(format!(
+        "qgh-live-model-frozen-index-files-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let generation = root.join("generation-7");
+    let replacement = root.join("replacement");
+    for (path, marker) in [(&generation, "original"), (&replacement, "replacement")] {
+        std::fs::create_dir_all(path).unwrap();
+        let mut schema = tantivy::schema::Schema::builder();
+        let body = schema.add_text_field("body", tantivy::schema::TEXT | tantivy::schema::STORED);
+        let index = tantivy::Index::create_in_dir(path, schema.build()).unwrap();
+        let mut writer = index.writer(15_000_000).unwrap();
+        let mut document = tantivy::TantivyDocument::default();
+        document.add_text(body, marker);
+        writer.add_document(document).unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+    }
+
+    let db_path = root.join("qgh.sqlite3");
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(&format!(
+            "CREATE TABLE retrieval_publications(
+               publication_id INTEGER PRIMARY KEY, tantivy_generation INTEGER, active INTEGER
+             );
+             CREATE TABLE retrieval_publication_pointer(
+               id INTEGER PRIMARY KEY, publication_id INTEGER
+             );
+             CREATE TABLE index_generations(
+               generation INTEGER PRIMARY KEY, path TEXT, active INTEGER
+             );
+             INSERT INTO retrieval_publications VALUES (70, 7, 1);
+             INSERT INTO retrieval_publication_pointer VALUES (1, 70);
+             INSERT INTO index_generations VALUES (7, '{}', 1);",
+            generation.display(),
+        ))
+        .unwrap();
+    drop(connection);
+
+    let frozen = live_model_eval_runtime::freeze_tantivy_snapshot_for_test(&db_path)
+        .expect("active index files freeze");
+    let files = frozen["generation_files"]
+        .as_array()
+        .expect("frozen snapshot carries a file manifest");
+    assert!(files.len() > 1);
+    assert!(files.windows(2).all(|pair| {
+        pair[0]["relative_path"].as_str().unwrap() < pair[1]["relative_path"].as_str().unwrap()
+    }));
+    assert_eq!(
+        frozen["generation_files_sha256"].as_str().unwrap().len(),
+        64
+    );
+    std::fs::remove_dir_all(&generation).unwrap();
+    std::fs::rename(&replacement, &generation).unwrap();
+
+    let error = live_model_eval_runtime::revalidate_tantivy_snapshot_for_test(&db_path, frozen)
+        .expect_err("same-schema index file replacement must invalidate the frozen run");
+    assert_eq!(error.to_string(), "eval.frozen_identity_changed");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(all(feature = "fastembed-provider", unix))]
+#[test]
+fn frozen_bm25_snapshot_rejects_symlink_nonregular_and_escaped_generation_entries() {
+    let root = std::path::PathBuf::from("/tmp").join(format!(
+        "qgh-fc-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let profile = root.join("profile");
+    let generation = profile.join("generation-7");
+    std::fs::create_dir_all(&generation).unwrap();
+    std::fs::write(
+        generation.join("meta.json"),
+        serde_json::to_vec(&json!({"schema": {"fields": []}})).unwrap(),
+    )
+    .unwrap();
+    let outside_file = root.join("outside-segment");
+    std::fs::write(&outside_file, b"outside").unwrap();
+    std::os::unix::fs::symlink(&outside_file, generation.join("segment-link")).unwrap();
+
+    let db_path = profile.join("qgh.sqlite3");
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(&format!(
+            "CREATE TABLE retrieval_publications(
+               publication_id INTEGER PRIMARY KEY, tantivy_generation INTEGER, active INTEGER
+             );
+             CREATE TABLE retrieval_publication_pointer(
+               id INTEGER PRIMARY KEY, publication_id INTEGER
+             );
+             CREATE TABLE index_generations(
+               generation INTEGER PRIMARY KEY, path TEXT, active INTEGER
+             );
+             INSERT INTO retrieval_publications VALUES (70, 7, 1);
+             INSERT INTO retrieval_publication_pointer VALUES (1, 70);
+             INSERT INTO index_generations VALUES (7, '{}', 1);",
+            generation.display(),
+        ))
+        .unwrap();
+    drop(connection);
+
+    assert!(live_model_eval_runtime::freeze_tantivy_snapshot_for_test(&db_path).is_err());
+    std::fs::remove_file(generation.join("segment-link")).unwrap();
+    let socket_path = generation.join("nonregular.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    assert!(live_model_eval_runtime::freeze_tantivy_snapshot_for_test(&db_path).is_err());
+    drop(listener);
+    std::fs::remove_file(socket_path).unwrap();
+
+    let escaped = root.join("escaped-generation");
+    std::fs::create_dir_all(&escaped).unwrap();
+    std::fs::write(
+        escaped.join("meta.json"),
+        serde_json::to_vec(&json!({"schema": {"fields": []}})).unwrap(),
+    )
+    .unwrap();
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute(
+            "UPDATE index_generations SET path = ?1 WHERE generation = 7",
+            [escaped.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(live_model_eval_runtime::freeze_tantivy_snapshot_for_test(&db_path).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
 
