@@ -2241,6 +2241,7 @@ model_path = "/definitely/not/a/model"
 file = "onnx/model.onnx"
 pooling = "cls"
 query_prefix = "query: "
+quantization = "none"
 "#,
     );
 
@@ -2519,6 +2520,7 @@ model_path = "{}"
 file = "onnx/model.onnx"
 pooling = "cls"
 query_prefix = "query: "
+quantization = "none"
 "#,
             model_dir.display()
         ),
@@ -2555,6 +2557,7 @@ model_path = "{}"
 file = "onnx/model.onnx"
 pooling = "cls"
 query_prefix = "query: "
+quantization = "none"
 "#,
             model_dir.display()
         ),
@@ -2623,6 +2626,7 @@ model_path = "{}"
 file = "onnx/model.onnx"
 pooling = "cls"
 query_prefix = "query: "
+quantization = "none"
 "#,
             model_dir.display()
         ),
@@ -2911,6 +2915,7 @@ model_path = "{model_path}"
 file = "onnx/model_quantized.onnx"
 pooling = "cls"
 query_prefix = "query: "
+quantization = "none"
 "#
         ),
     );
@@ -2997,14 +3002,20 @@ fn cached_prepared_manifest_query_is_offline_and_falls_back_to_bm25() {
         ),
     );
 
-    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
-    let chunk_id = fixture.insert_chunk_for_source(
-        "qgh://github.com/issue/I_kwDOISSUE1",
-        "prepared manifest chunk",
+    let acquisition = fixture.qgh(["sync", "--if-stale", "--max-age", "30m", "--json"]);
+    assert_success(&acquisition);
+    assert_eq!(
+        server.request_count(),
+        request_count,
+        "prepared model acquisition during a fresh sync must not contact GitHub"
     );
+
+    assert_success(&fixture.qgh(["query", "prepare vector schema", "--json"]));
     fixture
         .insert_active_embedding_fingerprint_with_revision("local:offline-fixture", &manifest_hash);
-    fixture.insert_embedding_for_chunk(chunk_id);
+    for chunk_id in fixture.sqlite_chunk_ids() {
+        fixture.insert_embedding_for_chunk(chunk_id);
+    }
 
     let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
     assert_success(&query);

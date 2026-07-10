@@ -1,7 +1,6 @@
-#[cfg(feature = "fastembed-provider")]
-use crate::embedding::FastembedProviderOptions;
 use crate::embedding::{
-    is_builtin_preset_id, parse_hf_model_reference, PoolingKind, PreparedModelStore,
+    default_prepared_model_store, is_builtin_preset_id, parse_hf_model_reference,
+    FastembedProviderOptions, PoolingKind, PreparedModelStore, QuantizationKind,
     DEFAULT_HF_MODEL_ID, DEFAULT_QUERY_PREFIX,
 };
 use crate::error::QghError;
@@ -151,6 +150,7 @@ pub struct EmbeddingConfig {
     pub file: Option<String>,
     pub pooling: Option<PoolingKind>,
     pub query_prefix: Option<String>,
+    pub quantization: Option<QuantizationKind>,
     pub token_source: Option<EmbeddingTokenSource>,
 }
 
@@ -168,6 +168,7 @@ impl EmbeddingConfig {
             file: self.file.clone(),
             pooling: self.pooling,
             query_prefix: self.query_prefix.clone(),
+            quantization: self.quantization,
             token_source_env,
             cache_dir: None,
         }
@@ -220,6 +221,8 @@ struct RawEmbeddingConfig {
     pooling: Option<PoolingKind>,
     #[serde(default)]
     query_prefix: Option<String>,
+    #[serde(default)]
+    quantization: Option<QuantizationKind>,
     #[serde(default)]
     token_source: Option<EmbeddingTokenSource>,
 }
@@ -652,6 +655,7 @@ fn embedding_config_from_raw(raw: &RawEmbeddingConfig) -> EmbeddingConfig {
         file: raw.file.clone(),
         pooling: raw.pooling,
         query_prefix: raw.query_prefix.clone(),
+        quantization: raw.quantization,
         token_source: raw.token_source.clone(),
     }
 }
@@ -1050,23 +1054,46 @@ fn parse_embedding_config(raw: &RawEmbeddingConfig) -> Result<(), QghError> {
             || raw.file.is_some()
             || raw.pooling.is_some()
             || raw.query_prefix.is_some()
+            || raw.quantization.is_some()
             || raw.token_source.is_some()
         {
             return Err(QghError::config(
-                "Embedding manifest_path cannot be combined with legacy model, model_path, file, pooling, query_prefix, or token_source fields.",
+                "Embedding manifest_path cannot be combined with legacy model, model_path, file, pooling, query_prefix, quantization, or token_source fields.",
             ));
         }
-        PreparedModelStore::new(PathBuf::new())
-            .load_manifest(manifest_path)
-            .map_err(|error| {
-                QghError::validation(error.code(), error.message())
-                    .with_details(error.details().clone())
-            })?;
+        let options = FastembedProviderOptions {
+            manifest_path: Some(manifest_path.clone()),
+            model: None,
+            model_path: None,
+            file: None,
+            pooling: None,
+            query_prefix: None,
+            quantization: None,
+            token_source_env: None,
+            cache_dir: None,
+        };
+        let prepared = match default_prepared_model_store() {
+            Ok(store) => store.load(&options),
+            Err(_) => PreparedModelStore::new(PathBuf::new()).load_manifest(manifest_path),
+        };
+        match prepared {
+            Ok(_) => {}
+            Err(error) if error.code() == "embedding.prepared_snapshot_missing" => {}
+            Err(error) => {
+                return Err(QghError::validation(error.code(), error.message())
+                    .with_details(error.details().clone()));
+            }
+        }
         return Ok(());
     }
     if raw.model.is_some() && raw.model_path.is_some() {
         return Err(QghError::config(
             "Embedding config must use only one of `model` or `model_path`.",
+        ));
+    }
+    if raw.model_path.is_some() && raw.quantization.is_none() {
+        return Err(QghError::config(
+            "Legacy embedding model_path requires explicit quantization = \"none\" or \"static\".",
         ));
     }
     if let Some(model) = raw.model.as_deref() {
@@ -1207,6 +1234,7 @@ mod tests {
             file: None,
             pooling: None,
             query_prefix: None,
+            quantization: None,
             token_source: None,
         };
         let mut with_model = base.clone();

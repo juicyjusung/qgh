@@ -617,7 +617,10 @@ impl PreparedModelStore {
         options: &FastembedProviderOptions,
     ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
         if let Some(manifest_path) = &options.manifest_path {
-            return self.load_manifest(manifest_path);
+            let source = self.load_manifest(manifest_path)?;
+            let manifest = source.manifest.clone();
+            let artifacts = runtime_artifact_sources_from_prepared(&source);
+            return self.materialize(options, manifest, artifacts);
         }
         if let Some(model_path) = &options.model_path {
             let snapshot = resolve_model_path_snapshot(
@@ -645,7 +648,7 @@ impl PreparedModelStore {
                 native_dimension: contract.native_dimension,
                 output_dimension: contract.output_dimension,
                 max_length: contract.max_length,
-                quantization: quantization_for_file(&snapshot.model_file),
+                quantization: required_legacy_quantization(options)?,
                 context_template_version: "qgh.context.none.v1".to_string(),
             };
             return self.materialize(options, manifest, runtime_artifact_sources(&snapshot)?);
@@ -667,16 +670,19 @@ impl PreparedModelStore {
         &self,
         options: &FastembedProviderOptions,
     ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
-        if let Some(manifest_path) = &options.manifest_path {
-            return self.load_manifest(manifest_path);
-        }
-        let bytes = fs::read(self.alias_path(options)).map_err(|error| {
-            EmbeddingProviderError::structured(
-                "embedding.prepared_snapshot_missing",
-                "No prepared local model snapshot is available.",
-            )
-            .with_details(json!({ "error": error.to_string() }))
-        })?;
+        let bytes = match fs::read(self.alias_path(options)) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if let Some(manifest_path) = &options.manifest_path {
+                    self.load_manifest(manifest_path)?;
+                }
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.prepared_snapshot_missing",
+                    "No prepared local model snapshot is available.",
+                )
+                .with_details(json!({ "error": error.to_string() })));
+            }
+        };
         let alias: PreparedModelAliasV1 = serde_json::from_slice(&bytes).map_err(|error| {
             EmbeddingProviderError::structured(
                 "embedding.prepared_alias_invalid",
@@ -874,9 +880,23 @@ impl PreparedModelStore {
     ) -> Result<PreparedModelSnapshot, EmbeddingProviderError> {
         let configured_model = options.model.as_deref();
         let explicit_preset = configured_model.and_then(builtin_preset);
-        let default_preset = configured_model
-            .is_none()
-            .then(|| builtin_preset("arctic-l-v2-fp32").expect("default preset is registered"));
+        if explicit_preset.is_some()
+            && (options.file.is_some()
+                || options.pooling.is_some()
+                || options.query_prefix.is_some()
+                || options.quantization.is_some())
+        {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.preset_override_forbidden",
+                "Built-in preset runtime behavior cannot be overridden.",
+            ));
+        }
+        let default_preset = (configured_model.is_none()
+            && options.file.is_none()
+            && options.pooling.is_none()
+            && options.query_prefix.is_none()
+            && options.quantization.is_none())
+        .then(|| builtin_preset("arctic-l-v2-fp32").expect("default preset is registered"));
         if let Some(preset) = explicit_preset.or(default_preset) {
             return self.acquire_builtin_preset(options, preset);
         }
@@ -928,7 +948,7 @@ impl PreparedModelStore {
             native_dimension: contract.native_dimension,
             output_dimension: contract.output_dimension,
             max_length: contract.max_length,
-            quantization: quantization_for_file(&snapshot.model_file),
+            quantization: required_legacy_quantization(options)?,
             context_template_version: "qgh.context.none.v1".to_string(),
         };
         self.materialize(options, manifest, runtime_artifact_sources(&snapshot)?)
@@ -1129,15 +1149,16 @@ fn find_prompt(value: &Value, name: &str) -> Option<String> {
     }
 }
 
-fn quantization_for_file(file: &str) -> QuantizationKind {
-    let lower = file.to_ascii_lowercase();
-    if lower.contains("quint8") || lower.contains("qint8") || lower.contains("static") {
-        QuantizationKind::Static
-    } else if lower.contains("quantized") || lower.contains("dynamic") {
-        QuantizationKind::Dynamic
-    } else {
-        QuantizationKind::None
-    }
+fn required_legacy_quantization(
+    options: &FastembedProviderOptions,
+) -> Result<QuantizationKind, EmbeddingProviderError> {
+    options.quantization.ok_or_else(|| {
+        EmbeddingProviderError::structured(
+            "embedding.legacy_quantization_required",
+            "Legacy model configuration must explicitly declare quantization.",
+        )
+        .with_hint("Set quantization to `none` or `static`, or use embedding.manifest_path.")
+    })
 }
 
 fn runtime_artifact_sources(
@@ -1180,6 +1201,22 @@ fn runtime_artifact_sources(
     Ok(sources)
 }
 
+fn runtime_artifact_sources_from_prepared(
+    snapshot: &PreparedModelSnapshot,
+) -> Vec<RuntimeArtifactSource> {
+    snapshot
+        .manifest
+        .artifacts
+        .iter()
+        .map(|artifact| RuntimeArtifactSource {
+            role: artifact.role,
+            relative_path: artifact.relative_path.clone(),
+            source_path: snapshot.root.join(&artifact.relative_path),
+            external_initializer_name: artifact.external_initializer_name.clone(),
+        })
+        .collect()
+}
+
 fn required_path_from_resolved<'a>(
     snapshot: &'a ResolvedModelSnapshot,
     file: &str,
@@ -1195,13 +1232,14 @@ fn required_path_from_resolved<'a>(
 
 fn prepared_request_key(options: &FastembedProviderOptions) -> String {
     let identity = format!(
-        "manifest={:?}\nmodel={:?}\nmodel_path={:?}\nfile={:?}\npooling={:?}\nquery_prefix={:?}",
+        "manifest={:?}\nmodel={:?}\nmodel_path={:?}\nfile={:?}\npooling={:?}\nquery_prefix={:?}\nquantization={:?}",
         options.manifest_path,
         options.model,
         options.model_path,
         options.file,
         options.pooling,
-        options.query_prefix
+        options.query_prefix,
+        options.quantization
     );
     hex_digest(&Sha256::digest(identity.as_bytes()))
 }
@@ -1242,6 +1280,7 @@ pub struct FastembedProviderOptions {
     pub file: Option<String>,
     pub pooling: Option<PoolingKind>,
     pub query_prefix: Option<String>,
+    pub quantization: Option<QuantizationKind>,
     pub token_source_env: Option<String>,
     pub cache_dir: Option<PathBuf>,
 }
@@ -1255,6 +1294,7 @@ impl Default for FastembedProviderOptions {
             file: None,
             pooling: None,
             query_prefix: None,
+            quantization: None,
             token_source_env: None,
             cache_dir: None,
         }
@@ -1372,6 +1412,9 @@ fn preset_for_compatible_legacy_hf(
                 && options
                     .pooling
                     .is_none_or(|pooling| pooling == preset.pooling)
+                && options
+                    .quantization
+                    .is_none_or(|quantization| quantization == preset.quantization)
                 && options.query_prefix.as_deref().is_none_or(|prefix| {
                     preset
                         .query_prefix
@@ -2715,6 +2758,7 @@ mod tests {
             file: Some("model.onnx".to_string()),
             pooling: Some(PoolingKind::Cls),
             query_prefix: Some(String::new()),
+            quantization: Some(QuantizationKind::None),
             token_source_env: None,
             cache_dir: None,
         };
@@ -2730,6 +2774,114 @@ mod tests {
             .path_for_role(ArtifactRole::OnnxModel)
             .unwrap()
             .is_file());
+    }
+
+    #[test]
+    fn acquire_explicit_manifest_copies_snapshot_and_load_ignores_source_mutation() {
+        let source = temp_dir("qgh-explicit-manifest-source");
+        let declarations = [
+            (
+                ArtifactRole::OnnxModel,
+                "model.onnx",
+                b"original-graph".as_slice(),
+            ),
+            (ArtifactRole::Tokenizer, "tokenizer.json", b"{}".as_slice()),
+            (ArtifactRole::Config, "config.json", b"{}".as_slice()),
+            (
+                ArtifactRole::SpecialTokensMap,
+                "special_tokens_map.json",
+                b"{}".as_slice(),
+            ),
+            (
+                ArtifactRole::TokenizerConfig,
+                "tokenizer_config.json",
+                b"{}".as_slice(),
+            ),
+        ];
+        let artifacts = declarations
+            .into_iter()
+            .map(|(role, relative_path, bytes)| {
+                fs::write(source.join(relative_path), bytes).unwrap();
+                fixture_artifact(role, relative_path, bytes, None)
+            })
+            .collect();
+        let manifest_path = source.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&fixture_manifest(artifacts)).unwrap(),
+        )
+        .unwrap();
+        let options = FastembedProviderOptions {
+            manifest_path: Some(manifest_path.clone()),
+            model: None,
+            model_path: None,
+            file: None,
+            pooling: None,
+            query_prefix: None,
+            quantization: None,
+            token_source_env: None,
+            cache_dir: None,
+        };
+        let store = PreparedModelStore::new(temp_dir("qgh-explicit-manifest-store"));
+
+        let acquired = store.acquire(&options).unwrap();
+        assert_ne!(acquired.root, fs::canonicalize(&source).unwrap());
+        fs::write(source.join("model.onnx"), b"mutated-graph").unwrap();
+        fs::remove_file(manifest_path).unwrap();
+
+        let loaded = store.load(&options).unwrap();
+        assert_eq!(loaded.manifest.hash(), acquired.manifest.hash());
+        assert_eq!(
+            fs::read(loaded.path_for_role(ArtifactRole::OnnxModel).unwrap()).unwrap(),
+            b"original-graph"
+        );
+    }
+
+    #[test]
+    fn legacy_model_path_rejects_declared_dynamic_with_plain_model_filename() {
+        let source = temp_dir("qgh-legacy-dynamic-source");
+        fs::write(source.join("model.onnx"), b"dynamic-graph").unwrap();
+        fs::write(source.join("tokenizer.json"), b"{}").unwrap();
+        fs::write(
+            source.join("config.json"),
+            br#"{"hidden_size":4,"max_position_embeddings":32}"#,
+        )
+        .unwrap();
+        fs::write(source.join("special_tokens_map.json"), b"{}").unwrap();
+        fs::write(
+            source.join("tokenizer_config.json"),
+            br#"{"model_max_length":32}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("modules.json"),
+            br#"[
+                {"type":"sentence_transformers.models.Normalize"},
+                {"prompts":{"query":"","document":""}}
+            ]"#,
+        )
+        .unwrap();
+        let options = FastembedProviderOptions {
+            manifest_path: None,
+            model: None,
+            model_path: Some(source),
+            file: Some("model.onnx".to_string()),
+            pooling: Some(PoolingKind::Cls),
+            query_prefix: Some(String::new()),
+            quantization: Some(QuantizationKind::Dynamic),
+            token_source_env: None,
+            cache_dir: None,
+        };
+
+        let store = PreparedModelStore::new(temp_dir("qgh-legacy-dynamic-store"));
+        let error = store.acquire(&options).unwrap_err();
+
+        assert_eq!(error.code(), "embedding.dynamic_quantization_unsupported");
+
+        let mut undeclared = options;
+        undeclared.quantization = None;
+        let error = store.acquire(&undeclared).unwrap_err();
+        assert_eq!(error.code(), "embedding.legacy_quantization_required");
     }
 
     #[test]
