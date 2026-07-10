@@ -2113,7 +2113,9 @@ impl Store {
             ))
         })?;
         let mut invalid = false;
+        let mut validated_rows = 0i64;
         for row in rows {
+            validated_rows += 1;
             let (
                 bytes,
                 checksum,
@@ -2143,7 +2145,7 @@ impl Store {
             }
         }
         drop(stmt);
-        if invalid {
+        if invalid || validated_rows != total_chunks {
             return self.fail_embedding_generation(
                 generation_id,
                 "embedding.generation_validation_failed",
@@ -3881,6 +3883,40 @@ mod tests {
             Some(second_generation)
         );
         assert_eq!(publication_view.output_dimension, Some(3));
+        let missing_generation = store
+            .begin_embedding_generation(&EmbeddingGenerationSpec {
+                model_manifest_hash: "manifest-missing".to_string(),
+                ..second_spec.clone()
+            })
+            .unwrap();
+        store
+            .stage_embedding_generation_batch(
+                missing_generation,
+                &[EmbeddingGenerationChunk {
+                    chunk_id,
+                    source_version_id,
+                    source_version_hash: "body-hash-generation-sync".to_string(),
+                    context_hash: embedding_context_hash(
+                        "manifest-missing",
+                        "chunker-a",
+                        "context-v1",
+                        "alpha beta",
+                    ),
+                    vector: vec![1.0, 2.0, 3.0],
+                }],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM chunks WHERE id = ?1", params![chunk_id])
+            .unwrap();
+        assert_eq!(
+            store
+                .validate_embedding_generation(missing_generation)
+                .unwrap_err()
+                .code,
+            "embedding.generation_validation_failed"
+        );
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
