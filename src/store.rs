@@ -934,13 +934,14 @@ impl Store {
             [],
         )?;
         let content_write_epoch = read_content_write_epoch(&tx)?;
+        let completed_at = now_rfc3339();
         let changed = tx.execute(
             "UPDATE purge_requests
              SET purge_pending = 0, failure_stage = NULL, updated_at = ?3
              WHERE target_kind = ?1 AND target_value = ?2
                AND purge_pending = 1 AND completion_ready = 1
                AND current_stage = 'finalize'",
-            params![kind, value, now_rfc3339()],
+            params![kind, value, completed_at],
         )?;
         if changed != 1 {
             return Err(purge_error());
@@ -948,6 +949,23 @@ impl Store {
         if let PurgeTarget::Repository { repo } = target {
             tx.execute("DELETE FROM repositories WHERE repo = ?1", params![repo])?;
         }
+        tx.execute(
+            "INSERT INTO purge_requests
+                (target_kind, target_value, trigger, purge_pending,
+                 current_stage, failure_stage, completion_ready, created_at, updated_at)
+             SELECT 'source', pts.source_id, parent.trigger, 0,
+                    'finalize', NULL, 1, ?3, ?3
+             FROM purge_target_sources pts
+             JOIN purge_requests parent
+               ON parent.target_kind = pts.target_kind
+              AND parent.target_value = pts.target_value
+             WHERE pts.target_kind = ?1 AND pts.target_value = ?2
+               AND parent.purge_pending = 0
+               AND parent.current_stage = 'finalize'
+               AND parent.completion_ready = 1
+             ON CONFLICT(target_kind, target_value) DO NOTHING",
+            params![kind, value, completed_at],
+        )?;
         tx.execute(
             "DELETE FROM purge_target_sources
              WHERE target_kind = ?1 AND target_value = ?2",
@@ -1428,44 +1446,10 @@ impl Store {
     }
 
     fn purge_target_has_sensitive_content(&self, target: &PurgeTarget) -> Result<bool, QghError> {
-        for source_id in self.purge_target_source_ids(target)? {
-            let lifecycle_state: String = self.conn.query_row(
-                "SELECT lifecycle_state FROM source_entities WHERE source_id = ?1",
-                params![source_id],
-                |row| row.get(0),
-            )?;
-            if lifecycle_state == "purge_pending" {
-                return Ok(true);
-            }
-            for table in ["issue_metadata", "comment_metadata", "source_versions"] {
-                if self
-                    .conn
-                    .query_row(
-                        &format!("SELECT 1 FROM {table} WHERE source_id = ?1 LIMIT 1"),
-                        params![source_id],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some()
-                {
-                    return Ok(true);
-                }
-            }
-            if table_exists(&self.conn, "chunks")?
-                && self
-                    .conn
-                    .query_row(
-                        "SELECT 1 FROM chunks WHERE source_id = ?1 LIMIT 1",
-                        params![source_id],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some()
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        // The durable target mapping is captured before destructive work. Its
+        // presence is sufficient proof that a managed Tantivy generation may
+        // still contain the target even if SQLite cleanup was partially done.
+        Ok(!self.purge_target_source_ids(target)?.is_empty())
     }
 
     fn purge_target_source_ids(&self, target: &PurgeTarget) -> Result<Vec<String>, QghError> {
@@ -4966,6 +4950,7 @@ impl Store {
              WHERE reason IN ('not_found', 'gone', 'moved', 'permission_denied')",
             [],
         )?;
+        self.queue_untracked_legacy_tombstones()?;
         self.conn.execute(
             "INSERT INTO schema_migrations (version, applied_at)
              VALUES (?1, ?2)
@@ -4979,6 +4964,93 @@ impl Store {
             params!["qgh.purge.v1", now_rfc3339()],
         )?;
         Ok(())
+    }
+
+    fn queue_untracked_legacy_tombstones(&self) -> Result<usize, QghError> {
+        type LegacyTombstoneCandidate = (String, String, String, String, String);
+        let candidates = (|| -> Result<Vec<LegacyTombstoneCandidate>, rusqlite::Error> {
+            let mut stmt = self.conn.prepare(
+                "SELECT t.source_id, t.reason, se.host, se.entity_type, se.node_id
+                 FROM tombstones t
+                 JOIN source_entities se ON se.source_id = t.source_id
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM purge_requests pr
+                     WHERE pr.target_kind = 'source'
+                       AND pr.target_value = t.source_id
+                 )
+                 ORDER BY t.source_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })()
+        .map_err(|_| purge_error())?;
+        let now = now_rfc3339();
+        let mut inserted = 0;
+        for (source_id, reason, host, entity_type, node_id) in candidates {
+            let canonical_entity_type = match entity_type.as_str() {
+                "issue" => "issue",
+                "issue_comment" => "issue-comment",
+                _ => continue,
+            };
+            let target = PurgeTarget::Source {
+                source_id: source_id.clone(),
+            };
+            if source_id != format!("qgh://{host}/{canonical_entity_type}/{node_id}")
+                || validate_purge_target(&target).is_err()
+            {
+                continue;
+            }
+            let trigger = match reason.as_str() {
+                "transferred" => PurgeTrigger::ConfirmedTombstone,
+                "permission_loss" => PurgeTrigger::PermissionLoss,
+                "allowlist_removal" => PurgeTrigger::AllowlistRemoval,
+                _ => PurgeTrigger::ConfirmedDelete,
+            };
+            let changed = self
+                .conn
+                .execute(
+                    "INSERT INTO purge_requests
+                        (target_kind, target_value, trigger, purge_pending,
+                         current_stage, failure_stage, completion_ready, created_at, updated_at)
+                     VALUES ('source', ?1, ?2, 1, 'secure_delete', NULL, 0, ?3, ?3)
+                     ON CONFLICT(target_kind, target_value) DO NOTHING",
+                    params![source_id, trigger.as_str(), now],
+                )
+                .map_err(|_| purge_error())?;
+            if changed == 0 {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "INSERT INTO purge_target_sources
+                        (target_kind, target_value, source_id)
+                     VALUES ('source', ?1, ?1)
+                     ON CONFLICT(target_kind, target_value, source_id) DO NOTHING",
+                    params![source_id],
+                )
+                .map_err(|_| purge_error())?;
+            inserted += 1;
+        }
+        if inserted > 0 {
+            self.conn
+                .execute(
+                    "UPDATE profile_meta
+                     SET value = CAST(value AS INTEGER) + 1
+                     WHERE key = 'content_write_epoch'",
+                    [],
+                )
+                .map_err(|_| purge_error())?;
+            invalidate_publications_for_pending_purge(&self.conn).map_err(|_| purge_error())?;
+        }
+        Ok(inserted)
     }
 }
 
@@ -5544,14 +5616,12 @@ fn read_fence_error() -> QghError {
     )
 }
 
-fn invalidate_publications_for_pending_purge(
-    tx: &rusqlite::Transaction<'_>,
-) -> Result<(), QghError> {
-    tx.execute("DELETE FROM retrieval_publication_pointer", [])?;
-    tx.execute("UPDATE retrieval_publications SET active = 0", [])?;
-    tx.execute("UPDATE index_generations SET active = 0", [])?;
-    if table_exists(tx, "embedding_generations")? {
-        tx.execute(
+fn invalidate_publications_for_pending_purge(conn: &Connection) -> Result<(), QghError> {
+    conn.execute("DELETE FROM retrieval_publication_pointer", [])?;
+    conn.execute("UPDATE retrieval_publications SET active = 0", [])?;
+    conn.execute("UPDATE index_generations SET active = 0", [])?;
+    if table_exists(conn, "embedding_generations")? {
+        conn.execute(
             "UPDATE embedding_generations SET state = 'ready'
              WHERE state = 'active'",
             [],
@@ -5756,6 +5826,466 @@ mod tests {
             "confirmed_tombstone"
         );
         assert_eq!(PurgeFailureStage::WalCheckpoint.as_str(), "wal_checkpoint");
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn legacy_tombstone_is_queued_on_reopen_then_retry_purges_residual_state() {
+        let paths = temp_profile_paths("purge-legacy-tombstone-migration");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_LEGACY_TOMBSTONE";
+        let marker = "PRIVATE_LEGACY_TOMBSTONE_MARKER_38c1";
+        store
+            .upsert_sources_for_run(
+                "sync-legacy-tombstone-migration",
+                &[test_issue(source_id, "owner/repo", marker)],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let chunk_id = insert_chunk(&mut store, source_id, marker);
+        let embedding_generation =
+            stage_test_generation(&mut store, "manifest-legacy-tombstone", &[chunk_id]);
+        let (tantivy_generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        fs::create_dir_all(&generation_path).unwrap();
+        fs::write(generation_path.join("segment"), marker).unwrap();
+        store
+            .activate_retrieval_publication(
+                "sync-legacy-tombstone-migration",
+                tantivy_generation,
+                Some(embedding_generation),
+                None,
+            )
+            .unwrap();
+        store.tombstone_source(source_id, "transferred").unwrap();
+        let epoch_before = read_content_write_epoch(&store.conn).unwrap();
+        assert!(store.pending_purges().unwrap().is_empty());
+        assert!(generation_path.join("segment").exists());
+        drop(store);
+
+        let mut reopened = Store::open(&paths).unwrap();
+        reopened.enable_vector().unwrap();
+
+        assert_eq!(
+            reopened.pending_purges().unwrap(),
+            vec![PendingPurgeView {
+                target: PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                trigger: PurgeTrigger::ConfirmedTombstone,
+                current_stage: PurgeFailureStage::SecureDelete,
+                failure_stage: None,
+            }]
+        );
+        assert_eq!(
+            read_content_write_epoch(&reopened.conn).unwrap(),
+            epoch_before + 1
+        );
+        assert!(reopened.active_retrieval_publication().unwrap().is_none());
+        assert!(generation_path.join("segment").exists());
+        assert!(reopened
+            .embedding_generation_state(embedding_generation)
+            .is_ok());
+        let residual_versions: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT count(*) FROM source_versions WHERE source_id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(residual_versions, 1);
+
+        let outcomes = reopened.retry_pending_purges().unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].purged_sources, 1);
+        assert!(reopened.pending_purges().unwrap().is_empty());
+        assert!(!generation_path.exists());
+        assert!(reopened
+            .embedding_generation_state(embedding_generation)
+            .is_err());
+        let residual_versions: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT count(*) FROM source_versions WHERE source_id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(residual_versions, 0);
+        assert_eq!(
+            reopened.get_tombstone(source_id).unwrap().unwrap().reason,
+            "transferred"
+        );
+
+        drop(reopened);
+        let db_bytes = fs::read(&paths.db_path).unwrap();
+        assert!(!db_bytes
+            .windows(marker.len())
+            .any(|bytes| bytes == marker.as_bytes()));
+        let wal_path = PathBuf::from(format!("{}-wal", paths.db_path.display()));
+        if wal_path.exists() {
+            let wal_bytes = fs::read(wal_path).unwrap();
+            assert!(!wal_bytes
+                .windows(marker.len())
+                .any(|bytes| bytes == marker.as_bytes()));
+        }
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn legacy_comment_tombstone_is_queued_with_canonical_source_target() {
+        let paths = temp_profile_paths("purge-legacy-comment-tombstone");
+        let mut store = Store::open(&paths).unwrap();
+        let issue_id = "qgh://github.com/issue/I_PURGE_LEGACY_COMMENT_PARENT";
+        let comment_id = "qgh://github.com/issue-comment/IC_PURGE_LEGACY_COMMENT_TARGET";
+        store
+            .upsert_sources_for_run(
+                "sync-legacy-comment-tombstone",
+                &[test_issue(issue_id, "owner/repo", "comment-parent")],
+                &[test_comment(
+                    comment_id,
+                    issue_id,
+                    "owner/repo",
+                    "comment-target",
+                )],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .tombstone_source(comment_id, "permission_loss")
+            .unwrap();
+        let epoch_before = read_content_write_epoch(&store.conn).unwrap();
+        drop(store);
+
+        let reopened = Store::open(&paths).unwrap();
+
+        assert_eq!(
+            reopened.pending_purges().unwrap(),
+            vec![PendingPurgeView {
+                target: PurgeTarget::Source {
+                    source_id: comment_id.to_string(),
+                },
+                trigger: PurgeTrigger::PermissionLoss,
+                current_stage: PurgeFailureStage::SecureDelete,
+                failure_stage: None,
+            }]
+        );
+        assert_eq!(
+            read_content_write_epoch(&reopened.conn).unwrap(),
+            epoch_before + 1
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn legacy_tombstone_batch_maps_reasons_and_bumps_epoch_once() {
+        let paths = temp_profile_paths("purge-legacy-tombstone-batch");
+        let mut store = Store::open(&paths).unwrap();
+        let moved_id = "qgh://github.com/issue/I_LEGACY_BATCH_A_MOVED";
+        let permission_id = "qgh://github.com/issue/I_LEGACY_BATCH_B_PERMISSION";
+        let allowlist_id = "qgh://github.com/issue/I_LEGACY_BATCH_C_ALLOWLIST";
+        let deleted_id = "qgh://github.com/issue/I_LEGACY_BATCH_D_DELETED";
+        store
+            .upsert_sources_for_run(
+                "sync-legacy-tombstone-batch",
+                &[
+                    test_issue(moved_id, "owner/moved", "batch-moved"),
+                    test_issue(permission_id, "owner/permission", "batch-permission"),
+                    test_issue(allowlist_id, "owner/allowlist", "batch-allowlist"),
+                    test_issue(deleted_id, "owner/deleted", "batch-deleted"),
+                ],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        for (source_id, reason) in [
+            (moved_id, "moved"),
+            (permission_id, "permission_denied"),
+            (allowlist_id, "allowlist_removal"),
+            (deleted_id, "gone"),
+        ] {
+            store.tombstone_source(source_id, reason).unwrap();
+        }
+        let epoch_before = read_content_write_epoch(&store.conn).unwrap();
+        drop(store);
+
+        let reopened = Store::open(&paths).unwrap();
+
+        assert_eq!(
+            reopened.pending_purges().unwrap(),
+            vec![
+                PendingPurgeView {
+                    target: PurgeTarget::Source {
+                        source_id: moved_id.to_string(),
+                    },
+                    trigger: PurgeTrigger::ConfirmedTombstone,
+                    current_stage: PurgeFailureStage::SecureDelete,
+                    failure_stage: None,
+                },
+                PendingPurgeView {
+                    target: PurgeTarget::Source {
+                        source_id: permission_id.to_string(),
+                    },
+                    trigger: PurgeTrigger::PermissionLoss,
+                    current_stage: PurgeFailureStage::SecureDelete,
+                    failure_stage: None,
+                },
+                PendingPurgeView {
+                    target: PurgeTarget::Source {
+                        source_id: allowlist_id.to_string(),
+                    },
+                    trigger: PurgeTrigger::AllowlistRemoval,
+                    current_stage: PurgeFailureStage::SecureDelete,
+                    failure_stage: None,
+                },
+                PendingPurgeView {
+                    target: PurgeTarget::Source {
+                        source_id: deleted_id.to_string(),
+                    },
+                    trigger: PurgeTrigger::ConfirmedDelete,
+                    current_stage: PurgeFailureStage::SecureDelete,
+                    failure_stage: None,
+                },
+            ]
+        );
+        assert_eq!(
+            read_content_write_epoch(&reopened.conn).unwrap(),
+            epoch_before + 1
+        );
+        let mapped_count: i64 = reopened
+            .conn
+            .query_row("SELECT count(*) FROM purge_target_sources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(mapped_count, 4);
+        let issue_metadata_count: i64 = reopened
+            .conn
+            .query_row("SELECT count(*) FROM issue_metadata", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(issue_metadata_count, 4);
+        for (source_id, reason) in [
+            (moved_id, "transferred"),
+            (permission_id, "permission_loss"),
+            (allowlist_id, "allowlist_removal"),
+            (deleted_id, "deleted"),
+        ] {
+            assert_eq!(
+                reopened.get_tombstone(source_id).unwrap().unwrap().reason,
+                reason
+            );
+        }
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn legacy_tombstone_batch_failure_is_atomic_and_content_free() {
+        let paths = temp_profile_paths("purge-legacy-tombstone-batch-failure");
+        let mut store = Store::open(&paths).unwrap();
+        let first_id = "qgh://github.com/issue/I_LEGACY_ATOMIC_A";
+        let second_id = "qgh://github.com/issue/I_LEGACY_ATOMIC_B";
+        let private_failure = "PRIVATE_LEGACY_MIGRATION_FAILURE_5f2a";
+        store
+            .upsert_sources_for_run(
+                "sync-legacy-tombstone-batch-failure",
+                &[
+                    test_issue(first_id, "owner/first", "atomic-first"),
+                    test_issue(second_id, "owner/second", "atomic-second"),
+                ],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store.tombstone_source(first_id, "moved").unwrap();
+        store
+            .tombstone_source(second_id, "permission_denied")
+            .unwrap();
+        let epoch_before = read_content_write_epoch(&store.conn).unwrap();
+        store
+            .conn
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_legacy_purge_queue
+                 BEFORE INSERT ON purge_requests
+                 WHEN NEW.target_value = '{second_id}'
+                 BEGIN
+                     SELECT RAISE(ABORT, '{private_failure}');
+                 END;"
+            ))
+            .unwrap();
+        drop(store);
+
+        let error = match Store::open(&paths) {
+            Ok(_) => panic!("legacy tombstone migration unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "purge.failed");
+        let serialized = serde_json::to_string(&error).unwrap();
+        assert!(!serialized.contains(private_failure));
+        assert!(!serialized.contains(first_id));
+        assert!(!serialized.contains(second_id));
+        let conn = Connection::open(&paths.db_path).unwrap();
+        let queued: i64 = conn
+            .query_row("SELECT count(*) FROM purge_requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(queued, 0);
+        let mapped: i64 = conn
+            .query_row("SELECT count(*) FROM purge_target_sources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(mapped, 0);
+        assert_eq!(read_content_write_epoch(&conn).unwrap(), epoch_before);
+        assert_eq!(
+            conn.query_row(
+                "SELECT reason FROM tombstones WHERE source_id = ?1",
+                params![first_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "moved"
+        );
+        conn.execute_batch("DROP TRIGGER fail_legacy_purge_queue")
+            .unwrap();
+        drop(conn);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn legacy_tombstone_migration_does_not_reset_existing_pending_source_request() {
+        let paths = temp_profile_paths("purge-legacy-existing-pending");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_LEGACY_EXISTING_PENDING";
+        store
+            .upsert_sources_for_run(
+                "sync-legacy-existing-pending",
+                &[test_issue(source_id, "owner/repo", "existing-pending")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .tombstone_source(source_id, "permission_loss")
+            .unwrap();
+        store
+            .conn
+            .pragma_update(None, "secure_delete", "OFF")
+            .unwrap();
+        store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap_err();
+        let request_before: (String, i64, String, Option<String>, i64, String, String) = store
+            .conn
+            .query_row(
+                "SELECT trigger, purge_pending, current_stage, failure_stage,
+                        completion_ready, created_at, updated_at
+                 FROM purge_requests
+                 WHERE target_kind = 'source' AND target_value = ?1",
+                params![source_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let epoch_before = read_content_write_epoch(&store.conn).unwrap();
+        drop(store);
+
+        let reopened = Store::open(&paths).unwrap();
+
+        let request_after: (String, i64, String, Option<String>, i64, String, String) = reopened
+            .conn
+            .query_row(
+                "SELECT trigger, purge_pending, current_stage, failure_stage,
+                        completion_ready, created_at, updated_at
+                 FROM purge_requests
+                 WHERE target_kind = 'source' AND target_value = ?1",
+                params![source_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(request_after, request_before);
+        assert_eq!(
+            reopened.pending_purges().unwrap(),
+            vec![PendingPurgeView {
+                target: PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                trigger: PurgeTrigger::ConfirmedDelete,
+                current_stage: PurgeFailureStage::SecureDelete,
+                failure_stage: Some(PurgeFailureStage::SecureDelete),
+            }]
+        );
+        assert_eq!(
+            read_content_write_epoch(&reopened.conn).unwrap(),
+            epoch_before
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn empty_store_reopen_does_not_create_purge_work_or_bump_epoch() {
+        let paths = temp_profile_paths("purge-empty-store-migration-noop");
+        let store = Store::open(&paths).unwrap();
+        let epoch_before = read_content_write_epoch(&store.conn).unwrap();
+        assert_eq!(epoch_before, 0);
+        drop(store);
+
+        let reopened = Store::open(&paths).unwrap();
+
+        assert_eq!(read_content_write_epoch(&reopened.conn).unwrap(), 0);
+        assert!(reopened.pending_purges().unwrap().is_empty());
+        let request_count: i64 = reopened
+            .conn
+            .query_row("SELECT count(*) FROM purge_requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(request_count, 0);
+        let mapping_count: i64 = reopened
+            .conn
+            .query_row("SELECT count(*) FROM purge_target_sources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(mapping_count, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
     #[test]
@@ -7063,6 +7593,72 @@ mod tests {
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
+    #[test]
+    fn mapped_partially_cleaned_tombstone_still_discards_tantivy() {
+        let paths = temp_profile_paths("purge-partially-cleaned-tombstone-tantivy");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_PURGE_PARTIAL_TOMBSTONE";
+        let marker = "PRIVATE_PARTIAL_TOMBSTONE_TANTIVY_8a51";
+        store
+            .upsert_sources_for_run(
+                "sync-partially-cleaned-tombstone",
+                &[test_issue(source_id, "owner/repo", marker)],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let (generation, generation_path) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        fs::create_dir_all(&generation_path).unwrap();
+        fs::write(generation_path.join("segment"), marker).unwrap();
+        store
+            .activate_retrieval_publication(
+                "sync-partially-cleaned-tombstone",
+                generation,
+                None,
+                None,
+            )
+            .unwrap();
+        store.tombstone_source(source_id, "deleted").unwrap();
+        for table in [
+            "issue_metadata",
+            "source_versions",
+            "source_aliases",
+            "index_tasks",
+        ] {
+            store
+                .conn
+                .execute(
+                    &format!("DELETE FROM {table} WHERE source_id = ?1"),
+                    params![source_id],
+                )
+                .unwrap();
+        }
+        assert!(store.get_tombstone(source_id).unwrap().is_some());
+        assert!(generation_path.join("segment").exists());
+
+        let outcome = store
+            .purge(
+                PurgeTarget::Source {
+                    source_id: source_id.to_string(),
+                },
+                PurgeTrigger::ConfirmedDelete,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.discarded_tantivy_generations, 1);
+        assert!(!generation_path.exists());
+        assert!(store
+            .index_path_for_generation(generation)
+            .unwrap()
+            .is_none());
+        assert!(store.pending_purges().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn purge_rejects_symlinked_index_root_without_touching_external_files() {
@@ -7774,6 +8370,42 @@ mod tests {
             publication
         );
 
+        let epoch_before_reopen = read_content_write_epoch(&store.conn).unwrap();
+        drop(store);
+        let reopened = Store::open(&paths).unwrap();
+        assert!(reopened.pending_purges().unwrap().is_empty());
+        assert_eq!(
+            read_content_write_epoch(&reopened.conn).unwrap(),
+            epoch_before_reopen
+        );
+        assert_eq!(
+            reopened
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            publication
+        );
+        let source_completion: (String, bool, String, bool) = reopened
+            .conn
+            .query_row(
+                "SELECT trigger, purge_pending, current_stage, completion_ready
+                 FROM purge_requests
+                 WHERE target_kind = 'source' AND target_value = ?1",
+                params![target_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            source_completion,
+            (
+                "allowlist_removal".to_string(),
+                false,
+                "finalize".to_string(),
+                true,
+            )
+        );
+
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
@@ -7839,6 +8471,28 @@ mod tests {
                 PurgeTrigger::ConfirmedDelete,
             )
             .unwrap();
+        let completion_evidence_before: (String, i64, String, Option<String>, i64, String, String) =
+            store
+                .conn
+                .query_row(
+                    "SELECT trigger, purge_pending, current_stage, failure_stage,
+                            completion_ready, created_at, updated_at
+                     FROM purge_requests
+                     WHERE target_kind = 'source' AND target_value = ?1",
+                    params![target_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .unwrap();
         let (generation, generation_path) = store
             .reserve_index_generation(&paths.index_root, 1)
             .unwrap();
@@ -7871,6 +8525,48 @@ mod tests {
             publication
         );
         assert!(store.get_source(other_id).unwrap().is_some());
+
+        let epoch_before_reopen = read_content_write_epoch(&store.conn).unwrap();
+        drop(store);
+        let reopened = Store::open(&paths).unwrap();
+        assert!(reopened.pending_purges().unwrap().is_empty());
+        assert_eq!(
+            read_content_write_epoch(&reopened.conn).unwrap(),
+            epoch_before_reopen
+        );
+        assert!(generation_path.join("segment").exists());
+        assert_eq!(
+            reopened
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            publication
+        );
+        assert!(reopened.get_source(other_id).unwrap().is_some());
+        let completion_evidence_after: (String, i64, String, Option<String>, i64, String, String) =
+            reopened
+                .conn
+                .query_row(
+                    "SELECT trigger, purge_pending, current_stage, failure_stage,
+                            completion_ready, created_at, updated_at
+                     FROM purge_requests
+                     WHERE target_kind = 'source' AND target_value = ?1",
+                    params![target_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .unwrap();
+        assert_eq!(completion_evidence_after, completion_evidence_before);
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -8021,6 +8717,25 @@ mod tests {
             publication
         );
         assert!(store.get_source(other_id).unwrap().is_some());
+
+        let epoch_before_reopen = read_content_write_epoch(&store.conn).unwrap();
+        drop(store);
+        let reopened = Store::open(&paths).unwrap();
+        assert!(reopened.pending_purges().unwrap().is_empty());
+        assert_eq!(
+            read_content_write_epoch(&reopened.conn).unwrap(),
+            epoch_before_reopen
+        );
+        assert!(generation_path.join("segment").exists());
+        assert_eq!(
+            reopened
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            publication
+        );
+        assert!(reopened.get_source(other_id).unwrap().is_some());
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
