@@ -138,21 +138,39 @@ pub async fn sync(
         if let Some(last_sync_at) = last_sync.as_deref() {
             let snapshot_age_seconds = freshness::snapshot_age_seconds(last_sync_at)?;
             if snapshot_age_seconds <= max_age_seconds {
-                progress.line(format_args!(
-                    "qgh sync: skipped, snapshot fresh age={snapshot_age_seconds}s max_age={max_age_seconds}s"
-                ));
-                return Ok(local_read_outcome(
-                    json!({
-                        "profile_id": profile.id,
-                        "sync_state": "skipped_fresh",
-                        "sync": {
-                            "last_successful_sync": last_sync,
-                            "snapshot_age_seconds": snapshot_age_seconds,
-                            "max_age_seconds": max_age_seconds
-                        }
-                    }),
-                    Vec::new(),
-                ));
+                let publication = store.active_retrieval_publication()?;
+                match store.validate_query_publication_snapshot(publication.as_ref()) {
+                    Ok(()) => {
+                        progress.line(format_args!(
+                            "qgh sync: skipped, snapshot fresh age={snapshot_age_seconds}s max_age={max_age_seconds}s"
+                        ));
+                        return Ok(local_read_outcome(
+                            json!({
+                                "profile_id": profile.id,
+                                "sync_state": "skipped_fresh",
+                                "sync": {
+                                    "last_successful_sync": last_sync,
+                                    "snapshot_age_seconds": snapshot_age_seconds,
+                                    "max_age_seconds": max_age_seconds
+                                }
+                            }),
+                            Vec::new(),
+                        ));
+                    }
+                    Err(error)
+                        if matches!(
+                            error.code.as_str(),
+                            "publication.source_snapshot_incomplete"
+                                | "publication.source_snapshot_changed"
+                                | "publication.embedding_snapshot_mismatch"
+                        ) =>
+                    {
+                        progress.line(format_args!(
+                            "qgh sync: fresh remote snapshot requires retrieval publication repair"
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
     }
@@ -1113,7 +1131,7 @@ fn rebuild_bm25_index(
     } else {
         None
     };
-    let sources = &snapshot.sources;
+    let sources = snapshot.sources();
     progress.line(format_args!(
         "qgh sync: rebuilding BM25 index sources={}",
         sources.len()
@@ -1123,10 +1141,10 @@ fn rebuild_bm25_index(
     let generation_path = index::rebuild(&profile.paths.index_root, generation, sources)?;
     debug_assert_eq!(generation_path, reserved_generation_path);
     match store.activate_retrieval_publication(
-        &snapshot.identity.sync_run_id,
+        snapshot.identity().sync_run_id(),
         generation,
         embedding_generation_id,
-        snapshot.expected_publication_id,
+        snapshot.expected_publication_id(),
     ) {
         Ok(_) if embedding_generation_id.is_some() => {
             match cleanup_old_embedding_generations(store) {
@@ -1216,10 +1234,10 @@ fn repair_lexical_successor_if_required(
     let snapshot = store
         .capture_retrieval_build_snapshot()?
         .ok_or_else(incomplete_source_snapshot_error_for_command)?;
-    if snapshot.identity.sync_run_id != source_snapshot_sync_run_id {
+    if snapshot.identity().sync_run_id() != source_snapshot_sync_run_id {
         return Err(incomplete_source_snapshot_error_for_command());
     }
-    let sources = &snapshot.sources;
+    let sources = snapshot.sources();
     let (generation, reserved_generation_path) =
         store.reserve_index_generation_for_snapshot(&profile.paths.index_root, &snapshot)?;
     let generation_path = index::rebuild(&profile.paths.index_root, generation, sources)?;
@@ -1228,7 +1246,7 @@ fn repair_lexical_successor_if_required(
         &source_snapshot_sync_run_id,
         generation,
         None,
-        snapshot.expected_publication_id,
+        snapshot.expected_publication_id(),
     )?;
     Ok(SuccessorRepairOutcome::Repaired {
         generation,
@@ -1825,7 +1843,7 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
     _expectation: &EmbeddingFingerprintExpectation,
     snapshot: &RetrievalBuildSnapshot,
 ) -> Result<(usize, Option<i64>), QghError> {
-    let chunks = &snapshot.embedding_chunks;
+    let chunks = snapshot.embedding_chunks();
     if chunks.is_empty() {
         return Ok((0, None));
     }
@@ -1847,7 +1865,6 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
     }
     let dimension = embedding_dimension(&vectors)?;
     let fingerprint = fingerprint_seed.with_dimension(dimension);
-    let source_sync_run_id = snapshot.identity.sync_run_id.clone();
     let model_manifest_hash = fingerprint.hash();
     let context_template_version = crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string();
     let spec = crate::store::EmbeddingGenerationSpec {
@@ -1858,10 +1875,8 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
             .unwrap_or_else(|| "none".to_string()),
         context_template_version: context_template_version.clone(),
         output_dimension: dimension,
-        source_sync_run_id: source_sync_run_id.clone(),
-        total_chunks: chunks.len() as i64,
     };
-    let generation_id = store.begin_embedding_generation(&spec)?;
+    let generation_id = store.begin_embedding_generation(snapshot, &spec)?;
     let embeddings = chunks.iter().zip(vectors).collect::<Vec<_>>();
     for batch in embeddings.chunks(32) {
         let staged = batch
@@ -2059,13 +2074,22 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
     let runtime = embedding_runtime_for_acquisition(embedding)?;
     let progress = StderrSyncProgress::new(false);
     let chunk_stats = refresh_embedding_chunks(&mut store, runtime.tokenizer.as_ref(), &progress)?;
-    let source_sync_run_id = store
-        .latest_successful_sync_run_id()?
-        .ok_or_else(incomplete_source_snapshot_error_for_command)?;
-    store.mark_sync_run_completed(&source_sync_run_id)?;
+    let source_snapshot_sync_run_id = if store.successor_repair_required()? {
+        store
+            .record_purge_successor_snapshot()?
+            .ok_or_else(incomplete_source_snapshot_error_for_command)?
+    } else {
+        store
+            .record_local_rebuild_snapshot()?
+            .sync_run_id()
+            .to_string()
+    };
     let snapshot = store
         .capture_retrieval_build_snapshot()?
         .ok_or_else(incomplete_source_snapshot_error_for_command)?;
+    if snapshot.identity().sync_run_id() != source_snapshot_sync_run_id {
+        return Err(incomplete_source_snapshot_error_for_command());
+    }
     let data = refresh_chunk_embeddings(
         &mut store,
         &profile.paths,
@@ -2397,7 +2421,7 @@ fn refresh_chunk_embeddings(
     fingerprint_seed: EmbeddingFingerprintSeed,
     snapshot: &RetrievalBuildSnapshot,
 ) -> Result<Value, QghError> {
-    let chunks = &snapshot.embedding_chunks;
+    let chunks = snapshot.embedding_chunks();
     if chunks.is_empty() {
         return Err(QghError::validation(
             "embedding.no_chunks",
@@ -2424,7 +2448,7 @@ fn refresh_chunk_embeddings(
     let dimension = embedding_dimension(&vectors)?;
     let fingerprint = fingerprint_seed.with_dimension(dimension);
     let embeddings = chunks.iter().zip(vectors).collect::<Vec<_>>();
-    let source_sync_run_id = snapshot.identity.sync_run_id.clone();
+    let source_sync_run_id = snapshot.identity().sync_run_id().to_string();
     let model_manifest_hash = fingerprint.hash();
     let context_template_version = crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string();
     let spec = crate::store::EmbeddingGenerationSpec {
@@ -2435,10 +2459,8 @@ fn refresh_chunk_embeddings(
             .unwrap_or_else(|| "none".to_string()),
         context_template_version: context_template_version.clone(),
         output_dimension: dimension,
-        source_sync_run_id: source_sync_run_id.clone(),
-        total_chunks: chunks.len() as i64,
     };
-    let generation_id = store.begin_embedding_generation(&spec)?;
+    let generation_id = store.begin_embedding_generation(snapshot, &spec)?;
     for batch in embeddings.chunks(32) {
         let staged = batch
             .iter()
@@ -2461,13 +2483,13 @@ fn refresh_chunk_embeddings(
     store.validate_embedding_generation(generation_id)?;
     let (tantivy_generation, reserved_path) =
         store.reserve_index_generation_for_snapshot(&paths.index_root, snapshot)?;
-    let built_path = index::rebuild(&paths.index_root, tantivy_generation, &snapshot.sources)?;
+    let built_path = index::rebuild(&paths.index_root, tantivy_generation, snapshot.sources())?;
     debug_assert_eq!(reserved_path, built_path);
     store.activate_retrieval_publication(
         &source_sync_run_id,
         tantivy_generation,
         Some(generation_id),
-        snapshot.expected_publication_id,
+        snapshot.expected_publication_id(),
     )?;
     let embedded_chunks = embeddings.len();
     let usable_embeddings = embedded_chunks;
@@ -5835,7 +5857,7 @@ mod tests {
             .reserve_index_generation_for_snapshot(&paths.index_root, &first_snapshot)
             .unwrap();
         let generation_path =
-            index::rebuild(&paths.index_root, generation, &first_snapshot.sources).unwrap();
+            index::rebuild(&paths.index_root, generation, first_snapshot.sources()).unwrap();
         assert_eq!(generation_path, reserved_path);
         store
             .activate_retrieval_publication("sync-command-embed", generation, None, None)

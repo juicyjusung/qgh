@@ -3248,6 +3248,82 @@ quantization = "none"
     );
 }
 
+#[cfg(feature = "vector-search")]
+#[test]
+fn force_embed_uses_local_snapshot_without_advancing_remote_freshness() {
+    let fixture = TestFixture::new("embed-local-rebuild-freshness");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.write_default_embedding_config(&server.base_url);
+    let backdated = "2020-01-01T00:00:00Z";
+    let db_path = fixture.data_home.join("qgh/profiles/work/qgh.sqlite3");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE sync_runs SET completed_at = ?1
+         WHERE snapshot_kind = 'remote_sync'",
+        [backdated],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE repository_sync_state SET last_successful_sync_at = ?1",
+        [backdated],
+    )
+    .unwrap();
+    drop(conn);
+    let document_vectors = json!({
+        "Repository: github.com/owner/repo\nIssue #42: Cache sync bug\n\nThe BM25 issue body tracer must round-trip through get before citation.": [0.1, 0.2, 0.3],
+        "Repository: github.com/owner/repo\nComment on issue #42: Cache sync bug\n\nThe answer lives in this comment-only mitigation note.": [0.3, 0.2, 0.1]
+    });
+
+    for _ in 0..2 {
+        let embed =
+            fixture.qgh_with_document_vectors(["embed", "--force", "--json"], &document_vectors);
+        assert_success(&embed);
+        assert_eq!(stdout_json(&embed)["data"]["embedding_state"], "refreshed");
+    }
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let remote_completed_at: String = conn
+        .query_row(
+            "SELECT completed_at FROM sync_runs
+             WHERE snapshot_kind = 'remote_sync' ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let repository_sync_at: String = conn
+        .query_row(
+            "SELECT last_successful_sync_at FROM repository_sync_state
+             WHERE repo = 'owner/repo'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remote_completed_at, backdated);
+    assert_eq!(repository_sync_at, backdated);
+    let local_snapshot_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sync_runs
+             WHERE snapshot_kind = 'local_rebuild' AND completed_successfully = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(local_snapshot_count, 2);
+    drop(conn);
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(status["data"]["sync"]["last_sync_at"], backdated);
+
+    let request_count_before = server.request_count();
+    let sync = fixture.qgh(["sync", "--if-stale", "--max-age", "30m", "--json"]);
+    assert_success(&sync);
+    assert!(
+        server.request_count() > request_count_before,
+        "force embed must not make a stale remote snapshot look fresh"
+    );
+}
+
 #[cfg(feature = "fastembed-provider")]
 #[test]
 fn cached_prepared_manifest_query_is_offline_and_falls_back_to_bm25() {
@@ -3564,6 +3640,61 @@ fn sync_if_stale_skips_when_fresh_and_runs_when_stale() {
     let ran = fixture.qgh(["sync", "--if-stale", "--max-age", "30m", "--json"]);
     assert_success(&ran);
     assert_eq!(stdout_json(&ran)["data"]["sync_state"], "ok");
+}
+
+#[test]
+fn sync_if_stale_repairs_detached_pre_epoch_publication_even_when_remote_sync_is_fresh() {
+    let fixture = TestFixture::new("sync-if-stale-pre-epoch-publication");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let db_path = fixture.data_home.join("qgh/profiles/work/qgh.sqlite3");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let original_publication_id: i64 = conn
+        .query_row(
+            "SELECT publication_id FROM retrieval_publication_pointer WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE retrieval_publications SET source_snapshot_epoch = NULL WHERE active = 1",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE index_generations
+         SET source_snapshot_epoch = NULL, source_inventory_hash = NULL
+         WHERE active = 1",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let requests_before_repair = server.request_count();
+    let repaired = fixture.qgh(["sync", "--if-stale", "--max-age", "30m", "--json"]);
+    assert_success(&repaired);
+    assert_eq!(stdout_json(&repaired)["data"]["sync_state"], "ok");
+    assert!(server.request_count() > requests_before_repair);
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let successor_publication_id: i64 = conn
+        .query_row(
+            "SELECT publication_id FROM retrieval_publication_pointer WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_ne!(successor_publication_id, original_publication_id);
+    drop(conn);
+
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&query);
+    assert!(!stdout_json(&query)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -6992,6 +7123,22 @@ limit = 10
     fn qgh<const N: usize>(&self, args: [&str; N]) -> Output {
         let mut cmd = self.base_command();
         cmd.args(["--profile", "work"]).args(args);
+        cmd.output().unwrap()
+    }
+
+    #[cfg(feature = "vector-search")]
+    fn qgh_with_document_vectors<const N: usize>(
+        &self,
+        args: [&str; N],
+        document_vectors: &Value,
+    ) -> Output {
+        let mut cmd = self.base_command();
+        cmd.env(
+            "QGH_TEST_EMBEDDING_DOCUMENT_VECTORS",
+            document_vectors.to_string(),
+        )
+        .args(["--profile", "work"])
+        .args(args);
         cmd.output().unwrap()
     }
 
