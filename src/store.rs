@@ -1337,6 +1337,38 @@ impl Store {
                 observed_at = excluded.observed_at",
             params![source_id, reason, observed_at],
         )?;
+        // Tombstoned content must fail closed and must not remain in qgh-managed
+        // derived storage. Keep only the minimal identity/tombstone metadata.
+        let chunk_ids = tx
+            .prepare("SELECT id FROM chunks WHERE source_id = ?1")?
+            .query_map(params![source_id], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !chunk_ids.is_empty() {
+            let placeholders = std::iter::repeat_n("?", chunk_ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let values = chunk_ids
+                .iter()
+                .map(|id| Value::Integer(*id))
+                .collect::<Vec<_>>();
+            if embedding_schema_exists(&tx)? {
+                let _ = tx.execute(
+                    &format!("DELETE FROM chunk_embeddings WHERE chunk_id IN ({placeholders})"),
+                    rusqlite::params_from_iter(values.iter()),
+                );
+                if vector_table_dimension(&tx)?.is_some() {
+                    let _ = tx.execute(
+                        &format!("DELETE FROM {CHUNK_EMBEDDING_VECTORS_TABLE} WHERE rowid IN ({placeholders})"),
+                        rusqlite::params_from_iter(values.iter()),
+                    );
+                }
+            }
+        }
+        tx.execute(
+            "DELETE FROM chunks WHERE source_id = ?1",
+            params![source_id],
+        )?;
+        tx.execute_batch("PRAGMA secure_delete = ON")?;
         if changed > 0 {
             tx.execute(
                 "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
