@@ -24,6 +24,21 @@ pub struct SearchFilters {
     pub source_types: Vec<String>,
 }
 
+/// Versioned lexical ranking profiles are intentionally internal.  The
+/// production default remains `V1`; experiments can opt into a named profile
+/// without exposing arbitrary user-controlled boosts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LexicalRankingProfile {
+    V1,
+    MetadataBoostV1,
+}
+
+impl Default for LexicalRankingProfile {
+    fn default() -> Self {
+        Self::V1
+    }
+}
+
 impl Default for SearchFilters {
     fn default() -> Self {
         Self {
@@ -88,6 +103,22 @@ pub fn search_with_filters(
     filters: &SearchFilters,
     limit: usize,
 ) -> Result<Vec<SearchHit>, QghError> {
+    search_with_filters_profile(
+        active_path,
+        query_text,
+        filters,
+        LexicalRankingProfile::default(),
+        limit,
+    )
+}
+
+pub fn search_with_filters_profile(
+    active_path: &Path,
+    query_text: &str,
+    filters: &SearchFilters,
+    profile: LexicalRankingProfile,
+    limit: usize,
+) -> Result<Vec<SearchHit>, QghError> {
     if limit == 0 || filters.source_types.is_empty() {
         return Ok(Vec::new());
     }
@@ -143,7 +174,15 @@ pub fn search_with_filters(
     if let Ok(cjk_ngrams) = schema.get_field("cjk_ngrams") {
         query_fields.push(cjk_ngrams);
     }
-    let parser = QueryParser::for_index(&index, query_fields);
+    let mut parser = QueryParser::for_index(&index, query_fields);
+    if matches!(profile, LexicalRankingProfile::MetadataBoostV1) {
+        parser.set_field_boost(title, 2.0);
+        parser.set_field_boost(labels, 1.5);
+        parser.set_field_boost(issue_number, 1.5);
+        if let Ok(parent_issue_title) = schema.get_field("parent_issue_title") {
+            parser.set_field_boost(parent_issue_title, 1.5);
+        }
+    }
     let expanded_query = expand_cjk_query(query_text);
     let query = parser.parse_query(&expanded_query).map_err(|e| {
         QghError::validation("validation.invalid_query", format!("Invalid query: {e}"))
