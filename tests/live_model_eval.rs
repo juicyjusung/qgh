@@ -2903,6 +2903,79 @@ fn path_redaction_scans_artifacts_stdout_and_stderr() {
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
+fn path_redaction_allows_only_contracted_repo_policy_json_fields() {
+    let root = std::env::temp_dir().join(format!(
+        "qgh-live-model-path-contract-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let marker = root.join("contracted-repo-policy-path");
+    let marker = marker.to_string_lossy().to_string();
+    let cli_meta = serde_json::to_vec(&json!({
+        "meta": {"repo_policy_path": &marker}
+    }))
+    .unwrap();
+    let cli_status = serde_json::to_vec(&json!({
+        "data": {"resolution": {"repo_policy_path": &marker}}
+    }))
+    .unwrap();
+    let mcp_jsonl = format!(
+        "{}\n{}\n",
+        json!({
+            "result": {"structuredContent": {
+                "meta": {"repo_policy_path": &marker}
+            }}
+        }),
+        json!({
+            "result": {"structuredContent": {
+                "data": {"resolution": {"repo_policy_path": &marker}}
+            }}
+        })
+    )
+    .into_bytes();
+    let unexpected_stdout = serde_json::to_vec(&json!({
+        "meta": {
+            "repo_policy_path": &marker,
+            "unexpected_path": &marker
+        }
+    }))
+    .unwrap();
+    let stderr = serde_json::to_vec(&json!({
+        "meta": {"repo_policy_path": &marker}
+    }))
+    .unwrap();
+    std::fs::write(
+        root.join("path-report.json"),
+        serde_json::to_vec(&json!({
+            "meta": {"repo_policy_path": &marker}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let evidence = live_model_eval_runtime::path_redaction_scan_for_test(
+        &root,
+        &[marker.as_str()],
+        &[cli_meta, cli_status, mcp_jsonl, unexpected_stdout],
+        &[stderr],
+    )
+    .expect("path redaction scan completes");
+    assert_eq!(evidence["stdout_streams_checked"], 4);
+    assert_eq!(evidence["stderr_streams_checked"], 1);
+    assert_eq!(
+        evidence["violation_artifacts"],
+        json!(["stdout-stream-3", "stderr-stream-0", "path-report.json"])
+    );
+    assert_eq!(evidence["path_privacy_passed"], false);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
 #[ignore = "downloads/loads local ONNX models; set QGH_LIVE_MODEL_EVAL=1"]
 fn live_model_runtime_evaluation() {
     assert!(

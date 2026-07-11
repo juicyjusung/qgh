@@ -3216,7 +3216,7 @@ fn audit_redaction(
     let mut sensitive_payload_passed = true;
     let mut path_privacy_passed = true;
     for (index, stream) in stdout.iter().enumerate() {
-        if contains_path_marker(stream, path_markers) {
+        if contains_uncontracted_stdout_path_marker(stream, path_markers) {
             path_privacy_passed = false;
             push_unique(&mut violation_artifacts, format!("stdout-stream-{index}"));
         }
@@ -3300,6 +3300,49 @@ fn contains_path_marker(bytes: &[u8], markers: &BTreeSet<String>) -> bool {
     markers
         .iter()
         .any(|marker| contains_sensitive_text(&rendered, marker))
+}
+
+fn contains_uncontracted_stdout_path_marker(bytes: &[u8], markers: &BTreeSet<String>) -> bool {
+    if let Ok(mut value) = serde_json::from_slice::<Value>(bytes) {
+        redact_contracted_repo_policy_paths(&mut value);
+        return serde_json::to_vec(&value)
+            .map(|sanitized| contains_path_marker(&sanitized, markers))
+            .unwrap_or(true);
+    }
+
+    let mut sanitized = Vec::new();
+    let mut parsed_any = false;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_slice::<Value>(line) else {
+            return contains_path_marker(bytes, markers);
+        };
+        parsed_any = true;
+        redact_contracted_repo_policy_paths(&mut value);
+        if serde_json::to_writer(&mut sanitized, &value).is_err() {
+            return true;
+        }
+        sanitized.push(b'\n');
+    }
+    if !parsed_any {
+        return contains_path_marker(bytes, markers);
+    }
+    contains_path_marker(&sanitized, markers)
+}
+
+fn redact_contracted_repo_policy_paths(value: &mut Value) {
+    for pointer in [
+        "/meta/repo_policy_path",
+        "/data/resolution/repo_policy_path",
+        "/result/structuredContent/meta/repo_policy_path",
+        "/result/structuredContent/data/resolution/repo_policy_path",
+    ] {
+        if let Some(path) = value.pointer_mut(pointer) {
+            *path = Value::Null;
+        }
+    }
 }
 
 fn collect_redaction_artifacts(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), DynError> {
