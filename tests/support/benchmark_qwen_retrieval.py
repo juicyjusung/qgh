@@ -145,6 +145,22 @@ def redacted_event(
     }
 
 
+def build_redacted_events(
+    qrels: list[dict], rankings: dict[str, dict[str, list[str]]]
+) -> list[dict]:
+    return [
+        redacted_event(
+            query_id=qrel["query_id"],
+            query_class=qrel["class"],
+            query=qrel["query"],
+            rankings={
+                name: values[qrel["query_id"]] for name, values in rankings.items()
+            },
+        )
+        for qrel in qrels
+    ]
+
+
 def read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
@@ -753,23 +769,12 @@ def write_report(
     output_root: Path,
     device: str,
     corpus: list[dict],
-    dev: list[dict],
-    test: list[dict],
+    screening_qrels: list[dict],
     report: dict,
     rankings: dict[str, dict[str, list[str]]],
 ) -> Path:
     output_root.mkdir(parents=True, exist_ok=True)
-    events = []
-    for qrel in [*dev, *test]:
-        query_id = qrel["query_id"]
-        events.append(
-            redacted_event(
-                query_id=query_id,
-                query_class=qrel["class"],
-                query=qrel["query"],
-                rankings={name: values[query_id] for name, values in rankings.items()},
-            )
-        )
+    events = build_redacted_events(screening_qrels, rankings)
     rendered_report = json.dumps(report, ensure_ascii=False, sort_keys=True)
     rendered_events = (
         "\n".join(
@@ -777,7 +782,7 @@ def write_report(
         )
         + "\n"
     )
-    for record in [*dev, *test]:
+    for record in screening_qrels:
         if record["query"] in rendered_report or record["query"] in rendered_events:
             raise RuntimeError("raw query escaped into benchmark artifacts")
     for source in corpus:
@@ -894,12 +899,32 @@ def run(args: argparse.Namespace) -> Path:
         "reranker": reranker,
         "total_runtime_seconds": time.perf_counter() - started,
     }
+    args.output_root.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = args.output_root / f"qwen-benchmark-{args.device}.checkpoint.json"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "qgh.qwen_screening_checkpoint.v1",
+                "report": report,
+                "screening_rankings": {
+                    "bm25": bm25_test,
+                    "qwen_dense": dense_test,
+                    "qwen_hybrid": hybrid_test,
+                    "qwen_bm25_rerank": bm25_reranked_test,
+                    "qwen_hybrid_rerank": hybrid_reranked_test,
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
     report_path = write_report(
         output_root=args.output_root,
         device=args.device,
         corpus=corpus,
-        dev=dev,
-        test=test,
+        screening_qrels=test,
         report=report,
         rankings={
             "bm25": bm25_test,

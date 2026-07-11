@@ -99,6 +99,23 @@ class QwenBenchmarkContractTests(unittest.TestCase):
             "f66ed72b8284e70d2c1bff3f906910cbf29a26219115aa016593f1629ab6a133",
         )
 
+    def test_screening_events_do_not_require_dev_rankings(self) -> None:
+        screening = [
+            {
+                "query_id": "test-001",
+                "query": "public screening query",
+                "class": "english_semantic",
+            }
+        ]
+
+        events = BENCHMARK.build_redacted_events(
+            screening,
+            {"qwen_hybrid": {"test-001": ["source-a"]}},
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["query_id"], "test-001")
+
 
 if __name__ == "__main__":
     unittest.main()
