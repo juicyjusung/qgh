@@ -89,6 +89,13 @@ compares model behavior without live model downloads. The default model remains
 `Snowflake/snowflake-arctic-embed-l-v2.0`; changing it still requires a
 PRD/ADR-backed human decision.
 
+This table is a deterministic contract test, not live-model evidence. It uses
+synthetic vectors and synthetic immutable revisions for non-default candidates,
+so it says nothing about artifact availability, multilingual quality, resource
+gates, or promotion eligibility. In particular, the synthetic Dragonkue score
+does not contradict a missing ONNX artifact at its real pinned revision. Live
+decisions are recorded in `docs/search-quality-live-model-eval.md`.
+
 The A/B path gives every synthetic candidate an explicit immutable fixture
 revision, switches the configured model before each non-default candidate,
 and verifies `embedding.fingerprint_mismatch` keeps BM25 fallback active before

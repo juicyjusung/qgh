@@ -110,6 +110,10 @@ impl FilesystemIdentity {
 //   again immediately before unlinkat; symlinks and special files fail closed;
 // - the quarantine pathname itself is removed only if it still resolves to
 //   the same, now-empty device/inode. A replacement foreign tree is untouched.
+// These guarantees assume qgh's local single-user threat model. A same-user
+// actor deliberately racing filesystem replacement between the final identity
+// check and unlinkat is outside that model; this is not an adversarial
+// multi-user filesystem deletion primitive.
 // The platform dirent layouts and open/unlink flags below mirror the Darwin
 // and Linux C ABIs selected by their cfg guards.
 #[cfg(target_os = "macos")]
