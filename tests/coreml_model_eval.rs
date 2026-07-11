@@ -68,6 +68,15 @@ struct PreparedArtifactIdentity {
     byte_size: u64,
 }
 
+struct CapturedProbeArtifact {
+    identity: PreparedArtifactIdentity,
+    bytes: Vec<u8>,
+}
+
+struct CapturedProbePayload {
+    artifacts: Vec<CapturedProbeArtifact>,
+}
+
 #[test]
 fn prepared_snapshot_digest_changes_with_artifact_identity() {
     let artifact = PreparedArtifactIdentity {
@@ -81,6 +90,26 @@ fn prepared_snapshot_digest_changes_with_artifact_identity() {
     changed.byte_size += 1;
 
     assert_ne!(first, prepared_snapshot_digest(&[changed]));
+}
+
+#[test]
+fn captured_probe_payload_reuses_the_same_verified_bytes() {
+    let payload = CapturedProbePayload {
+        artifacts: vec![CapturedProbeArtifact {
+            identity: PreparedArtifactIdentity {
+                role: ArtifactRole::OnnxModel,
+                relative_path: "onnx/model.onnx".to_string(),
+                sha256: digest_hex(b"verified-model"),
+                byte_size: 14,
+            },
+            bytes: b"verified-model".to_vec(),
+        }],
+    };
+
+    assert_eq!(
+        payload.artifact(ArtifactRole::OnnxModel).unwrap(),
+        payload.artifact(ArtifactRole::OnnxModel).unwrap()
+    );
 }
 
 #[test]
@@ -98,14 +127,15 @@ fn coreml_cpu_gpu_probe() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/qgh-eval"));
 
-    let manifest_bytes = fs::read(&manifest_path).expect("prepared model manifest is readable");
     let snapshot = PreparedModelStore::new(PathBuf::new())
         .load_manifest(&manifest_path)
         .expect("prepared model snapshot passes checksum and graph verification");
     let manifest = &snapshot.manifest;
     assert_eq!(manifest.quantization, QuantizationKind::None);
     assert_eq!(manifest.output_dimension, 384);
-    let prepared_artifacts = prepared_artifact_identities(manifest);
+    let payload = CapturedProbePayload::capture(&snapshot)
+        .expect("probe captures one checksum-verified artifact payload");
+    let prepared_artifacts = payload.identities();
     let git_head = command_text("git", &["rev-parse", "HEAD"]).expect("Git HEAD is available");
     let git_worktree_clean = command_text("git", &["status", "--porcelain"])
         .expect("Git status is available")
@@ -119,14 +149,14 @@ fn coreml_cpu_gpu_probe() {
             .expect("CoreML test binary is hashable");
 
     let (mut cpu, cpu_init_ms) =
-        build_model(&snapshot, Vec::new()).expect("CPU reference model initializes");
+        build_model(manifest, &payload, Vec::new()).expect("CPU reference model initializes");
     let coreml_provider = CoreML::default()
         .with_model_format(ModelFormat::MLProgram)
         .with_specialization_strategy(SpecializationStrategy::FastPrediction)
         .with_compute_units(ComputeUnits::CPUAndGPU)
         .build()
         .error_on_failure();
-    let (mut coreml, coreml_init_ms) = build_model(&snapshot, vec![coreml_provider])
+    let (mut coreml, coreml_init_ms) = build_model(manifest, &payload, vec![coreml_provider])
         .expect("CoreML CPU+GPU execution provider initializes");
 
     let prefix = manifest.query_prefix.as_deref().unwrap_or_default();
@@ -154,10 +184,10 @@ fn coreml_cpu_gpu_probe() {
     let cpu_p50 = percentile(&cpu_samples, 0.50);
     let coreml_p50 = percentile(&coreml_samples, 0.50);
     let report = CoreMlProbeReport {
-        schema_version: "qgh.coreml_model_eval.v2",
+        schema_version: "qgh.coreml_model_eval.v3",
         model_id: manifest_model_id(manifest),
         resolved_revision: manifest_revision(manifest),
-        manifest_sha256: digest_hex(&manifest_bytes),
+        manifest_sha256: manifest.hash(),
         prepared_snapshot_sha256: prepared_snapshot_digest(&prepared_artifacts),
         prepared_artifacts,
         git_head,
@@ -189,25 +219,23 @@ fn coreml_cpu_gpu_probe() {
 }
 
 fn build_model(
-    snapshot: &PreparedModelSnapshot,
+    manifest: &ModelManifestV1,
+    payload: &CapturedProbePayload,
     providers: Vec<ExecutionProviderDispatch>,
 ) -> Result<(TextEmbedding, f64), DynError> {
-    let manifest = &snapshot.manifest;
     let tokenizer_files = TokenizerFiles {
-        tokenizer_file: artifact(snapshot, ArtifactRole::Tokenizer)?,
-        config_file: artifact(snapshot, ArtifactRole::Config)?,
-        special_tokens_map_file: artifact(snapshot, ArtifactRole::SpecialTokensMap)?,
-        tokenizer_config_file: artifact(snapshot, ArtifactRole::TokenizerConfig)?,
+        tokenizer_file: payload.artifact(ArtifactRole::Tokenizer)?,
+        config_file: payload.artifact(ArtifactRole::Config)?,
+        special_tokens_map_file: payload.artifact(ArtifactRole::SpecialTokensMap)?,
+        tokenizer_config_file: payload.artifact(ArtifactRole::TokenizerConfig)?,
     };
-    let model = UserDefinedEmbeddingModel::new(
-        artifact(snapshot, ArtifactRole::OnnxModel)?,
-        tokenizer_files,
-    )
-    .with_pooling(match manifest.pooling {
-        PoolingKind::Cls => fastembed::Pooling::Cls,
-        PoolingKind::Mean => fastembed::Pooling::Mean,
-    })
-    .with_quantization(QuantizationMode::None);
+    let model =
+        UserDefinedEmbeddingModel::new(payload.artifact(ArtifactRole::OnnxModel)?, tokenizer_files)
+            .with_pooling(match manifest.pooling {
+                PoolingKind::Cls => fastembed::Pooling::Cls,
+                PoolingKind::Mean => fastembed::Pooling::Mean,
+            })
+            .with_quantization(QuantizationMode::None);
     let started = Instant::now();
     let model = TextEmbedding::try_new_from_user_defined(
         model,
@@ -219,31 +247,54 @@ fn build_model(
     Ok((model, started.elapsed().as_secs_f64() * 1_000.0))
 }
 
-fn artifact(snapshot: &PreparedModelSnapshot, role: ArtifactRole) -> Result<Vec<u8>, DynError> {
-    let paths = snapshot.paths_for_role(role).collect::<Vec<_>>();
-    if paths.len() != 1 {
-        return Err("prepared model artifact role is not unique".into());
+impl CapturedProbePayload {
+    fn capture(snapshot: &PreparedModelSnapshot) -> Result<Self, DynError> {
+        let mut artifacts = Vec::with_capacity(snapshot.manifest.artifacts.len());
+        for declared in &snapshot.manifest.artifacts {
+            let bytes = fs::read(snapshot.root.join(&declared.relative_path))?;
+            let sha256 = digest_hex(&bytes);
+            let byte_size = u64::try_from(bytes.len())?;
+            if sha256 != declared.sha256 || byte_size != declared.byte_size {
+                return Err("prepared artifact changed after snapshot verification".into());
+            }
+            artifacts.push(CapturedProbeArtifact {
+                identity: PreparedArtifactIdentity {
+                    role: declared.role,
+                    relative_path: declared.relative_path.clone(),
+                    sha256,
+                    byte_size,
+                },
+                bytes,
+            });
+        }
+        Ok(Self { artifacts })
     }
-    Ok(fs::read(paths[0])?)
-}
 
-fn prepared_artifact_identities(manifest: &ModelManifestV1) -> Vec<PreparedArtifactIdentity> {
-    let mut identities = manifest
-        .artifacts
-        .iter()
-        .map(|artifact| PreparedArtifactIdentity {
-            role: artifact.role,
-            relative_path: artifact.relative_path.clone(),
-            sha256: artifact.sha256.clone(),
-            byte_size: artifact.byte_size,
-        })
-        .collect::<Vec<_>>();
-    identities.sort_by(|left, right| {
-        left.relative_path
-            .cmp(&right.relative_path)
-            .then_with(|| left.sha256.cmp(&right.sha256))
-    });
-    identities
+    fn artifact(&self, role: ArtifactRole) -> Result<Vec<u8>, DynError> {
+        let matches = self
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.identity.role == role)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err("captured model artifact role is not unique".into());
+        }
+        Ok(matches[0].bytes.clone())
+    }
+
+    fn identities(&self) -> Vec<PreparedArtifactIdentity> {
+        let mut identities = self
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.identity.clone())
+            .collect::<Vec<_>>();
+        identities.sort_by(|left, right| {
+            left.relative_path
+                .cmp(&right.relative_path)
+                .then_with(|| left.sha256.cmp(&right.sha256))
+        });
+        identities
+    }
 }
 
 fn prepared_snapshot_digest(artifacts: &[PreparedArtifactIdentity]) -> String {
