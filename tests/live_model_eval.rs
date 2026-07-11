@@ -466,6 +466,7 @@ fn model_preparation_defines_the_lightweight_candidate_set() {
         "granite-embedding-97m-multilingual-r2",
         "dragonkue-koen-e5-tiny",
         "multilingual-e5-small",
+        "multilingual-e5-small-ko-v2",
     ] {
         assert!(MODEL_PREP_SCRIPT.contains(candidate), "missing {candidate}");
         assert!(
@@ -476,6 +477,7 @@ fn model_preparation_defines_the_lightweight_candidate_set() {
     assert!(MODEL_PREP_SCRIPT.contains("835ad14087e140460703cf0fae09f97d469d65c2"));
     assert!(MODEL_PREP_SCRIPT.contains("292c09c78c71a3f00ed56ee0d1ed9f0d39182fc9"));
     assert!(MODEL_PREP_SCRIPT.contains("614241f622f53c4eeff9890bdc4f31cfecc418b3"));
+    assert!(MODEL_PREP_SCRIPT.contains("fcfc26bf355882620c48df58be112275bd756f50"));
     assert!(!MODEL_PREP_SCRIPT.contains("model_quint8_avx2.onnx"));
 }
 

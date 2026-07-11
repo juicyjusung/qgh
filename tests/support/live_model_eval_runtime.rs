@@ -68,12 +68,13 @@ const CONTRACT_GATE_BUNDLE_FILE: &str = "contract-gate-bundle.json";
 const FINAL_REPORT_ARTIFACT: &str = "live-model-eval-report.json";
 const CANDIDATE_FILTER_ENV: &str = "QGH_LIVE_MODEL_EVAL_CANDIDATES";
 const QUALITY_MAX_RSS_BYTES: u64 = 5 * 1024 * 1024 * 1024 / 2;
-const LIVE_CANDIDATE_IDS: [&str; 5] = [
+const LIVE_CANDIDATE_IDS: [&str; 6] = [
     "arctic-embed-l-v2.0",
     "gte-modernbert-base",
     "granite-embedding-97m-multilingual-r2",
     "dragonkue-koen-e5-tiny",
     "multilingual-e5-small",
+    "multilingual-e5-small-ko-v2",
 ];
 // Debug-provider fixtures intentionally exercise the legacy static fingerprint.
 // Real prepared candidates must derive their identity from their strict manifest.
@@ -4323,6 +4324,7 @@ pub(super) fn run(
         "granite-embedding-97m-multilingual-r2-live",
         "dragonkue-koen-e5-tiny-live",
         "multilingual-e5-small-live",
+        "multilingual-e5-small-ko-v2-live",
     ] {
         remove_dir_if_exists(&root.join(stale))?;
     }
@@ -4425,6 +4427,12 @@ pub(super) fn run(
             "intfloat/multilingual-e5-small",
             "614241f622f53c4eeff9890bdc4f31cfecc418b3",
             root.join("models/multilingual-e5-small/manifest.json"),
+        ),
+        (
+            "multilingual-e5-small-ko-v2",
+            "dragonkue/multilingual-e5-small-ko-v2",
+            "fcfc26bf355882620c48df58be112275bd756f50",
+            root.join("models/multilingual-e5-small-ko-v2/manifest.json"),
         ),
     ] {
         if selected_candidates

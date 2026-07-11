@@ -58,6 +58,15 @@ MULTILINGUAL_E5_SMALL_FILES = [
     ("special_tokens_map", "special_tokens_map.json", None),
     ("tokenizer_config", "tokenizer_config.json", None),
 ]
+MULTILINGUAL_E5_SMALL_KO_V2_MODEL_ID = "dragonkue/multilingual-e5-small-ko-v2"
+MULTILINGUAL_E5_SMALL_KO_V2_REVISION = "fcfc26bf355882620c48df58be112275bd756f50"
+MULTILINGUAL_E5_SMALL_KO_V2_FILES = [
+    ("onnx_model", "onnx/model.onnx", None),
+    ("tokenizer", "tokenizer.json", None),
+    ("config", "config.json", None),
+    ("special_tokens_map", "special_tokens_map.json", None),
+    ("tokenizer_config", "tokenizer_config.json", None),
+]
 DRAGONKUE_UNAVAILABLE = {
     "candidate": "dragonkue-ko",
     "model_id": "dragonkue/snowflake-arctic-embed-l-v2.0-ko",
@@ -84,6 +93,7 @@ KNOWN_CANDIDATES = {
     "granite-embedding-97m-multilingual-r2",
     "dragonkue-koen-e5-tiny",
     "multilingual-e5-small",
+    "multilingual-e5-small-ko-v2",
 }
 SELECTED_CANDIDATES = None
 
@@ -176,6 +186,22 @@ def main() -> None:
             max_length=8192,
             offline=args.offline,
             prior_record=prior_records.get("gte-modernbert-base"),
+        )
+    )
+    summaries.append(
+        prepare_manifest(
+            args.output_root / "multilingual-e5-small-ko-v2",
+            "multilingual-e5-small-ko-v2",
+            MULTILINGUAL_E5_SMALL_KO_V2_MODEL_ID,
+            MULTILINGUAL_E5_SMALL_KO_V2_REVISION,
+            MULTILINGUAL_E5_SMALL_KO_V2_FILES,
+            pooling="mean",
+            query_prefix="query: ",
+            document_prefix="passage: ",
+            native_dimension=384,
+            max_length=512,
+            offline=args.offline,
+            prior_record=prior_records.get("multilingual-e5-small-ko-v2"),
         )
     )
     summaries.append(
