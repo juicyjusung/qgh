@@ -296,6 +296,9 @@ class FreshBlindBuilderTests(unittest.TestCase):
             self.assertEqual(len(test_rows), 80)
             self.assertEqual(Counter(row["class"] for row in test_rows), CLASS_COUNTS)
             self.assertTrue(all(row["split"] == "test" for row in test_rows))
+            self.assertTrue(
+                all("source_type" not in row["filters"] for row in test_rows)
+            )
             self.assertIn(
                 source_id("issue", "EXT/101"), {row["source_id"] for row in corpus_rows}
             )

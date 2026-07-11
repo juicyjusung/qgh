@@ -768,8 +768,6 @@ def _build_test_qrels(qrel_specs: list[dict], collector: CorpusCollector) -> lis
                 }
             )
         filters = {"repo": entry["repo"]}
-        if entry["class"] == "comment_only":
-            filters["source_type"] = "issue_comment"
         if entry["class"] == "exact_identifier":
             issue_numbers = {gold["issue_number"] for gold in entry["gold"]}
             if len(issue_numbers) != 1:
