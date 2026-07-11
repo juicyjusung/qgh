@@ -940,7 +940,7 @@ def build_fixture(
             "absolute_local_path": collector.exclusions.get("absolute_local_path", 0)
         },
         "adjudication": {
-            "method": "manual fresh blind source-body review",
+            "method": "manual source-body review",
             "ambiguous_candidate_policy": "second adjudication or exclusion",
             "title_only_paraphrases_allowed": False,
         },

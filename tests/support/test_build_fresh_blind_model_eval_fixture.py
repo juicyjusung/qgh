@@ -332,6 +332,9 @@ class FreshBlindBuilderTests(unittest.TestCase):
             self.assertEqual(provenance["dev_query_count"], 40)
             self.assertEqual(provenance["test_query_count"], 80)
             self.assertEqual(
+                provenance["adjudication"]["method"], "manual source-body review"
+            )
+            self.assertEqual(
                 provenance["judgment_pool"]["multi_source_query_count"], 10
             )
             self.assertEqual(
