@@ -7242,7 +7242,14 @@ fn select_bm25_rescue_candidate(candidates: &[CandidateReport]) -> Option<String
         candidates
             .iter()
             .filter_map(|candidate| {
-                let complement = candidate.held_out_bm25_complement.as_ref()?;
+                let complement = candidate
+                    .weighted_fusion
+                    .as_ref()
+                    .and_then(|weighted| weighted.held_out_bm25_complement.as_ref())
+                    .or(candidate.held_out_bm25_complement.as_ref())?;
+                if complement.overall.rescued_at_5 <= complement.overall.bm25_hit_harmed_at_5 {
+                    return None;
+                }
                 Some(Bm25RescueCandidateScore {
                     candidate: candidate.candidate.clone(),
                     rescued_at_5: complement.overall.rescued_at_5,
