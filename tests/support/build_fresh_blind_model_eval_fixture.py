@@ -696,6 +696,7 @@ def _fetch_dev_repo(
 def _fetch_external_distractors(
     repo: str,
     limit: int,
+    required_issue_numbers: set[int],
     collector: CorpusCollector,
     fetch_json: Callable[[str], object],
 ) -> None:
@@ -704,11 +705,13 @@ def _fetch_external_distractors(
         _api_url(
             repo,
             "issues",
-            f"state=all&sort=updated&direction=desc&per_page={limit}&page=1",
+            "state=all&sort=updated&direction=desc&per_page=100&page=1",
         ),
     )
-    for payload in payloads[:limit]:
-        collector.add_issue(repo, payload)
+    for index, payload in enumerate(payloads):
+        number = payload.get("number") if isinstance(payload, dict) else None
+        if index < limit or number in required_issue_numbers:
+            collector.add_issue(repo, payload)
 
 
 def _collect_gold(
@@ -868,12 +871,25 @@ def build_fixture(
     dev_raw, dev_qrels = _parse_dev_qrels(dev_qrels_path, spec["dev_repo"])
     fetch = fetch_json or GitHubRestClient().get_json
     collector = CorpusCollector(snapshot_at, spec["repo_metadata"])
+    required_issues_by_repo = {
+        repo: {
+            gold["issue_number"]
+            for qrel in spec["qrels"]
+            for gold in qrel["gold"]
+            if gold["repo"] == repo
+        }
+        for repo in spec["repo_metadata"]
+    }
 
     _fetch_dev_repo(spec["dev_repo"], collector, fetch)
     for repo in sorted(spec["repo_metadata"]):
         if repo != spec["dev_repo"]:
             _fetch_external_distractors(
-                repo, spec["distractor_limit"], collector, fetch
+                repo,
+                spec["distractor_limit"],
+                required_issues_by_repo[repo],
+                collector,
+                fetch,
             )
     _collect_gold(spec["qrels"], collector, fetch)
     test_qrels = _build_test_qrels(spec["qrels"], collector)
@@ -905,7 +921,7 @@ def build_fixture(
                     repo,
                     "issues",
                     "state=all&sort=updated&direction=desc&per_page="
-                    + str(100 if repo == spec["dev_repo"] else spec["distractor_limit"])
+                    + str(100)
                     + "&page=1",
                 ),
                 "source_count": repository_counts.get(repo, 0),

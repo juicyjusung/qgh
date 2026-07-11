@@ -553,6 +553,39 @@ class FreshBlindBuilderTests(unittest.TestCase):
                 )
             )
 
+    def test_reuses_external_issue_page_for_gold_outside_distractor_limit(self) -> None:
+        dev_rows, qgh_issues, qgh_comments = build_dev_rows()
+        fake = FakeGitHub(qgh_issues, qgh_comments)
+        spec = build_spec()
+        spec["distractor_limit"] = 1
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec_path = root / "spec.json"
+            dev_path = root / "qrels-dev.jsonl"
+            output_dir = root / "target" / "qgh-eval" / "fresh-blind"
+            spec_path.write_text(json.dumps(spec), encoding="utf-8")
+            dev_path.write_bytes(jsonl_bytes(dev_rows))
+            BUILDER.build_fixture(
+                spec_path=spec_path,
+                dev_qrels_path=dev_path,
+                output_dir=output_dir,
+                snapshot_at="2026-07-11T01:02:03Z",
+                fetch_json=fake,
+            )
+            external_page = next(
+                url
+                for url in fake.calls
+                if "/repos/example/public-repo/issues?" in url
+            )
+            self.assertIn("per_page=100", external_page)
+            self.assertFalse(
+                any(
+                    urlparse(url).path
+                    == "/repos/example/public-repo/issues/101"
+                    for url in fake.calls
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
