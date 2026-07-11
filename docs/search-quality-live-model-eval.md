@@ -1,5 +1,10 @@
 # Live multilingual model evaluation
 
+The follow-up screening of Qwen 0.6B embedding and reranking is documented in
+[Qwen 0.6B embedding and reranker screening](search-quality-qwen-screening.md).
+It identifies a strong future MPS embedding candidate but does not change the
+production preset or BM25 default.
+
 ## 2026-07-11 fresh blind BM25-rescue decision
 
 The fresh evaluation used an unauthenticated public GitHub REST snapshot that had not been used to select any embedding model. It contains 566 issue/comment sources from nine public repositories, the frozen 40-query qgh dev split, and 80 fresh held-out queries. The held-out class counts are English semantic 20, Korean semantic 15, Korean-query-to-English-source 10, English-query-to-Korean-source 10, exact/identifier 10, comment-focused 5, long/context-dependent 5, and negative 5. Twenty queries received manual multi-candidate pooling. An independent review finished with zero Critical, Important, or Minor findings; issue threads do not cross splits, and normal artifacts contain no raw query/body, token, authorization header, or absolute user path.

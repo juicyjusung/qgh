@@ -11,6 +11,8 @@ import importlib.metadata
 import json
 import math
 import platform
+import re
+import resource
 from pathlib import Path
 import subprocess
 import sys
@@ -27,12 +29,19 @@ EMBEDDING_MODEL_ID = "Qwen/Qwen3-Embedding-0.6B"
 EMBEDDING_REVISION = "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
 RERANKER_MODEL_ID = "Qwen/Qwen3-Reranker-0.6B"
 RERANKER_REVISION = "e61197ed45024b0ed8a2d74b80b4d909f1255473"
+REPORT_SCHEMA_VERSION = "qgh.qwen_screening_benchmark.v2"
+CHECKPOINT_SCHEMA_VERSION = "qgh.qwen_screening_checkpoint.v2"
 TASK_INSTRUCTION = (
     "Given a GitHub issue search query, retrieve relevant GitHub issue or "
     "comment passages that satisfy the information need"
 )
 WEIGHT_GRID = (0.25, 0.5, 0.75, 1.0)
 DIMENSION_GRID = (384, 1024)
+SENSITIVE_OUTPUT_PATTERNS = (
+    re.compile(r"(?:/Users/|/home/|[A-Za-z]:\\\\Users\\\\)"),
+    re.compile(r"authorization\s*:", re.IGNORECASE),
+    re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"),
+)
 WEIGHTED_CLASSES = (
     "english_semantic",
     "korean_semantic",
@@ -448,18 +457,33 @@ def snapshot_bytes(model_id: str, revision: str, cache_dir: Path) -> int:
     return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
 
 
+def rss_high_water_bytes(value: int, system: str) -> int:
+    return value if system == "Darwin" else value * 1024
+
+
+def process_high_water_rss_bytes() -> int:
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    return rss_high_water_bytes(int(usage.ru_maxrss), platform.system())
+
+
 class ResourceProbe:
     def __init__(self, device: str) -> None:
         import psutil
 
         self.process = psutil.Process()
         self.device = device
-        self.peak_rss_bytes = self.process.memory_info().rss
+        self.peak_rss_bytes = max(
+            self.process.memory_info().rss, process_high_water_rss_bytes()
+        )
         self.peak_mps_allocated_bytes = 0
         self.peak_mps_driver_bytes = 0
 
     def observe(self) -> None:
-        self.peak_rss_bytes = max(self.peak_rss_bytes, self.process.memory_info().rss)
+        self.peak_rss_bytes = max(
+            self.peak_rss_bytes,
+            self.process.memory_info().rss,
+            process_high_water_rss_bytes(),
+        )
         if self.device == "mps":
             import torch
 
@@ -474,6 +498,7 @@ class ResourceProbe:
         self.observe()
         return {
             "peak_rss_bytes": self.peak_rss_bytes,
+            "rss_measurement": "os_process_high_water",
             "peak_mps_allocated_bytes": self.peak_mps_allocated_bytes,
             "peak_mps_driver_bytes": self.peak_mps_driver_bytes,
             "quality_rss_limit_bytes": QUALITY_RSS_LIMIT_BYTES,
@@ -772,6 +797,7 @@ def write_report(
     screening_qrels: list[dict],
     report: dict,
     rankings: dict[str, dict[str, list[str]]],
+    extra_payloads: tuple[str, ...] = (),
 ) -> Path:
     output_root.mkdir(parents=True, exist_ok=True)
     events = build_redacted_events(screening_qrels, rankings)
@@ -782,16 +808,13 @@ def write_report(
         )
         + "\n"
     )
-    for record in screening_qrels:
-        if record["query"] in rendered_report or record["query"] in rendered_events:
-            raise RuntimeError("raw query escaped into benchmark artifacts")
-    for source in corpus:
-        if source["body"] and (
-            source["body"] in rendered_report or source["body"] in rendered_events
-        ):
-            raise RuntimeError("raw body escaped into benchmark artifacts")
-    report["raw_query_or_body_logged"] = False
-    report["absolute_path_logged"] = False
+    assert_redacted_payload(
+        corpus,
+        screening_qrels,
+        rendered_report,
+        rendered_events,
+        *extra_payloads,
+    )
     report_path = output_root / f"qwen-benchmark-{device}.json"
     report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
@@ -804,8 +827,34 @@ def command_output(arguments: list[str]) -> str:
     return subprocess.check_output(arguments, text=True).strip()
 
 
+def capture_git_identity() -> tuple[str, bool]:
+    return (
+        command_output(["git", "rev-parse", "HEAD"]),
+        command_output(["git", "status", "--porcelain"]) == "",
+    )
+
+
+def assert_redacted_payload(
+    corpus: list[dict], qrels: list[dict], *payloads: str
+) -> None:
+    payload = "\n".join(payloads)
+    raw_values = [record.get("query", "") for record in qrels]
+    raw_values.extend(
+        source.get(field, "")
+        for source in corpus
+        for field in ("title", "body", "snippet")
+    )
+    if any(value in payload for value in raw_values if len(value) >= 16):
+        raise RuntimeError("raw query or source text escaped into benchmark artifacts")
+    if any(pattern.search(payload) for pattern in SENSITIVE_OUTPUT_PATTERNS):
+        raise RuntimeError("sensitive path, header, or token escaped into artifacts")
+
+
 def run(args: argparse.Namespace) -> Path:
     started = time.perf_counter()
+    git_head, worktree_clean = capture_git_identity()
+    if not worktree_clean:
+        raise RuntimeError("benchmark requires a clean worktree")
     fixture_root = args.fixture_root
     bm25_root = args.bm25_root
     corpus_path = fixture_root / "corpus.jsonl"
@@ -851,7 +900,7 @@ def run(args: argparse.Namespace) -> Path:
         chunks_by_source=chunks_by_source,
     )
     report = {
-        "schema_version": "qgh.qwen_screening_benchmark.v1",
+        "schema_version": REPORT_SCHEMA_VERSION,
         "evaluation_state": "screening_only_previously_opened_heldout",
         "promotion_eligible": False,
         "promotion_blockers": [
@@ -859,9 +908,8 @@ def run(args: argparse.Namespace) -> Path:
             "production_runtime_adapter_not_implemented",
             "50k_resource_gate_not_measured",
         ],
-        "git_head": command_output(["git", "rev-parse", "HEAD"]),
-        "worktree_clean_at_start": command_output(["git", "status", "--porcelain"])
-        == "",
+        "git_head": git_head,
+        "worktree_clean_at_start": worktree_clean,
         "device": args.device,
         "host": {
             "system": platform.system(),
@@ -899,21 +947,27 @@ def run(args: argparse.Namespace) -> Path:
         "reranker": reranker,
         "total_runtime_seconds": time.perf_counter() - started,
     }
+    final_git_head, final_worktree_clean = capture_git_identity()
+    if final_git_head != git_head or not final_worktree_clean:
+        raise RuntimeError("Git identity changed during benchmark execution")
+    report["raw_query_or_body_logged"] = False
+    report["absolute_path_logged"] = False
     args.output_root.mkdir(parents=True, exist_ok=True)
     checkpoint_path = args.output_root / f"qwen-benchmark-{args.device}.checkpoint.json"
-    checkpoint_path.write_text(
+    checkpoint = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "report": report,
+        "screening_rankings": {
+            "bm25": bm25_test,
+            "qwen_dense": dense_test,
+            "qwen_hybrid": hybrid_test,
+            "qwen_bm25_rerank": bm25_reranked_test,
+            "qwen_hybrid_rerank": hybrid_reranked_test,
+        },
+    }
+    rendered_checkpoint = (
         json.dumps(
-            {
-                "schema_version": "qgh.qwen_screening_checkpoint.v1",
-                "report": report,
-                "screening_rankings": {
-                    "bm25": bm25_test,
-                    "qwen_dense": dense_test,
-                    "qwen_hybrid": hybrid_test,
-                    "qwen_bm25_rerank": bm25_reranked_test,
-                    "qwen_hybrid_rerank": hybrid_reranked_test,
-                },
-            },
+            checkpoint,
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
@@ -933,7 +987,9 @@ def run(args: argparse.Namespace) -> Path:
             "qwen_bm25_rerank": bm25_reranked_test,
             "qwen_hybrid_rerank": hybrid_reranked_test,
         },
+        extra_payloads=(rendered_checkpoint,),
     )
+    checkpoint_path.write_text(rendered_checkpoint)
     print(
         json.dumps(
             {

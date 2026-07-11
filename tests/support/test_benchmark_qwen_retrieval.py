@@ -99,6 +99,37 @@ class QwenBenchmarkContractTests(unittest.TestCase):
             "f66ed72b8284e70d2c1bff3f906910cbf29a26219115aa016593f1629ab6a133",
         )
 
+    def test_artifact_redaction_fails_closed_on_raw_text_and_paths(self) -> None:
+        corpus = [
+            {
+                "title": "Public issue title long enough to audit",
+                "body": "Public issue body long enough to audit",
+            }
+        ]
+        qrels = [{"query": "Public query long enough to audit"}]
+
+        for escaped in (
+            corpus[0]["title"],
+            corpus[0]["body"],
+            qrels[0]["query"],
+            "/Users/example/private/cache",
+            "Authorization: Bearer redacted",
+            "github_pat_abcdefghijklmnopqrstuvwxyz123456",
+        ):
+            with self.subTest(escaped=escaped[:16]):
+                with self.assertRaises(RuntimeError):
+                    BENCHMARK.assert_redacted_payload(corpus, qrels, escaped)
+
+        BENCHMARK.assert_redacted_payload(
+            corpus,
+            qrels,
+            '{"query_sha256":"abc","source_id":"public-source"}',
+        )
+
+    def test_os_high_water_rss_is_normalized_to_bytes(self) -> None:
+        self.assertEqual(BENCHMARK.rss_high_water_bytes(1234, "Darwin"), 1234)
+        self.assertEqual(BENCHMARK.rss_high_water_bytes(1234, "Linux"), 1263616)
+
     def test_screening_events_do_not_require_dev_rankings(self) -> None:
         screening = [
             {
