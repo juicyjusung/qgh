@@ -4292,6 +4292,9 @@ pub(super) fn run(
         "bm25-live",
         "arctic-embed-l-v2.0-live",
         "gte-modernbert-base-live",
+        "granite-embedding-97m-multilingual-r2-live",
+        "dragonkue-koen-e5-tiny-live",
+        "multilingual-e5-small-live",
     ] {
         remove_dir_if_exists(&root.join(stale))?;
     }
