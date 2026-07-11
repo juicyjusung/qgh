@@ -456,8 +456,9 @@ class CorpusCollector:
         except UnsafeSource as error:
             self.exclusions[error.reason] += 1
             if required:
+                number = payload.get("number") if isinstance(payload, dict) else None
                 raise FixtureBuildError(
-                    "required public gold/dev issue was rejected"
+                    f"required public gold/dev issue was rejected: {repo}#{number} ({error.reason})"
                 ) from None
             return None
         return self._insert(record, (repo, record["issue_number"]), None)
@@ -470,8 +471,9 @@ class CorpusCollector:
         except UnsafeSource as error:
             self.exclusions[error.reason] += 1
             if required:
+                comment_id = payload.get("id") if isinstance(payload, dict) else None
                 raise FixtureBuildError(
-                    "required public gold/dev comment was rejected"
+                    f"required public gold/dev comment was rejected: {repo} comment {comment_id} ({error.reason})"
                 ) from None
             return None
         return self._insert(record, None, (repo, comment_id))

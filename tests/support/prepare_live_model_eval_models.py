@@ -149,7 +149,9 @@ def snapshot_sha256(root: Path) -> str:
 def main() -> None:
     global SELECTED_CANDIDATES
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output-root", type=Path, default=Path("target/qgh-eval/models"))
+    parser.add_argument(
+        "--output-root", type=Path, default=Path("target/qgh-eval/models")
+    )
     parser.add_argument(
         "--offline",
         action="store_true",
@@ -158,6 +160,11 @@ def main() -> None:
     parser.add_argument(
         "--candidates",
         help="comma-separated eval candidate ids; default prepares the full set",
+    )
+    parser.add_argument(
+        "--multilingual-e5-small-ko-v2-export-root",
+        type=Path,
+        help="local pinned-revision FP32 ONNX export to import for the optional ko-v2 candidate",
     )
     args = parser.parse_args()
     if args.candidates:
@@ -188,22 +195,33 @@ def main() -> None:
             prior_record=prior_records.get("gte-modernbert-base"),
         )
     )
-    summaries.append(
-        prepare_manifest(
-            args.output_root / "multilingual-e5-small-ko-v2",
-            "multilingual-e5-small-ko-v2",
-            MULTILINGUAL_E5_SMALL_KO_V2_MODEL_ID,
-            MULTILINGUAL_E5_SMALL_KO_V2_REVISION,
-            MULTILINGUAL_E5_SMALL_KO_V2_FILES,
-            pooling="mean",
-            query_prefix="query: ",
-            document_prefix="passage: ",
-            native_dimension=384,
-            max_length=512,
-            offline=args.offline,
-            prior_record=prior_records.get("multilingual-e5-small-ko-v2"),
+    ko_v2_root = args.output_root / "multilingual-e5-small-ko-v2"
+    if args.multilingual_e5_small_ko_v2_export_root is not None:
+        import_ko_v2_export(args.multilingual_e5_small_ko_v2_export_root, ko_v2_root)
+    if (ko_v2_root / "onnx/model.onnx").is_file():
+        summaries.append(
+            prepare_manifest(
+                ko_v2_root,
+                "multilingual-e5-small-ko-v2",
+                MULTILINGUAL_E5_SMALL_KO_V2_MODEL_ID,
+                MULTILINGUAL_E5_SMALL_KO_V2_REVISION,
+                MULTILINGUAL_E5_SMALL_KO_V2_FILES,
+                pooling="mean",
+                query_prefix="query: ",
+                document_prefix="passage: ",
+                native_dimension=384,
+                max_length=512,
+                offline=True,
+                prior_record=prior_records.get("multilingual-e5-small-ko-v2"),
+            )
         )
-    )
+    elif (
+        SELECTED_CANDIDATES is not None
+        and "multilingual-e5-small-ko-v2" in SELECTED_CANDIDATES
+    ):
+        raise RuntimeError(
+            "optional ko-v2 candidate requires a local pinned-revision ONNX export"
+        )
     summaries.append(
         prepare_manifest(
             args.output_root / "granite-embedding-97m-multilingual-r2",
@@ -423,6 +441,23 @@ def prepare_manifest(
     return summary
 
 
+def import_ko_v2_export(source_root: Path, destination_root: Path) -> None:
+    mappings = {
+        "model.onnx": "onnx/model.onnx",
+        "tokenizer.json": "tokenizer.json",
+        "config.json": "config.json",
+        "special_tokens_map.json": "special_tokens_map.json",
+        "tokenizer_config.json": "tokenizer_config.json",
+    }
+    for source_name, destination_name in mappings.items():
+        source = source_root / source_name
+        if not source.is_file() or source.stat().st_size == 0:
+            raise RuntimeError("optional ko-v2 export is missing a required artifact")
+        destination = destination_root / destination_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+
+
 def load_prior_prepared_records(output_root: Path):
     path = output_root / "preparation-provenance.json"
     if not path.is_file():
@@ -497,8 +532,7 @@ def preserved_acquisition(
     matches = [
         artifact
         for artifact in prior_record.get("artifact_acquisition", [])
-        if isinstance(artifact, dict)
-        and artifact.get("relative_path") == relative_path
+        if isinstance(artifact, dict) and artifact.get("relative_path") == relative_path
     ]
     if len(matches) != 1:
         return None

@@ -528,6 +528,21 @@ fn bm25_rescue_selection_prefers_net_rescue_then_smaller_snapshot() {
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
+fn lower_dense_rrf_weight_keeps_a_lexical_hit_above_a_vector_only_hit() {
+    let observations = [
+        ("z-lexical", Some(2.0), None),
+        ("a-vector", None, Some(0.1)),
+    ];
+
+    let equal = live_model_eval_runtime::fuse_weighted_for_test(&observations, 60, 80, 1000);
+    let lexical_first = live_model_eval_runtime::fuse_weighted_for_test(&observations, 60, 80, 250);
+
+    assert_eq!(equal[0], "a-vector");
+    assert_eq!(lexical_first[0], "z-lexical");
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
 fn resource_rss_watchdog_stops_an_over_limit_child() {
     let evidence = live_model_eval_runtime::rss_watchdog_for_test()
         .expect("resource watchdog returns structured evidence");
@@ -639,9 +654,9 @@ fn real_manifest_tokenizer_contract_drives_frozen_and_resource_chunker_identity(
         "tokenizer_contract_identity_from_manifest",
         "chunker_fingerprint_for_tokenizer_identity",
         "tokenizer_contract_identity",
-        "qgh.live_model_eval_config.v6",
-        "qgh.live_model_eval_report.v5",
-        "qgh.live_model_eval_candidate.v3",
+        "qgh.live_model_eval_config.v7",
+        "qgh.live_model_eval_report.v6",
+        "qgh.live_model_eval_candidate.v4",
         "qgh.live_model_eval_resource.v2",
     ] {
         assert!(RUNTIME_SUPPORT.contains(required), "missing {required}");
@@ -796,7 +811,7 @@ fn model_preparation_records_download_and_cache_source_bytes() {
         assert_eq!(blocker["candidate"], "dragonkue-ko");
         assert_eq!(
             blocker["schema_version"],
-            "qgh.live_model_eval_candidate.v3"
+            "qgh.live_model_eval_candidate.v4"
         );
         assert_eq!(blocker["status"], "blocked");
         assert_eq!(

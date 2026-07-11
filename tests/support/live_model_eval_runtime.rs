@@ -47,6 +47,7 @@ const CANDIDATE_WINDOW: usize = TOP_K * 4;
 const DEV_DIAGNOSTIC_QUERY_LIMIT: usize = 100;
 const DEV_DIAGNOSTIC_RRF_K: [usize; 3] = [20, 60, 100];
 const DEV_DIAGNOSTIC_WINDOWS: [usize; 3] = [40, 80, 100];
+const DENSE_WEIGHT_GRID_MILLI: [u16; 4] = [250, 500, 750, 1000];
 const REQUIRED_BATCH_SIZE: usize = FASTEMBED_BATCH_SIZE;
 const REQUIRED_INTRA_OP_THREADS: usize = FASTEMBED_INTRA_OP_THREADS;
 const DRAGONKUE_MODEL_ID: &str = "dragonkue/snowflake-arctic-embed-l-v2.0-ko";
@@ -289,6 +290,18 @@ struct Bm25ComplementMetrics {
     #[serde(flatten)]
     overall: Bm25ComplementCounts,
     per_class: BTreeMap<QueryClass, Bm25ComplementCounts>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WeightedFusionEvidence {
+    dense_weight_milli: u16,
+    rrf_k: usize,
+    candidate_window: usize,
+    abstention: &'static str,
+    dev_metrics: RetrievalMetrics,
+    dev_bm25_complement: Bm25ComplementMetrics,
+    held_out_metrics: Option<RetrievalMetrics>,
+    held_out_bm25_complement: Option<Bm25ComplementMetrics>,
 }
 
 fn bm25_complement_metrics(
@@ -1053,6 +1066,7 @@ struct CandidateReport {
     dev_metrics: Option<RetrievalMetrics>,
     held_out_metrics: Option<RetrievalMetrics>,
     held_out_bm25_complement: Option<Bm25ComplementMetrics>,
+    weighted_fusion: Option<WeightedFusionEvidence>,
     offline_dev_diagnostics: Vec<OfflineFusionDiagnostic>,
     resources: Option<ResourceEvidence>,
     light_gate_failures: Vec<String>,
@@ -1102,6 +1116,7 @@ struct FrozenCandidateState {
     blocker_code: Option<String>,
     dev_metrics_sha256: Option<String>,
     offline_dev_diagnostics_sha256: Option<String>,
+    weighted_fusion_dev_sha256: Option<String>,
     manifest_relative_path: Option<String>,
     manifest_hash: Option<String>,
     tokenizer_contract_identity: Option<String>,
@@ -2115,6 +2130,15 @@ fn fuse_branch_observations(
     rrf_k: usize,
     candidate_window: usize,
 ) -> Vec<String> {
+    fuse_branch_observations_weighted(observations, rrf_k, candidate_window, 1000)
+}
+
+fn fuse_branch_observations_weighted(
+    observations: &[BranchObservation],
+    rrf_k: usize,
+    candidate_window: usize,
+    dense_weight_milli: u16,
+) -> Vec<String> {
     let mut lexical = observations
         .iter()
         .filter_map(|hit| {
@@ -2164,10 +2188,12 @@ fn fuse_branch_observations(
             .vector_rank = Some(index + 1);
     }
     let component = |rank: Option<usize>| rank.map_or(0.0, |rank| 1.0 / (rrf_k + rank) as f64);
+    let dense_weight = f64::from(dense_weight_milli) / 1000.0;
     let mut fused = fused.into_values().collect::<Vec<_>>();
     fused.sort_by(|left, right| {
-        let left_score = component(left.lexical_rank) + component(left.vector_rank);
-        let right_score = component(right.lexical_rank) + component(right.vector_rank);
+        let left_score = component(left.lexical_rank) + dense_weight * component(left.vector_rank);
+        let right_score =
+            component(right.lexical_rank) + dense_weight * component(right.vector_rank);
         right_score
             .partial_cmp(&left_score)
             .unwrap_or(Ordering::Equal)
@@ -2187,6 +2213,131 @@ fn fuse_branch_observations(
             .then_with(|| left.source_id.cmp(&right.source_id))
     });
     fused.into_iter().map(|hit| hit.source_id).collect()
+}
+
+pub(super) fn fuse_weighted_for_test(
+    observations: &[(&str, Option<f64>, Option<f64>)],
+    rrf_k: usize,
+    candidate_window: usize,
+    dense_weight_milli: u16,
+) -> Vec<String> {
+    fuse_branch_observations_weighted(
+        &observations
+            .iter()
+            .map(
+                |(source_id, lexical_score, vector_distance)| BranchObservation {
+                    source_id: (*source_id).to_string(),
+                    lexical_score: *lexical_score,
+                    vector_distance: *vector_distance,
+                },
+            )
+            .collect::<Vec<_>>(),
+        rrf_k,
+        candidate_window,
+        dense_weight_milli,
+    )
+}
+
+fn weighted_query_evidence(
+    qrels: &[QrelRecord],
+    diagnostic: &QueryEvidence,
+    dense_weight_milli: u16,
+) -> Result<QueryEvidence, DynError> {
+    let mut rankings = BTreeMap::new();
+    for qrel in qrels {
+        let ranked = if qrel.query_class == QueryClass::ExactIdentifier {
+            diagnostic
+                .rankings
+                .get(&qrel.query_id)
+                .cloned()
+                .ok_or("weighted fusion exact ranking missing")?
+        } else {
+            let observations = diagnostic
+                .branch_observations
+                .get(&qrel.query_id)
+                .ok_or("weighted fusion branch observations missing")?;
+            fuse_branch_observations_weighted(
+                observations,
+                RRF_K,
+                CANDIDATE_WINDOW,
+                dense_weight_milli,
+            )
+        };
+        rankings.insert(qrel.query_id.clone(), ranked);
+    }
+    Ok(QueryEvidence {
+        rankings,
+        branch_observations: diagnostic.branch_observations.clone(),
+        get_total: 0,
+        get_success: 0,
+        stale_failures: diagnostic.stale_failures,
+        hybrid_required: true,
+        hybrid_expected_queries: diagnostic.hybrid_expected_queries,
+        hybrid_path_queries: diagnostic.hybrid_path_queries,
+    })
+}
+
+fn select_weighted_fusion(
+    corpus: &[CorpusRecord],
+    qrels: &[QrelRecord],
+    diagnostic: &QueryEvidence,
+    bm25: &QueryEvidence,
+    events_root: &Path,
+) -> Result<WeightedFusionEvidence, DynError> {
+    let mut candidates = Vec::new();
+    for dense_weight_milli in DENSE_WEIGHT_GRID_MILLI {
+        let evidence = weighted_query_evidence(qrels, diagnostic, dense_weight_milli)?;
+        let metrics = evaluate_rankings(
+            corpus,
+            qrels,
+            &evidence,
+            &events_root.join(format!("weighted-dev-{dense_weight_milli}-events.jsonl")),
+        )?;
+        let complement = bm25_complement_metrics(qrels, &bm25.rankings, &evidence.rankings);
+        candidates.push(WeightedFusionEvidence {
+            dense_weight_milli,
+            rrf_k: RRF_K,
+            candidate_window: CANDIDATE_WINDOW,
+            abstention: "off_insufficient_negative_calibration",
+            dev_metrics: metrics,
+            dev_bm25_complement: complement,
+            held_out_metrics: None,
+            held_out_bm25_complement: None,
+        });
+    }
+    candidates.sort_by(|left, right| {
+        let left_net = left.dev_bm25_complement.overall.rescued_at_5 as i64
+            - left.dev_bm25_complement.overall.bm25_hit_harmed_at_5 as i64;
+        let right_net = right.dev_bm25_complement.overall.rescued_at_5 as i64
+            - right.dev_bm25_complement.overall.bm25_hit_harmed_at_5 as i64;
+        let recall = |candidate: &WeightedFusionEvidence| {
+            candidate
+                .dev_metrics
+                .per_class
+                .get(&QueryClass::KoQueryEnSource)
+                .map_or(0.0, |class| class.recall_at_5)
+        };
+        right_net
+            .cmp(&left_net)
+            .then_with(|| {
+                left.dev_bm25_complement
+                    .overall
+                    .bm25_hit_harmed_at_5
+                    .cmp(&right.dev_bm25_complement.overall.bm25_hit_harmed_at_5)
+            })
+            .then_with(|| recall(right).total_cmp(&recall(left)))
+            .then_with(|| {
+                right
+                    .dev_metrics
+                    .weighted_ndcg_at_10
+                    .total_cmp(&left.dev_metrics.weighted_ndcg_at_10)
+            })
+            .then_with(|| left.dense_weight_milli.cmp(&right.dense_weight_milli))
+    });
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| "weighted fusion grid is empty".into())
 }
 
 pub(super) fn fuse_for_test(
@@ -3589,6 +3740,7 @@ pub(super) fn final_report_artifact_for_test() -> &'static str {
 
 struct WarmEvidence {
     held_out: QueryEvidence,
+    diagnostic: QueryEvidence,
     latencies_ms: Vec<f64>,
     peak_rss_bytes: u64,
 }
@@ -3614,6 +3766,7 @@ struct PreparedCandidate {
     isolated_peak_rss: u64,
     dev_metrics: RetrievalMetrics,
     held_out_bm25_complement: Option<Bm25ComplementMetrics>,
+    weighted_fusion: WeightedFusionEvidence,
     offline_dev_diagnostics: Vec<OfflineFusionDiagnostic>,
 }
 
@@ -3655,6 +3808,10 @@ fn frozen_prepared_candidate_state(
             "{:x}",
             Sha256::digest(serde_json::to_vec(&prepared.offline_dev_diagnostics)?)
         )),
+        weighted_fusion_dev_sha256: Some(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&prepared.weighted_fusion)?)
+        )),
         manifest_relative_path: Some(relative),
         manifest_hash: Some(manifest.hash()),
         tokenizer_contract_identity: Some(tokenizer_chunker_contract.tokenizer_contract_identity),
@@ -3687,6 +3844,13 @@ fn frozen_blocked_candidate_state(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&report.offline_dev_diagnostics)?)
     );
+    let weighted_fusion_dev_sha256 = report
+        .weighted_fusion
+        .as_ref()
+        .map(|evidence| {
+            serde_json::to_vec(evidence).map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+        })
+        .transpose()?;
     let mut frozen = FrozenCandidateState {
         candidate: report.candidate.clone(),
         model_id: report.model_id.clone(),
@@ -3695,6 +3859,7 @@ fn frozen_blocked_candidate_state(
         blocker_code: report.blocker.as_ref().map(|blocker| blocker.code.clone()),
         dev_metrics_sha256,
         offline_dev_diagnostics_sha256: Some(offline_dev_diagnostics_sha256),
+        weighted_fusion_dev_sha256,
         manifest_relative_path: None,
         manifest_hash: report.manifest_hash.clone(),
         tokenizer_contract_identity: report.tokenizer_contract_identity.clone(),
@@ -4451,6 +4616,7 @@ pub(super) fn run(
             &manifest,
             &corpus,
             &dev,
+            &bm25_dev_evidence,
             frozen_lexical_profile.selected_profile,
         ));
     }
@@ -4464,7 +4630,7 @@ pub(super) fn run(
     // deployable frozen values are the actual source constants: k=60 and
     // TOP_K(20) * overfetch(4) = 80.  The k/window grid above is diagnostic.
     let frozen = FrozenConfig {
-        schema_version: "qgh.live_model_eval_config.v6",
+        schema_version: "qgh.live_model_eval_config.v7",
         integrated_git_head: integrated_git_head.clone(),
         worktree_clean,
         release_binary_sha256: host.binary_sha256.clone(),
@@ -4637,7 +4803,7 @@ pub(super) fn run(
     );
     frozen_guard.revalidate_before_final_report(root, &binary)?;
     let mut report = FullReport {
-        schema_version: "qgh.live_model_eval_report.v5",
+        schema_version: "qgh.live_model_eval_report.v6",
         run_finished_at: command_output("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
         corpus_snapshot_at: provenance.snapshot_at,
         host,
@@ -4824,6 +4990,7 @@ fn prepare_candidate_dev(
     manifest_path: &Path,
     corpus: &[CorpusRecord],
     dev: &[QrelRecord],
+    bm25_dev: &QueryEvidence,
     lexical_profile: FrozenLexicalProfileName,
 ) -> Result<PreparedCandidate, Box<CandidateReport>> {
     if model_candidate_requires_lexical_promotion(lexical_profile) {
@@ -4844,6 +5011,7 @@ fn prepare_candidate_dev(
         manifest_path,
         corpus,
         dev,
+        bm25_dev,
     ) {
         Ok(prepared) => Ok(prepared),
         Err(error) => {
@@ -4896,6 +5064,7 @@ fn try_prepare_candidate_dev(
     manifest_path: &Path,
     corpus: &[CorpusRecord],
     dev: &[QrelRecord],
+    bm25_dev: &QueryEvidence,
 ) -> Result<PreparedCandidate, DynError> {
     eprintln!("live-eval candidate={candidate} phase=sync status=running");
     let fixture = CliFixture::new_with_repositories(
@@ -4967,6 +5136,8 @@ fn try_prepare_candidate_dev(
         &fixture.root.join("dev-events.jsonl"),
     )?;
     let offline_dev_diagnostics = offline_fusion_diagnostics(dev, &dev_run.diagnostic)?;
+    let weighted_fusion =
+        select_weighted_fusion(corpus, dev, &dev_run.diagnostic, bm25_dev, &fixture.root)?;
     let hybrid_filter_contract =
         run_candidate_hybrid_filter_contract(root, binary, candidate, manifest_path, corpus)
             .map_err(|_| -> DynError { Box::new(HybridFilterContractFailure) })?;
@@ -5002,6 +5173,7 @@ fn try_prepare_candidate_dev(
         isolated_peak_rss,
         dev_metrics,
         held_out_bm25_complement: None,
+        weighted_fusion,
         offline_dev_diagnostics,
     })
 }
@@ -5085,6 +5257,40 @@ fn finish_candidate(
         &bm25_held_out.rankings,
         &warm.held_out.rankings,
     ));
+    let weighted_heldout = match weighted_query_evidence(
+        held_out,
+        &warm.diagnostic,
+        prepared.weighted_fusion.dense_weight_milli,
+    )
+    .and_then(|evidence| {
+        let metrics = evaluate_rankings(
+            corpus,
+            held_out,
+            &evidence,
+            &prepared.fixture.root.join("weighted-heldout-events.jsonl"),
+        )?;
+        let complement =
+            bm25_complement_metrics(held_out, &bm25_held_out.rankings, &evidence.rankings);
+        Ok((metrics, complement))
+    }) {
+        Ok(evidence) => evidence,
+        Err(_) => {
+            return prepared_candidate_report(
+                prepared,
+                "blocked_after_heldout",
+                Some(held_out_metrics),
+                None,
+                vec!["weighted_fusion_unavailable".to_string()],
+                vec!["weighted_fusion_unavailable".to_string()],
+                Some(Blocker {
+                    code: "eval.weighted_fusion_failed".to_string(),
+                    phase: "heldout_weighted_fusion".to_string(),
+                }),
+            );
+        }
+    };
+    prepared.weighted_fusion.held_out_metrics = Some(weighted_heldout.0);
+    prepared.weighted_fusion.held_out_bm25_complement = Some(weighted_heldout.1);
     if verify_active_chunker_contract(
         &prepared.fixture.db_path(),
         &prepared.tokenizer_chunker_contract.chunker_fingerprint,
@@ -5331,7 +5537,7 @@ fn prepared_candidate_report(
 ) -> CandidateReport {
     let report_path = prepared.fixture.root.join("report.json");
     let report = CandidateReport {
-        schema_version: "qgh.live_model_eval_candidate.v3",
+        schema_version: "qgh.live_model_eval_candidate.v4",
         candidate: prepared.candidate,
         model_id: prepared.model_id,
         resolved_revision: prepared.revision,
@@ -5351,6 +5557,7 @@ fn prepared_candidate_report(
         dev_metrics: Some(prepared.dev_metrics),
         held_out_metrics,
         held_out_bm25_complement: prepared.held_out_bm25_complement,
+        weighted_fusion: Some(prepared.weighted_fusion),
         offline_dev_diagnostics: prepared.offline_dev_diagnostics,
         resources,
         light_gate_failures,
@@ -5370,7 +5577,7 @@ fn blocked_candidate(
     phase: &str,
 ) -> CandidateReport {
     CandidateReport {
-        schema_version: "qgh.live_model_eval_candidate.v3",
+        schema_version: "qgh.live_model_eval_candidate.v4",
         candidate: candidate.to_string(),
         model_id: model_id.to_string(),
         resolved_revision: revision.to_string(),
@@ -5386,6 +5593,7 @@ fn blocked_candidate(
         dev_metrics: None,
         held_out_metrics: None,
         held_out_bm25_complement: None,
+        weighted_fusion: None,
         offline_dev_diagnostics: Vec::new(),
         resources: None,
         light_gate_failures: vec!["runtime_unavailable".to_string()],
@@ -5427,7 +5635,7 @@ fn dragonkue_blocker(root: &Path) -> Result<CandidateReport, DynError> {
         blocker.code
     );
     Ok(CandidateReport {
-        schema_version: "qgh.live_model_eval_candidate.v3",
+        schema_version: "qgh.live_model_eval_candidate.v4",
         candidate: "dragonkue-ko".to_string(),
         model_id: DRAGONKUE_MODEL_ID.to_string(),
         resolved_revision: DRAGONKUE_REVISION.to_string(),
@@ -5443,6 +5651,7 @@ fn dragonkue_blocker(root: &Path) -> Result<CandidateReport, DynError> {
         dev_metrics: None,
         held_out_metrics: None,
         held_out_bm25_complement: None,
+        weighted_fusion: None,
         offline_dev_diagnostics: Vec::new(),
         resources: None,
         light_gate_failures: vec!["runtime_unavailable".to_string()],
@@ -6448,9 +6657,17 @@ fn run_heldout_mcp(
             held_out_evidence = Some(evidence);
         }
     }
+    let (diagnostic, _) = query_pass(
+        &mut client,
+        held_out,
+        false,
+        DEV_DIAGNOSTIC_QUERY_LIMIT,
+        true,
+    )?;
     let peak_rss_bytes = client.finish()?;
     Ok(WarmEvidence {
         held_out: held_out_evidence.ok_or("held-out evidence missing")?,
+        diagnostic,
         latencies_ms: latencies,
         peak_rss_bytes,
     })
