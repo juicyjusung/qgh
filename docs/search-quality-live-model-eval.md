@@ -6,16 +6,16 @@ The fresh evaluation used an unauthenticated public GitHub REST snapshot that ha
 
 `dragonkue-koen-e5-tiny` is the practical Pareto winner for optional BM25 rescue. Its dev-selected dense RRF weight is `0.25`; on fresh held-out it rescues eight BM25 misses at top 5, harms zero BM25 top-5 hits, preserves exact top-1, and raises Korean-query-to-English-source Recall@5 from `0.20` to `0.90`. Granite is the raw-quality winner but reached 26.19 GB peak RSS in the 50k watchdog. The two 487 MB E5 models are about 3.19 times the Tiny snapshot and do not provide enough quality or harm reduction to justify that cost.
 
-No embedding preset is promoted automatically. Tiny exceeded the frozen 2.5 GiB quality RSS ceiling by 2,441,216 bytes and therefore did not complete 50k throughput/publication evidence. It is the recommended next opt-in preset candidate, not a new production default. BM25-only remains the complete production path. `production_v1` also remains the lexical profile: `metadata_boost_v1` improved dev nDCG but both profiles retained the same Korean Recall@5 failure.
+No embedding preset is promoted automatically. Tiny exceeded the frozen 2.5 GiB quality RSS ceiling by 4,177,920 bytes (about 3.98 MiB) and therefore did not complete 50k throughput/publication evidence. It is the recommended next opt-in preset candidate, not a new production default. BM25-only remains the complete production path. `production_v1` also remains the lexical profile: `metadata_boost_v1` improved dev nDCG, but both profiles failed Korean Recall@5 and the separate comment-gold Recall@5 gate.
 
 | Candidate and frozen dense weight | Fresh nDCG / MRR | BM25 rescue@5 / harm@5 | KO→EN / EN→KO Recall@5 | Snapshot | Peak RSS / cold p95 | Decision |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Granite 97M R2, `0.75` | **0.8731 / 0.8395** | **10 / 0** | **1.00 / 0.50** | 415.3 MB | 26.19 GB / 3.10 s | reject: runaway RSS |
-| Dragonkue KoEn E5 Tiny, `0.25` | 0.8320 / 0.7930 | 8 / 0 | 0.90 / 0.50 | **152.7 MB** | **2.687 GB / 1.12 s** | **practical winner; no automatic promotion** |
-| multilingual-E5-small, `1.00` | 0.8377 / 0.7962 | 10 / 1 | 1.00 / 0.50 | 487.4 MB | 2.713 GB / 3.13 s | reject: larger and harms one BM25 hit |
-| multilingual-E5-small-ko-v2, `0.25` | 0.8382 / 0.8018 | 8 / 0 | 0.90 / 0.50 | 487.4 MB | 2.845 GB / 3.15 s | reject: dominated by Tiny on resources |
+| Granite 97M R2, `0.75` | **0.8731 / 0.8395** | **10 / 0** | **1.00 / 0.50** | 415.3 MB | 26.93 GB / 3.09 s | reject: runaway RSS |
+| Dragonkue KoEn E5 Tiny, `0.25` | 0.8320 / 0.7930 | 8 / 0 | 0.90 / 0.50 | **152.7 MB** | **2.689 GB / 1.12 s** | **practical winner; no automatic promotion** |
+| multilingual-E5-small, `1.00` | 0.8377 / 0.7962 | 10 / 1 | 1.00 / 0.50 | 487.4 MB | 2.724 GB / 3.39 s | reject: larger and harms one BM25 hit |
+| multilingual-E5-small-ko-v2, `0.25` | 0.8382 / 0.8018 | 8 / 0 | 0.90 / 0.50 | 487.4 MB | 2.830 GB / 3.16 s | reject: dominated by Tiny on resources |
 
-The BM25 baseline is nDCG `0.7244`, MRR `0.7024`, Korean-query-to-English-source Recall@5 `0.20`, English-query-to-Korean-source Recall@5 `0.50`, exact Recall@5 `1.00`, comment-focused Recall@5 `0.90`, and long-context Recall@5 `1.00`. Every hybrid candidate preserved exact top-1, hard filters, stale exclusion, and `query -> get` round-trip.
+The BM25 baseline is nDCG `0.7244`, MRR `0.7024`, Korean-query-to-English-source Recall@5 `0.20`, English-query-to-Korean-source Recall@5 `0.50`, exact Recall@5 `1.00`, comment-focused graded Recall@5 `0.90`, separate actual-comment-gold Recall@5 `0.80`, and long-context Recall@5 `1.00`. BM25 completed `712/712` profile-aware `get` calls. Each hybrid candidate completed every raw and weighted profile-aware `get`; the weighted totals were `1,159/1,159` for every candidate. All candidates also preserved exact top-1, hard filters, stale exclusion, and the new comment-gold `0.80` hard gate. Every candidate still failed the English-query-to-Korean-source `0.60` minimum with Recall@5 `0.50`, so none is production-promotion eligible even under the BM25-rescue objective.
 
 Dynamic ARM64 INT8 Tiny was investigated and deliberately excluded. ONNX Runtime generally recommends dynamic quantization for Transformer inference, but qgh persists embeddings across bounded batches; activation ranges that change per batch conflict with the existing deterministic embedding-generation contract. The manifest and fastembed runtime already reject this path. A genuine static, calibrated candidate would need batch-order/vector parity evidence before it could enter a future grid. See the [ONNX Runtime quantization guide](https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html) and [Optimum ONNX quantization guide](https://huggingface.co/docs/optimum-onnx/onnxruntime/usage_guides/quantization).
 
@@ -25,16 +25,16 @@ GPU acceleration remains optional backfill work, not a query-path dependency. Th
 
 | Field | Value |
 | --- | --- |
-| Evaluation | `completed_not_eligible`; blocker `no_passing_candidate`; 1498.36 s |
-| Evidence HEAD | `6f1a815301eb7015ee6e2941a762371e4c79548d` |
+| Evaluation | `completed_not_eligible`; blocker `no_passing_candidate`; finished `2026-07-11T13:29:04Z` |
+| Evidence HEAD | `680564657420a85f37f9d20ee22419719009c58a` |
 | Public snapshot | `2026-07-11T12:18:44Z`; authentication `none` |
 | Corpus | 566 sources; SHA-256 `992b375ef47f31f36caef54d2798c5315d734754146528cd60a78ce5e7153ef0` |
 | Dev qrels | 40 queries; SHA-256 `7e4daa6376fff4f013b088596c4b98ce99aa52340cc7df76046f82ed1d555494` |
 | Held-out qrels | 80 queries; SHA-256 `1a639489b0d19f5f31a3f7065335ab34815af3b3a58d1de1b04047bc497c7c2c` |
 | Release binary | SHA-256 `ee8c895c20f744e5758c934c5c87b5c15ebb61538cf9c171eb71da7f4624ae2c` |
-| Final report | `qgh.live_model_eval_report.v6`; SHA-256 `8d79ef51aa4e3796e372b0714469bfaa92ed83f07f96c3efa9f327d8ccc11dbc` |
-| Frozen config | SHA-256 `81ca8f848d9d1d7d73996965448dda6381bbe0ea4353a0c065b4cc0df0cea5b7` |
-| Contract gate bundle | SHA-256 `7fd20e3b29d12b9c115a3f4b6e330413d6d8e92b37708c9288e5594d32a30986` |
+| Final report | `qgh.live_model_eval_report.v7`; SHA-256 `cd9ff129ccc3b3a16d29572f368a00b5892970d8110c396400b4d633228aea2b` |
+| Frozen config | SHA-256 `387063c09f60d6a714f5661feb83c8d50778bbb8d68a9435a71173a2ccd994be` |
+| Contract gate bundle | SHA-256 `4920b512c1e8d28e1067cdac6fa0e0583cf1a935d24307bd8453274781ffd285` |
 | Model preparation provenance | SHA-256 `f24a82ab635b90d66d59d2156ee86024d3c63b85c3fad8abc43967dd2818cbe6` |
 
 ## 2026-07-11 lightweight BM25-rescue follow-up
@@ -193,17 +193,22 @@ Prepare already pinned artifacts without network access:
 
 ```sh
 python3 tests/support/prepare_live_model_eval_models.py \
-  --output-root target/qgh-eval/models \
+  --output-root target/qgh-eval/fresh-blind-run/models \
+  --candidates granite-embedding-97m-multilingual-r2,dragonkue-koen-e5-tiny,multilingual-e5-small,multilingual-e5-small-ko-v2 \
   --offline
 ```
 
-Run the canonical release evaluation from a clean integrated HEAD:
+The offline command verifies an already prepared canonical root. When preparing a new root, the optional `multilingual-e5-small-ko-v2` candidate additionally requires a local FP32 ONNX export of pinned revision `fcfc26bf355882620c48df58be112275bd756f50`; pass its root with `--multilingual-e5-small-ko-v2-export-root`. The preparation script fails closed if that pinned export or another required offline artifact is absent.
+
+Run the fresh blind canonical release evaluation from a clean integrated HEAD after generating the public fixture under `target/qgh-eval/fresh-blind-fixture/generated`:
 
 ```sh
-QGH_LIVE_MODEL_EVAL=1 \
-QGH_LIVE_MODEL_EVAL_ROOT=target/qgh-eval \
+QGH_FRESH_BLIND_MODEL_EVAL=1 \
+QGH_FRESH_BLIND_FIXTURE_ROOT=target/qgh-eval/fresh-blind-fixture/generated \
+QGH_LIVE_MODEL_EVAL_ROOT=target/qgh-eval/fresh-blind-run \
+QGH_LIVE_MODEL_EVAL_CANDIDATES=granite-embedding-97m-multilingual-r2,dragonkue-koen-e5-tiny,multilingual-e5-small,multilingual-e5-small-ko-v2 \
 cargo test --release --locked --all-features \
-  --test live_model_eval live_model_runtime_evaluation \
+  --test live_model_eval fresh_blind_model_runtime_evaluation \
   -- --ignored --exact --nocapture
 ```
 
