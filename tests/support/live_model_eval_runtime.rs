@@ -36,7 +36,7 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TOP_K: usize = 20;
 const WARMUP_RUNS: usize = 1;
@@ -67,6 +67,7 @@ const FILTER_PROBE_PRESET: &str = "arctic-l-v2-fp32";
 const CONTRACT_GATE_BUNDLE_FILE: &str = "contract-gate-bundle.json";
 const FINAL_REPORT_ARTIFACT: &str = "live-model-eval-report.json";
 const CANDIDATE_FILTER_ENV: &str = "QGH_LIVE_MODEL_EVAL_CANDIDATES";
+const QUALITY_MAX_RSS_BYTES: u64 = 5 * 1024 * 1024 * 1024 / 2;
 const LIVE_CANDIDATE_IDS: [&str; 5] = [
     "arctic-embed-l-v2.0",
     "gte-modernbert-base",
@@ -5487,7 +5488,14 @@ fn measure_50k_backfill(
                     partial.chunks_per_second = Some(chunks as f64 / seconds);
                 }
             }
-            return Err(resource_run_failure("50k_embed", &partial));
+            return Err(resource_run_failure(
+                if failure.rss_cap_exceeded {
+                    "50k_peak_rss_cap"
+                } else {
+                    "50k_embed"
+                },
+                &partial,
+            ));
         }
     };
     partial.peak_rss_bytes = embed.peak_rss_bytes;
@@ -6859,7 +6867,7 @@ fn live_resource_failures(resources: &ResourceEvidence, light: bool) -> Vec<Stri
         if resources.cold_start_p95_ms > 10_000.0 {
             failures.push("cold_start_p95_ms".to_string());
         }
-        if resources.isolated_peak_rss_bytes > 5 * gib / 2 {
+        if resources.isolated_peak_rss_bytes > QUALITY_MAX_RSS_BYTES {
             failures.push("isolated_peak_rss_bytes".to_string());
         }
         if resources
@@ -7027,31 +7035,58 @@ struct TimedCommandFailure {
     elapsed_ms: f64,
     peak_rss_bytes: u64,
     embedded_chunks: Option<usize>,
+    #[serde(skip)]
+    rss_cap_exceeded: bool,
 }
 
 fn run_timed_command(
     mut command: Command,
     candidate: &str,
+    rss_cap_bytes: u64,
 ) -> Result<TimedOutput, TimedCommandFailure> {
     let started = Instant::now();
-    let child = command.spawn().map_err(|_| TimedCommandFailure {
+    let mut child = command.spawn().map_err(|_| TimedCommandFailure {
         elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
         peak_rss_bytes: 0,
         embedded_chunks: None,
+        rss_cap_exceeded: false,
     })?;
     eprintln!(
         "live-eval candidate={candidate} phase=50k-production-embed time_wrapper_pid={}",
         child.id()
     );
+    let mut peak_rss_bytes = 0_u64;
+    let mut rss_cap_exceeded = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(_) => {
+                return Err(TimedCommandFailure {
+                    elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                    peak_rss_bytes,
+                    embedded_chunks: None,
+                    rss_cap_exceeded,
+                });
+            }
+        }
+        peak_rss_bytes = peak_rss_bytes.max(process_rss_bytes(child.id()).unwrap_or_default());
+        if peak_rss_bytes > rss_cap_bytes {
+            rss_cap_exceeded = true;
+            let _ = child.kill();
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
     let output = child.wait_with_output().map_err(|_| TimedCommandFailure {
         elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
-        peak_rss_bytes: 0,
+        peak_rss_bytes,
         embedded_chunks: None,
+        rss_cap_exceeded,
     })?;
     record_output(&output);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-    let peak_rss_bytes = parse_peak_rss(&String::from_utf8_lossy(&output.stderr));
-    if !output.status.success() {
+    if rss_cap_exceeded || !output.status.success() {
         return Err(TimedCommandFailure {
             elapsed_ms,
             peak_rss_bytes,
@@ -7059,6 +7094,7 @@ fn run_timed_command(
                 .ok()
                 .and_then(|value| value["data"]["chunks"]["embedded"].as_u64())
                 .map(|count| count as usize),
+            rss_cap_exceeded,
         });
     }
     Ok(TimedOutput {
@@ -7066,6 +7102,37 @@ fn run_timed_command(
         elapsed_ms,
         peak_rss_bytes,
     })
+}
+
+fn process_rss_bytes(pid: u32) -> Option<u64> {
+    let output = Command::new("/bin/ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(1024)
+}
+
+pub(super) fn rss_watchdog_for_test() -> Result<Value, DynError> {
+    let mut command = Command::new("/bin/sleep");
+    command
+        .arg("5")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let failure = run_timed_command(command, "watchdog-test", 1)
+        .expect_err("one-byte RSS cap must stop the child");
+    Ok(json!({
+        "elapsed_ms": failure.elapsed_ms,
+        "peak_rss_bytes": failure.peak_rss_bytes,
+        "rss_cap_exceeded": failure.rss_cap_exceeded,
+    }))
 }
 
 pub(super) fn timed_failure_evidence_for_test() -> Result<Value, DynError> {
@@ -7079,8 +7146,8 @@ pub(super) fn timed_failure_evidence_for_test() -> Result<Value, DynError> {
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let failure =
-        run_timed_command(command, "typed-failure-test").expect_err("test child must exit nonzero");
+    let failure = run_timed_command(command, "typed-failure-test", u64::MAX)
+        .expect_err("test child must exit nonzero");
     Ok(serde_json::to_value(failure)?)
 }
 
@@ -7389,17 +7456,14 @@ limit = 10
         arguments: &[&str],
         candidate: &str,
     ) -> Result<TimedOutput, TimedCommandFailure> {
-        let mut command = Command::new("/usr/bin/time");
-        command
-            .arg("-l")
-            .arg(&self.binary)
-            .args(["--profile", "work"]);
+        let mut command = Command::new(&self.binary);
+        command.args(["--profile", "work"]);
         command
             .args(arguments)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         self.apply_env(&mut command);
-        run_timed_command(command, candidate)
+        run_timed_command(command, candidate, QUALITY_MAX_RSS_BYTES)
     }
 
     fn timed_query(&self, qrel: &QrelRecord) -> Result<TimedQuery, DynError> {

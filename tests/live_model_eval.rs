@@ -518,6 +518,17 @@ fn bm25_rescue_selection_prefers_net_rescue_then_smaller_snapshot() {
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
+fn resource_rss_watchdog_stops_an_over_limit_child() {
+    let evidence = live_model_eval_runtime::rss_watchdog_for_test()
+        .expect("resource watchdog returns structured evidence");
+
+    assert_eq!(evidence["rss_cap_exceeded"], true);
+    assert!(evidence["peak_rss_bytes"].as_u64().unwrap() > 1);
+    assert!(evidence["elapsed_ms"].as_f64().unwrap() < 2_000.0);
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
 fn real_manifest_tokenizer_contract_drives_frozen_and_resource_chunker_identity() {
     let artifact = |role: &str, relative_path: &str, marker: u8| {
         json!({
