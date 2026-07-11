@@ -76,7 +76,7 @@ fn prepared_snapshot_digest_changes_with_artifact_identity() {
         sha256: "11".repeat(32),
         byte_size: 42,
     };
-    let first = prepared_snapshot_digest(&[artifact.clone()]);
+    let first = prepared_snapshot_digest(std::slice::from_ref(&artifact));
     let mut changed = artifact;
     changed.byte_size += 1;
 
@@ -155,8 +155,8 @@ fn coreml_cpu_gpu_probe() {
     let coreml_p50 = percentile(&coreml_samples, 0.50);
     let report = CoreMlProbeReport {
         schema_version: "qgh.coreml_model_eval.v2",
-        model_id: manifest_model_id(&manifest),
-        resolved_revision: manifest_revision(&manifest),
+        model_id: manifest_model_id(manifest),
+        resolved_revision: manifest_revision(manifest),
         manifest_sha256: digest_hex(&manifest_bytes),
         prepared_snapshot_sha256: prepared_snapshot_digest(&prepared_artifacts),
         prepared_artifacts,
