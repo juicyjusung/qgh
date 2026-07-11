@@ -22,10 +22,10 @@ The best experimental candidate was also loaded through ONNX Runtime's CoreML `C
 
 | Runtime | Init | Warm batch-8 p50 / p95 |
 | --- | ---: | ---: |
-| ORT CPU, four intra-op threads | 133 ms | 8.23 / 8.65 ms |
-| CoreML CPU+GPU, CPU fallback allowed | 2,396 ms | 27.79 / 29.85 ms |
+| ORT CPU, four intra-op threads | 272 ms | 14.92 / 15.15 ms |
+| CoreML CPU+GPU, CPU fallback allowed | 2,661 ms | 34.38 / 38.07 ms |
 
-CoreML p50 speedup was `0.296x` (about 3.38 times slower); minimum CPU/CoreML vector cosine was `0.999999999999`. The machine artifact is `qgh.coreml_model_eval.v1`, SHA-256 `1e220a6a7d19ae201aa0910b44054c9f95e2fc7fd2a8b297048a297712e68812`. Successful EP registration allows CPU+GPU execution but does not prove that every graph node ran on the GPU, so this result must not be described as a pure-GPU benchmark.
+CoreML p50 speedup was `0.434x` (about 2.30 times slower); minimum CPU/CoreML vector cosine was `0.999999999999`. The machine artifact is `qgh.coreml_model_eval.v2`, SHA-256 `a7e2ec82096b10a43f323800f74956b8a36110235fcc07800e1658304c5f785a`. It is bound to clean HEAD `71abc59d105775be0e28043847d7ec116d415836`, manifest SHA-256 `3fbd9ad6a8554f1f0f09851c5888f867611611ab136326f7e44a4dbfc9cf343a`, verified prepared-snapshot SHA-256 `93ff0e3fb474494ca47cbf10d6c96c0fb14748152969d7faa5b2f8acdb81eaf8`, five artifact identities, and test-binary SHA-256 `807e191f64a4a75b7c1f1247f3f9a4256195701bfafdbf584b3e5dc09c77efe0`. Successful EP registration allows CPU+GPU execution but does not prove that every graph node ran on the GPU, so this result must not be described as a pure-GPU benchmark.
 
 ### Preset integrity correction
 
