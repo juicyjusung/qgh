@@ -5489,7 +5489,9 @@ fn measure_50k_backfill(
                 }
             }
             return Err(resource_run_failure(
-                if failure.rss_cap_exceeded {
+                if failure.rss_monitor_failed {
+                    "50k_rss_monitor"
+                } else if failure.rss_cap_exceeded {
                     "50k_peak_rss_cap"
                 } else {
                     "50k_embed"
@@ -7037,19 +7039,34 @@ struct TimedCommandFailure {
     embedded_chunks: Option<usize>,
     #[serde(skip)]
     rss_cap_exceeded: bool,
+    #[serde(skip)]
+    rss_monitor_failed: bool,
 }
 
 fn run_timed_command(
-    mut command: Command,
+    command: Command,
     candidate: &str,
     rss_cap_bytes: u64,
 ) -> Result<TimedOutput, TimedCommandFailure> {
+    run_timed_command_with_rss_observer(command, candidate, rss_cap_bytes, process_rss_bytes)
+}
+
+fn run_timed_command_with_rss_observer<F>(
+    mut command: Command,
+    candidate: &str,
+    rss_cap_bytes: u64,
+    mut observe_rss: F,
+) -> Result<TimedOutput, TimedCommandFailure>
+where
+    F: FnMut(u32) -> Option<u64>,
+{
     let started = Instant::now();
     let mut child = command.spawn().map_err(|_| TimedCommandFailure {
         elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
         peak_rss_bytes: 0,
         embedded_chunks: None,
         rss_cap_exceeded: false,
+        rss_monitor_failed: false,
     })?;
     eprintln!(
         "live-eval candidate={candidate} phase=50k-production-embed time_wrapper_pid={}",
@@ -7062,15 +7079,27 @@ fn run_timed_command(
             Ok(Some(_)) => break,
             Ok(None) => {}
             Err(_) => {
+                terminate_and_reap(&mut child);
                 return Err(TimedCommandFailure {
                     elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
                     peak_rss_bytes,
                     embedded_chunks: None,
                     rss_cap_exceeded,
+                    rss_monitor_failed: true,
                 });
             }
         }
-        peak_rss_bytes = peak_rss_bytes.max(process_rss_bytes(child.id()).unwrap_or_default());
+        let Some(observed_rss_bytes) = observe_rss(child.id()) else {
+            terminate_and_reap(&mut child);
+            return Err(TimedCommandFailure {
+                elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                peak_rss_bytes,
+                embedded_chunks: None,
+                rss_cap_exceeded,
+                rss_monitor_failed: true,
+            });
+        };
+        peak_rss_bytes = peak_rss_bytes.max(observed_rss_bytes);
         if peak_rss_bytes > rss_cap_bytes {
             rss_cap_exceeded = true;
             let _ = child.kill();
@@ -7083,6 +7112,7 @@ fn run_timed_command(
         peak_rss_bytes,
         embedded_chunks: None,
         rss_cap_exceeded,
+        rss_monitor_failed: false,
     })?;
     record_output(&output);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
@@ -7095,6 +7125,7 @@ fn run_timed_command(
                 .and_then(|value| value["data"]["chunks"]["embedded"].as_u64())
                 .map(|count| count as usize),
             rss_cap_exceeded,
+            rss_monitor_failed: false,
         });
     }
     Ok(TimedOutput {
@@ -7102,6 +7133,11 @@ fn run_timed_command(
         elapsed_ms,
         peak_rss_bytes,
     })
+}
+
+fn terminate_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn process_rss_bytes(pid: u32) -> Option<u64> {
@@ -7132,6 +7168,22 @@ pub(super) fn rss_watchdog_for_test() -> Result<Value, DynError> {
         "elapsed_ms": failure.elapsed_ms,
         "peak_rss_bytes": failure.peak_rss_bytes,
         "rss_cap_exceeded": failure.rss_cap_exceeded,
+    }))
+}
+
+pub(super) fn rss_monitor_failure_for_test() -> Result<Value, DynError> {
+    let mut command = Command::new("/bin/sleep");
+    command
+        .arg("5")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let failure =
+        run_timed_command_with_rss_observer(command, "monitor-failure-test", u64::MAX, |_| None)
+            .expect_err("missing RSS observation must stop the child");
+    Ok(json!({
+        "elapsed_ms": failure.elapsed_ms,
+        "rss_cap_exceeded": failure.rss_cap_exceeded,
+        "rss_monitor_failed": failure.rss_monitor_failed,
     }))
 }
 

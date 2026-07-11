@@ -529,6 +529,17 @@ fn resource_rss_watchdog_stops_an_over_limit_child() {
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
+fn resource_rss_watchdog_fails_closed_when_rss_cannot_be_observed() {
+    let evidence = live_model_eval_runtime::rss_monitor_failure_for_test()
+        .expect("resource watchdog returns structured monitor-failure evidence");
+
+    assert_eq!(evidence["rss_monitor_failed"], true);
+    assert_eq!(evidence["rss_cap_exceeded"], false);
+    assert!(evidence["elapsed_ms"].as_f64().unwrap() < 2_000.0);
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
 fn real_manifest_tokenizer_contract_drives_frozen_and_resource_chunker_identity() {
     let artifact = |role: &str, relative_path: &str, marker: u8| {
         json!({

@@ -1,6 +1,37 @@
 # Live multilingual model evaluation
 
-## Decision
+## 2026-07-11 lightweight BM25-rescue follow-up
+
+The follow-up compared three smaller multilingual models under the same public 154-source corpus, 40-query dev split, reused 80-query screening/regression split, equal RRF `k=60`, batch 8, and four ORT intra-op threads. The 80-query split was blind for the original Arctic/GTE decision, but it had already been examined before this follow-up. It is therefore no longer independent held-out evidence for choosing or promoting another model. The follow-up objective was changed from standalone dense quality to complementarity: rescue BM25 misses while preserving existing BM25 hits.
+
+`dragonkue-koen-e5-tiny` is the best experimental screening candidate. It has the highest reused-test nDCG/MRR, the only positive top-5 rescue-minus-harm result, the smallest snapshot, and the lowest cold-start cost. It is not promoted to the production preset: Korean-query-to-English-source Recall@5 still fails, the 50k backfill crossed the 2.5 GiB quality RSS limit before completion, and a fresh blind multilingual split has not confirmed the result. BM25 remains the production default and `production_v1` remains the lexical profile.
+
+| Candidate | Reused-test nDCG / MRR | BM25 miss rescue@5 / hit harm@5 | Rescue@10 / harm@10 | Snapshot | 50k resource result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Granite 97M multilingual R2 FP32 | 0.6978 / 0.6824 | 6 / 7 | 6 / 3 | 415.3 MB | stopped at 3.157 GB RSS; incomplete |
+| Dragonkue KoEn E5 Tiny FP32 | **0.7235 / 0.7351** | **5 / 4** | **6 / 1** | **152.7 MB** | stopped at 2.690 GB RSS; incomplete |
+| multilingual-E5-small FP32 | 0.6517 / 0.6891 | 5 / 5 | 4 / 2 | 487.4 MB | stopped at 2.907 GB RSS; incomplete |
+
+All three passed exact/identifier, hard-filter, stale-leakage, `query -> get`, context, and redaction contracts. Granite failed English and Korean-query-to-English Recall@5. KoEn Tiny failed Korean-query-to-English Recall@5. multilingual-E5-small failed both English and Korean-query-to-English Recall@5. The resource watchdog stops a candidate after the existing quality RSS ceiling is exceeded; therefore the recorded 50k values are conclusive failures, not completed throughput measurements. The report schema retains the historical `held_out_metrics` field name for compatibility, but the follow-up values in that field are screening evidence only. A fresh blind split is required before any production promotion.
+
+The CPU run is bound to clean HEAD `9f0b61915dfdeb99ec2d1eac1c7aba531dee2cd8`, release binary SHA-256 `2352a8671430c2645f2b93b8359453510d0dcf0307e97a7de992750962527be9`, and report `qgh.live_model_eval_report.v5` SHA-256 `18eacadadb510c4c2424577ddefe074859e7384623bdf950326db8694286e962`. It completed in 839.02 seconds with no sensitive-payload or absolute-path violation. The frozen config SHA-256 is `a8d6f93c21a1d926f363a27669a3002e026c3c0688f87d58b0e5e9957264f46d`; gate bundle SHA-256 is `0f8b1e12501f63dc812585093f391398f154f9ac40797e931af9d86559d1ad79`; model-preparation provenance SHA-256 is `3e9ab1290831db8d5e543d095ff9715c9707ef987870886dba9a11093550741d`.
+
+### CoreML CPU+GPU probe
+
+The best experimental candidate was also loaded through ONNX Runtime's CoreML `CPUAndGPU` execution provider. Vector parity passed, but CoreML was slower for qgh's small batch and short-query shape, so CPU remains the recommended execution provider.
+
+| Runtime | Init | Warm batch-8 p50 / p95 |
+| --- | ---: | ---: |
+| ORT CPU, four intra-op threads | 133 ms | 8.23 / 8.65 ms |
+| CoreML CPU+GPU, CPU fallback allowed | 2,396 ms | 27.79 / 29.85 ms |
+
+CoreML p50 speedup was `0.296x` (about 3.38 times slower); minimum CPU/CoreML vector cosine was `0.999999999999`. The machine artifact is `qgh.coreml_model_eval.v1`, SHA-256 `1e220a6a7d19ae201aa0910b44054c9f95e2fc7fd2a8b297048a297712e68812`. Successful EP registration allows CPU+GPU execution but does not prove that every graph node ran on the GPU, so this result must not be described as a pure-GPU benchmark.
+
+### Preset integrity correction
+
+The pinned Granite `model_quint8_avx2.onnx` artifacts contain `DynamicQuantizeLinear` nodes even though the previous preset names declared static INT8. They are also AVX2-targeted and unsuitable as the Apple ARM64 default. The mislabeled presets were removed, the Granite presets now point to pinned FP32 `onnx/model.onnx`, and prepared ONNX graphs containing dynamic quantization fail closed when their manifest declares `none` or `static`.
+
+## Original Arctic/GTE decision
 
 The integrated live run completed against public GitHub Issues and comments with real local model artifacts. It selected neither a light nor a quality candidate, so no embedding preset is promoted. The existing optional `Snowflake/snowflake-arctic-embed-l-v2.0` default remains unchanged as a compatibility control; this evaluation does not newly approve it as a resource-qualified preset.
 
