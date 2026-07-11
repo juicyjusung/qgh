@@ -80,7 +80,7 @@ source snapshot, immutable Tantivy generation, optional embedding generation, CA
 - `ModelManifestV1`과 tagged `hf|local` source, artifact role/path/SHA-256/byte-size, query/document prefix, CLS/mean, normalization, native/output dimension, max length, quantization, context template version을 추가한다.
 - config에 strict `manifest_path`를 추가해 explicit custom manifest를 선택한다. legacy `model`/`model_path`와 동시에 지정하면 fail closed한다.
 - `PreparedModelStore::acquire/load`를 구현한다. artifact는 manifest root 아래 canonical regular file만 허용하고 absolute path, `..`, symlink escape, checksum/size mismatch를 거부한다.
-- preset registry를 `arctic-m-v2-fp32`, `granite-97m-multilingual-r2-int8-static`, `granite-311m-multilingual-r2-int8-static`, `arctic-l-v2-fp32`로 제한한다. revision은 commit SHA로 고정하고 acquisition 결과의 모든 runtime artifact checksum을 manifest에 기록한다.
+- preset registry를 `arctic-m-v2-fp32`, `granite-97m-multilingual-r2-fp32`, `granite-311m-multilingual-r2-fp32`, `arctic-l-v2-fp32`로 제한한다. revision은 commit SHA로 고정하고 acquisition 결과의 모든 runtime artifact checksum을 manifest에 기록한다. `DynamicQuantizeLinear`를 포함한 ONNX graph는 manifest가 static/none으로 선언되어도 fail closed한다.
 - custom `hf:`에서 revision을 생략하면 Snowflake preset SHA를 재사용하지 않고 해당 repo default branch를 acquisition 시 commit SHA로 resolve해 manifest에 기록한다.
 - external ONNX initializer를 `UserDefinedEmbeddingModel::with_external_initializer`로 실제 연결한다.
 - document/query prefix, output truncation 후 L2 normalization, max length를 runtime에 적용한다. dynamic artifact는 fail closed한다.

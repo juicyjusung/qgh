@@ -138,8 +138,8 @@ ModelManifestV1
 첫 평가 preset은 다음으로 제한한다.
 
 - `arctic-m-v2-fp32`: 현 provider 동작과 맞는 drop-in control
-- `granite-97m-multilingual-r2-int8-static`: 경량 최우선 challenger. vendor INT8 artifact가 batch-comparability smoke를 통과하지 못하면 fp32 artifact로 평가한다.
-- `granite-311m-multilingual-r2-int8-static`: multilingual quality ceiling. 같은 smoke 실패 시 fp32 artifact로 평가한다.
+- `granite-97m-multilingual-r2-fp32`: 경량 최우선 challenger. vendor AVX2 INT8 artifact는 실제 graph가 dynamic quantization이므로 preset에서 제외하고 fp32 artifact만 평가한다.
+- `granite-311m-multilingual-r2-fp32`: multilingual quality ceiling. 같은 이유로 fp32 artifact만 허용하며 97M이 충분하지 않을 때만 평가한다.
 - `arctic-l-v2-fp32`: 기존 quality control
 
 Jina v5는 non-commercial license 때문에 built-in preset에서 제외한다. EmbeddingGemma, BGE-M3, Harrier, Qwen3는 이 네 후보로 결론이 나지 않을 때만 후속 challenger다.

@@ -49,8 +49,8 @@ pub const DEFAULT_HF_MODEL_FILE: &str = "onnx/model.onnx";
 pub const DEFAULT_QUERY_PREFIX: &str = "query: ";
 pub const BUILTIN_PRESET_IDS: [&str; 4] = [
     "arctic-m-v2-fp32",
-    "granite-97m-multilingual-r2-int8-static",
-    "granite-311m-multilingual-r2-int8-static",
+    "granite-97m-multilingual-r2-fp32",
+    "granite-311m-multilingual-r2-fp32",
     "arctic-l-v2-fp32",
 ];
 const ARCTIC_M_V2_REVISION: &str = "95c2741480856aa9666782eb4afe11959938017f";
@@ -1444,12 +1444,13 @@ fn read_manifest_contract(
 fn verify_streamed_prepared_artifact(
     file: &mut File,
     artifact: &PreparedArtifactInspection,
-) -> Result<ArtifactFileIdentity, EmbeddingProviderError> {
+) -> Result<(ArtifactFileIdentity, bool), EmbeddingProviderError> {
     let opened_identity = artifact_file_identity(&file.metadata()?);
     if opened_identity != artifact.identity {
         return Err(artifact_changed_error());
     }
-    let (sha256, byte_size) = stream_sha256(file)?;
+    let (sha256, byte_size, contains_dynamic_quantization) =
+        stream_sha256_and_detect_dynamic_quantization(file)?;
     let final_identity = artifact_file_identity(&file.metadata()?);
     if final_identity != opened_identity {
         return Err(artifact_changed_error());
@@ -1466,7 +1467,24 @@ fn verify_streamed_prepared_artifact(
             "Prepared model artifact checksum does not match the manifest.",
         ));
     }
-    Ok(opened_identity)
+    Ok((opened_identity, contains_dynamic_quantization))
+}
+
+fn validate_onnx_quantization_contract(
+    declared: QuantizationKind,
+    contains_dynamic_quantization: bool,
+) -> Result<(), EmbeddingProviderError> {
+    if contains_dynamic_quantization {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.quantization_contract_mismatch",
+            "Prepared ONNX graph does not match its declared quantization contract.",
+        )
+        .with_details(json!({
+            "declared_quantization": declared,
+            "detected_quantization": QuantizationKind::Dynamic,
+        })));
+    }
+    Ok(())
 }
 
 impl PreparedModelStore {
@@ -1479,7 +1497,14 @@ impl PreparedModelStore {
         let mut runtime_artifacts = Vec::with_capacity(inspection.artifacts.len());
         for artifact in &inspection.artifacts {
             let mut file = File::open(&artifact.canonical_path)?;
-            let opened_identity = verify_streamed_prepared_artifact(&mut file, artifact)?;
+            let (opened_identity, contains_dynamic_quantization) =
+                verify_streamed_prepared_artifact(&mut file, artifact)?;
+            if artifact.role == ArtifactRole::OnnxModel {
+                validate_onnx_quantization_contract(
+                    inspection.manifest.quantization,
+                    contains_dynamic_quantization,
+                )?;
+            }
             paths
                 .entry(artifact.role)
                 .or_default()
@@ -1542,7 +1567,7 @@ impl PreparedModelStore {
                 tokenizer_bytes = Some(bytes);
             } else {
                 let mut file = File::open(&artifact.canonical_path)?;
-                verify_streamed_prepared_artifact(&mut file, &artifact)?;
+                let _ = verify_streamed_prepared_artifact(&mut file, &artifact)?;
                 #[cfg(test)]
                 record_tokenizer_only_artifact_bytes(artifact.role, artifact.expected_byte_size);
             }
@@ -3334,6 +3359,47 @@ fn stream_sha256(reader: &mut impl Read) -> Result<(String, u64), EmbeddingProvi
     Ok((hex_digest(&hasher.finalize()), byte_size))
 }
 
+fn stream_sha256_and_detect_dynamic_quantization(
+    reader: &mut impl Read,
+) -> Result<(String, u64, bool), EmbeddingProviderError> {
+    const BUFFER_BYTES: usize = 1024 * 1024;
+    const DYNAMIC_QUANTIZE_LINEAR: &[u8] = b"DynamicQuantizeLinear";
+
+    let mut buffer = vec![0_u8; BUFFER_BYTES];
+    let mut hasher = Sha256::new();
+    let mut byte_size = 0_u64;
+    let mut marker_offset = 0_usize;
+    let mut detected = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let bytes = &buffer[..read];
+        hasher.update(bytes);
+        byte_size = byte_size.checked_add(read as u64).ok_or_else(|| {
+            EmbeddingProviderError::structured(
+                "embedding.artifact_size_mismatch",
+                "Prepared model artifact size exceeds the supported range.",
+            )
+        })?;
+        if !detected {
+            for byte in bytes {
+                if *byte == DYNAMIC_QUANTIZE_LINEAR[marker_offset] {
+                    marker_offset += 1;
+                    if marker_offset == DYNAMIC_QUANTIZE_LINEAR.len() {
+                        detected = true;
+                        break;
+                    }
+                } else {
+                    marker_offset = usize::from(*byte == DYNAMIC_QUANTIZE_LINEAR[0]);
+                }
+            }
+        }
+    }
+    Ok((hex_digest(&hasher.finalize()), byte_size, detected))
+}
+
 fn stream_copy_and_hash(
     source: &Path,
     destination: &Path,
@@ -3762,11 +3828,11 @@ fn builtin_preset(id: &str) -> Option<BuiltinPresetSpec> {
             max_length: 8192,
             quantization: QuantizationKind::None,
         }),
-        "granite-97m-multilingual-r2-int8-static" => Some(BuiltinPresetSpec {
-            id: "granite-97m-multilingual-r2-int8-static",
+        "granite-97m-multilingual-r2-fp32" => Some(BuiltinPresetSpec {
+            id: "granite-97m-multilingual-r2-fp32",
             model_id: "ibm-granite/granite-embedding-97m-multilingual-r2",
             revision: GRANITE_97M_R2_REVISION,
-            model_file: "onnx/model_quint8_avx2.onnx",
+            model_file: "onnx/model.onnx",
             external_initializer: None,
             pooling: PoolingKind::Cls,
             query_prefix: Some(""),
@@ -3775,13 +3841,13 @@ fn builtin_preset(id: &str) -> Option<BuiltinPresetSpec> {
             native_dimension: 384,
             output_dimension: 384,
             max_length: 32_768,
-            quantization: QuantizationKind::Static,
+            quantization: QuantizationKind::None,
         }),
-        "granite-311m-multilingual-r2-int8-static" => Some(BuiltinPresetSpec {
-            id: "granite-311m-multilingual-r2-int8-static",
+        "granite-311m-multilingual-r2-fp32" => Some(BuiltinPresetSpec {
+            id: "granite-311m-multilingual-r2-fp32",
             model_id: "ibm-granite/granite-embedding-311m-multilingual-r2",
             revision: GRANITE_311M_R2_REVISION,
-            model_file: "onnx/model_quint8_avx2.onnx",
+            model_file: "onnx/model.onnx",
             external_initializer: None,
             pooling: PoolingKind::Cls,
             query_prefix: Some(""),
@@ -3790,7 +3856,7 @@ fn builtin_preset(id: &str) -> Option<BuiltinPresetSpec> {
             native_dimension: 768,
             output_dimension: 768,
             max_length: 32_768,
-            quantization: QuantizationKind::Static,
+            quantization: QuantizationKind::None,
         }),
         "arctic-l-v2-fp32" => Some(BuiltinPresetSpec {
             id: "arctic-l-v2-fp32",
@@ -4336,7 +4402,9 @@ impl FastembedEngine {
 
         let model = TextEmbedding::try_new_from_user_defined(
             fastembed_user_defined_model(snapshot)?,
-            InitOptionsUserDefined::new().with_max_length(snapshot.manifest.max_length),
+            InitOptionsUserDefined::new()
+                .with_max_length(snapshot.manifest.max_length)
+                .with_intra_threads(FASTEMBED_INTRA_OP_THREADS),
         )
         .map_err(|_| {
             EmbeddingProviderError::structured(
@@ -4389,7 +4457,10 @@ impl FastembedEngine {
 }
 
 #[cfg(feature = "fastembed-provider")]
-const FASTEMBED_BATCH_SIZE: usize = 16;
+pub const FASTEMBED_BATCH_SIZE: usize = 8;
+
+#[cfg(feature = "fastembed-provider")]
+pub const FASTEMBED_INTRA_OP_THREADS: usize = 4;
 
 #[cfg(feature = "fastembed-provider")]
 impl EmbeddingEngine for FastembedEngine {
@@ -5208,6 +5279,30 @@ mod tests {
         manifest.quantization = QuantizationKind::Dynamic;
         let error = manifest.validate_contract().unwrap_err();
         assert_eq!(error.code(), "embedding.dynamic_quantization_unsupported");
+    }
+
+    #[test]
+    fn prepared_static_manifest_rejects_dynamic_quantization_graph() {
+        let root = temp_dir("qgh-static-manifest-dynamic-graph");
+        let manifest_path =
+            write_prepared_manifest_fixture(&root, b"graph\0DynamicQuantizeLinear\0node");
+        let mut manifest = ModelManifestV1::from_json_slice(&fs::read(&manifest_path).unwrap())
+            .expect("fixture manifest is valid");
+        manifest.quantization = QuantizationKind::Static;
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let store = PreparedModelStore::new(temp_dir("qgh-static-manifest-store"));
+        let error = store.load_manifest(&manifest_path).unwrap_err();
+
+        assert_eq!(error.code(), "embedding.quantization_contract_mismatch");
+        assert!(!error
+            .details()
+            .to_string()
+            .contains(&root.to_string_lossy()[..]));
     }
 
     #[test]
@@ -6201,12 +6296,23 @@ mod tests {
             assert_ne!(preset.quantization, QuantizationKind::Dynamic);
         }
         assert!(builtin_preset("jina-v5").is_none());
-        assert_eq!(
-            builtin_preset("granite-97m-multilingual-r2-int8-static")
-                .unwrap()
-                .quantization,
-            QuantizationKind::Static
-        );
+        for preset_id in [
+            "granite-97m-multilingual-r2-fp32",
+            "granite-311m-multilingual-r2-fp32",
+        ] {
+            let preset = builtin_preset(preset_id).expect("Granite FP32 preset is registered");
+            assert_eq!(preset.model_file, "onnx/model.onnx");
+            assert_eq!(preset.quantization, QuantizationKind::None);
+        }
+        assert!(builtin_preset("granite-97m-multilingual-r2-int8-static").is_none());
+        assert!(builtin_preset("granite-311m-multilingual-r2-int8-static").is_none());
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn production_runtime_resource_protocol_is_fixed() {
+        assert_eq!(FASTEMBED_BATCH_SIZE, 8);
+        assert_eq!(FASTEMBED_INTRA_OP_THREADS, 4);
     }
 
     #[test]
