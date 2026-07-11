@@ -23,6 +23,7 @@
     "records containing absolute macOS user-home paths"
   ],
   "judgment_pool": {
+    "count_definition": "queries reviewed against multiple candidate sources, including unique-gold outcomes",
     "complete": true,
     "method": "manual source-body overlap review across split-safe qgh issue threads",
     "multi_source_query_count": 12

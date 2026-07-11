@@ -4377,6 +4377,8 @@ fn validate_heldout_fixture_after_freeze(
         || provenance.adjudication.title_only_paraphrases_allowed
         || !provenance.judgment_pool.complete
         || provenance.judgment_pool.multi_source_query_count < 10
+        || provenance.judgment_pool.count_definition
+            != "queries reviewed against multiple candidate sources, including unique-gold outcomes"
         || !provenance
             .judgment_pool
             .method

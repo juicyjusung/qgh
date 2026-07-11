@@ -134,6 +134,7 @@ struct JudgmentPoolProvenance {
     method: String,
     complete: bool,
     multi_source_query_count: usize,
+    count_definition: String,
 }
 
 #[derive(Debug, Deserialize)]

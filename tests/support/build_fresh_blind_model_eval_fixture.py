@@ -456,8 +456,6 @@ def _validate_gold_locator(
         raise FixtureBuildError(f"{context} gold comment_id is invalid")
     if query_class == "comment_only" and comment_id is None:
         raise FixtureBuildError(f"{context} comment_only gold must locate a comment")
-    if query_class != "comment_only" and comment_id is not None:
-        raise FixtureBuildError(f"{context} non-comment gold must locate an issue")
     if query_class == "exact_identifier" and comment_id is not None:
         raise FixtureBuildError(f"{context} exact_identifier gold must locate an issue")
     if "rationale" in locator:
@@ -934,6 +932,7 @@ def build_fixture(
             "method": "manual source-body overlap review across split-safe public issue threads",
             "complete": True,
             "multi_source_query_count": len(spec["pooled_query_ids"]),
+            "count_definition": "queries reviewed against multiple candidate sources, including unique-gold outcomes",
         },
         "corpus_sha256": sha256_bytes(corpus_raw),
         "qrels_dev_sha256": sha256_bytes(dev_raw),

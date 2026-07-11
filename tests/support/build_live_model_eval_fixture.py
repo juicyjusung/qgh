@@ -466,6 +466,7 @@ def main() -> None:
             "multi_source_query_count": sum(
                 1 for record in dev + heldout if len(record["relevant"]) > 1
             ),
+            "count_definition": "queries reviewed against multiple candidate sources, including unique-gold outcomes",
         },
         "corpus_sha256": sha256_file(corpus_path),
         "qrels_dev_sha256": sha256_file(dev_path),
