@@ -364,6 +364,77 @@ fn mcp_get_tombstone_envelope_counts_as_stale_round_trip_failure() {
         .contains(private_message));
 }
 
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn live_eval_replays_exact_profile_aware_get_arguments() {
+    let emitted = json!({
+        "source_id": "qgh://github.com/issue/EXPECTED",
+        "get_args": {
+            "source_id": "qgh://github.com/issue/EXPECTED",
+            "profile_id": "work",
+        },
+    });
+
+    assert_eq!(
+        live_model_eval_runtime::get_arguments_for_test(emitted)
+            .expect("valid emitted get arguments"),
+        json!({
+            "source_id": "qgh://github.com/issue/EXPECTED",
+            "profile_id": "work",
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn live_eval_rejects_missing_or_mismatched_get_arguments() {
+    for invalid in [
+        json!({
+            "source_id": "qgh://github.com/issue/EXPECTED",
+            "get_args": {"source_id": "qgh://github.com/issue/EXPECTED"},
+        }),
+        json!({
+            "source_id": "qgh://github.com/issue/EXPECTED",
+            "get_args": {
+                "source_id": "qgh://github.com/issue/OTHER",
+                "profile_id": "work",
+            },
+        }),
+    ] {
+        assert!(live_model_eval_runtime::get_arguments_for_test(invalid).is_err());
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn unmeasured_get_round_trip_is_not_a_pass() {
+    assert_eq!(
+        live_model_eval_runtime::unmeasured_get_round_trip_for_test(),
+        json!({
+            "total": 0,
+            "success": 0,
+            "stale": 0,
+            "quality_gate_failures": ["get_round_trip_unmeasured"],
+        })
+    );
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn comment_only_gate_requires_a_comment_gold_hit_not_only_its_parent_issue() {
+    let parent_issue = "qgh://github.com/issue/parent";
+    let relevant_comment = "qgh://github.com/issue-comment/relevant";
+
+    assert!(!live_model_eval_runtime::comment_gold_hit_at_5_for_test(
+        &[parent_issue],
+        &[relevant_comment],
+    ));
+    assert!(live_model_eval_runtime::comment_gold_hit_at_5_for_test(
+        &[parent_issue, relevant_comment],
+        &[relevant_comment],
+    ));
+}
+
 #[test]
 fn resource_gate_reports_each_blocking_dimension() {
     let light = ResourceMetrics {
@@ -656,7 +727,7 @@ fn real_manifest_tokenizer_contract_drives_frozen_and_resource_chunker_identity(
         "chunker_fingerprint_for_tokenizer_identity",
         "tokenizer_contract_identity",
         "qgh.live_model_eval_config.v7",
-        "qgh.live_model_eval_report.v6",
+        "qgh.live_model_eval_report.v7",
         "qgh.live_model_eval_candidate.v4",
         "qgh.live_model_eval_resource.v2",
     ] {

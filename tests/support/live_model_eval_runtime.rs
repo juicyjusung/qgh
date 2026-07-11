@@ -68,7 +68,9 @@ const FILTER_PROBE_PRESET: &str = "arctic-l-v2-fp32";
 const CONTRACT_GATE_BUNDLE_FILE: &str = "contract-gate-bundle.json";
 const FINAL_REPORT_ARTIFACT: &str = "live-model-eval-report.json";
 const CANDIDATE_FILTER_ENV: &str = "QGH_LIVE_MODEL_EVAL_CANDIDATES";
+const LIVE_PROFILE_ID: &str = "work";
 const QUALITY_MAX_RSS_BYTES: u64 = 5 * 1024 * 1024 * 1024 / 2;
+const COMMENT_GOLD_RECALL_AT_5_MINIMUM: f64 = 0.8;
 const LIVE_CANDIDATE_IDS: [&str; 6] = [
     "arctic-embed-l-v2.0",
     "gte-modernbert-base",
@@ -263,8 +265,11 @@ struct RetrievalMetrics {
     weighted_ndcg_at_10: f64,
     weighted_mrr_at_10: f64,
     exact_top_1: f64,
+    comment_gold_recall_at_5: f64,
     hard_filter_violations: usize,
     get_round_trip: f64,
+    get_round_trip_total: usize,
+    get_round_trip_success: usize,
     stale_leakage_live_fixture: Option<usize>,
     duplicate_crowding_queries: usize,
     hybrid_expected_queries: usize,
@@ -1621,8 +1626,11 @@ pub(super) fn lexical_profile_heldout_artifact_contract_for_test(
         weighted_ndcg_at_10: 0.0,
         weighted_mrr_at_10: 0.0,
         exact_top_1: 0.0,
+        comment_gold_recall_at_5: 0.0,
         hard_filter_violations: 0,
         get_round_trip: 0.0,
+        get_round_trip_total: 0,
+        get_round_trip_success: 0,
         stale_leakage_live_fixture: Some(0),
         duplicate_crowding_queries: 0,
         hybrid_expected_queries: 0,
@@ -2045,6 +2053,7 @@ struct ClassAccumulator {
 struct QueryEvidence {
     rankings: BTreeMap<String, Vec<String>>,
     branch_observations: BTreeMap<String, Vec<BranchObservation>>,
+    get_arguments: BTreeMap<String, Value>,
     get_total: usize,
     get_success: usize,
     stale_failures: usize,
@@ -2082,13 +2091,70 @@ impl GetRoundTripEvidence {
 
 fn get_round_trip_quality_failures(evidence: &GetRoundTripEvidence) -> Vec<String> {
     let mut failures = Vec::new();
-    if evidence.total != 0 && evidence.success != evidence.total {
+    if evidence.total == 0 {
+        failures.push("get_round_trip_unmeasured".to_string());
+    } else if evidence.success != evidence.total {
         failures.push("get_round_trip".to_string());
     }
     if evidence.stale != 0 {
         failures.push("unexpected_tombstone_during_get".to_string());
     }
     failures
+}
+
+fn get_arguments_from_result(result: &Value) -> Result<(String, Value), DynError> {
+    let source_id = result["source_id"]
+        .as_str()
+        .filter(|source_id| !source_id.is_empty())
+        .ok_or("query result source identity missing")?;
+    let get_arguments = result["get_args"]
+        .as_object()
+        .ok_or("query result get arguments missing")?;
+    if get_arguments.get("source_id").and_then(Value::as_str) != Some(source_id) {
+        return Err("query result get source identity mismatch".into());
+    }
+    if get_arguments
+        .get("profile_id")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err("query result get profile identity missing".into());
+    }
+    Ok((source_id.to_string(), Value::Object(get_arguments.clone())))
+}
+
+pub(super) fn get_arguments_for_test(result: Value) -> Result<Value, DynError> {
+    get_arguments_from_result(&result).map(|(_, arguments)| arguments)
+}
+
+pub(super) fn unmeasured_get_round_trip_for_test() -> Value {
+    let evidence = GetRoundTripEvidence::default();
+    json!({
+        "total": evidence.total,
+        "success": evidence.success,
+        "stale": evidence.stale,
+        "quality_gate_failures": get_round_trip_quality_failures(&evidence),
+    })
+}
+
+fn comment_gold_hit_at_5(ranked: &[String], relevant_comment_ids: &BTreeSet<&str>) -> bool {
+    ranked
+        .iter()
+        .take(5)
+        .any(|source_id| relevant_comment_ids.contains(source_id.as_str()))
+}
+
+pub(super) fn comment_gold_hit_at_5_for_test(
+    ranked: &[&str],
+    relevant_comment_ids: &[&str],
+) -> bool {
+    comment_gold_hit_at_5(
+        &ranked
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>(),
+        &relevant_comment_ids.iter().copied().collect(),
+    )
 }
 
 pub(super) fn get_round_trip_evidence_for_test(
@@ -2268,6 +2334,7 @@ fn weighted_query_evidence(
     Ok(QueryEvidence {
         rankings,
         branch_observations: diagnostic.branch_observations.clone(),
+        get_arguments: diagnostic.get_arguments.clone(),
         get_total: 0,
         get_success: 0,
         stale_failures: diagnostic.stale_failures,
@@ -4821,7 +4888,7 @@ pub(super) fn run(
     );
     frozen_guard.revalidate_before_final_report(root, &binary)?;
     let mut report = FullReport {
-        schema_version: "qgh.live_model_eval_report.v6",
+        schema_version: "qgh.live_model_eval_report.v7",
         run_finished_at: command_output("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
         corpus_snapshot_at: provenance.snapshot_at,
         host,
@@ -5154,8 +5221,20 @@ fn try_prepare_candidate_dev(
         &fixture.root.join("dev-events.jsonl"),
     )?;
     let offline_dev_diagnostics = offline_fusion_diagnostics(dev, &dev_run.diagnostic)?;
-    let weighted_fusion =
+    let mut weighted_fusion =
         select_weighted_fusion(corpus, dev, &dev_run.diagnostic, bm25_dev, &fixture.root)?;
+    let mut selected_dev_evidence =
+        weighted_query_evidence(dev, &dev_run.diagnostic, weighted_fusion.dense_weight_milli)?;
+    verify_query_evidence_with_get(&fixture, &mut selected_dev_evidence)?;
+    weighted_fusion.dev_metrics = evaluate_rankings(
+        corpus,
+        dev,
+        &selected_dev_evidence,
+        &fixture.root.join(format!(
+            "weighted-dev-{}-events.jsonl",
+            weighted_fusion.dense_weight_milli
+        )),
+    )?;
     let hybrid_filter_contract =
         run_candidate_hybrid_filter_contract(root, binary, candidate, manifest_path, corpus)
             .map_err(|_| -> DynError { Box::new(HybridFilterContractFailure) })?;
@@ -5280,7 +5359,8 @@ fn finish_candidate(
         &warm.diagnostic,
         prepared.weighted_fusion.dense_weight_milli,
     )
-    .and_then(|evidence| {
+    .and_then(|mut evidence| {
+        verify_query_evidence_with_get(&prepared.fixture, &mut evidence)?;
         let metrics = evaluate_rankings(
             corpus,
             held_out,
@@ -6434,11 +6514,37 @@ fn verify_rankings_with_get(
     let mut client = McpClient::start(fixture)?;
     let mut evidence = GetRoundTripEvidence::default();
     for source_id in rankings.values().flat_map(|ranked| ranked.iter()) {
-        let response = client.call_tool("get", json!({ "source_id": source_id }))?;
+        let response = client.call_tool("get", fixture.get_arguments(source_id))?;
         evidence.observe(&response, source_id)?;
     }
     let _ = client.finish()?;
     Ok((evidence.total, evidence.success, evidence.stale))
+}
+
+fn verify_query_evidence_with_get(
+    fixture: &CliFixture,
+    query_evidence: &mut QueryEvidence,
+) -> Result<(), DynError> {
+    let mut client = McpClient::start(fixture)?;
+    let mut round_trip = GetRoundTripEvidence::default();
+    for source_id in query_evidence
+        .rankings
+        .values()
+        .flat_map(|ranked| ranked.iter())
+    {
+        let arguments = query_evidence
+            .get_arguments
+            .get(source_id)
+            .cloned()
+            .ok_or("weighted ranking get arguments missing")?;
+        let response = client.call_tool("get", arguments)?;
+        round_trip.observe(&response, source_id)?;
+    }
+    let _ = client.finish()?;
+    query_evidence.get_total = round_trip.total;
+    query_evidence.get_success = round_trip.success;
+    query_evidence.stale_failures = round_trip.stale;
+    Ok(())
 }
 
 fn run_lexical_profile_pass(
@@ -6510,6 +6616,7 @@ fn run_lexical_profile_pass(
         QueryEvidence {
             rankings,
             branch_observations,
+            get_arguments: BTreeMap::new(),
             get_total,
             get_success,
             stale_failures,
@@ -6700,6 +6807,7 @@ fn query_pass(
 ) -> Result<(QueryEvidence, Vec<f64>), DynError> {
     let mut rankings = BTreeMap::new();
     let mut branch_observations = BTreeMap::new();
+    let mut get_arguments = BTreeMap::new();
     let mut latencies = Vec::with_capacity(qrels.len());
     let mut get_evidence = GetRoundTripEvidence::default();
     let mut hybrid_expected_queries = 0usize;
@@ -6748,9 +6856,17 @@ fn query_pass(
                 })
             })
             .collect::<Vec<_>>();
+        for result in results {
+            let (source_id, arguments) = get_arguments_from_result(result)?;
+            get_arguments.insert(source_id, arguments);
+        }
         if verify_get {
             for source_id in &ranked {
-                let get_response = client.call_tool("get", json!({ "source_id": source_id }))?;
+                let arguments = get_arguments
+                    .get(source_id)
+                    .cloned()
+                    .ok_or("ranked source get arguments missing")?;
+                let get_response = client.call_tool("get", arguments)?;
                 get_evidence.observe(&get_response, source_id)?;
             }
         }
@@ -6761,6 +6877,7 @@ fn query_pass(
         QueryEvidence {
             rankings,
             branch_observations,
+            get_arguments,
             get_total: get_evidence.total,
             get_success: get_evidence.success,
             stale_failures: get_evidence.stale,
@@ -6910,6 +7027,8 @@ fn evaluate_rankings(
     let mut per_class = BTreeMap::<QueryClass, ClassAccumulator>::new();
     let mut exact_total = 0usize;
     let mut exact_hits = 0usize;
+    let mut comment_only_total = 0usize;
+    let mut comment_gold_hits_at_5 = 0usize;
     let mut hard_filter_violations = 0usize;
     let mut duplicate_crowding_queries = 0usize;
     for qrel in qrels {
@@ -6938,6 +7057,22 @@ fn evaluate_rankings(
                     .iter()
                     .any(|gold| gold.source_id == *source_id)
             }));
+        }
+        if qrel.query_class == QueryClass::CommentOnly {
+            comment_only_total += 1;
+            let relevant_comment_ids = qrel
+                .relevant
+                .iter()
+                .filter(|gold| {
+                    gold.grade > 0
+                        && sources
+                            .get(gold.source_id.as_str())
+                            .is_some_and(|source| source.entity_type == "issue_comment")
+                })
+                .map(|gold| gold.source_id.as_str())
+                .collect::<BTreeSet<_>>();
+            comment_gold_hits_at_5 +=
+                usize::from(comment_gold_hit_at_5(ranked, &relevant_comment_ids));
         }
         let mut unique = BTreeSet::new();
         duplicate_crowding_queries += usize::from(
@@ -6998,8 +7133,13 @@ fn evaluate_rankings(
     } else {
         exact_hits as f64 / exact_total as f64
     };
-    let get_round_trip = if evidence.get_total == 0 {
+    let comment_gold_recall_at_5 = if comment_only_total == 0 {
         1.0
+    } else {
+        comment_gold_hits_at_5 as f64 / comment_only_total as f64
+    };
+    let get_round_trip = if evidence.get_total == 0 {
+        0.0
     } else {
         evidence.get_success as f64 / evidence.get_total as f64
     };
@@ -7008,6 +7148,9 @@ fn evaluate_rankings(
     let mut quality_gate_failures = Vec::new();
     if exact_top_1 < 0.95 {
         quality_gate_failures.push("exact_top_1".to_string());
+    }
+    if comment_gold_recall_at_5 < COMMENT_GOLD_RECALL_AT_5_MINIMUM {
+        quality_gate_failures.push("comment_gold_recall_at_5".to_string());
     }
     for (class, minimum, name) in [
         (QueryClass::EnglishSemantic, 0.75, "english_recall_at_5"),
@@ -7045,8 +7188,11 @@ fn evaluate_rankings(
         weighted_ndcg_at_10,
         weighted_mrr_at_10,
         exact_top_1,
+        comment_gold_recall_at_5,
         hard_filter_violations,
         get_round_trip,
+        get_round_trip_total: evidence.get_total,
+        get_round_trip_success: evidence.get_success,
         stale_leakage_live_fixture: Some(evidence.stale_failures),
         duplicate_crowding_queries,
         hybrid_expected_queries: evidence.hybrid_expected_queries,
@@ -7521,6 +7667,13 @@ struct CliFixture {
 }
 
 impl CliFixture {
+    fn get_arguments(&self, source_id: &str) -> Value {
+        json!({
+            "source_id": source_id,
+            "profile_id": LIVE_PROFILE_ID,
+        })
+    }
+
     fn new(root: PathBuf, binary: PathBuf, api_base_url: String) -> Result<Self, DynError> {
         Self::new_with_repositories(
             root,
@@ -7597,13 +7750,13 @@ impl CliFixture {
         let config = format!(
             r#"schema_version = "qgh.config.v1"
 
-[profiles.work]
+[profiles.{LIVE_PROFILE_ID}]
 host = "github.com"
 api_base_url = "{}"
 web_base_url = "https://github.com"
 repos = {repositories}
 
-[profiles.work.token_source]
+[profiles.{LIVE_PROFILE_ID}.token_source]
 type = "env"
 env = "QGH_PUBLIC_FIXTURE_AUTH"
 {}"#,
@@ -7618,13 +7771,13 @@ env = "QGH_PUBLIC_FIXTURE_AUTH"
         let config = format!(
             r#"schema_version = "qgh.config.v1"
 
-[profiles.work]
+[profiles.{LIVE_PROFILE_ID}]
 host = "github.com"
 api_base_url = "{}"
 web_base_url = "https://github.com"
 repos = {repositories}
 
-[profiles.work.token_source]
+[profiles.{LIVE_PROFILE_ID}.token_source]
 type = "env"
 env = "QGH_PUBLIC_FIXTURE_AUTH"
 
@@ -7686,13 +7839,13 @@ model = "arctic-l-v2-fp32"
         let config = format!(
             r#"schema_version = "qgh.config.v1"
 
-[profiles.work]
+[profiles.{LIVE_PROFILE_ID}]
 host = "github.com"
 api_base_url = "{}"
 web_base_url = "https://github.com"
 repos = ["{target_repo}", "{competing_repo}"]
 
-[profiles.work.token_source]
+[profiles.{LIVE_PROFILE_ID}.token_source]
 type = "env"
 env = "QGH_PUBLIC_FIXTURE_AUTH"
 {}"#,
@@ -7801,7 +7954,7 @@ limit = 10
         command
             .arg("-l")
             .arg(&self.binary)
-            .args(["--profile", "work"]);
+            .args(["--profile", LIVE_PROFILE_ID]);
         command.args(arguments);
         self.apply_env(&mut command);
         let started = Instant::now();
@@ -7825,7 +7978,7 @@ limit = 10
         candidate: &str,
     ) -> Result<TimedOutput, TimedCommandFailure> {
         let mut command = Command::new(&self.binary);
-        command.args(["--profile", "work"]);
+        command.args(["--profile", LIVE_PROFILE_ID]);
         command
             .args(arguments)
             .stdout(Stdio::piped())
@@ -7841,7 +7994,7 @@ limit = 10
             .arg(&self.binary)
             .args([
                 "--profile",
-                "work",
+                LIVE_PROFILE_ID,
                 "query",
                 &qrel.query,
                 "--limit",
@@ -7873,7 +8026,7 @@ limit = 10
 
     fn base_command(&self) -> Command {
         let mut command = Command::new(&self.binary);
-        command.args(["--profile", "work"]);
+        command.args(["--profile", LIVE_PROFILE_ID]);
         self.apply_env(&mut command);
         command
     }
@@ -7890,7 +8043,8 @@ limit = 10
     }
 
     fn db_path(&self) -> PathBuf {
-        self.data_home.join("qgh/profiles/work/qgh.sqlite3")
+        self.data_home
+            .join(format!("qgh/profiles/{LIVE_PROFILE_ID}/qgh.sqlite3"))
     }
 
     fn db_bytes(&self) -> Result<u64, DynError> {
@@ -7948,7 +8102,7 @@ impl McpClient {
         command
             .arg("-l")
             .arg(&fixture.binary)
-            .args(["--profile", "work", "mcp"])
+            .args(["--profile", LIVE_PROFILE_ID, "mcp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
