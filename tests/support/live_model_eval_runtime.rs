@@ -4699,7 +4699,23 @@ pub(super) fn run(
     if frozen_lexical_profile.selected_profile == frozen_lexical_profile.production_profile
         && lexical_heldout_evidence.rankings != bm25_evidence.rankings
     {
-        return Err("eval lexical baseline diverged from the held-out production protocol".into());
+        let query_ids = bm25_evidence
+            .rankings
+            .keys()
+            .chain(lexical_heldout_evidence.rankings.keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|query_id| {
+                bm25_evidence.rankings.get(*query_id)
+                    != lexical_heldout_evidence.rankings.get(*query_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        return Err(format!(
+            "eval lexical baseline diverged from the held-out production protocol query_ids={query_ids}"
+        )
+        .into());
     }
     let frozen_selected_profile = evaluate_rankings(
         &corpus,
