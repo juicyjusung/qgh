@@ -13,7 +13,7 @@ use qgh::context::{
 };
 use qgh::embedding::{
     tokenizer_contract_identity_from_manifest, EmbeddingTokenizer, FastembedTokenizer,
-    ModelManifestV1, PreparedModelStore,
+    ModelManifestV1, PreparedModelStore, FASTEMBED_BATCH_SIZE, FASTEMBED_INTRA_OP_THREADS,
 };
 use qgh::search_eval::{
     production_lexical_profile_for_eval, search_with_lexical_profile_for_eval, EvalLexicalProfile,
@@ -47,9 +47,8 @@ const CANDIDATE_WINDOW: usize = TOP_K * 4;
 const DEV_DIAGNOSTIC_QUERY_LIMIT: usize = 100;
 const DEV_DIAGNOSTIC_RRF_K: [usize; 3] = [20, 60, 100];
 const DEV_DIAGNOSTIC_WINDOWS: [usize; 3] = [40, 80, 100];
-const REQUIRED_BATCH_SIZE: usize = 8;
-const EFFECTIVE_BATCH_SIZE: usize = 16;
-const REQUIRED_INTRA_OP_THREADS: usize = 4;
+const REQUIRED_BATCH_SIZE: usize = FASTEMBED_BATCH_SIZE;
+const REQUIRED_INTRA_OP_THREADS: usize = FASTEMBED_INTRA_OP_THREADS;
 const DRAGONKUE_MODEL_ID: &str = "dragonkue/snowflake-arctic-embed-l-v2.0-ko";
 const DRAGONKUE_REVISION: &str = "55ec6e9358a56d56af759bc8372e970caf8c305f";
 const DRAGONKUE_REQUIRED_ARTIFACT: &str = "onnx/model.onnx";
@@ -67,10 +66,38 @@ const FILTER_PROBE_SENTINEL: &str = "bounded-adversarial-filter-sentinel";
 const FILTER_PROBE_PRESET: &str = "arctic-l-v2-fp32";
 const CONTRACT_GATE_BUNDLE_FILE: &str = "contract-gate-bundle.json";
 const FINAL_REPORT_ARTIFACT: &str = "live-model-eval-report.json";
+const CANDIDATE_FILTER_ENV: &str = "QGH_LIVE_MODEL_EVAL_CANDIDATES";
+const LIVE_CANDIDATE_IDS: [&str; 5] = [
+    "arctic-embed-l-v2.0",
+    "gte-modernbert-base",
+    "granite-embedding-97m-multilingual-r2",
+    "dragonkue-koen-e5-tiny",
+    "multilingual-e5-small",
+];
 // Debug-provider fixtures intentionally exercise the legacy static fingerprint.
 // Real prepared candidates must derive their identity from their strict manifest.
 const DEBUG_TEST_TOKENIZER_CONTRACT_IDENTITY: &str = "qgh.debug-test-tokenizer-static.v1";
 const DEBUG_TEST_CHUNKER_FINGERPRINT: &str = CHUNKER_FINGERPRINT;
+
+fn selected_live_candidates() -> Result<Option<BTreeSet<String>>, DynError> {
+    let Ok(raw) = std::env::var(CANDIDATE_FILTER_ENV) else {
+        return Ok(None);
+    };
+    let selected = raw
+        .split(',')
+        .map(str::trim)
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if selected.is_empty()
+        || selected.contains("")
+        || selected
+            .iter()
+            .any(|candidate| !LIVE_CANDIDATE_IDS.contains(&candidate.as_str()))
+    {
+        return Err("live model candidate filter is invalid".into());
+    }
+    Ok(Some(selected))
+}
 
 struct ContractGateSpec {
     name: &'static str,
@@ -240,6 +267,104 @@ struct RetrievalMetrics {
     hybrid_expected_queries: usize,
     hybrid_path_queries: usize,
     quality_gate_failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct Bm25ComplementCounts {
+    positive_query_count: usize,
+    bm25_miss_at_5: usize,
+    rescued_at_5: usize,
+    bm25_hit_preserved_at_5: usize,
+    bm25_hit_harmed_at_5: usize,
+    bm25_miss_at_10: usize,
+    rescued_at_10: usize,
+    bm25_hit_preserved_at_10: usize,
+    bm25_hit_harmed_at_10: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct Bm25ComplementMetrics {
+    #[serde(flatten)]
+    overall: Bm25ComplementCounts,
+    per_class: BTreeMap<QueryClass, Bm25ComplementCounts>,
+}
+
+fn bm25_complement_metrics(
+    qrels: &[QrelRecord],
+    bm25: &BTreeMap<String, Vec<String>>,
+    hybrid: &BTreeMap<String, Vec<String>>,
+) -> Bm25ComplementMetrics {
+    let mut metrics = Bm25ComplementMetrics::default();
+    for qrel in qrels.iter().filter(|qrel| !qrel.relevant.is_empty()) {
+        let bm25_ranking = bm25.get(&qrel.query_id).map(Vec::as_slice).unwrap_or(&[]);
+        let hybrid_ranking = hybrid.get(&qrel.query_id).map(Vec::as_slice).unwrap_or(&[]);
+        let per_class = metrics.per_class.entry(qrel.query_class).or_default();
+        for counts in [&mut metrics.overall, per_class] {
+            counts.positive_query_count += 1;
+            observe_bm25_complement_at(
+                counts,
+                5,
+                relevant_hit(qrel, bm25_ranking, 5),
+                relevant_hit(qrel, hybrid_ranking, 5),
+            );
+            observe_bm25_complement_at(
+                counts,
+                10,
+                relevant_hit(qrel, bm25_ranking, 10),
+                relevant_hit(qrel, hybrid_ranking, 10),
+            );
+        }
+    }
+    metrics
+}
+
+fn relevant_hit(qrel: &QrelRecord, ranking: &[String], limit: usize) -> bool {
+    ranking.iter().take(limit).any(|source_id| {
+        qrel.relevant
+            .iter()
+            .any(|relevant| relevant.grade > 0 && relevant.source_id == *source_id)
+    })
+}
+
+fn observe_bm25_complement_at(
+    counts: &mut Bm25ComplementCounts,
+    limit: usize,
+    bm25_hit: bool,
+    hybrid_hit: bool,
+) {
+    let (miss, rescued, preserved, harmed) = match limit {
+        5 => (
+            &mut counts.bm25_miss_at_5,
+            &mut counts.rescued_at_5,
+            &mut counts.bm25_hit_preserved_at_5,
+            &mut counts.bm25_hit_harmed_at_5,
+        ),
+        10 => (
+            &mut counts.bm25_miss_at_10,
+            &mut counts.rescued_at_10,
+            &mut counts.bm25_hit_preserved_at_10,
+            &mut counts.bm25_hit_harmed_at_10,
+        ),
+        _ => unreachable!("complement metrics only support @5 and @10"),
+    };
+    match (bm25_hit, hybrid_hit) {
+        (false, false) => *miss += 1,
+        (false, true) => {
+            *miss += 1;
+            *rescued += 1;
+        }
+        (true, true) => *preserved += 1,
+        (true, false) => *harmed += 1,
+    }
+}
+
+pub(super) fn bm25_complement_for_test(
+    qrels: &[QrelRecord],
+    bm25: &BTreeMap<String, Vec<String>>,
+    hybrid: &BTreeMap<String, Vec<String>>,
+) -> Value {
+    serde_json::to_value(bm25_complement_metrics(qrels, bm25, hybrid))
+        .expect("BM25 complement metrics serialize")
 }
 
 #[derive(Debug, Serialize)]
@@ -925,6 +1050,7 @@ struct CandidateReport {
     hybrid_filter_contract: Option<CandidateHybridFilterContract>,
     dev_metrics: Option<RetrievalMetrics>,
     held_out_metrics: Option<RetrievalMetrics>,
+    held_out_bm25_complement: Option<Bm25ComplementMetrics>,
     offline_dev_diagnostics: Vec<OfflineFusionDiagnostic>,
     resources: Option<ResourceEvidence>,
     light_gate_failures: Vec<String>,
@@ -1714,6 +1840,7 @@ struct FullReport {
     lexical_profile_dev: LexicalProfileAbReport,
     lexical_profile_heldout: LexicalProfileHeldoutConfirmation,
     candidates: Vec<CandidateReport>,
+    best_bm25_rescue_candidate: Option<String>,
     selected_light_candidate: Option<String>,
     selected_quality_candidate: Option<String>,
     raw_query_or_body_logged: bool,
@@ -3484,6 +3611,7 @@ struct PreparedCandidate {
     cold_samples_ms: Vec<f64>,
     isolated_peak_rss: u64,
     dev_metrics: RetrievalMetrics,
+    held_out_bm25_complement: Option<Bm25ComplementMetrics>,
     offline_dev_diagnostics: Vec<OfflineFusionDiagnostic>,
 }
 
@@ -4233,6 +4361,7 @@ pub(super) fn run(
         )?;
     path_guard.add_path(&bm25_tantivy_snapshot.path)?;
 
+    let selected_candidates = selected_live_candidates()?;
     let mut candidate_states = Vec::new();
     for (candidate, model_id, revision, manifest) in [
         (
@@ -4247,7 +4376,31 @@ pub(super) fn run(
             "e7f32e3c00f91d699e8c43b53106206bcc72bb22",
             root.join("models/gte-modernbert-base/manifest.json"),
         ),
+        (
+            "granite-embedding-97m-multilingual-r2",
+            "ibm-granite/granite-embedding-97m-multilingual-r2",
+            "835ad14087e140460703cf0fae09f97d469d65c2",
+            root.join("models/granite-embedding-97m-multilingual-r2/manifest.json"),
+        ),
+        (
+            "dragonkue-koen-e5-tiny",
+            "exp-models/dragonkue-KoEn-E5-Tiny",
+            "292c09c78c71a3f00ed56ee0d1ed9f0d39182fc9",
+            root.join("models/dragonkue-koen-e5-tiny/manifest.json"),
+        ),
+        (
+            "multilingual-e5-small",
+            "intfloat/multilingual-e5-small",
+            "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+            root.join("models/multilingual-e5-small/manifest.json"),
+        ),
     ] {
+        if selected_candidates
+            .as_ref()
+            .is_some_and(|selected| !selected.contains(candidate))
+        {
+            continue;
+        }
         candidate_states.push(prepare_candidate_dev(
             root,
             &server,
@@ -4271,7 +4424,7 @@ pub(super) fn run(
     // deployable frozen values are the actual source constants: k=60 and
     // TOP_K(20) * overfetch(4) = 80.  The k/window grid above is diagnostic.
     let frozen = FrozenConfig {
-        schema_version: "qgh.live_model_eval_config.v5",
+        schema_version: "qgh.live_model_eval_config.v6",
         integrated_git_head: integrated_git_head.clone(),
         worktree_clean,
         release_binary_sha256: host.binary_sha256.clone(),
@@ -4373,6 +4526,7 @@ pub(super) fn run(
                 prepared,
                 &corpus,
                 &held_out,
+                &bm25_evidence,
             ),
             Err(report) => *report,
         });
@@ -4412,6 +4566,7 @@ pub(super) fn run(
         }
     }
 
+    let best_bm25_rescue_candidate = select_bm25_rescue_candidate(&candidates);
     let selected_light_candidate = select_candidate(&candidates, true);
     let selected_quality_candidate = select_candidate(&candidates, false);
     let candidate_promotion_eligible =
@@ -4442,7 +4597,7 @@ pub(super) fn run(
     );
     frozen_guard.revalidate_before_final_report(root, &binary)?;
     let mut report = FullReport {
-        schema_version: "qgh.live_model_eval_report.v4",
+        schema_version: "qgh.live_model_eval_report.v5",
         run_finished_at: command_output("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
         corpus_snapshot_at: provenance.snapshot_at,
         host,
@@ -4452,6 +4607,7 @@ pub(super) fn run(
         lexical_profile_dev,
         lexical_profile_heldout,
         candidates,
+        best_bm25_rescue_candidate,
         selected_light_candidate,
         selected_quality_candidate,
         raw_query_or_body_logged: !redaction.sensitive_payload_passed,
@@ -4484,6 +4640,7 @@ pub(super) fn run(
             "candidate": candidate.candidate,
             "status": candidate.status,
         })).collect::<Vec<_>>(),
+        "best_bm25_rescue_candidate": report.best_bm25_rescue_candidate,
         "selected_light_candidate": report.selected_light_candidate,
         "selected_quality_candidate": report.selected_quality_candidate,
     }))?;
@@ -4803,6 +4960,7 @@ fn try_prepare_candidate_dev(
         cold_samples_ms,
         isolated_peak_rss,
         dev_metrics,
+        held_out_bm25_complement: None,
         offline_dev_diagnostics,
     })
 }
@@ -4816,6 +4974,7 @@ fn finish_candidate(
     mut prepared: PreparedCandidate,
     corpus: &[CorpusRecord],
     held_out: &[QrelRecord],
+    bm25_held_out: &QueryEvidence,
 ) -> CandidateReport {
     eprintln!(
         "live-eval candidate={} phase=heldout-warm-mcp status=running",
@@ -4880,6 +5039,11 @@ fn finish_candidate(
             );
         }
     };
+    prepared.held_out_bm25_complement = Some(bm25_complement_metrics(
+        held_out,
+        &bm25_held_out.rankings,
+        &warm.held_out.rankings,
+    ));
     if verify_active_chunker_contract(
         &prepared.fixture.db_path(),
         &prepared.tokenizer_chunker_contract.chunker_fingerprint,
@@ -5057,18 +5221,15 @@ fn resource_evidence(
         backfill_integrity: backfill.integrity.clone(),
         download_transfer_bytes: prepared.download_transfer_bytes,
         required_batch_size: REQUIRED_BATCH_SIZE,
-        effective_batch_size: EFFECTIVE_BATCH_SIZE,
+        effective_batch_size: FASTEMBED_BATCH_SIZE,
         required_intra_op_threads: REQUIRED_INTRA_OP_THREADS,
-        effective_intra_op_threads: None,
+        effective_intra_op_threads: Some(FASTEMBED_INTRA_OP_THREADS),
         effective_ort_inter_op: "fastembed/ORT effective default; not exposed by qgh v1"
             .to_string(),
         effective_ort_execution_mode: "fastembed/ORT effective default; not exposed by qgh v1"
             .to_string(),
         fastembed_version: "5.17.2".to_string(),
-        protocol_unverified: vec![
-            "batch_size_8_unavailable_existing_runtime_hardcodes_16".to_string(),
-            "intra_op_threads_4_not_exposed".to_string(),
-        ],
+        protocol_unverified: Vec::new(),
     }
 }
 
@@ -5099,9 +5260,9 @@ pub(super) fn resource_failure_contract_for_test() -> Value {
         backfill_integrity: None,
         download_transfer_bytes: Some(1),
         required_batch_size: REQUIRED_BATCH_SIZE,
-        effective_batch_size: EFFECTIVE_BATCH_SIZE,
+        effective_batch_size: FASTEMBED_BATCH_SIZE,
         required_intra_op_threads: REQUIRED_INTRA_OP_THREADS,
-        effective_intra_op_threads: None,
+        effective_intra_op_threads: Some(FASTEMBED_INTRA_OP_THREADS),
         effective_ort_inter_op: "unverified".to_string(),
         effective_ort_execution_mode: "unverified".to_string(),
         fastembed_version: "5.17.2".to_string(),
@@ -5129,7 +5290,7 @@ fn prepared_candidate_report(
 ) -> CandidateReport {
     let report_path = prepared.fixture.root.join("report.json");
     let report = CandidateReport {
-        schema_version: "qgh.live_model_eval_candidate.v2",
+        schema_version: "qgh.live_model_eval_candidate.v3",
         candidate: prepared.candidate,
         model_id: prepared.model_id,
         resolved_revision: prepared.revision,
@@ -5148,6 +5309,7 @@ fn prepared_candidate_report(
         hybrid_filter_contract: Some(prepared.hybrid_filter_contract),
         dev_metrics: Some(prepared.dev_metrics),
         held_out_metrics,
+        held_out_bm25_complement: prepared.held_out_bm25_complement,
         offline_dev_diagnostics: prepared.offline_dev_diagnostics,
         resources,
         light_gate_failures,
@@ -5167,7 +5329,7 @@ fn blocked_candidate(
     phase: &str,
 ) -> CandidateReport {
     CandidateReport {
-        schema_version: "qgh.live_model_eval_candidate.v2",
+        schema_version: "qgh.live_model_eval_candidate.v3",
         candidate: candidate.to_string(),
         model_id: model_id.to_string(),
         resolved_revision: revision.to_string(),
@@ -5182,6 +5344,7 @@ fn blocked_candidate(
         hybrid_filter_contract: None,
         dev_metrics: None,
         held_out_metrics: None,
+        held_out_bm25_complement: None,
         offline_dev_diagnostics: Vec::new(),
         resources: None,
         light_gate_failures: vec!["runtime_unavailable".to_string()],
@@ -5223,7 +5386,7 @@ fn dragonkue_blocker(root: &Path) -> Result<CandidateReport, DynError> {
         blocker.code
     );
     Ok(CandidateReport {
-        schema_version: "qgh.live_model_eval_candidate.v2",
+        schema_version: "qgh.live_model_eval_candidate.v3",
         candidate: "dragonkue-ko".to_string(),
         model_id: DRAGONKUE_MODEL_ID.to_string(),
         resolved_revision: DRAGONKUE_REVISION.to_string(),
@@ -5238,6 +5401,7 @@ fn dragonkue_blocker(root: &Path) -> Result<CandidateReport, DynError> {
         hybrid_filter_contract: None,
         dev_metrics: None,
         held_out_metrics: None,
+        held_out_bm25_complement: None,
         offline_dev_diagnostics: Vec::new(),
         resources: None,
         light_gate_failures: vec!["runtime_unavailable".to_string()],
@@ -6779,6 +6943,68 @@ fn select_candidate(candidates: &[CandidateReport], light: bool) -> Option<Strin
     eligible
         .first()
         .map(|candidate| candidate.candidate.clone())
+}
+
+#[derive(Debug, Clone)]
+struct Bm25RescueCandidateScore {
+    candidate: String,
+    rescued_at_5: usize,
+    harmed_at_5: usize,
+    snapshot_bytes: u64,
+}
+
+fn select_bm25_rescue_score(mut candidates: Vec<Bm25RescueCandidateScore>) -> Option<String> {
+    candidates.sort_by(|left, right| {
+        let left_net = left.rescued_at_5 as i64 - left.harmed_at_5 as i64;
+        let right_net = right.rescued_at_5 as i64 - right.harmed_at_5 as i64;
+        right_net
+            .cmp(&left_net)
+            .then_with(|| right.rescued_at_5.cmp(&left.rescued_at_5))
+            .then_with(|| left.harmed_at_5.cmp(&right.harmed_at_5))
+            .then_with(|| left.snapshot_bytes.cmp(&right.snapshot_bytes))
+            .then_with(|| left.candidate.cmp(&right.candidate))
+    });
+    candidates
+        .into_iter()
+        .next()
+        .map(|candidate| candidate.candidate)
+}
+
+fn select_bm25_rescue_candidate(candidates: &[CandidateReport]) -> Option<String> {
+    select_bm25_rescue_score(
+        candidates
+            .iter()
+            .filter_map(|candidate| {
+                let complement = candidate.held_out_bm25_complement.as_ref()?;
+                Some(Bm25RescueCandidateScore {
+                    candidate: candidate.candidate.clone(),
+                    rescued_at_5: complement.overall.rescued_at_5,
+                    harmed_at_5: complement.overall.bm25_hit_harmed_at_5,
+                    snapshot_bytes: candidate.resources.as_ref().map_or(u64::MAX, |resources| {
+                        resources.complete_model_snapshot_bytes
+                    }),
+                })
+            })
+            .collect(),
+    )
+}
+
+pub(super) fn select_bm25_rescue_candidate_for_test(
+    candidates: &[(&str, usize, usize, u64)],
+) -> Option<String> {
+    select_bm25_rescue_score(
+        candidates
+            .iter()
+            .map(|(candidate, rescued_at_5, harmed_at_5, snapshot_bytes)| {
+                Bm25RescueCandidateScore {
+                    candidate: (*candidate).to_string(),
+                    rescued_at_5: *rescued_at_5,
+                    harmed_at_5: *harmed_at_5,
+                    snapshot_bytes: *snapshot_bytes,
+                }
+            })
+            .collect(),
+    )
 }
 
 struct TimedQuery {

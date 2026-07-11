@@ -444,6 +444,78 @@ fn prepared_manifests_target_context_v1() {
     assert!(!MODEL_PREP_SCRIPT.contains("qgh.context.none.v1"));
 }
 
+#[test]
+fn live_resource_protocol_uses_production_runtime_constants() {
+    assert!(RUNTIME_SUPPORT.contains("FASTEMBED_BATCH_SIZE"));
+    assert!(RUNTIME_SUPPORT.contains("FASTEMBED_INTRA_OP_THREADS"));
+    assert!(!RUNTIME_SUPPORT.contains("batch_size_8_unavailable_existing_runtime_hardcodes_16"));
+    assert!(!RUNTIME_SUPPORT.contains("intra_op_threads_4_not_exposed"));
+}
+
+#[test]
+fn model_preparation_defines_the_lightweight_candidate_set() {
+    for candidate in [
+        "granite-embedding-97m-multilingual-r2",
+        "dragonkue-koen-e5-tiny",
+        "multilingual-e5-small",
+    ] {
+        assert!(MODEL_PREP_SCRIPT.contains(candidate), "missing {candidate}");
+        assert!(
+            RUNTIME_SUPPORT.contains(candidate),
+            "runtime missing {candidate}"
+        );
+    }
+    assert!(MODEL_PREP_SCRIPT.contains("835ad14087e140460703cf0fae09f97d469d65c2"));
+    assert!(MODEL_PREP_SCRIPT.contains("292c09c78c71a3f00ed56ee0d1ed9f0d39182fc9"));
+    assert!(MODEL_PREP_SCRIPT.contains("614241f622f53c4eeff9890bdc4f31cfecc418b3"));
+    assert!(!MODEL_PREP_SCRIPT.contains("model_quint8_avx2.onnx"));
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn bm25_complement_metrics_count_rescue_preservation_and_harm() {
+    let qrels = parse_jsonl::<QrelRecord>(DEV_QRELS_JSONL)
+        .into_iter()
+        .filter(|qrel| !qrel.relevant.is_empty())
+        .take(3)
+        .collect::<Vec<_>>();
+    assert_eq!(qrels.len(), 3);
+    let relevant = qrels
+        .iter()
+        .map(|qrel| qrel.relevant[0].source_id.clone())
+        .collect::<Vec<_>>();
+    let bm25 = BTreeMap::from([
+        (qrels[0].query_id.clone(), vec!["irrelevant-a".to_string()]),
+        (qrels[1].query_id.clone(), vec![relevant[1].clone()]),
+        (qrels[2].query_id.clone(), vec![relevant[2].clone()]),
+    ]);
+    let hybrid = BTreeMap::from([
+        (qrels[0].query_id.clone(), vec![relevant[0].clone()]),
+        (qrels[1].query_id.clone(), vec!["irrelevant-b".to_string()]),
+        (qrels[2].query_id.clone(), vec![relevant[2].clone()]),
+    ]);
+
+    let metrics = live_model_eval_runtime::bm25_complement_for_test(&qrels, &bm25, &hybrid);
+
+    assert_eq!(metrics["positive_query_count"], 3);
+    assert_eq!(metrics["bm25_miss_at_5"], 1);
+    assert_eq!(metrics["rescued_at_5"], 1);
+    assert_eq!(metrics["bm25_hit_preserved_at_5"], 1);
+    assert_eq!(metrics["bm25_hit_harmed_at_5"], 1);
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn bm25_rescue_selection_prefers_net_rescue_then_smaller_snapshot() {
+    let selected = live_model_eval_runtime::select_bm25_rescue_candidate_for_test(&[
+        ("large-negative", 4, 3, 400),
+        ("large-positive", 3, 1, 300),
+        ("small-positive", 3, 1, 100),
+    ]);
+
+    assert_eq!(selected.as_deref(), Some("small-positive"));
+}
+
 #[cfg(feature = "fastembed-provider")]
 #[test]
 fn real_manifest_tokenizer_contract_drives_frozen_and_resource_chunker_identity() {
@@ -516,9 +588,9 @@ fn real_manifest_tokenizer_contract_drives_frozen_and_resource_chunker_identity(
         "tokenizer_contract_identity_from_manifest",
         "chunker_fingerprint_for_tokenizer_identity",
         "tokenizer_contract_identity",
-        "qgh.live_model_eval_config.v5",
-        "qgh.live_model_eval_report.v4",
-        "qgh.live_model_eval_candidate.v2",
+        "qgh.live_model_eval_config.v6",
+        "qgh.live_model_eval_report.v5",
+        "qgh.live_model_eval_candidate.v3",
         "qgh.live_model_eval_resource.v2",
     ] {
         assert!(RUNTIME_SUPPORT.contains(required), "missing {required}");
@@ -555,6 +627,36 @@ fn model_preparation_records_download_and_cache_source_bytes() {
             vec![
                 "onnx/model.onnx",
                 "onnx/model.onnx_data",
+                "tokenizer.json",
+                "config.json",
+                "special_tokens_map.json",
+                "tokenizer_config.json",
+            ],
+        ),
+        (
+            "granite-embedding-97m-multilingual-r2",
+            vec![
+                "onnx/model.onnx",
+                "tokenizer.json",
+                "config.json",
+                "special_tokens_map.json",
+                "tokenizer_config.json",
+            ],
+        ),
+        (
+            "dragonkue-koen-e5-tiny",
+            vec![
+                "onnx/model.onnx",
+                "tokenizer.json",
+                "config.json",
+                "special_tokens_map.json",
+                "tokenizer_config.json",
+            ],
+        ),
+        (
+            "multilingual-e5-small",
+            vec![
+                "onnx/model.onnx",
                 "tokenizer.json",
                 "config.json",
                 "special_tokens_map.json",
@@ -643,7 +745,7 @@ fn model_preparation_records_download_and_cache_source_bytes() {
         assert_eq!(blocker["candidate"], "dragonkue-ko");
         assert_eq!(
             blocker["schema_version"],
-            "qgh.live_model_eval_candidate.v2"
+            "qgh.live_model_eval_candidate.v3"
         );
         assert_eq!(blocker["status"], "blocked");
         assert_eq!(
@@ -800,7 +902,8 @@ fn model_preparation_offline_refresh_preserves_valid_acquisition_evidence() {
                 "tests/support/prepare_live_model_eval_models.py",
                 "--output-root",
             ])
-            .arg(&models_root);
+            .arg(&models_root)
+            .args(["--candidates", "gte-modernbert-base,arctic-embed-l-v2.0"]);
         if offline {
             command.arg("--offline");
         }

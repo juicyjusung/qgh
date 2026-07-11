@@ -31,6 +31,33 @@ ARCTIC_FILES = [
     ("special_tokens_map", "special_tokens_map.json", None),
     ("tokenizer_config", "tokenizer_config.json", None),
 ]
+GRANITE_97M_MODEL_ID = "ibm-granite/granite-embedding-97m-multilingual-r2"
+GRANITE_97M_REVISION = "835ad14087e140460703cf0fae09f97d469d65c2"
+GRANITE_97M_FILES = [
+    ("onnx_model", "onnx/model.onnx", None),
+    ("tokenizer", "tokenizer.json", None),
+    ("config", "config.json", None),
+    ("special_tokens_map", "special_tokens_map.json", None),
+    ("tokenizer_config", "tokenizer_config.json", None),
+]
+DRAGONKUE_KOEN_TINY_MODEL_ID = "exp-models/dragonkue-KoEn-E5-Tiny"
+DRAGONKUE_KOEN_TINY_REVISION = "292c09c78c71a3f00ed56ee0d1ed9f0d39182fc9"
+DRAGONKUE_KOEN_TINY_FILES = [
+    ("onnx_model", "onnx/model.onnx", None),
+    ("tokenizer", "tokenizer.json", None),
+    ("config", "config.json", None),
+    ("special_tokens_map", "special_tokens_map.json", None),
+    ("tokenizer_config", "tokenizer_config.json", None),
+]
+MULTILINGUAL_E5_SMALL_MODEL_ID = "intfloat/multilingual-e5-small"
+MULTILINGUAL_E5_SMALL_REVISION = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
+MULTILINGUAL_E5_SMALL_FILES = [
+    ("onnx_model", "onnx/model.onnx", None),
+    ("tokenizer", "tokenizer.json", None),
+    ("config", "config.json", None),
+    ("special_tokens_map", "special_tokens_map.json", None),
+    ("tokenizer_config", "tokenizer_config.json", None),
+]
 DRAGONKUE_UNAVAILABLE = {
     "candidate": "dragonkue-ko",
     "model_id": "dragonkue/snowflake-arctic-embed-l-v2.0-ko",
@@ -51,6 +78,14 @@ DRAGONKUE_UNAVAILABLE = {
         "resolve_revision": "55ec6e9358a56d56af759bc8372e970caf8c305f",
     },
 }
+KNOWN_CANDIDATES = {
+    "gte-modernbert-base",
+    "arctic-embed-l-v2.0",
+    "granite-embedding-97m-multilingual-r2",
+    "dragonkue-koen-e5-tiny",
+    "multilingual-e5-small",
+}
+SELECTED_CANDIDATES = None
 
 
 def sha256_file(path: Path) -> str:
@@ -102,6 +137,7 @@ def snapshot_sha256(root: Path) -> str:
 
 
 def main() -> None:
+    global SELECTED_CANDIDATES
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-root", type=Path, default=Path("target/qgh-eval/models"))
     parser.add_argument(
@@ -109,7 +145,21 @@ def main() -> None:
         action="store_true",
         help="fail instead of downloading a missing artifact",
     )
+    parser.add_argument(
+        "--candidates",
+        help="comma-separated eval candidate ids; default prepares the full set",
+    )
     args = parser.parse_args()
+    if args.candidates:
+        SELECTED_CANDIDATES = {
+            candidate.strip() for candidate in args.candidates.split(",")
+        }
+        if (
+            not SELECTED_CANDIDATES
+            or "" in SELECTED_CANDIDATES
+            or not SELECTED_CANDIDATES.issubset(KNOWN_CANDIDATES)
+        ):
+            raise RuntimeError("candidate filter is invalid")
     prior_records = load_prior_prepared_records(args.output_root)
     summaries = []
     summaries.append(
@@ -126,6 +176,54 @@ def main() -> None:
             max_length=8192,
             offline=args.offline,
             prior_record=prior_records.get("gte-modernbert-base"),
+        )
+    )
+    summaries.append(
+        prepare_manifest(
+            args.output_root / "granite-embedding-97m-multilingual-r2",
+            "granite-embedding-97m-multilingual-r2",
+            GRANITE_97M_MODEL_ID,
+            GRANITE_97M_REVISION,
+            GRANITE_97M_FILES,
+            pooling="cls",
+            query_prefix="",
+            document_prefix="",
+            native_dimension=384,
+            max_length=32768,
+            offline=args.offline,
+            prior_record=prior_records.get("granite-embedding-97m-multilingual-r2"),
+        )
+    )
+    summaries.append(
+        prepare_manifest(
+            args.output_root / "dragonkue-koen-e5-tiny",
+            "dragonkue-koen-e5-tiny",
+            DRAGONKUE_KOEN_TINY_MODEL_ID,
+            DRAGONKUE_KOEN_TINY_REVISION,
+            DRAGONKUE_KOEN_TINY_FILES,
+            pooling="mean",
+            query_prefix="query: ",
+            document_prefix="passage: ",
+            native_dimension=384,
+            max_length=512,
+            offline=args.offline,
+            prior_record=prior_records.get("dragonkue-koen-e5-tiny"),
+        )
+    )
+    summaries.append(
+        prepare_manifest(
+            args.output_root / "multilingual-e5-small",
+            "multilingual-e5-small",
+            MULTILINGUAL_E5_SMALL_MODEL_ID,
+            MULTILINGUAL_E5_SMALL_REVISION,
+            MULTILINGUAL_E5_SMALL_FILES,
+            pooling="mean",
+            query_prefix="query: ",
+            document_prefix="passage: ",
+            native_dimension=384,
+            max_length=512,
+            offline=args.offline,
+            prior_record=prior_records.get("multilingual-e5-small"),
         )
     )
     arctic_cache = (
@@ -150,6 +248,7 @@ def main() -> None:
             prior_record=prior_records.get("arctic-embed-l-v2.0"),
         )
     )
+    summaries = [summary for summary in summaries if summary is not None]
     provenance = {
         "schema_version": "qgh.live_model_preparation.v1",
         "prepared": summaries,
@@ -178,6 +277,8 @@ def prepare_manifest(
     offline: bool = False,
     prior_record=None,
 ):
+    if SELECTED_CANDIDATES is not None and candidate not in SELECTED_CANDIDATES:
+        return None
     if (
         not isinstance(prior_record, dict)
         or prior_record.get("candidate") != candidate
