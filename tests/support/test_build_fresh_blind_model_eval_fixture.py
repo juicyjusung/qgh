@@ -189,6 +189,13 @@ def build_spec() -> dict:
             "grade": 2,
         }
     )
+    next(qrel for qrel in qrels if qrel["class"] == "comment_only")["gold"].append(
+        {
+            "repo": "example/public-repo",
+            "issue_number": 102,
+            "grade": 2,
+        }
+    )
     return {
         "schema_version": "qgh.fresh_blind_model_eval_spec.v2",
         "dev_repo": "juicyjusung/qgh",

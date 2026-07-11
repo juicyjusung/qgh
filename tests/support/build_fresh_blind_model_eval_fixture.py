@@ -395,6 +395,12 @@ def _parse_spec(path: Path) -> dict:
             if identity in locator_identities:
                 raise FixtureBuildError(f"{context} contains a duplicate gold locator")
             locator_identities.add(identity)
+        if query_class == "comment_only" and not any(
+            locator.get("comment_id") is not None for locator in gold
+        ):
+            raise FixtureBuildError(
+                f"{context} comment_only gold must include a comment"
+            )
     if dict(class_counts) != CLASS_COUNTS:
         raise FixtureBuildError("fresh blind qrel class balance is invalid")
     expected_ids = [f"test-{index:03d}" for index in range(1, 81)]
@@ -454,8 +460,6 @@ def _validate_gold_locator(
         or comment_id <= 0
     ):
         raise FixtureBuildError(f"{context} gold comment_id is invalid")
-    if query_class == "comment_only" and comment_id is None:
-        raise FixtureBuildError(f"{context} comment_only gold must locate a comment")
     if query_class == "exact_identifier" and comment_id is not None:
         raise FixtureBuildError(f"{context} exact_identifier gold must locate an issue")
     if "rationale" in locator:
