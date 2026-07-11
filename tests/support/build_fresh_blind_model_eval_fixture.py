@@ -21,7 +21,7 @@ from typing import Callable
 from urllib.parse import quote, urlparse
 
 
-SPEC_SCHEMA = "qgh.fresh_blind_model_eval_spec.v1"
+SPEC_SCHEMA = "qgh.fresh_blind_model_eval_spec.v2"
 CORPUS_SCHEMA = "qgh.live_model_corpus.v1"
 QREL_SCHEMA = "qgh.live_model_qrel.v1"
 PROVENANCE_SCHEMA = "qgh.live_model_provenance.v1"
@@ -305,7 +305,14 @@ def _parse_spec(path: Path) -> dict:
         raise FixtureBuildError("fresh blind specification must be an object")
     _require_exact_keys(
         spec,
-        {"schema_version", "dev_repo", "distractor_limit", "repositories", "qrels"},
+        {
+            "schema_version",
+            "dev_repo",
+            "distractor_limit",
+            "pooled_query_ids",
+            "repositories",
+            "qrels",
+        },
         "fresh blind specification",
     )
     if spec["schema_version"] != SPEC_SCHEMA:
@@ -395,9 +402,29 @@ def _parse_spec(path: Path) -> dict:
         raise FixtureBuildError(
             "fresh blind query IDs must be ordered test-001 through test-080"
         )
+    pooled_query_ids = spec["pooled_query_ids"]
+    if (
+        not isinstance(pooled_query_ids, list)
+        or len(pooled_query_ids) < 10
+        or any(not isinstance(query_id, str) for query_id in pooled_query_ids)
+        or len(set(pooled_query_ids)) != len(pooled_query_ids)
+    ):
+        raise FixtureBuildError(
+            "pooled_query_ids must contain at least 10 distinct query IDs"
+        )
+    qrel_by_id = {entry["query_id"]: entry for entry in qrels}
+    if any(
+        query_id not in qrel_by_id
+        or qrel_by_id[query_id]["class"] in {"exact_identifier", "negative"}
+        for query_id in pooled_query_ids
+    ):
+        raise FixtureBuildError(
+            "pooled_query_ids must name semantic test queries"
+        )
     return {
         "dev_repo": dev_repo,
         "distractor_limit": limit,
+        "pooled_query_ids": pooled_query_ids,
         "repo_metadata": repo_metadata,
         "qrels": qrels,
     }
@@ -906,9 +933,7 @@ def build_fixture(
         "judgment_pool": {
             "method": "manual source-body overlap review across split-safe public issue threads",
             "complete": True,
-            "multi_source_query_count": sum(
-                1 for qrel in dev_qrels + test_qrels if len(qrel["relevant"]) > 1
-            ),
+            "multi_source_query_count": len(spec["pooled_query_ids"]),
         },
         "corpus_sha256": sha256_bytes(corpus_raw),
         "qrels_dev_sha256": sha256_bytes(dev_raw),

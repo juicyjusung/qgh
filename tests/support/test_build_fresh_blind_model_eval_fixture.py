@@ -182,9 +182,10 @@ def build_spec() -> dict:
                 }
             )
     return {
-        "schema_version": "qgh.fresh_blind_model_eval_spec.v1",
+        "schema_version": "qgh.fresh_blind_model_eval_spec.v2",
         "dev_repo": "juicyjusung/qgh",
         "distractor_limit": 10,
+        "pooled_query_ids": [f"test-{index:03d}" for index in range(1, 11)],
         "repositories": [
             {
                 "repo": "juicyjusung/qgh",
@@ -323,6 +324,9 @@ class FreshBlindBuilderTests(unittest.TestCase):
             self.assertEqual(provenance["dev_query_count"], 40)
             self.assertEqual(provenance["test_query_count"], 80)
             self.assertEqual(
+                provenance["judgment_pool"]["multi_source_query_count"], 10
+            )
+            self.assertEqual(
                 set(provenance),
                 {
                     "schema_version",
@@ -433,6 +437,30 @@ class FreshBlindBuilderTests(unittest.TestCase):
             dev_path.write_bytes(jsonl_bytes(dev_rows))
             with self.assertRaisesRegex(
                 BUILDER.FixtureBuildError, "issue thread leaks"
+            ):
+                BUILDER.build_fixture(
+                    spec_path=spec_path,
+                    dev_qrels_path=dev_path,
+                    output_dir=output_dir,
+                    snapshot_at="2026-07-11T01:02:03Z",
+                    fetch_json=fake,
+                )
+            self.assertFalse(output_dir.exists())
+
+    def test_rejects_invalid_manual_judgment_pool(self) -> None:
+        dev_rows, qgh_issues, qgh_comments = build_dev_rows()
+        fake = FakeGitHub(qgh_issues, qgh_comments)
+        spec = build_spec()
+        spec["pooled_query_ids"] = ["test-001"] * 10
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec_path = root / "spec.json"
+            dev_path = root / "qrels-dev.jsonl"
+            output_dir = root / "target" / "qgh-eval" / "fresh-blind"
+            spec_path.write_text(json.dumps(spec), encoding="utf-8")
+            dev_path.write_bytes(jsonl_bytes(dev_rows))
+            with self.assertRaisesRegex(
+                BUILDER.FixtureBuildError, "pooled_query_ids"
             ):
                 BUILDER.build_fixture(
                     spec_path=spec_path,
