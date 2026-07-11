@@ -438,6 +438,14 @@ fn live_runtime_entrypoint_is_explicitly_opt_in() {
     assert!(live_eval_opt_in(Some("1")));
 }
 
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn fresh_blind_runtime_entrypoint_is_explicitly_opt_in() {
+    assert!(!fresh_blind_eval_opt_in(None));
+    assert!(!fresh_blind_eval_opt_in(Some("true")));
+    assert!(fresh_blind_eval_opt_in(Some("1")));
+}
+
 #[test]
 fn prepared_manifests_target_context_v1() {
     assert!(MODEL_PREP_SCRIPT.contains(r#""context_template_version": "qgh.context.v1""#));
@@ -536,6 +544,25 @@ fn resource_rss_watchdog_fails_closed_when_rss_cannot_be_observed() {
     assert_eq!(evidence["rss_monitor_failed"], true);
     assert_eq!(evidence["rss_cap_exceeded"], false);
     assert!(evidence["elapsed_ms"].as_f64().unwrap() < 2_000.0);
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn live_fixture_repository_allowlist_is_derived_from_the_public_corpus() {
+    let corpus = [
+        json!({"repo": "public-b/repo"}),
+        json!({"repo": "public-a/repo"}),
+        json!({"repo": "public-b/repo"}),
+    ]
+    .into_iter()
+    .map(|record| serde_json::to_string(&record).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n");
+
+    assert_eq!(
+        live_model_eval_runtime::repository_allowlist_for_test(&corpus).unwrap(),
+        json!(["public-a/repo", "public-b/repo"])
+    );
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -3122,6 +3149,34 @@ fn live_model_runtime_evaluation() {
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
+#[ignore = "loads machine-only fresh blind qrels and local ONNX models"]
+fn fresh_blind_model_runtime_evaluation() {
+    assert!(
+        fresh_blind_eval_opt_in(std::env::var("QGH_FRESH_BLIND_MODEL_EVAL").ok().as_deref()),
+        "set QGH_FRESH_BLIND_MODEL_EVAL=1 to run the fresh blind evaluation"
+    );
+    let fixture_root = std::env::var_os("QGH_FRESH_BLIND_FIXTURE_ROOT")
+        .map(std::path::PathBuf::from)
+        .expect("set QGH_FRESH_BLIND_FIXTURE_ROOT");
+    let eval_root = std::env::var_os("QGH_LIVE_MODEL_EVAL_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target/qgh-eval/fresh-blind-run"));
+    let read = |name: &str| {
+        std::fs::read_to_string(fixture_root.join(name))
+            .unwrap_or_else(|_| panic!("fresh blind fixture {name} is readable"))
+    };
+    live_model_eval_runtime::run(
+        &eval_root,
+        &read("corpus.jsonl"),
+        &read("qrels-dev.jsonl"),
+        &read("qrels-test.jsonl"),
+        &read("provenance.json"),
+    )
+    .expect("fresh blind model evaluation completes");
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
 #[ignore = "runs the release qgh binary against the qgh-only public snapshot"]
 fn live_model_runtime_smoke() {
     assert_eq!(
@@ -3582,5 +3637,9 @@ fn is_cjk(character: char) -> bool {
 }
 
 fn live_eval_opt_in(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn fresh_blind_eval_opt_in(value: Option<&str>) -> bool {
     value == Some("1")
 }

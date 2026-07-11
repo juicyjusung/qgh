@@ -4266,6 +4266,33 @@ pub(super) fn fixture_preflight_for_test(
     }))
 }
 
+fn repository_allowlist(corpus: &[CorpusRecord]) -> Vec<String> {
+    corpus
+        .iter()
+        .map(|source| source.repo.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+pub(super) fn repository_allowlist_for_test(corpus_raw: &str) -> Result<Value, DynError> {
+    let repositories = corpus_raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|record| {
+            record["repo"]
+                .as_str()
+                .filter(|repo| !repo.trim().is_empty())
+                .map(ToString::to_string)
+                .ok_or("public corpus record is missing repo")
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    Ok(serde_json::to_value(repositories)?)
+}
+
 pub(super) fn heldout_fixture_contract_for_test(
     corpus_raw: &str,
     dev_raw: &str,
@@ -4334,10 +4361,11 @@ pub(super) fn run(
         && provenance.judgment_pool.multi_source_query_count >= 10;
     let server = PublicSnapshotServer::start(&corpus)?;
     eprintln!("live-eval phase=bm25-dev-real-store status=running");
-    let bm25_fixture = CliFixture::new(
+    let bm25_fixture = CliFixture::new_with_repositories(
         root.join("bm25-live"),
         binary.clone(),
         server.base_url.clone(),
+        repository_allowlist(&corpus),
     )?;
     bm25_fixture.write_config(None)?;
     bm25_fixture.sync()?;
@@ -4862,10 +4890,11 @@ fn try_prepare_candidate_dev(
     dev: &[QrelRecord],
 ) -> Result<PreparedCandidate, DynError> {
     eprintln!("live-eval candidate={candidate} phase=sync status=running");
-    let fixture = CliFixture::new(
+    let fixture = CliFixture::new_with_repositories(
         root.join(format!("{candidate}-live")),
         binary.to_path_buf(),
         server.base_url.clone(),
+        repository_allowlist(corpus),
     )?;
     fixture.write_config(None)?;
     fixture.sync()?;
@@ -7238,12 +7267,30 @@ struct CliFixture {
     cache_home: PathBuf,
     binary: PathBuf,
     api_base_url: String,
+    repositories: Vec<String>,
 }
 
 impl CliFixture {
     fn new(root: PathBuf, binary: PathBuf, api_base_url: String) -> Result<Self, DynError> {
+        Self::new_with_repositories(
+            root,
+            binary,
+            api_base_url,
+            vec!["juicyjusung/qgh".to_string()],
+        )
+    }
+
+    fn new_with_repositories(
+        root: PathBuf,
+        binary: PathBuf,
+        api_base_url: String,
+        repositories: Vec<String>,
+    ) -> Result<Self, DynError> {
+        if repositories.is_empty() {
+            return Err("live fixture requires at least one public repository".into());
+        }
         let cache_home = root.join("cache");
-        Self::new_with_cache(root, binary, api_base_url, cache_home)
+        Self::new_with_cache_and_repositories(root, binary, api_base_url, cache_home, repositories)
     }
 
     fn new_with_cache(
@@ -7251,6 +7298,22 @@ impl CliFixture {
         binary: PathBuf,
         api_base_url: String,
         cache_home: PathBuf,
+    ) -> Result<Self, DynError> {
+        Self::new_with_cache_and_repositories(
+            root,
+            binary,
+            api_base_url,
+            cache_home,
+            vec!["juicyjusung/qgh".to_string()],
+        )
+    }
+
+    fn new_with_cache_and_repositories(
+        root: PathBuf,
+        binary: PathBuf,
+        api_base_url: String,
+        cache_home: PathBuf,
+        repositories: Vec<String>,
     ) -> Result<Self, DynError> {
         let root = absolute_path(root)?;
         let cache_home = absolute_path(cache_home)?;
@@ -7267,6 +7330,7 @@ impl CliFixture {
             cache_home,
             binary,
             api_base_url,
+            repositories,
         })
     }
 
@@ -7279,6 +7343,7 @@ impl CliFixture {
                     .to_string_lossy()
             )
         });
+        let repositories = serde_json::to_string(&self.repositories)?;
         let config = format!(
             r#"schema_version = "qgh.config.v1"
 
@@ -7286,7 +7351,7 @@ impl CliFixture {
 host = "github.com"
 api_base_url = "{}"
 web_base_url = "https://github.com"
-repos = ["juicyjusung/qgh"]
+repos = {repositories}
 
 [profiles.work.token_source]
 type = "env"
@@ -7299,6 +7364,7 @@ env = "QGH_PUBLIC_FIXTURE_AUTH"
     }
 
     fn write_test_embedding_config(&self) -> Result<(), DynError> {
+        let repositories = serde_json::to_string(&self.repositories)?;
         let config = format!(
             r#"schema_version = "qgh.config.v1"
 
@@ -7306,7 +7372,7 @@ env = "QGH_PUBLIC_FIXTURE_AUTH"
 host = "github.com"
 api_base_url = "{}"
 web_base_url = "https://github.com"
-repos = ["juicyjusung/qgh"]
+repos = {repositories}
 
 [profiles.work.token_source]
 type = "env"
