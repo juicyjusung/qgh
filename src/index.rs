@@ -2,6 +2,7 @@ use crate::error::QghError;
 use crate::model::IndexSource;
 use crate::paths::{ensure_private_dir, set_private_dir, set_private_file};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fs;
 use std::fs::OpenOptions;
@@ -717,7 +718,12 @@ fn search_with_filters_profile(
             parser.set_field_boost(cjk_ngrams, 0.25);
         }
     }
-    let expanded_query = expand_cjk_query(query_text);
+    let plain_query = if query_text.contains("--") {
+        Cow::Owned(query_text.replace("--", " "))
+    } else {
+        Cow::Borrowed(query_text)
+    };
+    let expanded_query = expand_cjk_query(&plain_query);
     let query = parser.parse_query(&expanded_query).map_err(|_| {
         QghError::validation(
             "validation.invalid_query",
@@ -1143,6 +1149,25 @@ mod tests {
                 .and_then(|hit| hit.source_updated_at.as_deref()),
             Some("2026-01-01T00:00:00Z")
         );
+        let _ = fs::remove_dir_all(index_root);
+    }
+
+    #[test]
+    fn cli_flag_terms_are_treated_as_plain_search_text() {
+        let index_root = temp_index_root("cli-flag-query");
+        let source = test_source(
+            "CLI_FLAG",
+            "owner/repo",
+            "open",
+            "alice",
+            &[],
+            "select the record category with the type option",
+        );
+        let generation_path = rebuild(&index_root, 1, &[source]).unwrap();
+
+        let hits = search(&generation_path, "record category --type option", 5).unwrap();
+
+        assert!(top_source_has_suffix(&hits, "CLI_FLAG"));
         let _ = fs::remove_dir_all(index_root);
     }
 
