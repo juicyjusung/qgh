@@ -13,6 +13,10 @@ use crate::config::{
 };
 use crate::context::{prepare_embedding_input, EmbeddingSourceContext};
 use crate::coverage;
+#[cfg(any(debug_assertions, test))]
+use crate::embedding::TokenSpan;
+#[cfg(debug_assertions)]
+use crate::embedding::DEFAULT_QUERY_PREFIX;
 use crate::embedding::{
     builtin_preset_hf_reference, default_hf_model_reference, default_prepared_model_store,
     parse_hf_model_reference, EmbeddingFingerprint, EmbeddingFingerprintExpectation,
@@ -26,8 +30,6 @@ use crate::embedding::{
     FastembedTokenizer, LocalEmbeddingProvider, PreparedEmbeddingTokenizer,
     PreparedModelInspection, PreparedModelSnapshot,
 };
-#[cfg(debug_assertions)]
-use crate::embedding::{TokenSpan, DEFAULT_QUERY_PREFIX};
 use crate::error::QghError;
 use crate::freshness::{self, FreshnessContext, FreshnessOverrides};
 use crate::github;
@@ -2279,10 +2281,10 @@ impl EmbeddingProvider for TestEmbeddingProvider {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 struct TestEmbeddingTokenizer;
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 impl EmbeddingTokenizer for TestEmbeddingTokenizer {
     fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError> {
         if text.is_empty() {
