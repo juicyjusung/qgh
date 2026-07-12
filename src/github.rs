@@ -470,7 +470,7 @@ async fn fetch_issues_classified_with_client(
         let mut repo_skipped_pull_requests = 0;
         let mut last_progress_issue_count = 0;
         while let Some(url) = next_url.take() {
-            let mut request = github_get(client, &url, token, &profile.api_base_url);
+            let mut request = github_get(client, &url, token, &profile.api_base_url)?;
             if let Some(etag) = stored_cursor.and_then(|cursor| cursor.etag.as_ref()) {
                 request = request.header(IF_NONE_MATCH, etag);
             }
@@ -909,7 +909,7 @@ async fn fetch_backfill_issues_classified_inner(
                 all_reached_end = false;
                 break 'repos;
             }
-            let response = match github_get(&client, &url, token, &profile.api_base_url)
+            let response = match github_get(&client, &url, token, &profile.api_base_url)?
                 .send()
                 .await
             {
@@ -1326,10 +1326,15 @@ async fn fetch_target_issue_classified_with_client_and_transition_commit(
 
         let url = issue_object_url(profile, &current_repo, current_issue_number);
 
-        let response = match github_get(client, &url, token, &profile.api_base_url)
-            .send()
-            .await
-        {
+        let request = match github_get(client, &url, token, &profile.api_base_url) {
+            Ok(request) => request,
+            Err(_) => {
+                finish_target!(ClassifiedTargetIssueTerminal::Transient(
+                    GitHubTransientKind::UnexpectedResponse
+                ));
+            }
+        };
+        let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
                 finish_target!(ClassifiedTargetIssueTerminal::Transient(
@@ -1780,7 +1785,10 @@ async fn fetch_issue_comments(
     let mut endpoint_not_modified = false;
     let mut next_url = Some(comment_url(profile, repo, issue.number, stored_cursor));
     while let Some(url) = next_url.take() {
-        let mut request = github_get(client, &url, token, &profile.api_base_url);
+        let mut request = match github_get(client, &url, token, &profile.api_base_url) {
+            Ok(request) => request,
+            Err(error) => return CommentFetchOutcome::Failed(error),
+        };
         if let Some(etag) = stored_cursor.and_then(|cursor| cursor.etag.as_ref()) {
             request = request.header(IF_NONE_MATCH, etag);
         }
@@ -2031,7 +2039,7 @@ async fn fetch_repo_comments_classified_inner(
         let mut blocked = false;
         let mut next_url = Some(repo_comment_url(profile, repo, stored_cursor));
         while let Some(url) = next_url.take() {
-            let mut request = github_get(&client, &url, token, &profile.api_base_url);
+            let mut request = github_get(&client, &url, token, &profile.api_base_url)?;
             if let Some(etag) = conditional_etag.take() {
                 request = request.header(IF_NONE_MATCH, etag);
             }
@@ -2241,10 +2249,11 @@ async fn classify_parent(
     progress: Option<&dyn ProgressReporter>,
 ) -> ParentClass {
     let url = issue_object_url(profile, repo, issue_number);
-    let response = match github_get(client, &url, token, &profile.api_base_url)
-        .send()
-        .await
-    {
+    let request = match github_get(client, &url, token, &profile.api_base_url) {
+        Ok(request) => request,
+        Err(error) => return ParentClass::Failed(error),
+    };
+    let response = match request.send().await {
         Ok(response) => response,
         Err(error) => return ParentClass::Transient(classify_transport_failure(&error)),
     };
@@ -2482,7 +2491,11 @@ async fn repository_access_attempt_at(
 ) -> ResponseDisposition {
     let url = repository_object_url_at(api_base_url, repo);
     let scope = format!("repository:{}", repo.full_name());
-    let response = match github_get(client, &url, token, api_base_url).send().await {
+    let request = match github_get(client, &url, token, api_base_url) {
+        Ok(request) => request,
+        Err(_) => return ResponseDisposition::Transient(GitHubTransientKind::UnexpectedResponse),
+    };
+    let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
             return ResponseDisposition::Transient(classify_transport_failure(&error));
@@ -2710,6 +2723,10 @@ fn target_terminal_from_lifecycle_check(
 }
 
 fn lifecycle_client() -> Result<reqwest::Client, QghError> {
+    github_http_client()
+}
+
+pub(crate) fn github_http_client() -> Result<reqwest::Client, QghError> {
     lifecycle_client_with_timeout(GITHUB_REQUEST_TIMEOUT)
 }
 
@@ -2729,7 +2746,7 @@ async fn check_candidate_lifecycle_classified(
     progress: Option<&dyn ProgressReporter>,
 ) -> Result<ClassifiedLifecycleCheck, QghError> {
     let url = source_check_url(profile, candidate)?;
-    let response = match github_get(client, &url, token, &profile.api_base_url)
+    let response = match github_get(client, &url, token, &profile.api_base_url)?
         .send()
         .await
     {
@@ -2917,22 +2934,41 @@ fn stable_error_identity(
     }
 }
 
-fn github_get(
+pub(crate) fn github_get(
     client: &reqwest::Client,
     url: &str,
     token: &str,
     trusted_api_base_url: &str,
-) -> reqwest::RequestBuilder {
+) -> Result<reqwest::RequestBuilder, QghError> {
+    let target = reqwest::Url::parse(url).map_err(|_| untrusted_github_request_origin())?;
+    let trusted =
+        reqwest::Url::parse(trusted_api_base_url).map_err(|_| untrusted_github_request_origin())?;
+    if !target.username().is_empty()
+        || target.password().is_some()
+        || target.fragment().is_some()
+        || !trusted.username().is_empty()
+        || trusted.password().is_some()
+        || trusted.query().is_some()
+        || trusted.fragment().is_some()
+        || !same_url_origin(&target, &trusted)
+        || !url_path_is_within_base(&target, &trusted)
+    {
+        return Err(untrusted_github_request_origin());
+    }
     let request = client.get(url);
     let request = if github_request_may_receive_token(url, trusted_api_base_url) {
         request.bearer_auth(token)
     } else {
         request
     };
-    request
+    Ok(request
         .header("accept", "application/vnd.github+json")
         .header("user-agent", user_agent())
-        .header("x-github-api-version", GITHUB_API_VERSION)
+        .header("x-github-api-version", GITHUB_API_VERSION))
+}
+
+fn untrusted_github_request_origin() -> QghError {
+    QghError::github("GitHub request origin did not match the configured API endpoint.")
 }
 
 fn github_request_may_receive_token(url: &str, trusted_api_base_url: &str) -> bool {
@@ -2960,6 +2996,16 @@ fn same_url_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
             .zip(right.host_str())
             .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
         && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn url_path_is_within_base(target: &reqwest::Url, trusted: &reqwest::Url) -> bool {
+    let base = trusted.path().trim_end_matches('/');
+    base.is_empty()
+        || target.path() == base
+        || target
+            .path()
+            .strip_prefix(base)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn source_check_url(
@@ -3318,6 +3364,64 @@ mod permission_classification_tests {
             "http://127.0.0.1:43123/repos/owner/repo",
             "http://127.0.0.1:43123"
         ));
+
+        let client = reqwest::Client::new();
+        let loopback = github_get(
+            &client,
+            "http://127.0.0.1:43123/repos/owner/repo",
+            "PRIVATE_LOOPBACK_TOKEN",
+            "http://127.0.0.1:43123",
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert!(loopback
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .is_none());
+
+        let off_origin = github_get(
+            &client,
+            "http://127.0.0.1:43123/metadata",
+            "PRIVATE_OFF_ORIGIN_TOKEN",
+            "https://api.github.com",
+        )
+        .unwrap_err();
+        assert_eq!(off_origin.code, "github.request_failed");
+        let serialized = serde_json::to_string(&off_origin).unwrap();
+        assert!(!serialized.contains("PRIVATE_"), "{serialized}");
+
+        let off_base_path = github_get(
+            &client,
+            "https://ghe.example/PRIVATE_OUTSIDE_API",
+            "PRIVATE_PATH_TOKEN",
+            "https://ghe.example/api/v3",
+        )
+        .unwrap_err();
+        assert_eq!(off_base_path.code, "github.request_failed");
+        assert!(!serde_json::to_string(&off_base_path)
+            .unwrap()
+            .contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn off_origin_pagination_is_rejected_before_request_build() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            LINK,
+            HeaderValue::from_static("<http://127.0.0.1:43123/metadata>; rel=\"next\""),
+        );
+        let next = next_link(&headers).unwrap();
+        let error = github_get(
+            &reqwest::Client::new(),
+            &next,
+            "PRIVATE_PAGINATION_TOKEN",
+            "https://api.github.com",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "github.request_failed");
+        assert!(!serde_json::to_string(&error).unwrap().contains("PRIVATE_"));
     }
 
     fn spawn_responses(

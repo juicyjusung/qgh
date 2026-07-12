@@ -1159,6 +1159,22 @@ fn validate_profile_endpoints(
             "Profile base URLs must not override the HTTPS port.",
         ));
     }
+    let expected_api_path = if host.eq_ignore_ascii_case("github.com") || api_is_loopback {
+        "/"
+    } else {
+        "/api/v3"
+    };
+    let api_path_valid = if expected_api_path == "/" {
+        api.path() == "/"
+    } else {
+        api.path().trim_end_matches('/') == expected_api_path
+    };
+    if !api_path_valid || web.path() != "/" {
+        return Err(QghError::validation(
+            "validation.invalid_url",
+            "Profile base URL path does not match the GitHub API contract.",
+        ));
+    }
     Ok(())
 }
 
@@ -1524,6 +1540,14 @@ mod tests {
             (
                 "http://api.github.com/PRIVATE_PLAINTEXT",
                 "https://github.com",
+            ),
+            (
+                "https://api.github.com/PRIVATE_API_PATH",
+                "https://github.com",
+            ),
+            (
+                "https://api.github.com",
+                "https://github.com/PRIVATE_WEB_PATH",
             ),
         ] {
             let error =

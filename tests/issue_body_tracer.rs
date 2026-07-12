@@ -575,6 +575,43 @@ fn sync_sends_github_rest_headers_required_by_real_api() {
 }
 
 #[test]
+fn doctor_does_not_forward_a_token_to_a_loopback_api_transport() {
+    let fixture = TestFixture::new("doctor-loopback-token-boundary");
+    let server = HeaderCheckingFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    let doctor = fixture.qgh(["doctor", "--json"]);
+    assert_success(&doctor);
+    let checks = stdout_json(&doctor)["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .clone();
+    for name in ["github_auth_reachability", "rate_limit_headers"] {
+        assert!(
+            checks
+                .iter()
+                .any(|check| check["name"] == name && check["ok"] == true),
+            "missing successful {name} check: {checks:#?}"
+        );
+    }
+}
+
+#[test]
+fn doctor_does_not_follow_an_off_origin_redirect() {
+    let fixture = TestFixture::new("doctor-off-origin-redirect");
+    let server = DoctorRedirectFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    let doctor = fixture.qgh(["doctor", "--json"]);
+    assert_success(&doctor);
+    assert_eq!(
+        server.redirected_request_count(),
+        0,
+        "doctor must not follow a configured GitHub probe to another origin"
+    );
+}
+
+#[test]
 fn sync_reports_human_progress_on_stderr_without_polluting_stdout() {
     let fixture = TestFixture::new("sync-progress");
     let server = FakeGitHub::start(issue_payload_with_pr());
@@ -2072,6 +2109,53 @@ fn init_without_json_prints_human_summary_for_profile_and_repo_policy_paths() {
     assert!(repo_stdout.contains("repo: owner/repo (cli)"));
     assert!(repo_stdout.contains("repo policy:"));
     assert!(repo_stdout.contains("profile check: validated"));
+}
+
+#[test]
+fn init_repo_inputs_with_secret_suffixes_fail_content_free() {
+    let fixture = TestFixture::new("init-secret-repo-inputs");
+    let worktree = fixture.init_git_worktree();
+    let marker = "owner/repo?token=PRIVATE_INIT_REPO_MARKER";
+
+    let repo_only =
+        fixture.qgh_without_profile_in(&worktree, ["init", "repo", "--repo", marker, "--json"]);
+    assert_eq!(repo_only.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&repo_only)["error"]["code"],
+        "validation.invalid_repo"
+    );
+    assert!(
+        !format!("{}{}", stdout_text(&repo_only), stderr_text(&repo_only))
+            .contains("PRIVATE_INIT_REPO_MARKER")
+    );
+
+    let preset = fixture.qgh_without_profile_in(
+        &worktree,
+        [
+            "init",
+            "--yes",
+            "--repo",
+            marker,
+            "--host",
+            "github.com",
+            "--api-base-url",
+            "https://api.github.com",
+            "--web-base-url",
+            "https://github.com",
+            "--token-source",
+            "env",
+            "--token-env",
+            "QGH_TEST_TOKEN",
+            "--json",
+        ],
+    );
+    assert_eq!(preset.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&preset)["error"]["code"],
+        "validation.invalid_repo"
+    );
+    assert!(!format!("{}{}", stdout_text(&preset), stderr_text(&preset))
+        .contains("PRIVATE_INIT_REPO_MARKER"));
 }
 
 #[test]
@@ -10348,6 +10432,94 @@ fn handle_connection(
     stream.write_all(response.as_bytes()).unwrap();
 }
 
+struct DoctorRedirectFakeGitHub {
+    base_url: String,
+    redirected_requests: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    trusted_address: String,
+    redirected_address: String,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl DoctorRedirectFakeGitHub {
+    fn start() -> Self {
+        let trusted = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirected = TcpListener::bind("127.0.0.1:0").unwrap();
+        trusted.set_nonblocking(true).unwrap();
+        redirected.set_nonblocking(true).unwrap();
+        let trusted_address = trusted.local_addr().unwrap().to_string();
+        let redirected_address = redirected.local_addr().unwrap().to_string();
+        let base_url = format!("http://{trusted_address}");
+        let redirect_url = format!("http://{redirected_address}/capture");
+        let stop = Arc::new(AtomicBool::new(false));
+        let redirected_requests = Arc::new(AtomicUsize::new(0));
+
+        let trusted_stop = Arc::clone(&stop);
+        let trusted_handle = thread::spawn(move || {
+            while !trusted_stop.load(Ordering::SeqCst) {
+                match trusted.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request);
+                        let response = format!(
+                            "HTTP/1.1 302 Found\r\nlocation: {redirect_url}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let redirected_stop = Arc::clone(&stop);
+        let redirected_count = Arc::clone(&redirected_requests);
+        let redirected_handle = thread::spawn(move || {
+            while !redirected_stop.load(Ordering::SeqCst) {
+                match redirected.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request);
+                        redirected_count.fetch_add(1, Ordering::SeqCst);
+                        let response = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nx-ratelimit-remaining: 1\r\nx-ratelimit-reset: 1\r\nconnection: close\r\n\r\n{}";
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            base_url,
+            redirected_requests,
+            stop,
+            trusted_address,
+            redirected_address,
+            handles: vec![trusted_handle, redirected_handle],
+        }
+    }
+
+    fn redirected_request_count(&self) -> usize {
+        self.redirected_requests.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for DoctorRedirectFakeGitHub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(&self.trusted_address);
+        let _ = TcpStream::connect(&self.redirected_address);
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
 struct HeaderCheckingFakeGitHub {
     base_url: String,
     stop: Arc<AtomicBool>,
@@ -10400,7 +10572,8 @@ fn handle_header_checking_connection(mut stream: TcpStream) {
     let lower = request.to_ascii_lowercase();
     let has_required_headers = lower.contains("user-agent: qgh/")
         && lower.contains("x-github-api-version: 2022-11-28")
-        && lower.contains("accept: application/vnd.github+json");
+        && lower.contains("accept: application/vnd.github+json")
+        && !lower.contains("authorization:");
 
     let (status, body) = if !has_required_headers {
         (
@@ -10416,6 +10589,8 @@ fn handle_header_checking_connection(mut stream: TcpStream) {
         && request_line.contains("per_page=100")
     {
         ("200 OK", issue_comments_payload())
+    } else if request_line.starts_with("GET /rate_limit ") {
+        ("200 OK", rate_limit_payload())
     } else {
         ("404 Not Found", r#"{"message":"not found"}"#)
     };

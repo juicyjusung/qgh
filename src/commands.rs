@@ -3293,14 +3293,7 @@ pub fn init_repo_policy(
 
     let (repo, repo_source) = match args.repo.as_deref() {
         Some(repo) => {
-            parse_repo(repo).map_err(|message| {
-                QghError::validation(
-                    "validation.invalid_repo",
-                    format!("Repo `{repo}` {message}"),
-                )
-                .with_details(json!({ "repo": repo }))
-                .with_hint("Use explicit owner/repo format.")
-            })?;
+            parse_repo(repo).map_err(|_| invalid_repo_input())?;
             (repo.to_string(), "cli")
         }
         None => (repo_from_origin_remote(&root)?, "git_remote"),
@@ -3407,12 +3400,7 @@ fn init_custom_interactive(
 ) -> Result<InitCommandOutcome, QghError> {
     let repo = match args.repo.as_deref() {
         Some(repo) => {
-            parse_repo(repo).map_err(|message| {
-                QghError::validation(
-                    "validation.invalid_repo",
-                    format!("Repo `{repo}` {message}"),
-                )
-            })?;
+            parse_repo(repo).map_err(|_| invalid_repo_input())?;
             repo.to_string()
         }
         None => remote
@@ -3507,12 +3495,7 @@ fn init_preset(
 ) -> Result<InitPreset, QghError> {
     let repo = match args.repo.as_deref() {
         Some(repo) => {
-            parse_repo(repo).map_err(|message| {
-                QghError::validation(
-                    "validation.invalid_repo",
-                    format!("Repo `{repo}` {message}"),
-                )
-            })?;
+            parse_repo(repo).map_err(|_| invalid_repo_input())?;
             repo.to_string()
         }
         None => remote
@@ -5596,12 +5579,17 @@ fn parse_issue_number(query_text: &str) -> Option<i64> {
 }
 
 fn validate_repo(repo: &str) -> Result<(), QghError> {
-    parse_repo(repo).map(|_| ()).map_err(|_| {
-        QghError::validation(
-            "validation.invalid_repo",
-            "Repo filter must use explicit owner/repo format.",
-        )
-    })
+    parse_repo(repo)
+        .map(|_| ())
+        .map_err(|_| invalid_repo_input())
+}
+
+fn invalid_repo_input() -> QghError {
+    QghError::validation(
+        "validation.invalid_repo",
+        "Repo must use explicit owner/repo format.",
+    )
+    .with_hint("Use explicit owner/repo format.")
 }
 
 fn enforce_source_scope(
@@ -6373,14 +6361,13 @@ fn age_seconds(timestamp: &str) -> Option<i64> {
 
 async fn doctor_github_probe(profile: &crate::config::Profile, token: &str) -> (bool, bool, Value) {
     let url = format!("{}/rate_limit", profile.api_base_url);
-    let response = reqwest::Client::new()
-        .get(url)
-        .bearer_auth(token)
-        .header("accept", "application/vnd.github+json")
-        .header("user-agent", github::user_agent())
-        .header("x-github-api-version", github::GITHUB_API_VERSION)
-        .send()
-        .await;
+    let Ok(client) = github::github_http_client() else {
+        return (false, false, rate_limit_headers_json(None, None));
+    };
+    let Ok(request) = github::github_get(&client, &url, token, &profile.api_base_url) else {
+        return (false, false, rate_limit_headers_json(None, None));
+    };
+    let response = request.send().await;
     let Ok(response) = response else {
         return (false, false, rate_limit_headers_json(None, None));
     };
