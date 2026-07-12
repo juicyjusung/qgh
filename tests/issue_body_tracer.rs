@@ -3373,6 +3373,81 @@ quantization = "none"
     );
 }
 
+#[cfg(all(feature = "vector-search", feature = "fastembed-provider"))]
+#[test]
+#[ignore = "requires explicitly installed pinned Qwen embedding snapshot"]
+fn installed_qwen_normal_sync_publishes_hybrid_generation() {
+    let fixture = TestFixture::new("qwen-normal-sync-generation");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    let prepared_models = PathBuf::from(
+        std::env::var("QGH_QWEN_PREPARED_MODELS")
+            .expect("QGH_QWEN_PREPARED_MODELS must point to the prepared store"),
+    );
+    let cache_home = prepared_models
+        .parent()
+        .and_then(Path::parent)
+        .expect("prepared store must be <cache>/qgh/prepared-qwen-models");
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        r#"
+provider = "local"
+model = "qwen3-embedding-0.6b"
+device = "auto"
+"#,
+    );
+
+    let mut sync_command = fixture.base_command();
+    let sync = sync_command
+        .env("XDG_CACHE_HOME", cache_home)
+        .args(["--profile", "work", "sync", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&sync);
+    let sync_json = stdout_json(&sync);
+    assert!(
+        warning_codes(&sync_json)
+            .iter()
+            .all(|code| !code.starts_with("embedding.sync_")),
+        "normal Qwen sync must not fall back after tokenizer/runtime preparation: {sync_json}"
+    );
+
+    let mut status_command = fixture.base_command();
+    let status = status_command
+        .env("XDG_CACHE_HOME", cache_home)
+        .args(["--profile", "work", "status", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["embedding"]["state"], "complete");
+    assert_eq!(
+        status_json["data"]["embedding"]["coverage"]["missing_chunks"],
+        0
+    );
+    assert_eq!(
+        status_json["data"]["embedding"]["configured_model"]["model_id"],
+        "Qwen/Qwen3-Embedding-0.6B"
+    );
+
+    let mut query_command = fixture.base_command();
+    let query = query_command
+        .env("XDG_CACHE_HOME", cache_home)
+        .args(["--profile", "work", "query", "BM25 tracer", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    assert!(warning_codes(&query_json).is_empty());
+    assert_eq!(
+        query_json["data"]["results"][0]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+    assert_eq!(
+        query_json["data"]["results"][0]["ranking"]["kind"],
+        "hybrid"
+    );
+}
+
 #[cfg(feature = "fastembed-provider")]
 #[test]
 fn embedding_if_stale_fresh_skip_does_not_backfill_local_artifacts() {

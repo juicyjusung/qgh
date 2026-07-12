@@ -46,8 +46,8 @@ use crate::model::{
 use crate::paths::ProfilePaths;
 #[cfg(feature = "fastembed-provider")]
 use crate::qwen::{
-    load_qwen_embedding, load_qwen_reranker, qwen_embedding_runtime_profile_id, QwenReranker,
-    QWEN_RERANK_DEPTH, QWEN_RERANK_MAX_LENGTH,
+    load_qwen_embedding, load_qwen_embedding_tokenizer, load_qwen_reranker,
+    qwen_embedding_runtime_profile_id, QwenReranker, QWEN_RERANK_DEPTH, QWEN_RERANK_MAX_LENGTH,
 };
 use crate::resolution::ResolvedRepoScope;
 use crate::store::{
@@ -2011,9 +2011,31 @@ struct EmbeddingChunkingRuntime {
 }
 
 #[cfg(feature = "fastembed-provider")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingTokenizerRoute {
+    PreparedQwenSnapshot,
+    PreparedFastembedSnapshot,
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn embedding_tokenizer_route(embedding: &EmbeddingConfig) -> EmbeddingTokenizerRoute {
+    if is_qwen_embedding_config(embedding) {
+        EmbeddingTokenizerRoute::PreparedQwenSnapshot
+    } else {
+        EmbeddingTokenizerRoute::PreparedFastembedSnapshot
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
 fn embedding_tokenizer(embedding: &EmbeddingConfig) -> Result<EmbeddingChunkingRuntime, QghError> {
-    match embedding.provider {
-        EmbeddingProviderKind::Local => {
+    match (embedding.provider, embedding_tokenizer_route(embedding)) {
+        (EmbeddingProviderKind::Local, EmbeddingTokenizerRoute::PreparedQwenSnapshot) => {
+            let spec = qwen_model_spec(QWEN_EMBEDDING_PRESET_ID)
+                .expect("Qwen embedding preset is registered");
+            let snapshot = default_prepared_qwen_model_store()?.inspect(&spec)?;
+            qwen_embedding_tokenizer_from_snapshot(&snapshot)
+        }
+        (EmbeddingProviderKind::Local, EmbeddingTokenizerRoute::PreparedFastembedSnapshot) => {
             let options = embedding.fastembed_options();
             let prepared_store = default_prepared_model_store().map_err(embedding_error)?;
             let tokenizer: PreparedEmbeddingTokenizer = prepared_store
@@ -2027,6 +2049,27 @@ fn embedding_tokenizer(embedding: &EmbeddingConfig) -> Result<EmbeddingChunkingR
             })
         }
     }
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_embedding_tokenizer_from_snapshot(
+    snapshot: &crate::local_models::PreparedQwenModelSnapshot,
+) -> Result<EmbeddingChunkingRuntime, QghError> {
+    let tokenizer = load_qwen_embedding_tokenizer(snapshot).map_err(embedding_error)?;
+    Ok(EmbeddingChunkingRuntime {
+        tokenizer: Box::new(tokenizer),
+        chunker_fingerprint: qwen_embedding_chunker_fingerprint(snapshot),
+    })
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_embedding_chunker_fingerprint(
+    snapshot: &crate::local_models::PreparedQwenModelSnapshot,
+) -> String {
+    chunker_fingerprint_for_tokenizer_identity(&format!(
+        "qgh.qwen_tokenizer.v1:{}",
+        snapshot.manifest_hash
+    ))
 }
 
 #[cfg(not(feature = "fastembed-provider"))]
@@ -2504,10 +2547,7 @@ fn build_qwen_embedding_runtime(
     validate_batch_comparability(&parts.provider, "qgh prepared Qwen model smoke")
         .map_err(embedding_error)?;
     let runtime_profile = parts.runtime_profile.as_str();
-    let chunker_fingerprint = chunker_fingerprint_for_tokenizer_identity(&format!(
-        "qgh.qwen_tokenizer.v1:{}",
-        snapshot.manifest_hash
-    ));
+    let chunker_fingerprint = qwen_embedding_chunker_fingerprint(snapshot);
     Ok(Arc::new(EmbeddingRuntime {
         tokenizer: Box::new(parts.tokenizer),
         chunker_fingerprint,
@@ -6174,6 +6214,28 @@ mod tests {
 
     #[cfg(feature = "fastembed-provider")]
     #[test]
+    fn qwen_sync_tokenizer_routes_to_installed_snapshot_not_legacy_hf_acquisition() {
+        let embedding = EmbeddingConfig {
+            provider: EmbeddingProviderKind::Local,
+            manifest_path: None,
+            model: Some(QWEN_EMBEDDING_PRESET_ID.to_string()),
+            model_path: None,
+            file: None,
+            pooling: None,
+            query_prefix: None,
+            quantization: None,
+            token_source: None,
+            device: crate::config::LocalModelDevice::Auto,
+        };
+
+        assert_eq!(
+            embedding_tokenizer_route(&embedding),
+            EmbeddingTokenizerRoute::PreparedQwenSnapshot
+        );
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
     fn metal_qwen_adapter_revision_invalidates_only_metal_generation_and_cache() {
         assert_eq!(
             QWEN_EMBEDDING_METAL_ADAPTER_REVISION,
@@ -6218,6 +6280,48 @@ mod tests {
         assert_eq!(
             qwen_embedding_runtime_cache_key("profile", "manifest", "cpu_f32"),
             "profile:qwen:manifest:cpu_f32"
+        );
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    #[ignore = "requires explicitly installed pinned Qwen model snapshots"]
+    fn installed_qwen_sync_tokenizer_matches_query_runtime_chunk_contract() {
+        let root = PathBuf::from(
+            std::env::var("QGH_QWEN_PREPARED_MODELS")
+                .expect("QGH_QWEN_PREPARED_MODELS must point to the prepared store"),
+        );
+        let spec = qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).unwrap();
+        let snapshot = crate::local_models::PreparedQwenModelStore::new(root)
+            .inspect(&spec)
+            .unwrap();
+        let embedding = EmbeddingConfig {
+            provider: EmbeddingProviderKind::Local,
+            manifest_path: None,
+            model: Some(QWEN_EMBEDDING_PRESET_ID.to_string()),
+            model_path: None,
+            file: None,
+            pooling: None,
+            query_prefix: None,
+            quantization: None,
+            token_source: None,
+            device: crate::config::LocalModelDevice::Auto,
+        };
+
+        let sync_tokenizer = qwen_embedding_tokenizer_from_snapshot(&snapshot).unwrap();
+        let query_runtime = build_qwen_embedding_runtime(&embedding, &snapshot).unwrap();
+
+        assert_eq!(
+            sync_tokenizer.chunker_fingerprint,
+            query_runtime.chunker_fingerprint
+        );
+        assert!(
+            sync_tokenizer
+                .tokenizer
+                .tokenize("public Qwen sync contract")
+                .unwrap()
+                .len()
+                > 1
         );
     }
 

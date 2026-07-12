@@ -74,6 +74,23 @@ pub struct QwenEmbeddingTokenizer {
     tokenizer: Tokenizer,
 }
 
+pub fn load_qwen_embedding_tokenizer(
+    snapshot: &PreparedQwenModelSnapshot,
+) -> Result<QwenEmbeddingTokenizer, EmbeddingProviderError> {
+    snapshot
+        .revalidate_artifact_identities()
+        .map_err(embedding_snapshot_error)?;
+    let tokenizer_path = snapshot
+        .artifact_path("tokenizer.json")
+        .map_err(embedding_snapshot_error)?;
+    let tokenizer =
+        Tokenizer::from_file(tokenizer_path).map_err(|_| embedding_tokenizer_error())?;
+    snapshot
+        .revalidate_artifact_identities()
+        .map_err(embedding_snapshot_error)?;
+    Ok(QwenEmbeddingTokenizer { tokenizer })
+}
+
 pub fn load_qwen_embedding(
     snapshot: &PreparedQwenModelSnapshot,
     requested_device: LocalModelDevice,
@@ -92,9 +109,6 @@ pub fn load_qwen_embedding(
     let weights_path = snapshot
         .artifact_path("model.safetensors")
         .map_err(embedding_snapshot_error)?;
-    let tokenizer_path = snapshot
-        .artifact_path("tokenizer.json")
-        .map_err(embedding_snapshot_error)?;
     let config: Qwen3Config =
         serde_json::from_slice(&fs::read(config_path).map_err(|_| embedding_runtime_error())?)
             .map_err(|_| embedding_runtime_error())?;
@@ -103,8 +117,7 @@ pub fn load_qwen_embedding(
             .map_err(|_| embedding_runtime_error())?
     };
     let model = Qwen3Model::new(config, builder).map_err(|_| embedding_runtime_error())?;
-    let chunk_tokenizer =
-        Tokenizer::from_file(tokenizer_path).map_err(|_| embedding_tokenizer_error())?;
+    let chunk_tokenizer = load_qwen_embedding_tokenizer(snapshot)?.tokenizer;
     let mut inference_tokenizer = chunk_tokenizer.clone();
     inference_tokenizer.with_padding(Some(PaddingParams {
         strategy: PaddingStrategy::BatchLongest,
@@ -698,6 +711,22 @@ mod tests {
             qwen_embedding_batch_plan(QwenEmbeddingRuntimeProfile::MetalF16, &token_lengths),
             vec![vec![6, 3, 1, 5], vec![4], vec![2], vec![0]]
         );
+    }
+
+    #[test]
+    #[ignore = "requires explicitly installed pinned Qwen model snapshots"]
+    fn live_prepared_embedding_snapshot_loads_sync_tokenizer_without_runtime() {
+        let root = PathBuf::from(
+            std::env::var("QGH_QWEN_PREPARED_MODELS")
+                .expect("QGH_QWEN_PREPARED_MODELS must point to the prepared store"),
+        );
+        let spec = qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).unwrap();
+        let snapshot = PreparedQwenModelStore::new(root).inspect(&spec).unwrap();
+
+        let tokenizer = load_qwen_embedding_tokenizer(&snapshot).unwrap();
+        let tokens = tokenizer.tokenize("public sync tokenizer smoke").unwrap();
+
+        assert!(!tokens.is_empty());
     }
 
     #[test]
