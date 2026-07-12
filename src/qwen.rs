@@ -17,6 +17,7 @@ pub const QWEN_EMBEDDING_NATIVE_DIMENSION: usize = 1024;
 pub const QWEN_EMBEDDING_OUTPUT_DIMENSION: usize = 384;
 pub const QWEN_EMBEDDING_MAX_LENGTH: usize = 1024;
 pub const QWEN_EMBEDDING_BATCH_SIZE: usize = 4;
+const QWEN_EMBEDDING_BATCH_MAX_TOKENS: usize = 128;
 pub const QWEN_RERANK_DEPTH: usize = 10;
 pub const QWEN_RERANK_MAX_LENGTH: usize = 384;
 const QWEN_RERANK_MICRO_BATCH: usize = 2;
@@ -65,6 +66,8 @@ pub struct QwenEmbeddingParts {
 
 pub struct QwenEmbeddingEngine {
     model: Mutex<Qwen3TextEmbedding>,
+    batch_tokenizer: Tokenizer,
+    runtime_profile: QwenEmbeddingRuntimeProfile,
 }
 
 pub struct QwenEmbeddingTokenizer {
@@ -114,8 +117,11 @@ pub fn load_qwen_embedding(
             ..Default::default()
         }))
         .map_err(|_| embedding_tokenizer_error())?;
+    let batch_tokenizer = inference_tokenizer.clone();
     let engine = QwenEmbeddingEngine {
         model: Mutex::new(Qwen3TextEmbedding::new(model, inference_tokenizer)),
+        batch_tokenizer,
+        runtime_profile,
     };
     let provider = LocalEmbeddingProvider::with_contract(
         engine,
@@ -163,17 +169,83 @@ fn resolve_embedding_profile(
 
 impl EmbeddingEngine for QwenEmbeddingEngine {
     fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingProviderError> {
-        let model = self.model.lock().map_err(|_| embedding_runtime_error())?;
-        let mut vectors = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(QWEN_EMBEDDING_BATCH_SIZE) {
-            vectors.extend(
-                model
-                    .embed(batch)
-                    .map_err(|_| embedding_inference_error())?,
-            );
+        if self.runtime_profile == QwenEmbeddingRuntimeProfile::CpuF32 {
+            let model = self.model.lock().map_err(|_| embedding_runtime_error())?;
+            let mut vectors = Vec::with_capacity(texts.len());
+            for batch in texts.chunks(QWEN_EMBEDDING_BATCH_SIZE) {
+                vectors.extend(
+                    model
+                        .embed(batch)
+                        .map_err(|_| embedding_inference_error())?,
+                );
+            }
+            return Ok(vectors);
         }
-        Ok(vectors)
+
+        let token_lengths = texts
+            .iter()
+            .map(|text| {
+                self.batch_tokenizer
+                    .encode(text.as_str(), true)
+                    .map(|encoding| encoding.len())
+                    .map_err(|_| embedding_tokenizer_error())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let batches = qwen_embedding_batch_plan(self.runtime_profile, &token_lengths);
+        let model = self.model.lock().map_err(|_| embedding_runtime_error())?;
+        let mut vectors = vec![None; texts.len()];
+        for batch_order in batches {
+            let batch = batch_order
+                .iter()
+                .map(|index| texts[*index].as_str())
+                .collect::<Vec<_>>();
+            let batch_vectors = model
+                .embed(&batch)
+                .map_err(|_| embedding_inference_error())?;
+            if batch_vectors.len() != batch_order.len() {
+                return Err(embedding_inference_error());
+            }
+            for (index, vector) in batch_order.iter().zip(batch_vectors) {
+                vectors[*index] = Some(vector);
+            }
+        }
+        vectors
+            .into_iter()
+            .map(|vector| vector.ok_or_else(embedding_inference_error))
+            .collect()
     }
+}
+
+fn qwen_embedding_batch_plan(
+    runtime_profile: QwenEmbeddingRuntimeProfile,
+    token_lengths: &[usize],
+) -> Vec<Vec<usize>> {
+    if runtime_profile == QwenEmbeddingRuntimeProfile::CpuF32 {
+        return (0..token_lengths.len())
+            .collect::<Vec<_>>()
+            .chunks(QWEN_EMBEDDING_BATCH_SIZE)
+            .map(<[usize]>::to_vec)
+            .collect();
+    }
+
+    let mut input_order = (0..token_lengths.len()).collect::<Vec<_>>();
+    input_order.sort_by_key(|index| token_lengths[*index]);
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    while start < input_order.len() {
+        let mut end = start + 1;
+        if token_lengths[input_order[start]] <= QWEN_EMBEDDING_BATCH_MAX_TOKENS {
+            while end < input_order.len()
+                && end - start < QWEN_EMBEDDING_BATCH_SIZE
+                && token_lengths[input_order[end]] <= QWEN_EMBEDDING_BATCH_MAX_TOKENS
+            {
+                end += 1;
+            }
+        }
+        batches.push(input_order[start..end].to_vec());
+        start = end;
+    }
+    batches
 }
 
 impl EmbeddingTokenizer for QwenEmbeddingTokenizer {
@@ -606,6 +678,26 @@ mod tests {
         assert_eq!(QWEN_RERANK_MICRO_BATCH, 2);
         assert_eq!(QWEN_RERANK_QUERY_MAX_TOKENS, 96);
         assert_eq!(QWEN_RERANK_MIN_DOCUMENT_TOKENS, 128);
+    }
+
+    #[test]
+    fn cpu_embedding_batch_plan_preserves_fixed_order_and_batch_size() {
+        let token_lengths = [900, 64, 256, 32, 129, 128, 5];
+
+        assert_eq!(
+            qwen_embedding_batch_plan(QwenEmbeddingRuntimeProfile::CpuF32, &token_lengths),
+            vec![vec![0, 1, 2, 3], vec![4, 5, 6]]
+        );
+    }
+
+    #[test]
+    fn metal_embedding_batch_plan_groups_short_inputs_and_singletons_long_inputs() {
+        let token_lengths = [900, 64, 256, 32, 129, 128, 5];
+
+        assert_eq!(
+            qwen_embedding_batch_plan(QwenEmbeddingRuntimeProfile::MetalF16, &token_lengths),
+            vec![vec![6, 3, 1, 5], vec![4], vec![2], vec![0]]
+        );
     }
 
     #[test]
