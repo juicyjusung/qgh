@@ -1,16 +1,21 @@
 # Local Qwen models
 
-qgh can use experimental local Qwen 0.6B models to complement BM25. Both are
-explicit opt-ins: BM25 remains the complete production default, neither Qwen
-model is a promoted light or quality preset, and model weights are not bundled
-with qgh.
+Qwen3-Embedding-0.6B is qgh's default semantic preset when a
+`fastembed-provider` binary creates a new config. BM25 remains a complete
+model-free path whenever `[embedding]` is absent, including no-default-feature
+builds and existing BM25-only configs. Existing configs are never silently
+rewritten. Model weights are not bundled or automatically downloaded, and the
+Qwen reranker remains separately configured and off by default.
 
 The [Qwen screening](search-quality-qwen-screening.md) found that Qwen
 embedding is a promising multilingual BM25-rescue path and that reranking can
 substantially improve ordering. It also found enough model and runtime cost to
-keep both capabilities explicit rather than always on.
+keep model installation explicit and reranking off unless individually
+requested.
 The later [native production-adapter regression](search-quality-qwen-production-adapter-eval.md)
-validated the implemented embedding path without making it promotion-eligible.
+validated the implemented embedding path. The product now fixes Qwen as the
+default semantic selection while preserving the report's unresolved quality
+and resource risks rather than treating them as passed promotion gates.
 The reranker figures in the screening document are not a production top-10
 qrels result; the implemented stage remains experimental and individually
 requested.
@@ -19,8 +24,8 @@ requested.
 
 | Path | Local model needed | What changes |
 | --- | --- | --- |
-| BM25 | None | Default lexical retrieval; full `query -> get -> cite` workflow |
-| Hybrid | Qwen embedding | Adds semantic candidates and combines them with BM25 using RRF |
+| BM25 | None | Complete lexical retrieval when `[embedding]` is absent; full `query -> get -> cite` workflow |
+| Hybrid | Qwen embedding | Default semantic selection for a new fastembed config; adds semantic candidates and combines them with BM25 using RRF after explicit model installation and publication |
 | Hybrid or BM25 with reranking | Qwen reranker, plus embedding only if hybrid is desired | Reorders at most the first 10 retrieved candidates when explicitly requested |
 
 Reranking does not replace retrieval. It cannot add a source that BM25 or
@@ -54,9 +59,10 @@ boundary does not change the legacy prepared-ONNX preset's existing explicit
 embed-time acquisition behavior. A configured but uninstalled Qwen model
 produces a typed diagnostic and keeps the safe retrieval path available.
 
-## Enable Qwen embedding
+## Configure Qwen embedding
 
-Add the opt-in preset to the strict qgh config at
+A fresh `qgh init` run from a fastembed-capable binary writes this preset to
+the strict qgh config at
 `${XDG_CONFIG_HOME:-~/.config}/qgh/config.toml`:
 
 ```toml
@@ -65,6 +71,10 @@ provider = "local"
 model = "qwen3-embedding-0.6b"
 device = "auto"
 ```
+
+Existing configs, including configs without `[embedding]` or with Arctic or a
+custom manifest, are not migrated. Add the same table manually only when you
+intend to change an existing config's semantic selection.
 
 The preset fixes the immutable upstream revision, query instruction,
 last-token pooling, L2 normalization, and 384-dimensional output. These fields
@@ -145,8 +155,9 @@ explicitly selects the experimental CPU slow path.
 
 CPU keeps embedding available on non-Metal systems, but first-time embedding
 and experimental CPU reranking can be noticeably slower than Metal. BM25
-remains unaffected on every device. Neither experimental Qwen path changes
-BM25 release readiness or establishes hybrid quality qualification.
+remains unaffected on every device. Selecting Qwen as the default semantic
+preset does not make BM25 depend on the runtime or erase the documented hybrid
+quality and resource risks.
 
 ## Privacy and failure boundaries
 
@@ -160,4 +171,6 @@ BM25 release readiness or establishes hybrid quality qualification.
   `query -> get -> cite` round-trip contract.
 
 See [ADR-0015](adr/0015-qwen-local-quality-preset-and-optional-reranking.md)
-for the fixed product and runtime contract.
+for the fixed model/runtime contract and historical evaluation evidence, and
+[ADR-0016](adr/0016-qwen-default-semantic-preset.md) for the default semantic
+selection and compatibility boundaries.

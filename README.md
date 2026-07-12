@@ -18,17 +18,26 @@ From a git repository with GitHub authentication available:
 
 ```sh
 qgh init -y
+qgh model install qwen3-embedding-0.6b
 qgh sync
 qgh query "search terms"
 ```
 
 Use `qgh get` with a returned `source_id` before citing a result. Search snippets are source candidates, not citation evidence.
 
-## Optional Local Qwen Search
+Fastembed-capable release binaries select local Qwen embedding when they create
+a new config. The model is not bundled or downloaded by `init`, `sync`, or
+`query`; the explicit install command above is required before hybrid search
+can be published. Builds without the provider stay model-free, and existing
+configs are never silently rewritten. Removing or omitting `[embedding]` keeps
+the complete BM25-only workflow.
 
-BM25 remains the complete default path. An experimental local Qwen embedding
-adapter and per-query reranker are available as explicit, separately downloaded
-options; model weights are not bundled with qgh. See
+## Local Qwen Search
+
+Qwen3-Embedding-0.6B is qgh's default semantic preset for newly created
+fastembed configs. BM25 remains the complete path whenever `[embedding]` is
+absent. The separately configured per-query reranker remains optional and off
+by default; neither model's weights are bundled with qgh. See
 [Local Qwen models](docs/local-qwen-models.md) for the pinned install,
 configuration, device, privacy, and fallback contracts.
 

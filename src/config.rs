@@ -243,6 +243,36 @@ struct ConfigFile {
     profiles: BTreeMap<String, RawProfile>,
 }
 
+fn config_for_bootstrap(existing: Option<ConfigFile>) -> ConfigFile {
+    existing.unwrap_or_else(|| ConfigFile {
+        schema_version: "qgh.config.v1".to_string(),
+        embedding: default_semantic_embedding(),
+        reranker: None,
+        profiles: BTreeMap::new(),
+    })
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn default_semantic_embedding() -> Option<RawEmbeddingConfig> {
+    Some(RawEmbeddingConfig {
+        provider: EmbeddingProviderKind::Local,
+        manifest_path: None,
+        model: Some(QWEN_EMBEDDING_PRESET_ID.to_string()),
+        model_path: None,
+        file: None,
+        pooling: None,
+        query_prefix: None,
+        quantization: None,
+        token_source: None,
+        device: Some(LocalModelDevice::Auto),
+    })
+}
+
+#[cfg(not(feature = "fastembed-provider"))]
+fn default_semantic_embedding() -> Option<RawEmbeddingConfig> {
+    None
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawRerankerConfig {
@@ -398,12 +428,7 @@ pub fn bootstrap_profile_repo(
     validate_token_source(&input.token_source)?;
 
     let config_path = config_file_path()?;
-    let mut config = load_config_file_optional()?.unwrap_or_else(|| ConfigFile {
-        schema_version: "qgh.config.v1".to_string(),
-        embedding: None,
-        reranker: None,
-        profiles: BTreeMap::new(),
-    });
+    let mut config = config_for_bootstrap(load_config_file_optional()?);
     let duplicate_profile_ids =
         profiles_allowlisting_repo(&config.profiles, &input.repo, Some(&input.profile_id));
     let profile_action;
@@ -1378,6 +1403,80 @@ pub(crate) fn parse_repo(value: &str) -> Result<RepoRef, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn fresh_fastembed_config_serializes_qwen_semantic_default_without_reranker() {
+        let config = config_for_bootstrap(None);
+        let text = toml::to_string_pretty(&config).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+
+        assert_eq!(value["embedding"]["provider"].as_str(), Some("local"));
+        assert_eq!(
+            value["embedding"]["model"].as_str(),
+            Some(QWEN_EMBEDDING_PRESET_ID)
+        );
+        assert_eq!(value["embedding"]["device"].as_str(), Some("auto"));
+        assert!(value.get("reranker").is_none());
+    }
+
+    #[cfg(not(feature = "fastembed-provider"))]
+    #[test]
+    fn fresh_model_free_config_serializes_without_embedding_or_reranker() {
+        let config = config_for_bootstrap(None);
+        let text = toml::to_string_pretty(&config).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+
+        assert!(value.get("embedding").is_none());
+        assert!(value.get("reranker").is_none());
+    }
+
+    #[test]
+    fn bootstrap_preserves_existing_embedding_absence() {
+        let existing = ConfigFile {
+            schema_version: "qgh.config.v1".to_string(),
+            embedding: None,
+            reranker: None,
+            profiles: BTreeMap::new(),
+        };
+        let config = config_for_bootstrap(Some(existing));
+        let text = toml::to_string_pretty(&config).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+
+        assert!(value.get("embedding").is_none());
+        assert!(value.get("reranker").is_none());
+    }
+
+    #[test]
+    fn bootstrap_preserves_existing_embedding_selection() {
+        let existing = ConfigFile {
+            schema_version: "qgh.config.v1".to_string(),
+            embedding: Some(RawEmbeddingConfig {
+                provider: EmbeddingProviderKind::Local,
+                manifest_path: None,
+                model: Some("arctic-m-v2-fp32".to_string()),
+                model_path: None,
+                file: None,
+                pooling: None,
+                query_prefix: None,
+                quantization: None,
+                token_source: None,
+                device: None,
+            }),
+            reranker: None,
+            profiles: BTreeMap::new(),
+        };
+        let config = config_for_bootstrap(Some(existing));
+        let text = toml::to_string_pretty(&config).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+
+        assert_eq!(
+            value["embedding"]["model"].as_str(),
+            Some("arctic-m-v2-fp32")
+        );
+        assert!(value["embedding"].get("device").is_none());
+        assert!(value.get("reranker").is_none());
+    }
 
     #[test]
     fn explicit_manifest_path_is_exclusive_with_legacy_model_configuration() {
