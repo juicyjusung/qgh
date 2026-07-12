@@ -24,8 +24,8 @@ per-query opt-in, and off by default.
 | Field | Value |
 | --- | --- |
 | Evaluation state | `production_adapter_previously_opened_heldout` |
-| Evidence HEAD / dirty | `beb6d104177e0283b21a5649cabd422d0519ce37` / `false` |
-| Machine artifact SHA-256 | `60acc3acc098b3b2136b2f5cd3f01f405ad79d319a3ceb444e86bb88149b6a80` |
+| Evidence HEAD / dirty | `ac61192938b24e4bd1fe35fdfead7cfb7241ad15` / `false` |
+| Machine artifact SHA-256 | `50481bce5077a92c9ad411f24d0c0a676085e3b3a19bcb2750523d1a86dcf8be` |
 | Runtime | release build; `metal_f16` |
 | Model | `qwen3-embedding-0.6b`; revision `97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3`; output dimension 384 |
 | Model manifest / verified bytes | `e0915f9f5946dc0b6309e9923e5d319b81de1e54985b7c00f9f23957e2c46af4` / 1,203,010,848 |
@@ -118,25 +118,34 @@ This smoke verifies normal GitHub sync, durable vector reuse, sqlite-vec
 publication, guarded CLI fusion, and `query -> get` together. It is not folded
 into the in-process latency numbers below.
 
+After chunk-manifest attestation and cross-run batch resume hardening, the
+installed-model release integration repeated `sync -> status -> hybrid query ->
+get -> no-change sync -> hybrid query` successfully. The whole ignored test,
+including first-sync inference, completed in 9.26 seconds. Its no-change sync
+used the pinned contract and Store-owned attestations without model payload
+hashing; semantic query initialization still performed full snapshot
+verification.
+
 ## Resource diagnostics
 
 | Metric | Result | Boundary |
 | --- | ---: | --- |
 | Verified snapshot | 1,203,010,848 bytes | model remains separately downloaded |
-| Cold adapter load | 350.8 ms | one release process, not five-process p95 |
-| Corpus embedding throughput | 5.921 chunks/s | 165 public chunks; not 50k publication |
-| Query embedding p50 / p95 | 34.2 / 36.1 ms | encoder-only |
-| BM25+dense+fusion p50 / p95 | 35.9 / 38.4 ms | in-process brute-force diagnostic |
-| Full test wall time | 33.75 s | one clean release run |
+| Cold adapter load | 332.3 ms | one release process, not five-process p95 |
+| Corpus embedding throughput | 5.923 chunks/s | 165 public chunks; not 50k publication |
+| Query embedding p50 / p95 | 34.0 / 35.9 ms | encoder-only |
+| BM25+dense+fusion p50 / p95 | 36.0 / 38.3 ms | in-process brute-force diagnostic |
+| Full test wall time | 33.73 s | one clean release run |
 | Peak RSS | not measured in this run | historical single-process evidence is not substituted |
 
 The resource protocol remains diagnostic. Five-process cold p95, three warm
 CLI repetitions, peak RSS for this exact run, 50k backfill/publication, and
 vector DB bytes per chunk are still unmeasured. Normal sync mitigates practical
 cost by embedding only missing chunks in bounded durable batches; a no-change
-sync performs zero inference and does not initialize the inference runtime. A
-new CLI process still verifies the complete snapshot hash, which remains a
-visible optimization opportunity.
+sync performs zero inference and uses trigger-invalidated source chunk
+manifests plus deep generation validation without reading the model payload.
+Changed or unattested chunks, `doctor`, inference, and semantic query runtime
+initialization still verify the complete snapshot hash.
 
 ## Privacy and product boundaries
 
