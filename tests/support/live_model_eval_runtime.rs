@@ -5975,6 +5975,7 @@ fn seed_50k_chunks(
     let chunks_per_source = 50_000 / active_versions.len();
     let remainder = 50_000 % active_versions.len();
     let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM source_chunk_manifests", [])?;
     transaction.execute("DELETE FROM chunks", [])?;
     {
         let mut insert = transaction.prepare(
@@ -5998,6 +5999,24 @@ fn seed_50k_chunks(
                     chunker_fingerprint,
                 ])?;
             }
+        }
+    }
+    {
+        let mut insert_manifest = transaction.prepare(
+            "INSERT INTO source_chunk_manifests (
+                source_version_id, source_id, chunker_fingerprint,
+                expected_count, chunk_digest, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, '1970-01-01T00:00:00Z')",
+        )?;
+        for (source_offset, (source_id, source_version_id)) in active_versions.iter().enumerate() {
+            let source_chunk_count = chunks_per_source + usize::from(source_offset < remainder);
+            insert_manifest.execute(params![
+                source_version_id,
+                source_id,
+                chunker_fingerprint,
+                source_chunk_count as i64,
+                "0".repeat(64),
+            ])?;
         }
     }
     transaction.commit()?;
@@ -7943,6 +7962,34 @@ limit = 10
                     byte_end,
                     CHUNKER_VERSION,
                     test_chunker_fingerprint,
+                ],
+            )?;
+        }
+        // Direct DB seeding is a test-only stand-in for Store-owned chunk
+        // publication. Attest the completed inventory after every insert so
+        // the production fail-closed manifest path does not reinterpret the
+        // fixture as legacy or interrupted chunking work.
+        connection.execute("DELETE FROM source_chunk_manifests", [])?;
+        for source in sources {
+            let source_version_id: i64 = connection.query_row(
+                "SELECT coalesce(im.latest_version_id, cm.latest_version_id)
+                 FROM source_entities se
+                 LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+                 LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+                 WHERE se.source_id = ?1 AND se.lifecycle_state = 'active'",
+                [&source.source_id],
+                |row| row.get(0),
+            )?;
+            connection.execute(
+                "INSERT INTO source_chunk_manifests (
+                    source_version_id, source_id, chunker_fingerprint,
+                    expected_count, chunk_digest, updated_at
+                 ) VALUES (?1, ?2, ?3, 1, ?4, '1970-01-01T00:00:00Z')",
+                params![
+                    source_version_id,
+                    source.source_id,
+                    test_chunker_fingerprint,
+                    "0".repeat(64),
                 ],
             )?;
         }
