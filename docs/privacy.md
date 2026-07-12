@@ -22,7 +22,7 @@ existing explicit embed-time acquisition behavior. `get` is local-only by
 default; CLI `qgh get --verify-lifecycle`
 explicitly opts in to a configured GitHub host lifecycle check. MCP `get`
 remains local-only/read-only and rejects lifecycle verification parameters.
-Hosted inference provider paths are disabled unless a future policy adds an
-explicit opt-in.
+Hosted provider paths are disabled for embedding and reranking unless a future
+policy adds an explicit opt-in.
 
 Tracked repo policy config is project policy, not personal credential config. It may define repo scope and safe default filters, but must not contain literal tokens, token source references, profile store paths, arbitrary database paths, or user-local absolute paths.
