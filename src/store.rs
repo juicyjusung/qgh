@@ -6235,9 +6235,13 @@ impl Store {
     /// Starts or resumes a building generation and fills it only with vectors
     /// proven reusable for the captured snapshot.
     ///
-    /// A predecessor must be `active` or `ready`, have the exact generation
-    /// identity, belong to the current content-write epoch, retain a valid
-    /// source-snapshot identity, and pass full BLOB/vec0 artifact validation.
+    /// A predecessor must have the exact generation identity, belong to the
+    /// current content-write epoch, retain a valid source-snapshot identity,
+    /// and pass full BLOB/vec0 artifact validation. Complete `active`/`ready`
+    /// generations may contribute unchanged rows across snapshots. A partial
+    /// `building` generation may contribute rows only to an identical current
+    /// source epoch and chunk inventory, allowing foreground work to resume
+    /// safely after a later sync run captures the same content.
     /// Individual rows are copied only when chunk ID, source version ID/hash,
     /// and metadata context hash match the current snapshot. Existing valid
     /// target rows are preserved. Any corrupt target row fails that generation
@@ -6343,15 +6347,25 @@ impl Store {
             .prepare(
                 "SELECT id FROM embedding_generations
                  WHERE id != ?1
-                   AND state IN ('active', 'ready')
                    AND model_manifest_hash = ?2
                    AND runtime_fingerprint_hash = ?3
                    AND chunker_fingerprint = ?4
                    AND context_template_version = ?5
                    AND output_dimension = ?6
                    AND write_epoch = ?7
-                   AND total_chunks = completed_chunks
-                   AND embedding_inventory_hash IS NOT NULL
+                   AND (
+                     (state IN ('active', 'ready')
+                      AND total_chunks = completed_chunks
+                      AND embedding_inventory_hash IS NOT NULL)
+                     OR
+                     (state = 'building'
+                      AND failure_code IS NULL
+                      AND completed_chunks > 0
+                      AND completed_chunks <= total_chunks
+                      AND source_snapshot_epoch = ?8
+                      AND total_chunks = ?9
+                      AND embedding_inventory_hash = ?10)
+                   )
                  ORDER BY id DESC",
             )?
             .query_map(
@@ -6363,6 +6377,9 @@ impl Store {
                     spec.context_template_version,
                     dimension as i64,
                     expected_epoch,
+                    current_source_epoch,
+                    snapshot.embedding_chunks.len() as i64,
+                    snapshot.embedding_inventory_hash,
                 ],
                 |row| row.get::<_, i64>(0),
             )?
@@ -6371,16 +6388,27 @@ impl Store {
         let mut reused = 0usize;
         for predecessor_id in predecessor_ids {
             let (
+                predecessor_state,
                 predecessor_total,
+                predecessor_completed,
                 predecessor_sync_run_id,
                 predecessor_source_epoch,
                 predecessor_snapshot_hash,
-            ): (i64, String, Option<i64>, String) = tx.query_row(
-                "SELECT total_chunks, source_sync_run_id, source_snapshot_epoch,
-                        source_snapshot_hash
+            ): (String, i64, i64, String, Option<i64>, String) = tx.query_row(
+                "SELECT state, total_chunks, completed_chunks, source_sync_run_id,
+                        source_snapshot_epoch, source_snapshot_hash
                  FROM embedding_generations WHERE id = ?1",
                 params![predecessor_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )?;
             let Some(predecessor_source_epoch) = predecessor_source_epoch else {
                 continue;
@@ -6400,21 +6428,45 @@ impl Store {
                     params![predecessor_identity.sync_run_id, predecessor_identity.epoch],
                     |row| row.get::<_, bool>(0),
                 )?;
-            if !predecessor_snapshot_valid
-                || !embedding_generation_stored_source_rows_valid(
+            let predecessor_row_count = if predecessor_state == "building" {
+                predecessor_completed
+            } else {
+                predecessor_total
+            };
+            let predecessor_rows_valid = predecessor_snapshot_valid
+                && predecessor_row_count > 0
+                && embedding_generation_stored_source_rows_valid(
                     &tx,
                     predecessor_id,
                     dimension,
-                    predecessor_total,
+                    predecessor_row_count,
                 )?
-                || validate_embedding_generation_vector_artifacts(
+                && validate_embedding_generation_vector_artifacts(
                     &tx,
                     predecessor_id,
                     dimension,
-                    predecessor_total,
+                    predecessor_row_count,
                 )
-                .is_err()
+                .is_ok();
+            if !predecessor_rows_valid {
+                if predecessor_state == "building" {
+                    mark_embedding_generation_failed(
+                        &tx,
+                        predecessor_id,
+                        "embedding.generation_validation_failed",
+                    )?;
+                }
+                continue;
+            }
+            if predecessor_state == "building"
+                && (predecessor_total != snapshot.embedding_chunks.len() as i64
+                    || predecessor_source_epoch != current_source_epoch)
             {
+                mark_embedding_generation_failed(
+                    &tx,
+                    predecessor_id,
+                    "embedding.generation_snapshot_mismatch",
+                )?;
                 continue;
             }
 
@@ -18352,6 +18404,161 @@ mod tests {
                 .embedding_generation_chunk_blob(resumed.generation_id, first_chunk_id)
                 .unwrap(),
             staged_before
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn embedding_generation_build_reuses_partial_rows_across_noop_sync_runs() {
+        let paths = temp_profile_paths("generation-resume-across-sync");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let first_chunk_id = insert_test_issue_chunk(
+            &mut store,
+            "qgh://github.com/issue/I_GENERATION_CROSS_SYNC_FIRST",
+            "sync-generation-cross-sync-first",
+        );
+        let second_chunk_id = insert_test_issue_chunk(
+            &mut store,
+            "qgh://github.com/issue/I_GENERATION_CROSS_SYNC_SECOND",
+            "sync-generation-cross-sync-second",
+        );
+        let first_snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let manifest = "manifest-generation-cross-sync";
+        let spec = EmbeddingGenerationSpec {
+            model_manifest_hash: manifest.to_string(),
+            runtime_fingerprint_hash: "runtime-generation-cross-sync".to_string(),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            output_dimension: 2,
+        };
+        let partial = store
+            .start_or_resume_embedding_generation(&first_snapshot, &spec)
+            .unwrap();
+        store
+            .stage_embedding_generation_batch(
+                partial.generation_id,
+                &[staged_test_chunk(&store, first_chunk_id, manifest)],
+            )
+            .unwrap();
+        let partial_blob = store
+            .embedding_generation_chunk_blob(partial.generation_id, first_chunk_id)
+            .unwrap();
+
+        store
+            .upsert_sources_for_run("sync-generation-cross-sync-noop", &[], &[], 0, &[])
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-generation-cross-sync-noop")
+            .unwrap();
+        let second_snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        assert_ne!(
+            second_snapshot.identity.sync_run_id,
+            first_snapshot.identity.sync_run_id
+        );
+        assert_eq!(
+            second_snapshot.identity.epoch,
+            first_snapshot.identity.epoch
+        );
+        assert_eq!(
+            second_snapshot.embedding_inventory_hash,
+            first_snapshot.embedding_inventory_hash
+        );
+
+        let resumed = store
+            .start_or_resume_embedding_generation(&second_snapshot, &spec)
+            .unwrap();
+
+        assert_ne!(resumed.generation_id, partial.generation_id);
+        assert_eq!(resumed.already_staged, 0);
+        assert_eq!(resumed.reused, 1);
+        assert_eq!(resumed.missing_chunk_ids, vec![second_chunk_id]);
+        assert_eq!(
+            store
+                .embedding_generation_chunk_blob(resumed.generation_id, first_chunk_id)
+                .unwrap(),
+            partial_blob
+        );
+        let target_mapping: (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT id, vector_rowid FROM embedding_generation_vector_rows
+                 WHERE generation_id = ?1 AND chunk_id = ?2",
+                params![resumed.generation_id, first_chunk_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(target_mapping.0, target_mapping.1);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn embedding_generation_build_rejects_corrupt_partial_predecessor() {
+        let paths = temp_profile_paths("generation-resume-corrupt-predecessor");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let first_chunk_id = insert_test_issue_chunk(
+            &mut store,
+            "qgh://github.com/issue/I_GENERATION_CORRUPT_PARTIAL_FIRST",
+            "sync-generation-corrupt-partial-first",
+        );
+        let second_chunk_id = insert_test_issue_chunk(
+            &mut store,
+            "qgh://github.com/issue/I_GENERATION_CORRUPT_PARTIAL_SECOND",
+            "sync-generation-corrupt-partial-second",
+        );
+        let first_snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let manifest = "manifest-generation-corrupt-partial";
+        let spec = EmbeddingGenerationSpec {
+            model_manifest_hash: manifest.to_string(),
+            runtime_fingerprint_hash: "runtime-generation-corrupt-partial".to_string(),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            output_dimension: 2,
+        };
+        let partial = store
+            .start_or_resume_embedding_generation(&first_snapshot, &spec)
+            .unwrap();
+        store
+            .stage_embedding_generation_batch(
+                partial.generation_id,
+                &[staged_test_chunk(&store, first_chunk_id, manifest)],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_generation_chunks SET vector_checksum = 'corrupt'
+                 WHERE generation_id = ?1 AND chunk_id = ?2",
+                params![partial.generation_id, first_chunk_id],
+            )
+            .unwrap();
+
+        store
+            .upsert_sources_for_run("sync-generation-corrupt-partial-noop", &[], &[], 0, &[])
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-generation-corrupt-partial-noop")
+            .unwrap();
+        let second_snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let resumed = store
+            .start_or_resume_embedding_generation(&second_snapshot, &spec)
+            .unwrap();
+
+        assert_eq!(resumed.reused, 0);
+        assert_eq!(
+            resumed.missing_chunk_ids,
+            vec![first_chunk_id, second_chunk_id]
+        );
+        assert_eq!(
+            store
+                .embedding_generation_state(partial.generation_id)
+                .unwrap(),
+            "failed"
         );
 
         let _ = fs::remove_dir_all(paths.profile_dir);

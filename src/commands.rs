@@ -6901,6 +6901,12 @@ mod tests {
     }
 
     #[cfg(feature = "vector-search")]
+    #[derive(Default)]
+    struct FailAfterFirstEmbeddingBatch {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "vector-search")]
     fn pinned_embedding_profile(paths: &ProfilePaths, model_revision: &str) -> Profile {
         Profile {
             id: "identity-test-profile".to_string(),
@@ -6952,6 +6958,27 @@ mod tests {
                 .lock()
                 .unwrap()
                 .extend(texts.iter().map(|text| (*text).to_string()));
+            Ok(texts.iter().map(|_| vec![1.0, 2.0, 3.0]).collect())
+        }
+
+        fn embed_query(&self, _text: &str) -> Result<EmbeddingVector, EmbeddingProviderError> {
+            Ok(vec![1.0, 2.0, 3.0])
+        }
+    }
+
+    #[cfg(feature = "vector-search")]
+    impl EmbeddingProvider for FailAfterFirstEmbeddingBatch {
+        fn embed_documents(
+            &self,
+            texts: &[&str],
+        ) -> Result<Vec<EmbeddingVector>, EmbeddingProviderError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call > 0 {
+                return Err(EmbeddingProviderError::structured(
+                    "embedding.test_interrupted",
+                    "Synthetic embedding interruption.",
+                ));
+            }
             Ok(texts.iter().map(|_| vec![1.0, 2.0, 3.0]).collect())
         }
 
@@ -8202,6 +8229,128 @@ mod tests {
         .unwrap();
         assert_eq!(lazy_skipped.0, 0);
         assert_eq!(runtime_loads.get(), 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn interrupted_embedding_batches_resume_after_a_later_noop_sync() {
+        let paths = temp_profile_paths("sync-incremental-resume-across-run");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let source_id = "qgh://github.com/issue/I_SYNC_EMBED_RESUME";
+        let issue = IssueRecord {
+            source_id: source_id.to_string(),
+            host: "github.com".to_string(),
+            repo: "owner/repo".to_string(),
+            node_id: "I_SYNC_EMBED_RESUME".to_string(),
+            github_id: 405,
+            number: 11,
+            title: "Sync embed resume".to_string(),
+            body: "public synthetic embedding resume corpus".to_string(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone: None,
+            assignees: Vec::new(),
+            author: Some("alice".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            closed_at: None,
+            canonical_url: "https://github.com/owner/repo/issues/11".to_string(),
+            body_hash: "body-hash-sync-embed-resume".to_string(),
+            indexed_at: "2026-01-02T00:00:01Z".to_string(),
+        };
+        store
+            .upsert_sources_for_run("sync-embed-resume-first", &[issue], &[], 0, &[])
+            .unwrap();
+        let source_version_id = store.latest_source_version_id(source_id).unwrap().unwrap();
+        let chunks = (0..33)
+            .map(|index| MarkdownChunk {
+                chunk_index: index,
+                byte_start: index,
+                byte_end: index + 1,
+                token_start: index,
+                token_end: index + 1,
+                token_count: 1,
+                body: format!("public synthetic chunk {index}"),
+                chunker_version: crate::chunking::CHUNKER_VERSION.to_string(),
+                chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+                heading_path: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        store
+            .replace_chunks_for_source_version(source_id, source_version_id, &chunks)
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-embed-resume-first")
+            .unwrap();
+        let first_snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let contract = EmbeddingGenerationContract {
+            model_manifest_hash: "manifest-sync-embed-resume".to_string(),
+            fingerprint_seed: EmbeddingFingerprintSeed {
+                provider: "local".to_string(),
+                model_id: "fixture/resume-model".to_string(),
+                model_revision: "fixture-resume-sha".to_string(),
+                pooling: PoolingKind::Cls,
+                query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
+            },
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            output_dimension: 3,
+        };
+        let interrupted = FailAfterFirstEmbeddingBatch::default();
+
+        let error = refresh_incremental_chunk_embeddings_with_provider_and_contract(
+            &mut store,
+            &interrupted,
+            &contract,
+            &first_snapshot,
+            &StderrSyncProgress::new(false),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "embedding.test_interrupted");
+        assert_eq!(
+            interrupted.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        let partial_generation: (i64, i64) = rusqlite::Connection::open(&paths.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT id, completed_chunks FROM embedding_generations
+                 WHERE state = 'building' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(partial_generation.1, 32);
+
+        store
+            .upsert_sources_for_run("sync-embed-resume-noop", &[], &[], 0, &[])
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-embed-resume-noop")
+            .unwrap();
+        let second_snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let provider = RecordingEmbeddingProvider::default();
+        let resumed = refresh_incremental_chunk_embeddings_with_provider_and_contract(
+            &mut store,
+            &provider,
+            &contract,
+            &second_snapshot,
+            &StderrSyncProgress::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(resumed.0, 1);
+        assert_eq!(provider.documents.lock().unwrap().len(), 1);
+        assert_ne!(resumed.1, Some(partial_generation.0));
+        assert_eq!(
+            store
+                .embedding_generation_state(resumed.1.unwrap())
+                .unwrap(),
+            "ready"
+        );
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
