@@ -19,7 +19,7 @@ split or incomplete resource protocol as fresh promotion evidence.
 | Fusion | `lexical_guard_v1`: BM25 top five protected, weighted RRF below |
 | Guarded quality | nDCG 0.6216; MRR 0.6023; Recall@5 0.7578; Recall@10 0.8667 |
 | BM25 complement | harm @5/@10 `0/0`; rescue @5/@10 `0/3` |
-| Runtime | Metal F16; 5.923 chunks/s; query embedding p95 35.9 ms; hybrid p95 38.3 ms |
+| Runtime | Metal F16; 5.911 chunks/s; query embedding p95 35.7 ms; hybrid p95 38.2 ms |
 | Reranker | optional per-query stage; off by default |
 | Formal promotion evidence | still blocked by opened split and incomplete resource protocol |
 | Full evidence | [production-adapter regression](search-quality-qwen-production-adapter-eval.md) |

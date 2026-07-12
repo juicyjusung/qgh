@@ -24,8 +24,8 @@ per-query opt-in, and off by default.
 | Field | Value |
 | --- | --- |
 | Evaluation state | `production_adapter_previously_opened_heldout` |
-| Evidence HEAD / dirty | `ac61192938b24e4bd1fe35fdfead7cfb7241ad15` / `false` |
-| Machine artifact SHA-256 | `50481bce5077a92c9ad411f24d0c0a676085e3b3a19bcb2750523d1a86dcf8be` |
+| Evidence HEAD / dirty | `2be824c6a3557c2d5ad6ad1b01640e51b401ff5a` / `false` |
+| Machine artifact SHA-256 | `6fc6df03ca5ef0bfd1edfbc211441648632a593af9624eb073ef901a047159f8` |
 | Runtime | release build; `metal_f16` |
 | Model | `qwen3-embedding-0.6b`; revision `97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3`; output dimension 384 |
 | Model manifest / verified bytes | `e0915f9f5946dc0b6309e9923e5d319b81de1e54985b7c00f9f23957e2c46af4` / 1,203,010,848 |
@@ -121,7 +121,7 @@ into the in-process latency numbers below.
 After chunk-manifest attestation and cross-run batch resume hardening, the
 installed-model release integration repeated `sync -> status -> hybrid query ->
 get -> no-change sync -> hybrid query` successfully. The whole ignored test,
-including first-sync inference, completed in 9.26 seconds. Its no-change sync
+including first-sync inference, completed in 10.43 seconds. Its no-change sync
 used the pinned contract and Store-owned attestations without model payload
 hashing; semantic query initialization still performed full snapshot
 verification.
@@ -131,11 +131,11 @@ verification.
 | Metric | Result | Boundary |
 | --- | ---: | --- |
 | Verified snapshot | 1,203,010,848 bytes | model remains separately downloaded |
-| Cold adapter load | 332.3 ms | one release process, not five-process p95 |
-| Corpus embedding throughput | 5.923 chunks/s | 165 public chunks; not 50k publication |
-| Query embedding p50 / p95 | 34.0 / 35.9 ms | encoder-only |
-| BM25+dense+fusion p50 / p95 | 36.0 / 38.3 ms | in-process brute-force diagnostic |
-| Full test wall time | 33.73 s | one clean release run |
+| Cold adapter load | 332.1 ms | one release process, not five-process p95 |
+| Corpus embedding throughput | 5.911 chunks/s | 165 public chunks; not 50k publication |
+| Query embedding p50 / p95 | 34.0 / 35.7 ms | encoder-only |
+| BM25+dense+fusion p50 / p95 | 35.8 / 38.2 ms | in-process brute-force diagnostic |
+| Full test wall time | 33.60 s | one clean release run |
 | Peak RSS | not measured in this run | historical single-process evidence is not substituted |
 
 The resource protocol remains diagnostic. Five-process cold p95, three warm
