@@ -508,6 +508,22 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         json!(["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"])
     );
     assert_eq!(
+        artifact["contract"]["optional_semantic"]["new_config_default_preset"],
+        "qwen3-embedding-0.6b"
+    );
+    assert_eq!(
+        artifact["contract"]["optional_semantic"]["fusion_profile"],
+        "lexical_guard_v1"
+    );
+    assert_eq!(
+        artifact["contract"]["optional_semantic"]["weights_bundled"],
+        false
+    );
+    assert_eq!(
+        artifact["contract"]["optional_semantic"]["reranker_default"],
+        "off"
+    );
+    assert_eq!(
         artifact["contract"]["release_integrity_gate"],
         json!([
             "artifact checksums",
@@ -676,6 +692,9 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         artifact["verification"],
         json!([
             "Tantivy BM25-only path",
+            "optional Qwen hybrid path",
+            "optional bounded reranker",
+            "fail-closed purge and publication snapshots",
             "strict schema/envelope",
             "human CLI summaries",
             "init output",
@@ -2545,6 +2564,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     }
     assert!(checklist.contains("credential_store"));
     assert!(checklist.contains("validation.invalid_token_source"));
+    assert!(checklist.contains("macOS Apple Silicon and Linux x86_64"));
+    assert!(!checklist.contains("macOS Apple Silicon, macOS Intel"));
+    assert!(checklist.contains("qwen3-embedding-0.6b"));
+    assert!(checklist.contains("lexical_guard_v1"));
 
     let readme = fs::read_to_string(root.join("README.md")).unwrap();
     for required in [

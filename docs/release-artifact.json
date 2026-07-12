@@ -56,6 +56,16 @@
     "supported_token_sources": ["github_cli", "env"],
     "command_resolution_sources": ["explicit", "repo_policy", "git_remote"],
     "sync_default_scope": "effective_repo_scope_when_available",
+    "optional_semantic": {
+      "new_config_default_preset": "qwen3-embedding-0.6b",
+      "weights_bundled": false,
+      "install_command": "qgh model install qwen3-embedding-0.6b",
+      "lexical_profile": "production_v1",
+      "fusion_profile": "lexical_guard_v1",
+      "bm25_protected_head": 5,
+      "reranker_default": "off",
+      "reranker_candidate_limit": 10
+    },
     "mcp_protocol_version": "2025-11-25",
     "mcp_role": "optional read-only thin adapter over the CLI JSON/local retrieval contract",
     "mcp_tools": ["query", "get", "status"],
@@ -75,7 +85,7 @@
     "mvp_sources": ["GitHub Issues", "GitHub issue comments"],
     "post_mvp_or_excluded_behavior": [
       "Wiki",
-      "vector",
+      "vector as a mandatory BM25 dependency",
       "shared server",
       "write-back",
       "user-facing eval",
@@ -126,7 +136,7 @@
     "excluded_from_mvp_gate": [
       {
         "id": "AC-13",
-        "reason": "post-MVP vector/hybrid capability; BM25-only path remains the MVP gate"
+        "reason": "optional local vector/hybrid capability is shipped and hardened, but BM25-only remains the complete mandatory MVP gate"
       },
       {
         "id": "AC-20",
@@ -136,6 +146,9 @@
   },
   "verification": [
     "Tantivy BM25-only path",
+    "optional Qwen hybrid path",
+    "optional bounded reranker",
+    "fail-closed purge and publication snapshots",
     "strict schema/envelope",
     "human CLI summaries",
     "init output",
@@ -153,7 +166,9 @@
   ],
   "residual_risks": [
     "Wiki source connector is post-MVP",
-    "vector and hosted provider quality improvements require an explicit future decision",
+    "Qwen default evidence uses a previously opened split and incomplete large resource qualification; it is not a fresh-blind general promotion claim",
+    "Qwen weights require an explicit separate model install and the canonical 80-query adapter artifact did not measure peak RSS",
+    "hosted provider quality improvements require an explicit future privacy decision",
     "shared server and GitHub App token operations require separate ACL and audit design",
     "GHES remains best-effort until a dedicated compatibility pass",
     "Linux ARM64, Windows packages, and homebrew/core submission are later distribution targets",

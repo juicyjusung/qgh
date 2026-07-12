@@ -40,7 +40,7 @@ is retained only as historical evidence.
 | Optimized corpus / throughput | 631 chunks / 5.562 chunks/s |
 | Whole-process peak RSS | 1.425 GiB on Apple M4 Pro, 48 GiB |
 | Quality | hybrid nDCG 0.8862; MRR 0.8559; exact top-1 1.00 |
-| Full evidence | [production-adapter regression](search-quality-qwen-production-adapter-eval.md) |
+| Evidence status | historical summary only; the 566-source snapshot is unavailable |
 
 ## 2026-07-11 fresh blind BM25-rescue decision
 
