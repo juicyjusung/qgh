@@ -4,8 +4,10 @@ The evidence sequence is the original Arctic/GTE evaluation, the later
 [Qwen 0.6B embedding and reranker screening](search-quality-qwen-screening.md),
 and the implemented
 [Qwen native production-adapter regression](search-quality-qwen-production-adapter-eval.md).
-The native adapter is available only as an experimental opt-in. No Qwen model
-is promoted as a light or quality preset; BM25 remains the complete production
+The optimized native adapter is available only as an experimental opt-in. It
+now clears the 3 chunks/s diagnostic throughput threshold, but the opened split,
+incomplete qualification protocol, and English-query-to-Korean-source miss keep
+it ineligible for preset promotion. BM25 remains the complete production
 default and `production_v1` remains the lexical profile.
 
 ## 2026-07-12 Qwen native production-adapter regression
@@ -17,6 +19,9 @@ default and `production_v1` remains the lexical profile.
 | Reranker promotion | none; optional top-10 stage only |
 | BM25 default | unchanged |
 | Lexical profile | `production_v1` |
+| Optimized corpus / throughput | 631 chunks / 5.562 chunks/s |
+| Whole-process peak RSS | 1.425 GiB on Apple M4 Pro, 48 GiB |
+| Quality | hybrid nDCG 0.8862; MRR 0.8559; exact top-1 1.00 |
 | Full evidence | [production-adapter regression](search-quality-qwen-production-adapter-eval.md) |
 
 ## 2026-07-11 fresh blind BM25-rescue decision

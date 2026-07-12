@@ -126,6 +126,13 @@ generation from another runtime profile; if the compatible runtime is
 unavailable, query falls back to BM25 until a compatible generation is
 published.
 
+The Metal F16 embedding adapter groups only short inputs, processes longer
+inputs as singletons, and uses fused Metal attention for supported sequences.
+Its adapter revision is also fingerprinted, so upgrading from the earlier
+adapter makes the old Metal generation incompatible and requires `qgh embed`
+to publish a replacement before hybrid search resumes. CPU F32 batching and
+Metal F32 reranking keep their existing execution paths.
+
 For reranking, `device = "auto"` resolves only to Apple Metal F32. It does not
 silently fall back to CPU. `device = "cpu"` enables an experimental slow path
 and emits a typed warning. If the required reranker runtime is unavailable,

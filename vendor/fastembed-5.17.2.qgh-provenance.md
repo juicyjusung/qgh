@@ -32,3 +32,21 @@ Release checks instead verify that Cargo resolves this directory, the
 dist-profile binary
 builds from the checkout, and `git archive` contains the vendored manifest,
 license, and patched source.
+
+## Maintenance boundary
+
+Do not remove the `t > 8` guard without an explicit left-padding parity test:
+Candle 0.10.2's short vector-SDPA path does not consume the supplied mask. The
+full path uses an explicit mask with `do_causal = false`; current Q/K/V and mask
+views have zero storage offsets, and qgh serializes the model behind a mutex.
+Those constraints keep this use outside the later Candle fixes for
+[storage offsets](https://github.com/huggingface/candle/commit/0c58953685e16278c73b48607502c44678110272)
+and
+[explicit-mask causal handling](https://github.com/huggingface/candle/commit/e020e8a42766c497c795c29df25c2ba2ef0e1480).
+
+A Candle or fastembed upgrade must rerun long, mixed-left-padding, query, and
+ranking parity gates before dropping this patch. Candle 0.11 compiled without
+source changes, but its default Metal command-buffer schedule erased this
+throughput gain in the measured workload; scheduler behavior therefore remains
+part of that future upgrade decision. Metal F32 reranking and CPU execution do
+not use the patched branch.
