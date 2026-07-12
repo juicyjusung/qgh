@@ -63,7 +63,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const GET_BATCH_SIZE_CAP: usize = 20;
-const QWEN_EMBEDDING_METAL_ADAPTER_REVISION: &str = "metal-adaptive-batching-v1";
+const QWEN_EMBEDDING_METAL_ADAPTER_REVISION: &str = "metal-sdpa-adaptive-batching-v2";
 const HYBRID_RRF_K: f32 = 60.0;
 const STALE_BUILDING_RETENTION_HOURS: i64 = 24;
 const PREVIOUS_READY_RETENTION_DAYS: i64 = 7;
@@ -6173,6 +6173,10 @@ mod tests {
     #[cfg(feature = "fastembed-provider")]
     #[test]
     fn metal_qwen_adapter_revision_invalidates_only_metal_generation_and_cache() {
+        assert_eq!(
+            QWEN_EMBEDDING_METAL_ADAPTER_REVISION,
+            "metal-sdpa-adaptive-batching-v2"
+        );
         let fingerprint = |model_revision: &str| {
             EmbeddingFingerprintSeed {
                 provider: "fastembed".to_string(),
