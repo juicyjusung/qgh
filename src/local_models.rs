@@ -104,6 +104,14 @@ pub fn qwen_model_spec(preset_id: &str) -> Option<QwenModelSpec> {
     }
 }
 
+/// Returns the pinned manifest identity without touching the installed model
+/// store. Status and other read-only contract views use this to compare stored
+/// generations without hashing model payloads.
+pub fn qwen_model_manifest_hash(spec: &QwenModelSpec) -> String {
+    debug_assert!(validate_spec(spec).is_ok());
+    LocalModelManifestV1::for_spec(spec).hash()
+}
+
 fn artifact(relative_path: &str, sha256: &str, byte_size: u64) -> ModelArtifactSpec {
     ModelArtifactSpec {
         relative_path: relative_path.to_string(),
@@ -917,6 +925,16 @@ mod tests {
             resolved_revision: "0123456789012345678901234567890123456789".to_string(),
             artifacts,
         }
+    }
+
+    #[test]
+    fn pinned_qwen_manifest_identity_is_pure_and_stable() {
+        let spec = qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).unwrap();
+
+        assert_eq!(
+            qwen_model_manifest_hash(&spec),
+            "e0915f9f5946dc0b6309e9923e5d319b81de1e54985b7c00f9f23957e2c46af4"
+        );
     }
 
     #[test]

@@ -4716,6 +4716,59 @@ device = "auto"
     );
 }
 
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn qwen_status_skips_artifact_validation_while_doctor_keeps_it_explicit() {
+    let fixture = TestFixture::new("qwen-status-no-artifact-validation");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        r#"
+provider = "local"
+model = "qwen3-embedding-0.6b"
+device = "auto"
+"#,
+    );
+    let snapshot = fixture
+        .cache_home
+        .join("qgh/prepared-qwen-models/qwen3-embedding-0.6b");
+    fs::create_dir_all(&snapshot).unwrap();
+    fs::write(
+        snapshot.join("manifest.json"),
+        b"private malformed model marker",
+    )
+    .unwrap();
+
+    let requests_before_local_reads = server.request_count();
+    let status = fixture.qgh(["status", "--json"]);
+
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["embedding"]["state"], "missing");
+    let status_output = format!("{}{}", stdout_text(&status), stderr_text(&status));
+    assert!(!status_output.contains("private malformed model marker"));
+    assert_eq!(server.request_count(), requests_before_local_reads);
+
+    let exact = fixture.qgh(["query", "https://github.com/owner/repo/issues/42", "--json"]);
+    assert_success(&exact);
+    let exact_json = stdout_json(&exact);
+    assert_eq!(exact_json["data"]["results"][0]["ranking"]["kind"], "exact");
+    let exact_output = format!("{}{}", stdout_text(&exact), stderr_text(&exact));
+    assert!(!exact_output.contains("private malformed model marker"));
+    assert_eq!(server.request_count(), requests_before_local_reads);
+
+    let doctor = fixture.qgh(["doctor", "--json"]);
+    assert_success(&doctor);
+    let doctor_json = stdout_json(&doctor);
+    let checks = doctor_json["data"]["checks"].as_array().unwrap();
+    assert_eq!(doctor_check_ok(checks, "embedding_artifacts"), Some(false));
+    assert_eq!(doctor_check_ok(checks, "embedding_runtime"), Some(false));
+    let doctor_output = format!("{}{}", stdout_text(&doctor), stderr_text(&doctor));
+    assert!(!doctor_output.contains("private malformed model marker"));
+}
+
 #[test]
 fn model_install_cli_rejects_unknown_presets_before_profile_resolution() {
     let fixture = TestFixture::new("model-install-strict-preset");

@@ -36,9 +36,9 @@ use crate::fusion::{self, LEXICAL_GUARD_V1};
 use crate::github;
 use crate::index;
 use crate::local_models::{
-    default_prepared_qwen_model_store, install_qwen_model, qwen_model_spec, ModelInstallAction,
-    QWEN_EMBEDDING_MODEL_ID, QWEN_EMBEDDING_PRESET_ID, QWEN_EMBEDDING_QUERY_PREFIX,
-    QWEN_EMBEDDING_REVISION, QWEN_RERANKER_PRESET_ID,
+    default_prepared_qwen_model_store, install_qwen_model, qwen_model_manifest_hash,
+    qwen_model_spec, ModelInstallAction, QWEN_EMBEDDING_MODEL_ID, QWEN_EMBEDDING_PRESET_ID,
+    QWEN_EMBEDDING_QUERY_PREFIX, QWEN_RERANKER_PRESET_ID,
 };
 use crate::model::{
     ReconciliationCandidate, StoredChunk, StoredComment, StoredIssue, StoredSource, SyncSummary,
@@ -2639,7 +2639,7 @@ fn test_embedding_runtime(
             "Test embedding vectors must be non-empty and share one dimension.",
         ));
     }
-    let configured = configured_embedding_snapshot(embedding);
+    let configured = configured_embedding_contract_snapshot(embedding);
     Ok(Some(EmbeddingRuntime {
         tokenizer: Box::new(TestEmbeddingTokenizer),
         // Explicit debug-provider fixture identity. Production prepared-model
@@ -4459,6 +4459,7 @@ enum PreparedRuntimeAvailability {
     Available,
     Missing,
     Corrupt,
+    NotChecked,
 }
 
 struct ConfiguredEmbeddingSnapshot {
@@ -4493,9 +4494,9 @@ impl EmbeddingCoverageState {
         match self.prepared_runtime {
             PreparedRuntimeAvailability::Corrupt => "corrupt",
             PreparedRuntimeAvailability::Missing if !self.artifact_corrupt => "missing",
-            PreparedRuntimeAvailability::Available | PreparedRuntimeAvailability::Missing => {
-                self.state()
-            }
+            PreparedRuntimeAvailability::Available
+            | PreparedRuntimeAvailability::Missing
+            | PreparedRuntimeAvailability::NotChecked => self.state(),
         }
     }
 
@@ -4518,7 +4519,7 @@ fn embedding_coverage_state(
     let Some(embedding) = profile.embedding.as_ref() else {
         return Ok(None);
     };
-    let configured = configured_embedding_snapshot(embedding);
+    let configured = configured_embedding_contract_snapshot(embedding);
     embedding_coverage_state_for_config(embedding, store, &configured).map(Some)
 }
 
@@ -5186,7 +5187,7 @@ fn embedding_status_report(
     let Some(embedding) = profile.embedding.as_ref() else {
         return Ok((None, Vec::new()));
     };
-    let configured = configured_embedding_snapshot(embedding);
+    let configured = configured_embedding_contract_snapshot(embedding);
     let coverage = embedding_coverage_state_for_config(embedding, store, &configured)?;
     let status_state = coverage.status_state();
     let warnings = embedding_warnings_for_state(status_state);
@@ -5275,52 +5276,36 @@ fn embedding_fingerprint_expectation_from_snapshot(
     }
 }
 
-fn configured_embedding_snapshot(embedding: &EmbeddingConfig) -> ConfiguredEmbeddingSnapshot {
-    if is_qwen_embedding_config(embedding) {
-        return configured_qwen_embedding_snapshot(embedding);
-    }
-    let mut configured = configured_embedding_contract_snapshot(embedding);
-    configured.prepared_runtime = match default_prepared_model_store() {
-        Ok(store) => store
-            .inspect(&embedding.fastembed_options())
-            .map(|_| configured_available_runtime())
-            .unwrap_or_else(|error| configured_runtime_error_availability(error.code())),
-        Err(_) => PreparedRuntimeAvailability::Missing,
-    };
-
-    #[cfg(debug_assertions)]
-    if std::env::var_os(TEST_EMBEDDING_QUERY_VECTORS_ENV).is_some()
-        || std::env::var_os(TEST_EMBEDDING_DOCUMENT_VECTORS_ENV).is_some()
-    {
-        configured.prepared_runtime = PreparedRuntimeAvailability::Available;
-    }
-
-    configured
-}
-
 fn configured_embedding_contract_snapshot(
     embedding: &EmbeddingConfig,
 ) -> ConfiguredEmbeddingSnapshot {
     if is_qwen_embedding_config(embedding) {
-        return configured_qwen_embedding_snapshot(embedding);
+        return configured_qwen_embedding_contract_snapshot(embedding);
     }
     let options = embedding.fastembed_options();
+    let mut prepared_runtime = PreparedRuntimeAvailability::Missing;
     if let Ok(store) = default_prepared_model_store() {
-        if let Ok(inspection) = store.inspect_prepared_alias_contract(&options) {
-            return configured_snapshot_from_contract(
-                &inspection,
-                PreparedRuntimeAvailability::Missing,
-            );
+        match store.inspect_prepared_alias_contract(&options) {
+            Ok(inspection) => {
+                return configured_snapshot_from_contract(
+                    &inspection,
+                    PreparedRuntimeAvailability::Available,
+                );
+            }
+            Err(error) if error.code() == "embedding.prepared_snapshot_missing" => {}
+            Err(_) => prepared_runtime = PreparedRuntimeAvailability::Corrupt,
         }
     }
     if let Some(manifest_path) = options.manifest_path.as_deref() {
-        if let Ok(inspection) =
-            PreparedModelStore::new(PathBuf::new()).inspect_manifest_contract(manifest_path)
-        {
-            return configured_snapshot_from_contract(
-                &inspection,
-                PreparedRuntimeAvailability::Missing,
-            );
+        match PreparedModelStore::new(PathBuf::new()).inspect_manifest_contract(manifest_path) {
+            Ok(inspection) => {
+                return configured_snapshot_from_contract(
+                    &inspection,
+                    PreparedRuntimeAvailability::Available,
+                );
+            }
+            Err(error) if error.code() == "embedding.prepared_manifest_missing" => {}
+            Err(_) => prepared_runtime = PreparedRuntimeAvailability::Corrupt,
         }
     }
 
@@ -5336,44 +5321,26 @@ fn configured_embedding_contract_snapshot(
         model_revision: configured_embedding_model_revision_without_snapshot(embedding),
         pooling: embedding.pooling,
         query_prefix: embedding.query_prefix.clone(),
-        prepared_runtime: PreparedRuntimeAvailability::Missing,
+        prepared_runtime,
     }
 }
 
-fn configured_qwen_embedding_snapshot(embedding: &EmbeddingConfig) -> ConfiguredEmbeddingSnapshot {
+fn configured_qwen_embedding_contract_snapshot(
+    embedding: &EmbeddingConfig,
+) -> ConfiguredEmbeddingSnapshot {
     let spec =
         qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).expect("Qwen embedding preset is registered");
+    let manifest_hash = qwen_model_manifest_hash(&spec);
     let runtime_profile = configured_qwen_runtime_profile_id(embedding.device);
-    let (model_revision, prepared_runtime) =
-        match default_prepared_qwen_model_store().and_then(|store| store.inspect(&spec)) {
-            Ok(snapshot) => (
-                Some(configured_qwen_runtime_identity(
-                    &snapshot.manifest_hash,
-                    runtime_profile,
-                )),
-                configured_available_runtime(),
-            ),
-            Err(error) if error.code == "model.not_installed" => (
-                Some(configured_qwen_runtime_identity(
-                    QWEN_EMBEDDING_REVISION,
-                    runtime_profile,
-                )),
-                PreparedRuntimeAvailability::Missing,
-            ),
-            Err(_) => (
-                Some(configured_qwen_runtime_identity(
-                    QWEN_EMBEDDING_REVISION,
-                    runtime_profile,
-                )),
-                PreparedRuntimeAvailability::Corrupt,
-            ),
-        };
     ConfiguredEmbeddingSnapshot {
         model_id: Some(QWEN_EMBEDDING_MODEL_ID.to_string()),
-        model_revision,
+        model_revision: Some(configured_qwen_runtime_identity(
+            &manifest_hash,
+            runtime_profile,
+        )),
         pooling: Some(PoolingKind::LastToken),
         query_prefix: Some(QWEN_EMBEDDING_QUERY_PREFIX.to_string()),
-        prepared_runtime,
+        prepared_runtime: PreparedRuntimeAvailability::NotChecked,
     }
 }
 
@@ -5437,43 +5404,16 @@ fn configured_snapshot_from_manifest(
     }
 }
 
-fn configured_runtime_error_availability(code: &str) -> PreparedRuntimeAvailability {
-    #[cfg(feature = "fastembed-provider")]
-    {
-        if matches!(
-            code,
-            "embedding.prepared_snapshot_missing" | "embedding.artifact_missing"
-        ) {
-            PreparedRuntimeAvailability::Missing
-        } else {
-            PreparedRuntimeAvailability::Corrupt
-        }
-    }
-    #[cfg(not(feature = "fastembed-provider"))]
-    {
-        let _ = code;
-        PreparedRuntimeAvailability::Missing
-    }
-}
-
-fn configured_available_runtime() -> PreparedRuntimeAvailability {
-    #[cfg(feature = "fastembed-provider")]
-    {
-        PreparedRuntimeAvailability::Available
-    }
-    #[cfg(not(feature = "fastembed-provider"))]
-    {
-        PreparedRuntimeAvailability::Missing
-    }
-}
-
 fn configured_embedding_model_revision_without_snapshot(
     embedding: &EmbeddingConfig,
 ) -> Option<String> {
     if is_qwen_embedding_config(embedding) {
+        let spec =
+            qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).expect("Qwen embedding preset is registered");
+        let manifest_hash = qwen_model_manifest_hash(&spec);
         let runtime_profile = configured_qwen_runtime_profile_id(embedding.device);
         return Some(configured_qwen_runtime_identity(
-            QWEN_EMBEDDING_REVISION,
+            &manifest_hash,
             runtime_profile,
         ));
     }
@@ -7541,8 +7481,7 @@ mod tests {
         );
         let profile = pinned_embedding_profile(&paths, model_revision);
         let embedding = profile.embedding.as_ref().unwrap();
-        let mut configured = configured_embedding_snapshot(embedding);
-        configured.prepared_runtime = PreparedRuntimeAvailability::Available;
+        let configured = configured_embedding_contract_snapshot(embedding);
         let coverage = embedding_coverage_state_for_config(embedding, &store, &configured).unwrap();
         assert_eq!(coverage.state(), "complete");
         assert!(coverage.hybrid_ready());
