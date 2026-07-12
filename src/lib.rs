@@ -9,6 +9,7 @@ mod coverage;
 pub mod embedding;
 mod error;
 mod freshness;
+mod fusion;
 mod github;
 mod index;
 mod local_models;
@@ -27,6 +28,7 @@ mod time;
 pub mod search_eval {
     #[cfg(feature = "fastembed-provider")]
     pub use crate::config::LocalModelDevice;
+    pub use crate::fusion::{fuse_ranked, FusionPolicy, LEXICAL_GUARD_V1};
     pub use crate::index::{
         production_lexical_profile_for_eval, rebuild as rebuild_lexical_index_for_eval,
         search_with_lexical_profile_for_eval, search_with_metadata_boost_v1_for_eval,

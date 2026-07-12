@@ -32,6 +32,7 @@ use crate::embedding::{
 };
 use crate::error::QghError;
 use crate::freshness::{self, FreshnessContext, FreshnessOverrides};
+use crate::fusion::{self, LEXICAL_GUARD_V1};
 use crate::github;
 use crate::index;
 use crate::local_models::{
@@ -69,7 +70,6 @@ use std::time::Instant;
 const GET_BATCH_SIZE_CAP: usize = 20;
 const QWEN_EMBEDDING_INPUT_ADAPTER_REVISION: &str = "explicit-window-v1";
 const QWEN_EMBEDDING_METAL_ADAPTER_REVISION: &str = "metal-sdpa-adaptive-batching-v2";
-const HYBRID_RRF_K: f32 = 60.0;
 const STALE_BUILDING_RETENTION_HOURS: i64 = 24;
 const PREVIOUS_READY_RETENTION_DAYS: i64 = 7;
 const HYBRID_OVERFETCH_FACTOR: usize = 4;
@@ -4153,19 +4153,7 @@ impl HybridAccumulator {
         }
     }
 
-    fn rrf_score(&self) -> f32 {
-        rrf_component(self.bm25_rank) + rrf_component(self.vector_rank)
-    }
-
-    fn best_rank(&self) -> usize {
-        self.bm25_rank
-            .into_iter()
-            .chain(self.vector_rank)
-            .min()
-            .unwrap_or(usize::MAX)
-    }
-
-    fn into_query_hit(self) -> QueryHit {
+    fn into_query_hit(self, rrf_rank_score: f32, final_order_score: f32) -> QueryHit {
         // A candidate only carries genuine hybrid evidence when it actually
         // received a vector contribution. Fusion still runs whenever the
         // hybrid path is eligible (config + coverage), even for a query
@@ -4174,12 +4162,11 @@ impl HybridAccumulator {
         // substance and must not report ranking.kind = hybrid, or eval/A-B
         // evidence cannot distinguish real fusion from a BM25 fallback.
         let ranking = if self.vector_rank.is_some() {
-            let rrf_rank_score = self.rrf_score();
             Ranking::Hybrid {
                 lexical_score: self.bm25_score,
                 vector_distance: self.vector_distance,
                 rrf_rank_score,
-                final_order_score: rrf_rank_score,
+                final_order_score,
             }
         } else {
             Ranking::Bm25(self.bm25_score.unwrap_or(0.0))
@@ -4194,11 +4181,6 @@ impl HybridAccumulator {
     }
 }
 
-fn rrf_component(rank: Option<usize>) -> f32 {
-    rank.map(|rank| 1.0 / (HYBRID_RRF_K + rank as f32))
-        .unwrap_or(0.0)
-}
-
 fn hybrid_candidate_limit(limit: usize) -> usize {
     limit.saturating_mul(HYBRID_OVERFETCH_FACTOR).max(limit)
 }
@@ -4208,6 +4190,14 @@ fn fuse_hybrid_hits(
     vector_hits: Vec<crate::model::VectorSearchHit>,
     limit: usize,
 ) -> Vec<QueryHit> {
+    let lexical_ranking = bm25_hits
+        .iter()
+        .map(|hit| hit.source_id.clone())
+        .collect::<Vec<_>>();
+    let dense_ranking = vector_hits
+        .iter()
+        .map(|hit| hit.source_id.clone())
+        .collect::<Vec<_>>();
     let mut candidates = HashMap::<String, HybridAccumulator>::new();
     for (rank, hit) in bm25_hits.into_iter().enumerate() {
         candidates
@@ -4223,18 +4213,13 @@ fn fuse_hybrid_hits(
             .record_vector(rank + 1, hit);
     }
 
-    let mut candidates = candidates.into_values().collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        right
-            .rrf_score()
-            .total_cmp(&left.rrf_score())
-            .then_with(|| left.best_rank().cmp(&right.best_rank()))
-            .then_with(|| left.source_id.cmp(&right.source_id))
-    });
-    candidates
+    fusion::fuse_ranked(&lexical_ranking, &dense_ranking, limit, LEXICAL_GUARD_V1)
         .into_iter()
-        .take(limit)
-        .map(HybridAccumulator::into_query_hit)
+        .filter_map(|fused| {
+            candidates
+                .remove(&fused.key)
+                .map(|candidate| candidate.into_query_hit(fused.rrf_score, fused.final_order_score))
+        })
         .collect()
 }
 
@@ -7468,7 +7453,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_rrf_overfetch_snapshot_differs_from_bm25_and_dedupes_sources() {
+    fn hybrid_lexical_guard_preserves_bm25_head_and_dedupes_semantic_tail() {
         let bm25_hits = vec![
             index::SearchHit {
                 source_id: "source-a".to_string(),
@@ -7486,6 +7471,16 @@ mod tests {
                 score: 8.0,
             },
             index::SearchHit {
+                source_id: "source-e".to_string(),
+                source_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+                score: 7.0,
+            },
+            index::SearchHit {
+                source_id: "source-f".to_string(),
+                source_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+                score: 6.0,
+            },
+            index::SearchHit {
                 source_id: "source-a".to_string(),
                 source_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
                 score: 1.0,
@@ -7493,7 +7488,7 @@ mod tests {
         ];
         let bm25_snapshot = bm25_hits
             .iter()
-            .take(3)
+            .take(5)
             .map(|hit| hit.source_id.clone())
             .collect::<Vec<_>>();
         let vector_hits = vec![
@@ -7517,15 +7512,18 @@ mod tests {
             },
         ];
 
-        let hits = fuse_hybrid_hits(bm25_hits, vector_hits, 3);
+        let hits = fuse_hybrid_hits(bm25_hits, vector_hits, 6);
         let hybrid_snapshot = hits
             .iter()
             .map(|hit| hit.source_id.clone())
             .collect::<Vec<_>>();
 
-        assert_eq!(bm25_snapshot, vec!["source-a", "source-b", "source-d"]);
-        assert_eq!(hybrid_snapshot, vec!["source-a", "source-c", "source-b"]);
-        assert_ne!(hybrid_snapshot, bm25_snapshot);
+        assert_eq!(
+            bm25_snapshot,
+            vec!["source-a", "source-b", "source-d", "source-e", "source-f"]
+        );
+        assert_eq!(&hybrid_snapshot[..5], bm25_snapshot);
+        assert_eq!(hybrid_snapshot[5], "source-c");
         assert_eq!(
             hits.iter()
                 .filter(|hit| hit.source_id == "source-c")
@@ -7541,13 +7539,21 @@ mod tests {
             } => {
                 assert_eq!(*lexical_score, Some(10.0));
                 assert_eq!(*vector_distance, Some(0.02));
-                let expected = rrf_component(Some(1)) + rrf_component(Some(2));
+                let expected = fusion::rrf_component(
+                    Some(1),
+                    LEXICAL_GUARD_V1.rrf_k(),
+                    LEXICAL_GUARD_V1.lexical_weight(),
+                ) + fusion::rrf_component(
+                    Some(2),
+                    LEXICAL_GUARD_V1.rrf_k(),
+                    LEXICAL_GUARD_V1.dense_weight(),
+                );
                 assert_eq!(*rrf_rank_score, expected);
-                assert_eq!(*final_order_score, expected);
+                assert_eq!(*final_order_score, 1.0);
             }
             _ => panic!("hybrid sources must expose fused ranking evidence"),
         }
-        match &hits[1].ranking {
+        match &hits[5].ranking {
             Ranking::Hybrid {
                 lexical_score,
                 vector_distance,
@@ -7556,9 +7562,13 @@ mod tests {
             } => {
                 assert_eq!(*lexical_score, None);
                 assert_eq!(*vector_distance, Some(0.01));
-                let expected = rrf_component(Some(1));
+                let expected = fusion::rrf_component(
+                    Some(1),
+                    LEXICAL_GUARD_V1.rrf_k(),
+                    LEXICAL_GUARD_V1.dense_weight(),
+                );
                 assert_eq!(*rrf_rank_score, expected);
-                assert_eq!(*final_order_score, expected);
+                assert_eq!(*final_order_score, 1.0 / 6.0);
             }
             _ => panic!("vector-only hybrid sources must expose fused ranking evidence"),
         }
