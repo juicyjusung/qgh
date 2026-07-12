@@ -2548,6 +2548,29 @@ fn init_fails_for_missing_malformed_or_non_github_origin() {
         "config.unsupported_git_remote"
     );
     assert!(!malformed.root.join(".qgh.toml").exists());
+
+    let secret = TestFixture::new("init-bad-origin-secret");
+    let secret_nested = secret.init_git_worktree_with_origin(
+        "https://github.com/owner/repo.git?access_token=PRIVATE_REMOTE_MARKER",
+    );
+    let secret_output = secret.qgh_without_profile_in(&secret_nested, ["init", "repo", "--json"]);
+    assert_eq!(secret_output.status.code(), Some(2));
+    let secret_json = stdout_json(&secret_output);
+    assert_eq!(
+        secret_json["error"]["code"],
+        "config.unsupported_git_remote"
+    );
+    assert_eq!(
+        secret_json["error"]["details"]["remote"],
+        "<redacted-remote>"
+    );
+    let output = format!(
+        "{}{}",
+        stdout_text(&secret_output),
+        stderr_text(&secret_output)
+    );
+    assert!(!output.contains("PRIVATE_REMOTE_MARKER"));
+    assert!(!secret.root.join(".qgh.toml").exists());
 }
 
 #[test]

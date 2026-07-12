@@ -822,6 +822,13 @@ fn origin_remote(root: &Path) -> Result<String, QghError> {
 
 fn parse_github_remote(remote: &str) -> Result<GitRemote, QghError> {
     let remote = remote.trim().trim_end_matches('/');
+    if remote.is_empty()
+        || remote
+            .chars()
+            .any(|character| matches!(character, '?' | '#' | '\r' | '\n' | '\0'))
+    {
+        return Err(unsupported_git_remote(remote));
+    }
     let (host, repo) = if let Some(rest) = remote.strip_prefix("https://") {
         let Some((host, path)) = rest.split_once('/') else {
             return Err(unsupported_git_remote(remote));
@@ -876,16 +883,8 @@ fn unsupported_git_remote(remote: &str) -> QghError {
 }
 
 fn sanitized_remote_for_error(remote: &str) -> String {
-    let remote = remote.trim();
-    if let Some((scheme, rest)) = remote.split_once("://") {
-        if let Some((_, after_userinfo)) = rest.split_once('@') {
-            return format!("{scheme}://<redacted>@{after_userinfo}");
-        }
-    }
-    if let Some((_, after_userinfo)) = remote.rsplit_once('@') {
-        return format!("<redacted>@{after_userinfo}");
-    }
-    remote.to_string()
+    let _ = remote;
+    "<redacted-remote>".to_string()
 }
 
 pub(crate) fn load_repo_policy_at(path: &Path) -> Result<RepoPolicy, QghError> {
@@ -1393,12 +1392,7 @@ pub(crate) fn parse_repo(value: &str) -> Result<RepoRef, String> {
     let Some((owner, name)) = value.split_once('/') else {
         return Err("must use owner/repo format.".to_string());
     };
-    if owner.is_empty()
-        || name.is_empty()
-        || owner.contains('/')
-        || name.contains('/')
-        || value.contains('*')
-    {
+    if !valid_repo_segment(owner) || !valid_repo_segment(name) {
         return Err("must be an explicit owner/repo allowlist entry.".to_string());
     }
     Ok(RepoRef {
@@ -1407,9 +1401,49 @@ pub(crate) fn parse_repo(value: &str) -> Result<RepoRef, String> {
     })
 }
 
+fn valid_repo_segment(value: &str) -> bool {
+    !value.is_empty()
+        && !matches!(value, "." | "..")
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_remote_query_and_fragment_secrets_are_rejected_and_redacted() {
+        for remote in [
+            "https://github.com/owner/repo.git?access_token=PRIVATE_QUERY_MARKER",
+            "https://github.com/owner/repo.git#PRIVATE_FRAGMENT_MARKER",
+            "git@github.com:owner/repo.git?token=PRIVATE_SCP_MARKER",
+        ] {
+            let error = parse_github_remote(remote).err().unwrap();
+            assert_eq!(error.code, "config.unsupported_git_remote");
+            let serialized = serde_json::to_string(&error).unwrap();
+            assert!(!serialized.contains("PRIVATE_"), "{serialized}");
+            assert_eq!(error.details["remote"], "<redacted-remote>");
+        }
+    }
+
+    #[test]
+    fn repo_identity_rejects_url_delimiters_and_whitespace() {
+        for repo in [
+            "owner/repo?token=PRIVATE",
+            "owner/repo#PRIVATE",
+            "owner/repo name",
+            "owner\\repo/name",
+            "owner/repo@github.com",
+        ] {
+            assert!(parse_repo(repo).is_err(), "repo={repo}");
+        }
+        assert_eq!(
+            parse_repo("juicy-jusung/qgh.rs_2").unwrap().full_name(),
+            "juicy-jusung/qgh.rs_2"
+        );
+    }
 
     #[cfg(feature = "fastembed-provider")]
     #[test]
