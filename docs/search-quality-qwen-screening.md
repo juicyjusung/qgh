@@ -11,19 +11,22 @@ selected Matryoshka dimension was 384 and its selected dense RRF weight was
 `1.0`.
 
 This is screening evidence, not promotion evidence. The 80-query split had
-already been opened during the preceding lightweight-model decision, qgh does
-not yet have a production adapter for Qwen's last-token pooling and task
-instruction contract, and a 50k-chunk backfill/publication run was not
-performed. The production preset therefore remains unchanged and BM25-only
-remains the complete default path.
+already been opened during the preceding lightweight-model decision. At the
+time of this screening, qgh did not yet have a production adapter for Qwen's
+last-token pooling and task instruction contract, and a 50k-chunk
+backfill/publication run was not performed. The later
+[native production-adapter regression](search-quality-qwen-production-adapter-eval.md)
+implemented and checked that contract but did not remove the promotion
+blockers. BM25-only remains the complete default path.
 
 `Qwen/Qwen3-Reranker-0.6B` establishes a high quality ceiling but is not
 practical as an always-on local CLI stage under this shared-union protocol.
 Reranking the union of BM25 top 20 and hybrid top 20 raised weighted nDCG@10 to
 `0.9896` on MPS, but per-query pool latency was 2.81 seconds p50 and 12.91
-seconds p95. CPU was 59.45 seconds p50 and 318.92 seconds p95. A future
-reranker experiment would need a shallower, selective trigger and a fresh
-blind split; this benchmark does not add one.
+seconds p95. CPU was 59.45 seconds p50 and 318.92 seconds p95. The later native
+implementation therefore chose a fixed top-10, explicit opt-in stage with an
+all-or-original fallback. This screening did not run that production stage
+against fresh qrels and does not qualify it for promotion.
 
 ## Evaluation identity and scope
 
@@ -57,7 +60,9 @@ This harness retrieves only the top 20 dense candidates before RRF. The
 canonical qgh live protocol uses a candidate window of 80 before returning 20
 results. Consequently, the Qwen numbers are not directly comparable with the
 canonical Tiny/Granite model-selection table and cannot establish a new model
-winner. They are a trigger for a future canonical-window qualification run.
+winner. They triggered the later native canonical-window regression, which
+used this already opened split and therefore still was not a qualification
+run.
 
 Sources were tokenized into 900-token chunks with 135-token overlap. A source
 score is the maximum of its chunk scores. Embedding used batch 8; query latency
@@ -110,8 +115,9 @@ The five negative queries are excluded from the weighted aggregate because
 they have no relevant source. Their non-empty top-result rate was `0.80` for
 BM25 and BM25 plus reranking, and `1.00` for dense, hybrid, and hybrid plus
 reranking. Qwen therefore does not provide abstention and slightly worsens this
-slice. A production adapter needs an explicit score/empty-result policy; the
-high positive-query metrics must not be interpreted as negative-query safety.
+slice. The production adapter does not claim abstention, and this report-only
+negative slice must not be interpreted as answer confidence or negative-query
+safety.
 
 Within this screen, the result supports investigating Qwen for complementing
 BM25 rather than replacing it. The embedding addresses the largest observed
@@ -185,16 +191,15 @@ than assuming byte-identical rankings across CPU and MPS.
 - Keep the existing production embedding preset unchanged. Qwen 0.6B is the
   next standalone signal worth canonical qualification, not an automatically
   promoted preset or a proven replacement for Tiny.
-- If Qwen is implemented, prefer MPS on supported Apple hardware and retain an
-  explicit CPU fallback warning. CPU embedding is usable for occasional
-  queries but too slow for a large initial backfill under the measured setup.
-- Do not ship the 0.6B reranker as an always-on shared-union stage. A later
-  study may test one fixed pool at depth 5 or 10 behind an
-  ambiguity/low-confidence trigger, but only after embedding recall is
-  available and a fresh blind split exists.
-- qgh's current prepared-model contract exposes only `cls` and `mean` pooling,
-  while Qwen requires last-token pooling and task instructions. A dedicated,
-  fail-closed runtime/manifest contract is required before production use.
+- The later experimental adapter uses Apple Metal on supported hardware and
+  retains an explicit CPU embedding path. CPU embedding remains too slow for a
+  large initial backfill under the measured setup.
+- Do not make the 0.6B reranker an always-on shared-union stage. The implemented
+  path is an explicit fixed top-10 option; a fresh blind qrels run would still
+  be required before any promotion.
+- At the time of screening, qgh's prepared-model contract exposed only `cls`
+  and `mean` pooling. The later adapter added a dedicated, fail-closed
+  last-token, task-instruction, runtime, and manifest contract.
 - Before promotion, run a new untouched multilingual qrels split, the complete
   50k backfill/publication/integrity gate, device-parity tolerances, fallback
   behavior, candidate window 80, and query-to-get round-trip using the actual
@@ -202,8 +207,8 @@ than assuming byte-identical rankings across CPU and MPS.
 - Bind a model artifact tree/content manifest, not only a Hugging Face revision
   and logical snapshot byte count.
 
-The benchmark deliberately does not implement a reranker, new MCP tool, hosted
-service, ANN index, sparse retriever, or production default change.
+This screening benchmark itself did not implement a reranker, new MCP tool,
+hosted service, ANN index, sparse retriever, or production default change.
 
 ## Verification
 

@@ -1,13 +1,19 @@
 # Local Qwen models
 
-qgh can use local Qwen 0.6B models to complement BM25. They are optional:
-BM25 is still the default, complete search path, and model weights are not
-bundled with qgh.
+qgh can use experimental local Qwen 0.6B models to complement BM25. Both are
+explicit opt-ins: BM25 remains the complete production default, neither Qwen
+model is a promoted light or quality preset, and model weights are not bundled
+with qgh.
 
 The [Qwen screening](search-quality-qwen-screening.md) found that Qwen
 embedding is a promising multilingual BM25-rescue path and that reranking can
 substantially improve ordering. It also found enough model and runtime cost to
 keep both capabilities explicit rather than always on.
+The later [native production-adapter regression](search-quality-qwen-production-adapter-eval.md)
+validated the implemented embedding path without making it promotion-eligible.
+The reranker figures in the screening document are not a production top-10
+qrels result; the implemented stage remains experimental and individually
+requested.
 
 ## Choose the smallest path that fits
 
@@ -22,8 +28,9 @@ hybrid retrieval did not already find.
 
 ## Install model snapshots explicitly
 
-Model installation is a CLI-only operation and the only qgh command allowed to
-contact a model host. Install only the capability you plan to use:
+For the Qwen presets documented here, model installation is CLI-only and
+`qgh model install` is the only command allowed to contact their model host.
+Install only the capability you plan to use:
 
 ```sh
 qgh model install qwen3-embedding-0.6b
@@ -38,12 +45,14 @@ verifies the complete artifact hash manifest, and atomically publishes it in
 source metadata, chunks, embeddings, or queries.
 
 Treat the qgh cache as sensitive, integrity-critical single-user data. Do not
-edit model files or manifests in place. A missing or modified file makes the
-snapshot unavailable; reinstall it instead.
+edit model files or manifests in place. Re-running `qgh model install` for an
+invalid snapshot quarantines it and atomically publishes a replacement only
+after full verification.
 
-`sync`, `embed`, `query`, `get`, `status`, `doctor`, and MCP do not download
-models. A configured but uninstalled model produces a typed diagnostic and
-keeps the safe retrieval path available.
+No other CLI or MCP path downloads these Qwen snapshots. This Qwen-only
+boundary does not change the legacy prepared-ONNX preset's existing explicit
+embed-time acquisition behavior. A configured but uninstalled Qwen model
+produces a typed diagnostic and keeps the safe retrieval path available.
 
 ## Enable Qwen embedding
 
@@ -74,7 +83,7 @@ vector state never becomes a partial hybrid result.
 
 ## Enable optional reranking
 
-Configure the local reranker:
+Configure the experimental local reranker:
 
 ```toml
 [reranker]
@@ -122,10 +131,15 @@ silently fall back to CPU. `device = "cpu"` enables an experimental slow path
 and emits a typed warning. If the required reranker runtime is unavailable,
 reranking is not applied and the original retrieval order is preserved.
 
+Apple Metal is the only supported GPU backend for this Qwen runtime;
+CUDA/NVIDIA acceleration is not implemented. On other systems embedding
+`auto` uses CPU F32, while reranker `auto` is non-applied unless the user
+explicitly selects the experimental CPU slow path.
+
 CPU keeps embedding available on non-Metal systems, but first-time embedding
 and experimental CPU reranking can be noticeably slower than Metal. BM25
-remains unaffected on every device, and experimental reranking does not block
-BM25 or hybrid release readiness.
+remains unaffected on every device. Neither experimental Qwen path changes
+BM25 release readiness or establishes hybrid quality qualification.
 
 ## Privacy and failure boundaries
 

@@ -1,9 +1,23 @@
 # Live multilingual model evaluation
 
-The follow-up screening of Qwen 0.6B embedding and reranking is documented in
-[Qwen 0.6B embedding and reranker screening](search-quality-qwen-screening.md).
-It identifies a strong future MPS embedding candidate but does not change the
-production preset or BM25 default.
+The evidence sequence is the original Arctic/GTE evaluation, the later
+[Qwen 0.6B embedding and reranker screening](search-quality-qwen-screening.md),
+and the implemented
+[Qwen native production-adapter regression](search-quality-qwen-production-adapter-eval.md).
+The native adapter is available only as an experimental opt-in. No Qwen model
+is promoted as a light or quality preset; BM25 remains the complete production
+default and `production_v1` remains the lexical profile.
+
+## 2026-07-12 Qwen native production-adapter regression
+
+| Decision | Result |
+| --- | --- |
+| Adapter | native local experimental opt-in |
+| Embedding promotion | none |
+| Reranker promotion | none; optional top-10 stage only |
+| BM25 default | unchanged |
+| Lexical profile | `production_v1` |
+| Full evidence | [production-adapter regression](search-quality-qwen-production-adapter-eval.md) |
 
 ## 2026-07-11 fresh blind BM25-rescue decision
 
@@ -79,7 +93,7 @@ The integrated live run completed against public GitHub Issues and comments with
 
 `metadata_boost_v1` is also not promoted. It improved dev weighted nDCG@10, but both lexical profiles failed the Korean Recall@5 quality gate. `production_v1` therefore remains the production lexical profile.
 
-These model decisions do not widen MVP scope. BM25-only remains the complete default path, and no hosted embedding, reranker, ANN, sparse retriever, or new MCP tool was added.
+Those original Arctic/GTE model decisions did not widen MVP scope. BM25-only remained the complete default path, and that run added no hosted embedding, reranker, ANN, sparse retriever, or new MCP tool.
 
 ## Run identity
 
@@ -181,13 +195,13 @@ Arctic cold samples were 11,522.1, 10,365.1, 10,256.3, 10,216.0, and 10,040.2 ms
 
 Arctic exceeds the light and quality cold-start and RSS limits; its snapshot also exceeds the light limit. GTE passes both cold-start limits but exceeds both RSS limits and the light snapshot limit. Both pass the warm-latency limits, use effective batch 16 instead of required batch 8, and do not expose required intra-op threads 4. Neither produced complete 50k throughput, DB-growth, publication, vec0, or backfill-integrity evidence, so the remaining backfill limits are unmeasured rather than passed. `synthetic_substitution=false` for every candidate.
 
-## Promotion and conditional follow-up
+## Original Arctic/GTE promotion and follow-up
 
 - Lexical profile: keep `production_v1`; do not promote `metadata_boost_v1`.
 - Embedding preset: promote none; selected light and quality candidates are both `null`.
 - Existing optional Arctic default: retain unchanged for compatibility, without a new resource-readiness claim.
 - Korean lexical follow-up: the dev Korean Recall@5 miss activates investigation of the existing NFC/ngram path. Lindera is only an ADR candidate after that cheaper tuning is measured; it is not implemented here.
-- Reranker: not triggered because the observed failures are recall failures, not passing recall with deficient top-rank precision/MRR.
+- In that original run, reranking was not triggered because the observed failures were recall failures, not passing recall with deficient top-rank precision/MRR.
 - Late chunking: not triggered; the long/context class did not identify context loss as the dominant failure.
 - ANN: not triggered; the 50k runs failed before a valid brute-force latency/throughput result existed.
 - Sparse retriever: not triggered; the run did not establish a repeated dense-plus-BM25 lexical-expansion failure.
