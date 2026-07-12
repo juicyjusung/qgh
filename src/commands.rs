@@ -63,6 +63,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const GET_BATCH_SIZE_CAP: usize = 20;
+const QWEN_EMBEDDING_METAL_ADAPTER_REVISION: &str = "metal-adaptive-batching-v1";
 const HYBRID_RRF_K: f32 = 60.0;
 const STALE_BUILDING_RETENTION_HOURS: i64 = 24;
 const PREVIOUS_READY_RETENTION_DAYS: i64 = 7;
@@ -2479,10 +2480,8 @@ fn qwen_embedding_runtime_local_only(
         })?;
     let runtime_profile = qwen_embedding_runtime_profile_id(embedding.device);
     if let Some(profile_id) = cache_profile_id {
-        let cache_key = format!(
-            "{profile_id}:qwen:{}:{runtime_profile}",
-            snapshot.manifest_hash
-        );
+        let cache_key =
+            qwen_embedding_runtime_cache_key(profile_id, &snapshot.manifest_hash, runtime_profile);
         let profile_prefix = format!("{profile_id}:");
         return runtime_cache_get_or_try_init(
             EMBEDDING_RUNTIME_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
@@ -2515,11 +2514,26 @@ fn build_qwen_embedding_runtime(
         fingerprint_seed: EmbeddingFingerprintSeed {
             provider: embedding_provider_name(embedding.provider).to_string(),
             model_id: QWEN_EMBEDDING_MODEL_ID.to_string(),
-            model_revision: format!("{}:{runtime_profile}", snapshot.manifest_hash),
+            model_revision: configured_qwen_runtime_identity(
+                &snapshot.manifest_hash,
+                runtime_profile,
+            ),
             pooling: PoolingKind::LastToken,
             query_prefix: QWEN_EMBEDDING_QUERY_PREFIX.to_string(),
         },
     }))
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_embedding_runtime_cache_key(
+    profile_id: &str,
+    manifest_hash: &str,
+    runtime_profile: &str,
+) -> String {
+    format!(
+        "{profile_id}:qwen:{}",
+        configured_qwen_runtime_identity(manifest_hash, runtime_profile)
+    )
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -4960,15 +4974,24 @@ fn configured_qwen_embedding_snapshot(embedding: &EmbeddingConfig) -> Configured
     let (model_revision, prepared_runtime) =
         match default_prepared_qwen_model_store().and_then(|store| store.inspect(&spec)) {
             Ok(snapshot) => (
-                Some(format!("{}:{runtime_profile}", snapshot.manifest_hash)),
+                Some(configured_qwen_runtime_identity(
+                    &snapshot.manifest_hash,
+                    runtime_profile,
+                )),
                 configured_available_runtime(),
             ),
             Err(error) if error.code == "model.not_installed" => (
-                Some(format!("{QWEN_EMBEDDING_REVISION}:{runtime_profile}")),
+                Some(configured_qwen_runtime_identity(
+                    QWEN_EMBEDDING_REVISION,
+                    runtime_profile,
+                )),
                 PreparedRuntimeAvailability::Missing,
             ),
             Err(_) => (
-                Some(format!("{QWEN_EMBEDDING_REVISION}:{runtime_profile}")),
+                Some(configured_qwen_runtime_identity(
+                    QWEN_EMBEDDING_REVISION,
+                    runtime_profile,
+                )),
                 PreparedRuntimeAvailability::Corrupt,
             ),
         };
@@ -5003,6 +5026,15 @@ fn configured_qwen_runtime_profile_id(device: crate::config::LocalModelDevice) -
                 }
             }
         }
+    }
+}
+
+fn configured_qwen_runtime_identity(base_revision: &str, runtime_profile: &str) -> String {
+    let identity = format!("{base_revision}:{runtime_profile}");
+    if runtime_profile == "metal_f16" {
+        format!("{identity}:{QWEN_EMBEDDING_METAL_ADAPTER_REVISION}")
+    } else {
+        identity
     }
 }
 
@@ -5065,9 +5097,10 @@ fn configured_embedding_model_revision_without_snapshot(
     embedding: &EmbeddingConfig,
 ) -> Option<String> {
     if is_qwen_embedding_config(embedding) {
-        return Some(format!(
-            "{QWEN_EMBEDDING_REVISION}:{}",
-            configured_qwen_runtime_profile_id(embedding.device)
+        let runtime_profile = configured_qwen_runtime_profile_id(embedding.device);
+        return Some(configured_qwen_runtime_identity(
+            QWEN_EMBEDDING_REVISION,
+            runtime_profile,
         ));
     }
     if embedding.model_path.is_some() {
@@ -6136,6 +6169,51 @@ fn lexical_evidence(
 mod tests {
     use super::*;
     use crate::model::{IssueRecord, SourceVersionView};
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn metal_qwen_adapter_revision_invalidates_only_metal_generation_and_cache() {
+        let fingerprint = |model_revision: &str| {
+            EmbeddingFingerprintSeed {
+                provider: "fastembed".to_string(),
+                model_id: QWEN_EMBEDDING_MODEL_ID.to_string(),
+                model_revision: model_revision.to_string(),
+                pooling: PoolingKind::LastToken,
+                query_prefix: QWEN_EMBEDDING_QUERY_PREFIX.to_string(),
+            }
+            .with_dimension(384)
+        };
+        let expectation = |model_revision: String| EmbeddingFingerprintExpectation {
+            provider: "fastembed".to_string(),
+            model_id: Some(QWEN_EMBEDDING_MODEL_ID.to_string()),
+            model_revision: Some(model_revision),
+            pooling: Some(PoolingKind::LastToken),
+            query_prefix: Some(QWEN_EMBEDDING_QUERY_PREFIX.to_string()),
+        };
+
+        let previous_metal_revision = "manifest:metal_f16";
+        let current_metal_revision = configured_qwen_runtime_identity("manifest", "metal_f16");
+        assert_eq!(
+            current_metal_revision,
+            format!("manifest:metal_f16:{QWEN_EMBEDDING_METAL_ADAPTER_REVISION}")
+        );
+        assert!(!fingerprint(previous_metal_revision)
+            .matches_expectation(&expectation(current_metal_revision.clone())));
+        assert!(fingerprint(&current_metal_revision)
+            .matches_expectation(&expectation(current_metal_revision)));
+        assert_eq!(
+            qwen_embedding_runtime_cache_key("profile", "manifest", "metal_f16"),
+            format!("profile:qwen:manifest:metal_f16:{QWEN_EMBEDDING_METAL_ADAPTER_REVISION}")
+        );
+
+        let cpu_revision = configured_qwen_runtime_identity("manifest", "cpu_f32");
+        assert_eq!(cpu_revision, "manifest:cpu_f32");
+        assert!(fingerprint("manifest:cpu_f32").matches_expectation(&expectation(cpu_revision)));
+        assert_eq!(
+            qwen_embedding_runtime_cache_key("profile", "manifest", "cpu_f32"),
+            "profile:qwen:manifest:cpu_f32"
+        );
+    }
 
     #[cfg(feature = "fastembed-provider")]
     #[test]
