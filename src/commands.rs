@@ -98,7 +98,7 @@ pub fn install_model(args: &ModelArgs) -> Result<LocalReadOutcome, QghError> {
     let ModelCommand::Install(args) = &args.command;
     let preset_id = args.model.as_str();
     let spec = qwen_model_spec(preset_id).expect("CLI model preset is registered");
-    let outcome = install_qwen_model(preset_id)?;
+    let outcome = install_qwen_model(preset_id, !args.json)?;
     let action = match outcome.action {
         ModelInstallAction::Installed => "installed",
         ModelInstallAction::AlreadyInstalled => "already_installed",

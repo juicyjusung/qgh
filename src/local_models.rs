@@ -448,13 +448,13 @@ struct HfQwenModelFetcher {
 
 #[cfg(feature = "fastembed-provider")]
 impl HfQwenModelFetcher {
-    fn new(spec: &QwenModelSpec) -> Result<Self, QghError> {
+    fn new(spec: &QwenModelSpec, show_progress: bool) -> Result<Self, QghError> {
         let cache_dir = qgh_cache_dir()?.join("hf");
         ensure_private_dir(&cache_dir).map_err(model_qgh_storage_error)?;
         let api = hf_hub::api::sync::ApiBuilder::new()
             .with_cache_dir(cache_dir)
             .with_endpoint("https://huggingface.co".to_string())
-            .with_progress(false)
+            .with_progress(show_progress)
             .with_retries(2)
             .with_token(None)
             .build()
@@ -486,7 +486,10 @@ impl ModelArtifactFetcher for HfQwenModelFetcher {
 }
 
 #[cfg(feature = "fastembed-provider")]
-pub fn install_qwen_model(preset_id: &str) -> Result<ModelInstallOutcome, QghError> {
+pub fn install_qwen_model(
+    preset_id: &str,
+    show_progress: bool,
+) -> Result<ModelInstallOutcome, QghError> {
     let spec = qwen_model_spec(preset_id).ok_or_else(|| {
         QghError::validation(
             "model.unknown",
@@ -508,12 +511,15 @@ pub fn install_qwen_model(preset_id: &str) -> Result<ModelInstallOutcome, QghErr
             ) => {}
         Err(error) => return Err(error),
     }
-    let mut fetcher = HfQwenModelFetcher::new(&spec)?;
+    let mut fetcher = HfQwenModelFetcher::new(&spec, show_progress)?;
     store.install_with_fetcher(&spec, &mut fetcher)
 }
 
 #[cfg(not(feature = "fastembed-provider"))]
-pub fn install_qwen_model(_preset_id: &str) -> Result<ModelInstallOutcome, QghError> {
+pub fn install_qwen_model(
+    _preset_id: &str,
+    _show_progress: bool,
+) -> Result<ModelInstallOutcome, QghError> {
     Err(QghError::validation(
         "model.provider_unavailable",
         "This qgh binary was built without local Qwen model installation support.",
