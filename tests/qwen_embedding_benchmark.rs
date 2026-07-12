@@ -283,7 +283,7 @@ fn ranking_parity(provider: &impl EmbeddingProvider) -> Vec<(usize, f32, bool)> 
     DOCUMENT_COUNTS
         .into_iter()
         .map(|document_count| {
-            let mut inputs = documents.iter().copied().collect::<Vec<_>>();
+            let mut inputs = documents.to_vec();
             while inputs.len() < document_count {
                 inputs.push("Synthetic filler about an unrelated public weather report.");
             }
