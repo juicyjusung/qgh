@@ -2,9 +2,10 @@
 
 ## Status
 
-Accepted as an experimental, opt-in local search-quality path. This is not a
-light or quality preset promotion. BM25 remains the complete production
-default.
+Accepted for the pinned local runtime, acquisition, and optional reranker
+contracts. ADR-0016 supersedes the manually selected embedding default, and
+ADR-0017 supersedes equal-weight hybrid ordering. BM25 remains the complete
+path whenever `[embedding]` is absent.
 
 ## Context
 
@@ -28,8 +29,10 @@ read-only MCP surface, exact-locator behavior, and a complete model-free
 ### Required path and acquisition boundary
 
 - BM25-only remains complete and is the default when `[embedding]` is absent.
-- Qwen embedding and reranking are explicit opt-in capabilities. Their weights
-  are not included in the qgh binary, Homebrew artifact, or release bundle.
+- Qwen model installation and reranking are explicit user actions. Model
+  weights are not included in the qgh binary, Homebrew artifact, or release
+  bundle; ADR-0016 separately makes Qwen embedding the semantic selection in
+  newly created fastembed-capable configs.
 - For the two Qwen presets in this ADR, `qgh model install` is the only
   model-network path. It downloads pinned Qwen files without sending repository
   content, source metadata, chunks, embeddings, or queries. No other CLI or MCP
@@ -128,8 +131,9 @@ installation logs.
   cannot recover a source that BM25/vector retrieval did not produce.
 - The explicit flag and all-or-original fallback make reranker latency and
   failure visible without weakening retrieval correctness.
-- Qwen embedding and reranking remain experimental opt-ins; neither changes
-  BM25 release readiness or establishes hybrid quality qualification.
+- Qwen model installation and reranking remain explicit; the selected
+  embedding default does not make BM25 release readiness depend on a model or
+  establish fresh-blind hybrid quality qualification.
 
 This decision extends ADR-0012's optional local vector design. It replaces
 implicit model acquisition and the earlier rerank deferral only for these

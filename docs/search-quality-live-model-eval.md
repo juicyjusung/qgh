@@ -4,13 +4,31 @@ The evidence sequence is the original Arctic/GTE evaluation, the later
 [Qwen 0.6B embedding and reranker screening](search-quality-qwen-screening.md),
 and the implemented
 [Qwen native production-adapter regression](search-quality-qwen-production-adapter-eval.md).
-The optimized native adapter is available only as an experimental opt-in. It
-now clears the 3 chunks/s diagnostic throughput threshold, but the opened split,
-incomplete qualification protocol, and English-query-to-Korean-source miss keep
-it ineligible for preset promotion. BM25 remains the complete production
-default and `production_v1` remains the lexical profile.
+Qwen is now the user-approved semantic default for newly created
+fastembed-capable configs, while installation stays explicit and BM25 remains
+the complete model-free path. This product choice does not rewrite the opened
+split or incomplete resource protocol as fresh promotion evidence.
+`production_v1` remains the lexical profile.
 
-## 2026-07-12 Qwen native production-adapter regression
+## 2026-07-13 Qwen default and protected-fusion decision
+
+| Decision | Result |
+| --- | --- |
+| Semantic preset | `qwen3-embedding-0.6b` for new fastembed configs |
+| Model delivery | separate explicit download; never bundled |
+| Fusion | `lexical_guard_v1`: BM25 top five protected, weighted RRF below |
+| Guarded quality | nDCG 0.6216; MRR 0.6023; Recall@5 0.7578; Recall@10 0.8667 |
+| BM25 complement | harm @5/@10 `0/0`; rescue @5/@10 `0/3` |
+| Runtime | Metal F16; 5.919 chunks/s; query embedding p95 35.9 ms |
+| Reranker | optional per-query stage; off by default |
+| Formal promotion evidence | still blocked by opened split and incomplete resource protocol |
+| Full evidence | [production-adapter regression](search-quality-qwen-production-adapter-eval.md) |
+
+## 2026-07-12 historical Qwen native production-adapter regression
+
+This earlier 566-source result preceded the default and protected-fusion
+decision above. Its snapshot is not committed in the current checkout, so it
+is retained only as historical evidence.
 
 | Decision | Result |
 | --- | --- |

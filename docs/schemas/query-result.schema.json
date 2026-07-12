@@ -381,11 +381,11 @@
             },
             "rrf_rank_score": {
               "type": "number",
-              "description": "Reciprocal-rank fusion ordering signal. It is not confidence or probability."
+              "description": "Weighted reciprocal-rank fusion evidence signal. It is not confidence or probability."
             },
             "final_order_score": {
               "type": "number",
-              "description": "Retrieval-stage ordering signal after RRF and before optional bounded reranking. It is not confidence or probability."
+              "description": "Reciprocal result rank after the fixed lexical guard and before optional bounded reranking. It is not confidence or probability."
             },
             "rerank_score": {
               "type": "number",

@@ -25,7 +25,7 @@ requested.
 | Path | Local model needed | What changes |
 | --- | --- | --- |
 | BM25 | None | Complete lexical retrieval when `[embedding]` is absent; full `query -> get -> cite` workflow |
-| Hybrid | Qwen embedding | Default semantic selection for a new fastembed config; adds semantic candidates and combines them with BM25 using RRF after explicit model installation and publication |
+| Hybrid | Qwen embedding | Default semantic selection for a new fastembed config; preserves the BM25 top five and adds semantic candidates below that lexical head after explicit model installation and publication |
 | Hybrid or BM25 with reranking | Qwen reranker, plus embedding only if hybrid is desired | Reorders at most the first 10 retrieved candidates when explicitly requested |
 
 Reranking does not replace retrieval. It cannot add a source that BM25 or
@@ -100,6 +100,15 @@ Until a complete embedding generation is validated and atomically published,
 queries keep using BM25. Missing, stale, corrupt, partial, or incompatible
 vector state never becomes a partial hybrid result.
 
+Hybrid ordering uses the fixed `lexical_guard_v1` policy. The first five BM25
+source candidates keep their exact order; the rest of the candidate pool uses
+weighted reciprocal-rank fusion with `k=60`, lexical weight `2`, dense weight
+`1`, and at most 80 dense candidates. This intentionally spends semantic
+capacity below the reliable lexical head: on the reproducible public qrels it
+preserved all observed BM25 hits at ranks 5 and 10 and rescued three misses at
+rank 10. There is no user-facing fusion weight, window, or protected-head
+setting.
+
 ## Enable optional reranking
 
 Configure the experimental local reranker:
@@ -122,7 +131,7 @@ no MCP model-install or other model-management tool.
 
 Reranking is deliberately bounded and predictable:
 
-- it considers at most the first 10 BM25 or RRF candidates;
+- it considers at most the first 10 BM25 or protected-hybrid candidates;
 - each query/candidate pair uses a deterministic maximum 384-token view;
 - there is no user-controlled depth, score threshold, rerank weight, fusion
   weight, or metadata-boost knob;
@@ -133,7 +142,7 @@ Reranking is deliberately bounded and predictable:
 
 If configuration or model files are missing, the snapshot is corrupt, runtime
 or device initialization fails, a score is non-finite, or output is partial,
-qgh discards the whole rerank attempt. The original BM25/RRF order is returned
+qgh discards the whole rerank attempt. The original retrieval order is returned
 with a typed warning and a rerank status explaining why it was not applied.
 
 ## Device behavior
@@ -183,7 +192,7 @@ quality and resource risks.
 - Raw query text and private source content are not written to model install
   logs or model manifests.
 - Model/runtime failures do not turn into empty or partly reordered search
-  results when the original BM25/RRF result remains safe.
+  results when the original retrieval result remains safe.
 - Every returned result must still satisfy the same hard filters and
   `query -> get -> cite` round-trip contract.
 

@@ -299,6 +299,14 @@ light/default preset은 warm p95<=1.5s, cold-start p95<=5s, peak RSS<=1 GiB, 전
 
 RRF는 baseline으로 유지하되 real qrels에서 `k={20,60,100}`과 candidate window를 함께 평가한다. weighted RRF나 normalized fusion은 equal RRF를 명확히 이긴 경우에만 ADR/PRD 변경으로 채택한다.
 
+2026-07-13 결정: 재현 가능한 80-query multilingual regression에서 equal
+RRF는 aggregate를 높였지만 BM25 hit를 @5에서 5건, @10에서 4건
+손상했고 comment-only Recall@5를 1.0에서 0.0으로 낮췄다. 따라서
+ADR-0017의 고정 `lexical_guard_v1`을 채택한다. BM25 top 5를 그대로
+보호하고 그 아래에서만 `k=60`, lexical weight 2, dense weight 1,
+dense window 80을 적용한다. 사용자 boost knob는 추가하지 않으며 fresh
+blind qualification 위험은 계속 기록한다.
+
 ### Wave 7: conditional follow-up
 
 - recall은 통과하지만 top-rank precision/MRR이 미달하면 top-20 local cross-encoder reranker를 prototype한다.

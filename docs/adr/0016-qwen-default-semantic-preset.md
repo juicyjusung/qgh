@@ -11,11 +11,13 @@ resource risks, and optional reranker behavior.
 ## Context
 
 The native Qwen production adapter materially improved multilingual retrieval
-over the BM25 baseline and rescued relevant sources without measured top-5
-harm in the frozen public evaluation. Its Metal runtime is practical for local
-indexing and interactive hybrid retrieval. The product decision is therefore
-to use `qwen3-embedding-0.6b` for every newly created fastembed-capable config,
-while retaining BM25 as a complete model-free capability.
+over the BM25 baseline when used through the BM25-protected
+`lexical_guard_v1` policy. On the reproducible 80-query public fixture it
+preserved every observed BM25 hit at ranks 5 and 10 and rescued three BM25
+misses at rank 10. Its Metal runtime is practical for local indexing and
+interactive hybrid retrieval. The product decision is therefore to use
+`qwen3-embedding-0.6b` for every newly created fastembed-capable config, while
+retaining BM25 as a complete model-free capability.
 
 This is a default-selection decision, not a claim that every Qwen promotion
 gate has passed. The existing evidence still records an English-to-Korean
@@ -63,6 +65,11 @@ The following boundaries are normative:
   inference. Metadata context at the beginning is retained, authoritative
   bodies/snippets are unchanged, and the input-adapter revision is part of the
   generation fingerprint.
+- Hybrid retrieval uses the fixed `lexical_guard_v1` policy from ADR-0017:
+  preserve the BM25 top five, then apply weighted RRF (`k=60`, lexical `2`,
+  dense `1`, dense window `80`) to the remaining candidate pool. Production
+  and evaluation share this implementation, and users cannot configure its
+  weights, window, or protected head.
 - Content-free progress belongs on stderr for human foreground sync. qgh does
   not add a background embedding daemon, TUI dependency, or MCP sync/write tool.
 - New configs do not contain `[reranker]`. Reranking remains separately
@@ -87,4 +94,5 @@ The following boundaries are normative:
 - Qwen runtime, lifecycle, cross-language quality, resource, and abstention
   risks remain tracked even though the default semantic selection is fixed.
 - The reranker remains optional and off by default because its latency and
-  candidate-only role have not changed.
+  candidate-only role have not changed. When explicitly requested it may
+  reorder the protected retrieval head; it still cannot introduce a source.

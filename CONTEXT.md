@@ -68,6 +68,18 @@ _Avoid_: latest source, revision
 A `query` result that may answer the user's need but is not itself citation evidence.
 _Avoid_: answer, citation
 
+**Lexical Head**:
+The leading BM25 source candidates whose order is preserved when semantic retrieval is used as a complement.
+_Avoid_: hybrid winners, semantic head
+
+**Semantic Complement**:
+Source candidates recovered through local semantic retrieval without displacing the lexical head.
+_Avoid_: BM25 replacement, vector answer
+
+**Reranking**:
+An explicitly requested, bounded reordering of already retrieved source candidates that cannot introduce a new source.
+_Avoid_: retrieval, semantic search, answer scoring
+
 **Authoritative Source**:
 The content returned by `get`, including canonical URL, parent context, and source version metadata.
 _Avoid_: snippet, preview

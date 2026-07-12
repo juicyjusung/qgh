@@ -206,9 +206,11 @@ validation error instead of silently returning an empty result set.
 with lexical evidence, otherwise `null`. `ranking.vector_distance` is populated
 for internal vector-ranked results and for hybrid results with vector evidence,
 otherwise `null`; lower distance is closer. Hybrid results also include
-`ranking.rrf_rank_score` and `ranking.final_order_score`; in hybrid v1,
-`final_order_score` is the retrieval-stage ordering signal after RRF fusion and
-before optional bounded reranking.
+`ranking.rrf_rank_score` and `ranking.final_order_score`. The former is the
+weighted RRF evidence signal. The latter is the reciprocal result rank after
+the fixed `lexical_guard_v1` policy preserves the BM25 top five; it is the
+actual retrieval-stage ordering signal before optional bounded reranking.
+Neither field is confidence or probability.
 
 When `--rerank` or MCP `"rerank": true` is requested, `data.rerank` reports
 whether the fixed top-10 local stage was applied. Applied BM25, vector, and
