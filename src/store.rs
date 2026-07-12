@@ -4146,6 +4146,59 @@ impl Store {
         Ok(actual_count == expected_count && actual_digest == expected_digest)
     }
 
+    /// Returns the active source count only when every latest source version
+    /// has an intact chunk manifest for the expected tokenizer contract.
+    /// Trigger-backed invalidation makes this a metadata-only no-change check;
+    /// missing legacy evidence fails closed and asks the caller to re-chunk.
+    #[cfg(feature = "fastembed-provider")]
+    pub fn verified_active_source_chunk_manifest_count(
+        &self,
+        expected_fingerprint: &str,
+    ) -> Result<Option<usize>, QghError> {
+        if !embedding_schema_exists(&self.conn)?
+            || !table_exists(&self.conn, "source_chunk_manifests")?
+            || !chunk_manifest_invalidation_triggers_present(&self.conn)?
+        {
+            return Ok(None);
+        }
+        let (total, verified): (i64, i64) = self.conn.query_row(
+            "WITH active_versions AS (
+                SELECT se.source_id,
+                       coalesce(im.latest_version_id, cm.latest_version_id) AS source_version_id
+                FROM source_entities se
+                LEFT JOIN issue_metadata im ON im.source_id = se.source_id
+                LEFT JOIN comment_metadata cm ON cm.source_id = se.source_id
+                WHERE se.lifecycle_state = 'active'
+                  AND coalesce(im.latest_version_id, cm.latest_version_id) IS NOT NULL
+             )
+             SELECT count(*),
+                    coalesce(sum(CASE
+                      WHEN m.source_id = av.source_id
+                       AND m.chunker_fingerprint = ?1
+                       AND m.expected_count = (
+                         SELECT count(*) FROM chunks c
+                         WHERE c.source_version_id = av.source_version_id
+                       )
+                       AND NOT EXISTS (
+                         SELECT 1 FROM chunks c
+                         WHERE c.source_version_id = av.source_version_id
+                           AND c.chunker_fingerprint IS NOT ?1
+                       )
+                      THEN 1 ELSE 0 END), 0)
+             FROM active_versions av
+             LEFT JOIN source_chunk_manifests m
+               ON m.source_version_id = av.source_version_id",
+            params![expected_fingerprint],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if total != verified {
+            return Ok(None);
+        }
+        usize::try_from(total)
+            .map(Some)
+            .map_err(|_| QghError::storage("Active source count exceeds the supported range."))
+    }
+
     pub fn cleanup_inactive_embedding_artifacts(&mut self) -> Result<usize, QghError> {
         let expected_epoch = self.content_write_epoch;
         let tx = self
@@ -17608,6 +17661,12 @@ mod tests {
                 crate::chunking::CHUNKER_FINGERPRINT
             )
             .unwrap());
+        assert_eq!(
+            store
+                .verified_active_source_chunk_manifest_count(crate::chunking::CHUNKER_FINGERPRINT)
+                .unwrap(),
+            Some(1)
+        );
 
         store
             .conn
@@ -17622,9 +17681,21 @@ mod tests {
                 crate::chunking::CHUNKER_FINGERPRINT
             )
             .unwrap());
+        assert_eq!(
+            store
+                .verified_active_source_chunk_manifest_count(crate::chunking::CHUNKER_FINGERPRINT)
+                .unwrap(),
+            None
+        );
         store
             .replace_chunks_for_source_version(source_id, source_version_id, &chunks)
             .unwrap();
+        assert_eq!(
+            store
+                .verified_active_source_chunk_manifest_count(crate::chunking::CHUNKER_FINGERPRINT)
+                .unwrap(),
+            Some(1)
+        );
 
         store
             .conn
@@ -17640,6 +17711,12 @@ mod tests {
                 crate::chunking::CHUNKER_FINGERPRINT
             )
             .unwrap());
+        assert_eq!(
+            store
+                .verified_active_source_chunk_manifest_count(crate::chunking::CHUNKER_FINGERPRINT)
+                .unwrap(),
+            None
+        );
         store
             .replace_chunks_for_source_version(source_id, source_version_id, &chunks)
             .unwrap();

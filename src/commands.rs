@@ -1865,6 +1865,26 @@ struct ChunkRefreshStats {
     skipped_sources: usize,
 }
 
+#[cfg(feature = "fastembed-provider")]
+fn verified_embedding_chunk_nochange(
+    store: &Store,
+    expected_fingerprint: &str,
+    progress: &StderrSyncProgress,
+) -> Result<Option<ChunkRefreshStats>, QghError> {
+    let Some(skipped_sources) =
+        store.verified_active_source_chunk_manifest_count(expected_fingerprint)?
+    else {
+        return Ok(None);
+    };
+    progress.line(format_args!(
+        "qgh sync: refreshed embedding chunks chunks=0 skipped_sources={skipped_sources}"
+    ));
+    Ok(Some(ChunkRefreshStats {
+        refreshed_chunks: 0,
+        skipped_sources,
+    }))
+}
+
 fn prepare_embedding_chunks_for_sync_if_enabled(
     profile: &Profile,
     store: &mut Store,
@@ -1891,6 +1911,15 @@ fn prepare_embedding_chunks_for_sync_if_enabled(
             "embedding.tombstone_cleanup_failed",
             "Tombstoned embedding artifact cleanup failed during sync. BM25 results remain available.",
         )),
+    }
+    #[cfg(feature = "fastembed-provider")]
+    if is_qwen_embedding_config(embedding) {
+        let expected_fingerprint = configured_qwen_chunker_fingerprint();
+        if let Ok(Some(_stats)) =
+            verified_embedding_chunk_nochange(store, &expected_fingerprint, progress)
+        {
+            return (warnings, true);
+        }
     }
     let tokenizer = match embedding_tokenizer(embedding) {
         Ok(tokenizer) => tokenizer,
@@ -2330,10 +2359,19 @@ fn qwen_embedding_tokenizer_from_snapshot(
 fn qwen_embedding_chunker_fingerprint(
     snapshot: &crate::local_models::PreparedQwenModelSnapshot,
 ) -> String {
-    chunker_fingerprint_for_tokenizer_identity(&format!(
-        "qgh.qwen_tokenizer.v1:{}",
-        snapshot.manifest_hash
-    ))
+    qwen_embedding_chunker_fingerprint_for_manifest(&snapshot.manifest_hash)
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn configured_qwen_chunker_fingerprint() -> String {
+    let spec =
+        qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).expect("Qwen embedding preset is registered");
+    qwen_embedding_chunker_fingerprint_for_manifest(&qwen_model_manifest_hash(&spec))
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_embedding_chunker_fingerprint_for_manifest(manifest_hash: &str) -> String {
+    chunker_fingerprint_for_tokenizer_identity(&format!("qgh.qwen_tokenizer.v1:{manifest_hash}"))
 }
 
 #[cfg(not(feature = "fastembed-provider"))]
@@ -2861,17 +2899,19 @@ fn installed_qwen_embedding_snapshot(
 fn qwen_embedding_generation_contract_local_only(
     embedding: &EmbeddingConfig,
 ) -> Result<EmbeddingGenerationContract, QghError> {
-    let snapshot = installed_qwen_embedding_snapshot()?;
+    let spec =
+        qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).expect("Qwen embedding preset is registered");
+    let manifest_hash = qwen_model_manifest_hash(&spec);
     validate_qwen_embedding_device(embedding.device).map_err(embedding_error)?;
     let runtime_profile = qwen_embedding_runtime_profile_id(embedding.device);
     Ok(EmbeddingGenerationContract {
-        model_manifest_hash: snapshot.manifest_hash.clone(),
+        model_manifest_hash: manifest_hash.clone(),
         fingerprint_seed: qwen_embedding_fingerprint_seed(
             embedding,
-            &snapshot.manifest_hash,
+            &manifest_hash,
             runtime_profile,
         ),
-        chunker_fingerprint: qwen_embedding_chunker_fingerprint(&snapshot),
+        chunker_fingerprint: qwen_embedding_chunker_fingerprint_for_manifest(&manifest_hash),
         output_dimension: crate::qwen::QWEN_EMBEDDING_OUTPUT_DIMENSION,
     })
 }
@@ -8083,6 +8123,105 @@ mod tests {
             store.get_issue(source_id).unwrap().unwrap().body,
             raw_body_before
         );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(all(feature = "vector-search", feature = "fastembed-provider"))]
+    #[test]
+    fn qwen_nochange_plan_uses_pinned_contract_without_model_snapshot_access() {
+        let paths = temp_profile_paths("qwen-nochange-pinned-contract");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let source_id = "qgh://github.com/issue/I_QWEN_NOCHANGE_CONTRACT";
+        let issue = IssueRecord {
+            source_id: source_id.to_string(),
+            host: "github.com".to_string(),
+            repo: "owner/repo".to_string(),
+            node_id: "I_QWEN_NOCHANGE_CONTRACT".to_string(),
+            github_id: 907,
+            number: 907,
+            title: "Qwen no-change contract".to_string(),
+            body: "public no-change body".to_string(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone: None,
+            assignees: Vec::new(),
+            author: Some("alice".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            closed_at: None,
+            canonical_url: "https://github.com/owner/repo/issues/907".to_string(),
+            body_hash: "body-hash-qwen-nochange-contract".to_string(),
+            indexed_at: "2026-01-02T00:00:01Z".to_string(),
+        };
+        store
+            .upsert_sources_for_run("sync-qwen-nochange-contract", &[issue], &[], 0, &[])
+            .unwrap();
+        let source_version_id = store.latest_source_version_id(source_id).unwrap().unwrap();
+        let expected_chunker_fingerprint = configured_qwen_chunker_fingerprint();
+        store
+            .replace_chunks_for_source_version(
+                source_id,
+                source_version_id,
+                &[MarkdownChunk {
+                    chunk_index: 0,
+                    byte_start: 0,
+                    byte_end: 21,
+                    token_start: 0,
+                    token_end: 3,
+                    token_count: 3,
+                    body: "public no-change body".to_string(),
+                    chunker_version: crate::chunking::CHUNKER_VERSION.to_string(),
+                    chunker_fingerprint: expected_chunker_fingerprint.clone(),
+                    heading_path: Vec::new(),
+                }],
+            )
+            .unwrap();
+        let embedding = EmbeddingConfig {
+            provider: EmbeddingProviderKind::Local,
+            manifest_path: None,
+            model: Some(QWEN_EMBEDDING_PRESET_ID.to_string()),
+            model_path: None,
+            file: None,
+            pooling: None,
+            query_prefix: None,
+            quantization: None,
+            token_source: None,
+            device: crate::config::LocalModelDevice::Auto,
+        };
+
+        let contract = qwen_embedding_generation_contract_local_only(&embedding).unwrap();
+        let spec = qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).unwrap();
+        assert_eq!(
+            contract.model_manifest_hash,
+            qwen_model_manifest_hash(&spec)
+        );
+        assert_eq!(contract.chunker_fingerprint, expected_chunker_fingerprint);
+        let stats = verified_embedding_chunk_nochange(
+            &store,
+            &contract.chunker_fingerprint,
+            &StderrSyncProgress::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(stats.refreshed_chunks, 0);
+        assert_eq!(stats.skipped_sources, 1);
+
+        rusqlite::Connection::open(&paths.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE chunks SET body = 'public changed body' WHERE source_version_id = ?1",
+                rusqlite::params![source_version_id],
+            )
+            .unwrap();
+        assert!(verified_embedding_chunk_nochange(
+            &store,
+            &contract.chunker_fingerprint,
+            &StderrSyncProgress::new(false),
+        )
+        .unwrap()
+        .is_none());
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
