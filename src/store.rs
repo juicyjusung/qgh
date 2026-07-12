@@ -141,6 +141,21 @@ pub struct EmbeddingGenerationSpec {
     pub output_dimension: usize,
 }
 
+/// Work remaining for one immutable retrieval snapshot.
+///
+/// `already_staged` counts valid target-owned rows present before this call;
+/// `reused` counts rows copied during this call from one validated compatible
+/// predecessor. Every ID in `missing_chunk_ids` still requires inference.
+/// Reused vec0 rows are always newly owned by `generation_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct EmbeddingGenerationBuild {
+    pub(crate) generation_id: i64,
+    pub(crate) already_staged: usize,
+    pub(crate) reused: usize,
+    pub(crate) missing_chunk_ids: Vec<i64>,
+}
+
 type EmbeddingGenerationValidationRow = (
     String,
     i64,
@@ -6135,6 +6150,324 @@ impl Store {
         Ok(generation_id)
     }
 
+    /// Starts or resumes a building generation and fills it only with vectors
+    /// proven reusable for the captured snapshot.
+    ///
+    /// A predecessor must be `active` or `ready`, have the exact generation
+    /// identity, belong to the current content-write epoch, retain a valid
+    /// source-snapshot identity, and pass full BLOB/vec0 artifact validation.
+    /// Individual rows are copied only when chunk ID, source version ID/hash,
+    /// and metadata context hash match the current snapshot. Existing valid
+    /// target rows are preserved. Any corrupt target row fails that generation
+    /// closed so a later call can create a fresh one.
+    #[allow(dead_code)]
+    pub(crate) fn start_or_resume_embedding_generation(
+        &mut self,
+        snapshot: &RetrievalBuildSnapshot,
+        spec: &EmbeddingGenerationSpec,
+    ) -> Result<EmbeddingGenerationBuild, QghError> {
+        let generation_id = self.begin_embedding_generation(snapshot, spec)?;
+        let expected_epoch = self.content_write_epoch;
+        let tx = self.content_write_transaction()?;
+        let (
+            state,
+            dimension,
+            generation_epoch,
+            generation_source_epoch,
+            source_sync_run_id,
+            source_snapshot_hash,
+        ): (String, i64, i64, i64, String, String) = tx.query_row(
+            "SELECT state, output_dimension, write_epoch, source_snapshot_epoch,
+                    source_sync_run_id, source_snapshot_hash
+             FROM embedding_generations WHERE id = ?1",
+            params![generation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        let dimension = usize::try_from(dimension)
+            .ok()
+            .filter(|dimension| *dimension > 0)
+            .ok_or_else(embedding_generation_corrupt_error)?;
+        let current_source_epoch = read_source_snapshot_epoch(&tx)?;
+        let expected_source_hash = source_snapshot_identity_hash(&SourceSnapshotIdentity {
+            sync_run_id: source_sync_run_id,
+            epoch: generation_source_epoch,
+        });
+        if generation_epoch != expected_epoch {
+            return Err(write_fence_error());
+        }
+        if generation_source_epoch != current_source_epoch
+            || generation_source_epoch != snapshot.identity.epoch
+            || source_snapshot_hash != expected_source_hash
+        {
+            return Err(changed_source_snapshot_error());
+        }
+        if state != "building" {
+            return Err(QghError::validation(
+                "embedding.generation_not_building",
+                "Only a building embedding generation can be resumed.",
+            ));
+        }
+
+        let already_staged: i64 = tx.query_row(
+            "SELECT count(*) FROM embedding_generation_chunks WHERE generation_id = ?1",
+            params![generation_id],
+            |row| row.get(0),
+        )?;
+        let target_rows_valid = embedding_generation_content_rows_valid(
+            &tx,
+            generation_id,
+            dimension,
+            already_staged,
+            &spec.model_manifest_hash,
+            &spec.chunker_fingerprint,
+            &spec.context_template_version,
+        )? && validate_embedding_generation_vector_artifacts(
+            &tx,
+            generation_id,
+            dimension,
+            already_staged,
+        )
+        .is_ok();
+        if !target_rows_valid {
+            mark_embedding_generation_failed(
+                &tx,
+                generation_id,
+                "embedding.generation_validation_failed",
+            )?;
+            tx.commit()?;
+            return Err(QghError::validation(
+                "embedding.generation_validation_failed",
+                "Embedding generation validation failed.",
+            ));
+        }
+
+        let mut staged_chunk_ids = tx
+            .prepare(
+                "SELECT chunk_id FROM embedding_generation_chunks
+                 WHERE generation_id = ?1 ORDER BY chunk_id",
+            )?
+            .query_map(params![generation_id], |row| row.get::<_, i64>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let predecessor_ids = tx
+            .prepare(
+                "SELECT id FROM embedding_generations
+                 WHERE id != ?1
+                   AND state IN ('active', 'ready')
+                   AND model_manifest_hash = ?2
+                   AND runtime_fingerprint_hash = ?3
+                   AND chunker_fingerprint = ?4
+                   AND context_template_version = ?5
+                   AND output_dimension = ?6
+                   AND write_epoch = ?7
+                   AND total_chunks = completed_chunks
+                   AND embedding_inventory_hash IS NOT NULL
+                 ORDER BY id DESC",
+            )?
+            .query_map(
+                params![
+                    generation_id,
+                    spec.model_manifest_hash,
+                    spec.runtime_fingerprint_hash,
+                    spec.chunker_fingerprint,
+                    spec.context_template_version,
+                    dimension as i64,
+                    expected_epoch,
+                ],
+                |row| row.get::<_, i64>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut reused = 0usize;
+        for predecessor_id in predecessor_ids {
+            let (
+                predecessor_total,
+                predecessor_sync_run_id,
+                predecessor_source_epoch,
+                predecessor_snapshot_hash,
+            ): (i64, String, Option<i64>, String) = tx.query_row(
+                "SELECT total_chunks, source_sync_run_id, source_snapshot_epoch,
+                        source_snapshot_hash
+                 FROM embedding_generations WHERE id = ?1",
+                params![predecessor_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            let Some(predecessor_source_epoch) = predecessor_source_epoch else {
+                continue;
+            };
+            let predecessor_identity = SourceSnapshotIdentity {
+                sync_run_id: predecessor_sync_run_id,
+                epoch: predecessor_source_epoch,
+            };
+            let predecessor_snapshot_valid = predecessor_snapshot_hash
+                == source_snapshot_identity_hash(&predecessor_identity)
+                && tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sync_runs
+                         WHERE id = ?1 AND completed_successfully = 1
+                           AND source_snapshot_epoch = ?2
+                     )",
+                    params![predecessor_identity.sync_run_id, predecessor_identity.epoch],
+                    |row| row.get::<_, bool>(0),
+                )?;
+            if !predecessor_snapshot_valid
+                || !embedding_generation_stored_source_rows_valid(
+                    &tx,
+                    predecessor_id,
+                    dimension,
+                    predecessor_total,
+                )?
+                || validate_embedding_generation_vector_artifacts(
+                    &tx,
+                    predecessor_id,
+                    dimension,
+                    predecessor_total,
+                )
+                .is_err()
+            {
+                continue;
+            }
+
+            let vector_table = generation_vector_table_name(dimension);
+            tx.execute(
+                &format!(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS {vector_table}
+                     USING vec0(embedding float[{dimension}])"
+                ),
+                [],
+            )?;
+            for contextual in &snapshot.embedding_chunks {
+                let chunk = &contextual.chunk;
+                if staged_chunk_ids.contains(&chunk.chunk_id) {
+                    continue;
+                }
+                let current_source_hash = tx
+                    .query_row(
+                        "SELECT body_hash FROM source_versions WHERE id = ?1",
+                        params![chunk.source_version_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let expected_context_hash = contextual
+                    .prepared_input
+                    .context_hash(&spec.model_manifest_hash, &spec.chunker_fingerprint);
+                let predecessor_row = tx
+                    .query_row(
+                        "SELECT source_version_id, source_version_hash, context_hash,
+                                vector_blob, vector_checksum, vector_dimension
+                         FROM embedding_generation_chunks
+                         WHERE generation_id = ?1 AND chunk_id = ?2",
+                        params![predecessor_id, chunk.chunk_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, Vec<u8>>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, i64>(5)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((
+                    source_version_id,
+                    source_version_hash,
+                    context_hash,
+                    vector_blob,
+                    vector_checksum,
+                    vector_dimension,
+                )) = predecessor_row
+                else {
+                    continue;
+                };
+                if source_version_id != chunk.source_version_id
+                    || current_source_hash.as_deref() != Some(source_version_hash.as_str())
+                    || chunk.chunker_fingerprint != spec.chunker_fingerprint
+                    || contextual.prepared_input.context_template_version()
+                        != spec.context_template_version
+                    || context_hash != expected_context_hash
+                    || usize::try_from(vector_dimension).ok() != Some(dimension)
+                {
+                    continue;
+                }
+
+                tx.execute(
+                    "INSERT INTO embedding_generation_chunks
+                        (generation_id, chunk_id, source_version_id, source_version_hash,
+                         context_hash, vector_blob, vector_checksum, vector_dimension, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        generation_id,
+                        chunk.chunk_id,
+                        source_version_id,
+                        source_version_hash,
+                        context_hash,
+                        vector_blob,
+                        vector_checksum,
+                        dimension as i64,
+                        now_rfc3339(),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO embedding_generation_vector_rows
+                        (generation_id, chunk_id, dimension, vector_table, vector_rowid)
+                     VALUES (?1, ?2, ?3, ?4, 0)",
+                    params![
+                        generation_id,
+                        chunk.chunk_id,
+                        dimension as i64,
+                        vector_table,
+                    ],
+                )?;
+                let mapping_id = tx.last_insert_rowid();
+                tx.execute(
+                    &format!("INSERT INTO {vector_table}(rowid, embedding) VALUES (?1, ?2)"),
+                    params![mapping_id, vector_blob],
+                )?;
+                tx.execute(
+                    "UPDATE embedding_generation_vector_rows
+                     SET vector_rowid = ?1 WHERE id = ?1",
+                    params![mapping_id],
+                )?;
+                staged_chunk_ids.insert(chunk.chunk_id);
+                reused += 1;
+            }
+            break;
+        }
+
+        tx.execute(
+            "UPDATE embedding_generations
+             SET completed_chunks = (SELECT count(*) FROM embedding_generation_chunks WHERE generation_id = ?1),
+                 checkpoint_chunk_id = (SELECT max(chunk_id) FROM embedding_generation_chunks WHERE generation_id = ?1),
+                 updated_at = ?2
+             WHERE id = ?1",
+            params![generation_id, now_rfc3339()],
+        )?;
+        let missing_chunk_ids = snapshot
+            .embedding_chunks
+            .iter()
+            .map(|contextual| contextual.chunk.chunk_id)
+            .filter(|chunk_id| !staged_chunk_ids.contains(chunk_id))
+            .collect();
+        tx.commit()?;
+        Ok(EmbeddingGenerationBuild {
+            generation_id,
+            already_staged: usize::try_from(already_staged)
+                .map_err(|_| embedding_generation_corrupt_error())?,
+            reused,
+            missing_chunk_ids,
+        })
+    }
+
     pub fn stage_embedding_generation_batch(
         &mut self,
         generation_id: i64,
@@ -9262,6 +9595,67 @@ fn validate_purge_generation_vector_mapping_ownership(
         validated.insert(*generation_id, owned);
     }
     Ok(validated)
+}
+
+#[allow(dead_code)]
+fn embedding_generation_stored_source_rows_valid(
+    conn: &Connection,
+    generation_id: i64,
+    dimension: usize,
+    total_chunks: i64,
+) -> Result<bool, QghError> {
+    let mut statement = conn.prepare(
+        "SELECT gc.source_version_id, gc.source_version_hash, sv.body_hash,
+                c.source_version_id, gc.vector_blob, gc.vector_checksum,
+                gc.vector_dimension
+         FROM embedding_generation_chunks gc
+         JOIN source_versions sv ON sv.id = gc.source_version_id
+         JOIN chunks c ON c.id = gc.chunk_id
+         WHERE gc.generation_id = ?1",
+    )?;
+    let rows = statement.query_map(params![generation_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+        ))
+    })?;
+    let mut validated_rows = 0i64;
+    for row in rows {
+        validated_rows = validated_rows
+            .checked_add(1)
+            .ok_or_else(embedding_generation_corrupt_error)?;
+        let (
+            source_version_id,
+            stored_source_hash,
+            authoritative_source_hash,
+            chunk_source_version_id,
+            vector_blob,
+            vector_checksum,
+            vector_dimension,
+        ) = row?;
+        let vector = match usize::try_from(vector_dimension).ok() {
+            Some(stored_dimension) if stored_dimension == dimension => {
+                decode_embedding_blob(&vector_blob, dimension).ok()
+            }
+            _ => None,
+        };
+        if source_version_id != chunk_source_version_id
+            || stored_source_hash != authoritative_source_hash
+            || embedding_blob_checksum(&vector_blob) != vector_checksum
+            || vector.as_ref().is_none_or(|vector| {
+                !vector.iter().all(|value| value.is_finite())
+                    || vector.iter().all(|value| *value == 0.0)
+            })
+        {
+            return Ok(false);
+        }
+    }
+    Ok(validated_rows == total_chunks)
 }
 
 fn embedding_generation_content_rows_valid(
@@ -17403,6 +17797,540 @@ mod tests {
             "embedding.generation_inventory_mismatch"
         );
         let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn embedding_generation_build_reuses_unchanged_active_vectors_with_fresh_ownership() {
+        let paths = temp_profile_paths("generation-reuse-active");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let retained_source_id = "qgh://github.com/issue/I_GENERATION_REUSE_RETAINED";
+        let retained_chunk_id = insert_test_issue_chunk(
+            &mut store,
+            retained_source_id,
+            "sync-generation-reuse-first",
+        );
+        let manifest = "manifest-generation-reuse";
+        let predecessor_id = stage_test_generation(&mut store, manifest, &[retained_chunk_id]);
+        publish_test_retrieval(&mut store, &paths, Some(predecessor_id));
+
+        let added_source_id = "qgh://github.com/issue/I_GENERATION_REUSE_ADDED";
+        store
+            .upsert_sources_for_run(
+                "sync-generation-reuse-second",
+                &[test_issue(added_source_id, "owner/repo", "added")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let added_chunk_id = insert_chunk(&mut store, added_source_id, "added chunk");
+        store
+            .mark_sync_run_completed("sync-generation-reuse-second")
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let spec = EmbeddingGenerationSpec {
+            model_manifest_hash: manifest.to_string(),
+            runtime_fingerprint_hash: format!("runtime-{manifest}"),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            output_dimension: 2,
+        };
+
+        let build = store
+            .start_or_resume_embedding_generation(&snapshot, &spec)
+            .unwrap();
+
+        assert_ne!(build.generation_id, predecessor_id);
+        assert_eq!(build.already_staged, 0);
+        assert_eq!(build.reused, 1);
+        assert_eq!(build.missing_chunk_ids, vec![added_chunk_id]);
+        assert_eq!(
+            store
+                .embedding_generation_chunk_blob(build.generation_id, retained_chunk_id)
+                .unwrap(),
+            store
+                .embedding_generation_chunk_blob(predecessor_id, retained_chunk_id)
+                .unwrap()
+        );
+        let predecessor_mapping: (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT id, vector_rowid FROM embedding_generation_vector_rows
+                 WHERE generation_id = ?1 AND chunk_id = ?2",
+                params![predecessor_id, retained_chunk_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let target_mapping: (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT id, vector_rowid FROM embedding_generation_vector_rows
+                 WHERE generation_id = ?1 AND chunk_id = ?2",
+                params![build.generation_id, retained_chunk_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(target_mapping, predecessor_mapping);
+        assert_eq!(target_mapping.0, target_mapping.1);
+        store
+            .stage_embedding_generation_batch(
+                build.generation_id,
+                &[staged_test_chunk(&store, added_chunk_id, manifest)],
+            )
+            .unwrap();
+        store
+            .validate_embedding_generation(build.generation_id)
+            .unwrap();
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn embedding_generation_build_resume_preserves_valid_staged_rows() {
+        let paths = temp_profile_paths("generation-resume-staged");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let first_chunk_id = insert_test_issue_chunk(
+            &mut store,
+            "qgh://github.com/issue/I_GENERATION_RESUME_FIRST",
+            "sync-generation-resume-first",
+        );
+        let second_chunk_id = insert_test_issue_chunk(
+            &mut store,
+            "qgh://github.com/issue/I_GENERATION_RESUME_SECOND",
+            "sync-generation-resume-second",
+        );
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let manifest = "manifest-generation-resume";
+        let spec = EmbeddingGenerationSpec {
+            model_manifest_hash: manifest.to_string(),
+            runtime_fingerprint_hash: "runtime-generation-resume".to_string(),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            output_dimension: 2,
+        };
+        let first_build = store
+            .start_or_resume_embedding_generation(&snapshot, &spec)
+            .unwrap();
+        let staged = staged_test_chunk(&store, first_chunk_id, manifest);
+        store
+            .stage_embedding_generation_batch(first_build.generation_id, &[staged])
+            .unwrap();
+        let staged_before = store
+            .embedding_generation_chunk_blob(first_build.generation_id, first_chunk_id)
+            .unwrap();
+
+        let resumed = store
+            .start_or_resume_embedding_generation(&snapshot, &spec)
+            .unwrap();
+
+        assert_eq!(resumed.generation_id, first_build.generation_id);
+        assert_eq!(resumed.already_staged, 1);
+        assert_eq!(resumed.reused, 0);
+        assert_eq!(resumed.missing_chunk_ids, vec![second_chunk_id]);
+        assert_eq!(
+            store
+                .embedding_generation_chunk_blob(resumed.generation_id, first_chunk_id)
+                .unwrap(),
+            staged_before
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn embedding_generation_build_fails_corrupt_target_and_restarts_fresh() {
+        let paths = temp_profile_paths("generation-resume-corrupt");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let chunk_id = insert_test_issue_chunk(
+            &mut store,
+            "qgh://github.com/issue/I_GENERATION_RESUME_CORRUPT",
+            "sync-generation-resume-corrupt",
+        );
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let manifest = "manifest-generation-resume-corrupt";
+        let spec = EmbeddingGenerationSpec {
+            model_manifest_hash: manifest.to_string(),
+            runtime_fingerprint_hash: "runtime-generation-resume-corrupt".to_string(),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            output_dimension: 2,
+        };
+        let first_build = store
+            .start_or_resume_embedding_generation(&snapshot, &spec)
+            .unwrap();
+        let staged = staged_test_chunk(&store, chunk_id, manifest);
+        store
+            .stage_embedding_generation_batch(first_build.generation_id, &[staged])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_generation_chunks SET vector_blob = X'0000000000000000'
+                 WHERE generation_id = ?1 AND chunk_id = ?2",
+                params![first_build.generation_id, chunk_id],
+            )
+            .unwrap();
+
+        let error = store
+            .start_or_resume_embedding_generation(&snapshot, &spec)
+            .unwrap_err();
+
+        assert_eq!(error.code, "embedding.generation_validation_failed");
+        assert_eq!(
+            store
+                .embedding_generation_state(first_build.generation_id)
+                .unwrap(),
+            "failed"
+        );
+        let restarted = store
+            .start_or_resume_embedding_generation(&snapshot, &spec)
+            .unwrap();
+        assert_ne!(restarted.generation_id, first_build.generation_id);
+        assert_eq!(restarted.already_staged, 0);
+        assert_eq!(restarted.reused, 0);
+        assert_eq!(restarted.missing_chunk_ids, vec![chunk_id]);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn embedding_generation_build_does_not_reuse_changed_metadata_context() {
+        let paths = temp_profile_paths("generation-reuse-context-change");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let source_id = "qgh://github.com/issue/I_GENERATION_REUSE_CONTEXT";
+        let mut issue = test_issue(source_id, "owner/repo", "context");
+        store
+            .upsert_sources_for_run(
+                "sync-generation-reuse-context-first",
+                std::slice::from_ref(&issue),
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let chunk_id = insert_chunk(&mut store, source_id, "context body chunk");
+        store
+            .mark_sync_run_completed("sync-generation-reuse-context-first")
+            .unwrap();
+        let manifest = "manifest-generation-reuse-context";
+        let predecessor_id = stage_test_generation(&mut store, manifest, &[chunk_id]);
+        publish_test_retrieval(&mut store, &paths, Some(predecessor_id));
+
+        issue.title = "Changed metadata title".to_string();
+        store
+            .upsert_sources_for_run(
+                "sync-generation-reuse-context-second",
+                &[issue],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-generation-reuse-context-second")
+            .unwrap();
+        assert!(store
+            .active_contextual_embedding_chunks()
+            .unwrap()
+            .iter()
+            .any(|chunk| chunk.chunk.chunk_id == chunk_id));
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let spec = EmbeddingGenerationSpec {
+            model_manifest_hash: manifest.to_string(),
+            runtime_fingerprint_hash: format!("runtime-{manifest}"),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            output_dimension: 2,
+        };
+
+        let build = store
+            .start_or_resume_embedding_generation(&snapshot, &spec)
+            .unwrap();
+
+        assert_eq!(build.reused, 0);
+        assert_eq!(build.missing_chunk_ids, vec![chunk_id]);
+        assert!(store
+            .embedding_generation_chunk_blob(build.generation_id, chunk_id)
+            .is_err());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn embedding_generation_build_does_not_reuse_mismatched_source_hash() {
+        let (paths, mut store, chunk_id, predecessor_id, manifest) =
+            ready_generation_fixture("generation-reuse-source-hash");
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_generation_chunks
+                 SET source_version_hash = 'mismatched-source-hash'
+                 WHERE generation_id = ?1 AND chunk_id = ?2",
+                params![predecessor_id, chunk_id],
+            )
+            .unwrap();
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let spec = EmbeddingGenerationSpec {
+            model_manifest_hash: manifest.clone(),
+            runtime_fingerprint_hash: format!("runtime-{manifest}"),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            output_dimension: 2,
+        };
+
+        let build = store
+            .start_or_resume_embedding_generation(&snapshot, &spec)
+            .unwrap();
+
+        assert_eq!(build.reused, 0);
+        assert_eq!(build.missing_chunk_ids, vec![chunk_id]);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn embedding_generation_build_skips_corrupt_latest_predecessor() {
+        let paths = temp_profile_paths("generation-reuse-corrupt-predecessor");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let source_id = "qgh://github.com/issue/I_GENERATION_REUSE_CORRUPT_PREDECESSOR";
+        let chunk_id = insert_test_issue_chunk(
+            &mut store,
+            source_id,
+            "sync-generation-reuse-corrupt-predecessor",
+        );
+        let manifest = "manifest-generation-reuse-corrupt-predecessor";
+        let valid_predecessor = stage_test_generation(&mut store, manifest, &[chunk_id]);
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let spec = EmbeddingGenerationSpec {
+            model_manifest_hash: manifest.to_string(),
+            runtime_fingerprint_hash: format!("runtime-{manifest}"),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            output_dimension: 2,
+        };
+        let corrupt_predecessor = store.begin_embedding_generation(&snapshot, &spec).unwrap();
+        let corrupt_chunk = staged_test_chunk(&store, chunk_id, manifest);
+        store
+            .stage_embedding_generation_batch(corrupt_predecessor, &[corrupt_chunk])
+            .unwrap();
+        store
+            .validate_embedding_generation(corrupt_predecessor)
+            .unwrap();
+        let corrupt_blob = encode_embedding_blob(&[9.0, 10.0]);
+        let corrupt_checksum = embedding_blob_checksum(&corrupt_blob);
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_generation_chunks
+                 SET vector_blob = ?2, vector_checksum = ?3
+                 WHERE generation_id = ?1 AND chunk_id = ?4",
+                params![
+                    corrupt_predecessor,
+                    corrupt_blob,
+                    corrupt_checksum,
+                    chunk_id
+                ],
+            )
+            .unwrap();
+
+        let build = store
+            .start_or_resume_embedding_generation(&snapshot, &spec)
+            .unwrap();
+
+        assert_ne!(build.generation_id, corrupt_predecessor);
+        assert_eq!(build.reused, 1);
+        assert!(build.missing_chunk_ids.is_empty());
+        assert_eq!(
+            store
+                .embedding_generation_chunk_blob(build.generation_id, chunk_id)
+                .unwrap(),
+            store
+                .embedding_generation_chunk_blob(valid_predecessor, chunk_id)
+                .unwrap()
+        );
+        assert_ne!(
+            store
+                .embedding_generation_chunk_blob(build.generation_id, chunk_id)
+                .unwrap()
+                .bytes,
+            corrupt_blob
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn embedding_generation_build_requires_exact_predecessor_identity() {
+        let paths = temp_profile_paths("generation-reuse-exact-identity");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let chunk_id = insert_test_issue_chunk(
+            &mut store,
+            "qgh://github.com/issue/I_GENERATION_REUSE_EXACT_IDENTITY",
+            "sync-generation-reuse-exact-identity",
+        );
+        let manifest = "manifest-generation-reuse-exact-identity";
+        stage_test_generation(&mut store, manifest, &[chunk_id]);
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let compatible = EmbeddingGenerationSpec {
+            model_manifest_hash: manifest.to_string(),
+            runtime_fingerprint_hash: format!("runtime-{manifest}"),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            output_dimension: 2,
+        };
+        let incompatible = [
+            EmbeddingGenerationSpec {
+                model_manifest_hash: "different-manifest".to_string(),
+                ..compatible.clone()
+            },
+            EmbeddingGenerationSpec {
+                runtime_fingerprint_hash: "different-runtime".to_string(),
+                ..compatible.clone()
+            },
+            EmbeddingGenerationSpec {
+                chunker_fingerprint: "different-chunker".to_string(),
+                ..compatible.clone()
+            },
+            EmbeddingGenerationSpec {
+                output_dimension: 3,
+                ..compatible.clone()
+            },
+        ];
+
+        for spec in incompatible {
+            let build = store
+                .start_or_resume_embedding_generation(&snapshot, &spec)
+                .unwrap();
+            assert_eq!(build.reused, 0);
+            assert_eq!(build.missing_chunk_ids, vec![chunk_id]);
+        }
+        let unsupported_context = EmbeddingGenerationSpec {
+            context_template_version: "unsupported-context-template".to_string(),
+            ..compatible
+        };
+        assert_eq!(
+            store
+                .start_or_resume_embedding_generation(&snapshot, &unsupported_context)
+                .unwrap_err()
+                .code,
+            "embedding.context_template_unsupported"
+        );
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn embedding_generation_build_rejects_pending_purge_and_write_epoch_drift() {
+        let pending_paths = temp_profile_paths("generation-reuse-pending-purge");
+        let mut pending_store = Store::open(&pending_paths).unwrap();
+        pending_store.enable_vector().unwrap();
+        let pending_chunk_id = insert_test_issue_chunk(
+            &mut pending_store,
+            "qgh://github.com/issue/I_GENERATION_REUSE_PENDING_PURGE",
+            "sync-generation-reuse-pending-purge",
+        );
+        let pending_manifest = "manifest-generation-reuse-pending-purge";
+        stage_test_generation(&mut pending_store, pending_manifest, &[pending_chunk_id]);
+        let pending_snapshot = pending_store
+            .capture_retrieval_build_snapshot()
+            .unwrap()
+            .unwrap();
+        let pending_spec = EmbeddingGenerationSpec {
+            model_manifest_hash: pending_manifest.to_string(),
+            runtime_fingerprint_hash: format!("runtime-{pending_manifest}"),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            output_dimension: 2,
+        };
+        let generations_before_pending: i64 = pending_store
+            .conn
+            .query_row("SELECT count(*) FROM embedding_generations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        pending_store
+            .queue_purges(&[(
+                PurgeTarget::Repository {
+                    repo: "owner/unrelated".to_string(),
+                },
+                PurgeTrigger::AllowlistRemoval,
+            )])
+            .unwrap();
+
+        assert_eq!(
+            pending_store
+                .start_or_resume_embedding_generation(&pending_snapshot, &pending_spec)
+                .unwrap_err()
+                .code,
+            "publication.source_snapshot_changed"
+        );
+        assert_eq!(
+            pending_store
+                .conn
+                .query_row("SELECT count(*) FROM embedding_generations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            generations_before_pending
+        );
+
+        let drift_paths = temp_profile_paths("generation-reuse-write-epoch-drift");
+        let mut stale_store = Store::open(&drift_paths).unwrap();
+        stale_store.enable_vector().unwrap();
+        let drift_chunk_id = insert_test_issue_chunk(
+            &mut stale_store,
+            "qgh://github.com/issue/I_GENERATION_REUSE_EPOCH_DRIFT",
+            "sync-generation-reuse-write-epoch-drift",
+        );
+        let drift_manifest = "manifest-generation-reuse-write-epoch-drift";
+        stage_test_generation(&mut stale_store, drift_manifest, &[drift_chunk_id]);
+        let stale_snapshot = stale_store
+            .capture_retrieval_build_snapshot()
+            .unwrap()
+            .unwrap();
+        let drift_spec = EmbeddingGenerationSpec {
+            model_manifest_hash: drift_manifest.to_string(),
+            runtime_fingerprint_hash: format!("runtime-{drift_manifest}"),
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            output_dimension: 2,
+        };
+        let mut purger = Store::open(&drift_paths).unwrap();
+        purger.enable_vector().unwrap();
+        purger
+            .conn
+            .execute(
+                "UPDATE profile_meta
+                 SET value = CAST(value AS INTEGER) + 1
+                 WHERE key = 'content_write_epoch'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            stale_store
+                .start_or_resume_embedding_generation(&stale_snapshot, &drift_spec)
+                .unwrap_err()
+                .code,
+            "purge.write_fenced"
+        );
+
+        let _ = fs::remove_dir_all(pending_paths.profile_dir);
+        let _ = fs::remove_dir_all(drift_paths.profile_dir);
     }
 
     #[test]
