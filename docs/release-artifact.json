@@ -5,12 +5,12 @@
     "product_core": "CLI-first local retrieval with strict --json envelopes and SQLite/Tantivy behavior",
     "contract_source_of_truth": ["CLI args", "docs/schemas/*.schema.json", "local SQLite/Tantivy retrieval behavior"],
     "schema_object_closure": "released schema object shapes are closed by default; only envelope.data and error.details are documented extension points",
-    "cli_commands": ["init", "sync", "embed", "query", "search", "get", "status", "doctor", "mcp"],
-    "canonical_cli_commands": ["init", "sync", "embed", "query", "get", "status", "doctor"],
+    "cli_commands": ["init", "sync", "embed", "model", "query", "search", "get", "status", "doctor", "mcp"],
+    "canonical_cli_commands": ["init", "sync", "embed", "model", "query", "get", "status", "doctor"],
     "cli_aliases": {
       "search": "query"
     },
-    "cli_only_commands": ["init", "sync", "embed", "doctor"],
+    "cli_only_commands": ["init", "sync", "embed", "model", "doctor"],
     "human_output": "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v1 envelopes",
     "primary_install_channel": {
       "manager": "homebrew",
@@ -66,6 +66,7 @@
       "doctor",
       "eval",
       "embed",
+      "model",
       "delete",
       "update",
       "write",
@@ -87,6 +88,7 @@
     "docs/schemas/error.schema.json",
     "docs/schemas/init-output.schema.json",
     "docs/schemas/sync-output.schema.json",
+    "docs/schemas/model-output.schema.json",
     "docs/schemas/query-result.schema.json",
     "docs/schemas/get-output.schema.json",
     "docs/schemas/status-output.schema.json",

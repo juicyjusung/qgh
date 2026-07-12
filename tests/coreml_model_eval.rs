@@ -234,6 +234,9 @@ fn build_model(
             .with_pooling(match manifest.pooling {
                 PoolingKind::Cls => fastembed::Pooling::Cls,
                 PoolingKind::Mean => fastembed::Pooling::Mean,
+                PoolingKind::LastToken => {
+                    panic!("CoreML ONNX eval does not support last-token pooling")
+                }
             })
             .with_quantization(QuantizationMode::None);
     let started = Instant::now();

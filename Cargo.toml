@@ -10,12 +10,14 @@ repository = "https://github.com/juicyjusung/qgh"
 [features]
 default = []
 vector-search = ["dep:sqlite-vec"]
-fastembed-provider = ["vector-search", "dep:fastembed", "dep:hf-hub", "dep:tokenizers"]
+fastembed-provider = ["vector-search", "dep:fastembed", "dep:hf-hub", "dep:tokenizers", "dep:candle-core", "dep:candle-nn"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-fastembed = { version = "5.17.2", default-features = false, features = ["ort-download-binaries-rustls-tls"], optional = true }
+fastembed = { version = "5.17.2", default-features = false, features = ["ort-download-binaries-rustls-tls", "qwen3"], optional = true }
+candle-core = { version = "=0.10.2", default-features = false, optional = true }
+candle-nn = { version = "=0.10.2", default-features = false, optional = true }
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
 percent-encoding = "2.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -32,6 +34,10 @@ tokenizers = { version = "0.22.2", optional = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["coreml"] }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+candle-core = { version = "=0.10.2", default-features = false, features = ["accelerate", "metal"], optional = true }
+candle-nn = { version = "=0.10.2", default-features = false, features = ["accelerate", "metal"], optional = true }
 
 [package.metadata.dist]
 dist = true

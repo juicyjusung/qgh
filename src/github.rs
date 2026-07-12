@@ -3060,6 +3060,7 @@ mod permission_classification_tests {
             web_base_url: "https://example.test".to_string(),
             repos,
             embedding: None,
+            reranker: None,
             reconcile_after_seconds: None,
             freshness: FreshnessSettings {
                 query_max_age_seconds: 60,

@@ -1,19 +1,23 @@
 use crate::chunking::{
     chunk_markdown_with_fingerprint, chunker_fingerprint_for_tokenizer_identity,
 };
-use crate::cli::{EmbedArgs, InitArgs, InitRepoArgs, InitTokenSourceArg, QueryArgs, ReconcileMode};
+use crate::cli::{
+    EmbedArgs, InitArgs, InitRepoArgs, InitTokenSourceArg, ModelArgs, ModelCommand, QueryArgs,
+    ReconcileMode,
+};
 use crate::config::{
     bootstrap_profile_repo, current_git_worktree_root, discover_repo_policy,
     git_remote_defaults_for_root, load_profile, load_repo_policy_at, parse_repo, resolve_token,
     suggest_init_profile_id, CommentsMode, EmbeddingConfig, EmbeddingProviderKind, GitRemote,
     Profile, ProfileBootstrapInput, RepoPolicy, RepoRef, TokenSource,
 };
+use crate::context::{prepare_embedding_input, EmbeddingSourceContext};
 use crate::coverage;
 use crate::embedding::{
     builtin_preset_hf_reference, default_hf_model_reference, default_prepared_model_store,
     parse_hf_model_reference, EmbeddingFingerprint, EmbeddingFingerprintExpectation,
     EmbeddingFingerprintSeed, EmbeddingProvider, EmbeddingProviderError, EmbeddingTokenizer,
-    EmbeddingVector, ModelManifestV1, ModelSourceV1, PreparedManifestInspection,
+    EmbeddingVector, ModelManifestV1, ModelSourceV1, PoolingKind, PreparedManifestInspection,
     PreparedModelInspection, PreparedModelStore, LOCAL_MODEL_REVISION,
 };
 #[cfg(feature = "fastembed-provider")]
@@ -22,16 +26,26 @@ use crate::embedding::{
     FastembedTokenizer, LocalEmbeddingProvider, PreparedEmbeddingTokenizer, PreparedModelSnapshot,
 };
 #[cfg(debug_assertions)]
-use crate::embedding::{PoolingKind, TokenSpan, DEFAULT_QUERY_PREFIX};
+use crate::embedding::{TokenSpan, DEFAULT_QUERY_PREFIX};
 use crate::error::QghError;
 use crate::freshness::{self, FreshnessContext, FreshnessOverrides};
 use crate::github;
 use crate::index;
+use crate::local_models::{
+    default_prepared_qwen_model_store, install_qwen_model, qwen_model_spec, ModelInstallAction,
+    QWEN_EMBEDDING_MODEL_ID, QWEN_EMBEDDING_PRESET_ID, QWEN_EMBEDDING_QUERY_PREFIX,
+    QWEN_EMBEDDING_REVISION, QWEN_RERANKER_PRESET_ID,
+};
 use crate::model::{
     ReconciliationCandidate, StoredChunk, StoredComment, StoredIssue, StoredSource, SyncSummary,
     TargetedSyncSummary, VectorSearchFilters,
 };
 use crate::paths::ProfilePaths;
+#[cfg(feature = "fastembed-provider")]
+use crate::qwen::{
+    load_qwen_embedding, load_qwen_reranker, qwen_embedding_runtime_profile_id, QwenReranker,
+    QWEN_RERANK_DEPTH, QWEN_RERANK_MAX_LENGTH,
+};
 use crate::resolution::ResolvedRepoScope;
 use crate::store::{
     PendingPurgeView, PurgeTarget, PurgeTrigger, RetrievalBuildSnapshot, RetrievalPublicationView,
@@ -52,6 +66,8 @@ const HYBRID_RRF_K: f32 = 60.0;
 const STALE_BUILDING_RETENTION_HOURS: i64 = 24;
 const PREVIOUS_READY_RETENTION_DAYS: i64 = 7;
 const HYBRID_OVERFETCH_FACTOR: usize = 4;
+const LOCAL_RERANK_DEPTH: usize = 10;
+const LOCAL_RERANK_MAX_TOKENS: usize = 384;
 
 /// Default `--if-stale` threshold when neither the flag nor `[sync].max_age`
 /// provides one: 30 minutes.
@@ -70,6 +86,42 @@ pub struct InitCommandOutcome {
 pub struct LocalReadOutcome {
     pub data: Value,
     pub warnings: Vec<Value>,
+}
+
+pub fn install_model(args: &ModelArgs) -> Result<LocalReadOutcome, QghError> {
+    let ModelCommand::Install(args) = &args.command;
+    let preset_id = args.model.as_str();
+    let spec = qwen_model_spec(preset_id).expect("CLI model preset is registered");
+    let outcome = install_qwen_model(preset_id)?;
+    let action = match outcome.action {
+        ModelInstallAction::Installed => "installed",
+        ModelInstallAction::AlreadyInstalled => "already_installed",
+    };
+    let warnings = if preset_id == QWEN_RERANKER_PRESET_ID {
+        vec![reranker_warning(
+            "reranker.experimental",
+            "The local Qwen reranker is experimental and remains disabled unless each query explicitly requests reranking.",
+        )]
+    } else {
+        Vec::new()
+    };
+    Ok(local_read_outcome(
+        json!({
+            "model": preset_id,
+            "purpose": match spec.purpose {
+                crate::local_models::ModelPurpose::Embedding => "embedding",
+                crate::local_models::ModelPurpose::Reranker => "reranker",
+            },
+            "model_id": spec.model_id,
+            "resolved_revision": spec.resolved_revision,
+            "action": action,
+            "artifact_count": spec.artifacts.len(),
+            "verified_bytes": spec.artifacts.iter().map(|artifact| artifact.byte_size).sum::<u64>(),
+            "manifest_hash": outcome.snapshot.manifest_hash,
+            "weights_bundled": false
+        }),
+        warnings,
+    ))
 }
 
 fn local_read_outcome(data: Value, warnings: Vec<Value>) -> LocalReadOutcome {
@@ -2195,11 +2247,16 @@ struct EmbeddingRuntime {
 #[cfg(feature = "fastembed-provider")]
 static EMBEDDING_RUNTIME_CACHE: OnceLock<Mutex<HashMap<String, Arc<EmbeddingRuntime>>>> =
     OnceLock::new();
+#[cfg(feature = "fastembed-provider")]
+static RERANKER_RUNTIME_CACHE: OnceLock<Mutex<HashMap<String, Arc<QwenReranker>>>> =
+    OnceLock::new();
 
 #[cfg(debug_assertions)]
 const TEST_EMBEDDING_QUERY_VECTORS_ENV: &str = "QGH_TEST_EMBEDDING_QUERY_VECTORS";
 #[cfg(debug_assertions)]
 const TEST_EMBEDDING_DOCUMENT_VECTORS_ENV: &str = "QGH_TEST_EMBEDDING_DOCUMENT_VECTORS";
+#[cfg(debug_assertions)]
+const TEST_RERANK_SCORES_ENV: &str = "QGH_TEST_RERANK_SCORES";
 
 #[cfg(debug_assertions)]
 struct TestEmbeddingProvider {
@@ -2306,10 +2363,9 @@ fn test_embedding_runtime(
             model_revision: configured
                 .model_revision
                 .unwrap_or_else(|| LOCAL_MODEL_REVISION.to_string()),
-            pooling: embedding.pooling.unwrap_or(PoolingKind::Cls),
-            query_prefix: embedding
+            pooling: configured.pooling.unwrap_or(PoolingKind::Cls),
+            query_prefix: configured
                 .query_prefix
-                .clone()
                 .unwrap_or_else(|| DEFAULT_QUERY_PREFIX.to_string()),
         },
     }))
@@ -2377,6 +2433,9 @@ fn embedding_runtime_with_access(
     if let Some(runtime) = test_embedding_runtime(embedding)? {
         return Ok(Arc::new(runtime));
     }
+    if is_qwen_embedding_config(embedding) {
+        return qwen_embedding_runtime_local_only(embedding, cache_profile_id);
+    }
     match embedding.provider {
         EmbeddingProviderKind::Local => {
             let options = embedding.fastembed_options();
@@ -2408,6 +2467,74 @@ fn embedding_runtime_with_access(
             }
         }
     }
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_embedding_runtime_local_only(
+    embedding: &EmbeddingConfig,
+    cache_profile_id: Option<&str>,
+) -> Result<Arc<EmbeddingRuntime>, QghError> {
+    let spec =
+        qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).expect("Qwen embedding preset is registered");
+    let snapshot = default_prepared_qwen_model_store()
+        .and_then(|store| store.inspect(&spec))
+        .map_err(|error| {
+            if error.code == "model.not_installed" {
+                QghError::validation(
+                    "embedding.model_not_installed",
+                    "The configured local Qwen embedding model is not installed.",
+                )
+                .with_hint("Run `qgh model install qwen3-embedding-0.6b`.")
+            } else {
+                QghError::validation(
+                    "embedding.qwen_snapshot_invalid",
+                    "The prepared Qwen embedding snapshot failed integrity validation.",
+                )
+            }
+        })?;
+    let runtime_profile = qwen_embedding_runtime_profile_id(embedding.device);
+    if let Some(profile_id) = cache_profile_id {
+        let cache_key = format!(
+            "{profile_id}:qwen:{}:{runtime_profile}",
+            snapshot.manifest_hash
+        );
+        let profile_prefix = format!("{profile_id}:");
+        return runtime_cache_get_or_try_init(
+            EMBEDDING_RUNTIME_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+            &cache_key,
+            &profile_prefix,
+            || build_qwen_embedding_runtime(embedding, &snapshot),
+        );
+    }
+    build_qwen_embedding_runtime(embedding, &snapshot)
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn build_qwen_embedding_runtime(
+    embedding: &EmbeddingConfig,
+    snapshot: &crate::local_models::PreparedQwenModelSnapshot,
+) -> Result<Arc<EmbeddingRuntime>, QghError> {
+    let parts = load_qwen_embedding(snapshot, embedding.device).map_err(embedding_error)?;
+    validate_batch_comparability(&parts.provider, "qgh prepared Qwen model smoke")
+        .map_err(embedding_error)?;
+    let runtime_profile = parts.runtime_profile.as_str();
+    let chunker_fingerprint = chunker_fingerprint_for_tokenizer_identity(&format!(
+        "qgh.qwen_tokenizer.v1:{}",
+        snapshot.manifest_hash
+    ));
+    Ok(Arc::new(EmbeddingRuntime {
+        tokenizer: Box::new(parts.tokenizer),
+        chunker_fingerprint,
+        provider: Box::new(parts.provider),
+        model_manifest_hash: snapshot.manifest_hash.clone(),
+        fingerprint_seed: EmbeddingFingerprintSeed {
+            provider: embedding_provider_name(embedding.provider).to_string(),
+            model_id: QWEN_EMBEDDING_MODEL_ID.to_string(),
+            model_revision: format!("{}:{runtime_profile}", snapshot.manifest_hash),
+            pooling: PoolingKind::LastToken,
+            query_prefix: QWEN_EMBEDDING_QUERY_PREFIX.to_string(),
+        },
+    }))
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -3363,7 +3490,7 @@ pub fn query(
                 .take(limit)
                 .collect(),
         };
-        let mut results = QueryResults::default();
+        let mut candidates = Vec::new();
         let mut unresolvable_hits = 0;
         for mut hit in hits {
             let Some(source) = store.get_source(&hit.source_id)? else {
@@ -3389,11 +3516,29 @@ pub fn query(
                 continue;
             }
             hit.lexical_evidence = lexical_evidence(&store, &source, &args.query)?;
-            let evidence = hit
+            candidates.push(ResolvedQueryCandidate {
+                source,
+                hit,
+                rerank: None,
+            });
+        }
+        let rerank_report = args
+            .rerank
+            .then(|| rerank_candidates(&profile, &args.query, &mut candidates));
+        let mut results = QueryResults::default();
+        for candidate in candidates {
+            let evidence = candidate
+                .hit
                 .vector_evidence
                 .as_ref()
-                .or(hit.lexical_evidence.as_ref());
-            results.push(source, hit.ranking, &profile.id, evidence);
+                .or(candidate.hit.lexical_evidence.as_ref());
+            results.push(
+                candidate.source,
+                candidate.hit.ranking,
+                &profile.id,
+                evidence,
+                candidate.rerank,
+            );
         }
         let last_successful_sync_at =
             query_freshness_sync_time(&store, &profile, &filters, &results)?;
@@ -3424,10 +3569,11 @@ pub fn query(
             },
             "results": results.items
         });
-        if args.rerank {
-            let (status, warning) = unavailable_rerank_outcome(&profile);
-            data["rerank"] = status;
-            warnings.push(warning);
+        if let Some(rerank_report) = rerank_report {
+            data["rerank"] = rerank_report.status;
+            if let Some(warning) = rerank_report.warning {
+                warnings.push(warning);
+            }
         }
         Ok(LocalReadOutcome { data, warnings })
     })();
@@ -3664,6 +3810,19 @@ struct QueryHit {
     ranking: Ranking,
     vector_evidence: Option<MatchedChunkEvidence>,
     lexical_evidence: Option<MatchedChunkEvidence>,
+}
+
+#[derive(Debug)]
+struct ResolvedQueryCandidate {
+    source: StoredSource,
+    hit: QueryHit,
+    rerank: Option<RerankMetadata>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RerankMetadata {
+    score: f32,
+    pre_rerank_rank: usize,
 }
 
 #[allow(dead_code)]
@@ -4221,46 +4380,273 @@ fn rerank_not_configured_status() -> Value {
     })
 }
 
-fn unavailable_rerank_outcome(profile: &Profile) -> (Value, Value) {
-    let Some(reranker) = &profile.reranker else {
-        return (
-            rerank_not_configured_status(),
-            reranker_warning(
-                "reranker.not_configured",
-                "Reranking was requested but no local reranker is configured. Original retrieval order is returned.",
-            ),
-        );
-    };
-    let manifest_path = profile
-        .paths
-        .cache_dir
-        .join("prepared-rerankers")
-        .join(&reranker.model)
-        .join("manifest.json");
-    if !manifest_path.is_file() {
-        return (
-            json!({
+struct RerankReport {
+    status: Value,
+    warning: Option<Value>,
+}
+
+fn rerank_candidates(
+    profile: &Profile,
+    query: &str,
+    candidates: &mut Vec<ResolvedQueryCandidate>,
+) -> RerankReport {
+    if candidates.is_empty() {
+        return RerankReport {
+            status: json!({
                 "requested": true,
                 "applied": false,
-                "reason": "model_not_installed"
+                "reason": "no_candidates"
             }),
-            reranker_warning(
-                "reranker.model_not_installed",
-                "Reranking was requested but the configured local model is not installed. Original retrieval order is returned.",
-            ),
-        );
+            warning: None,
+        };
     }
-    (
-        json!({
+    let Some(reranker) = &profile.reranker else {
+        return RerankReport {
+            status: rerank_not_configured_status(),
+            warning: Some(reranker_warning(
+                "reranker.not_configured",
+                "Reranking was requested but no local reranker is configured. Original retrieval order is returned.",
+            )),
+        };
+    };
+    let candidate_count = candidates.len().min(LOCAL_RERANK_DEPTH);
+
+    #[cfg(debug_assertions)]
+    if let Some(scores) = test_rerank_scores(candidates, candidate_count) {
+        return match scores {
+            Ok(scores) => {
+                apply_rerank_scores(candidates, scores);
+                rerank_applied_report("cpu_f32", candidate_count, None)
+            }
+            Err(()) => rerank_failure(
+                "inference_failed",
+                "reranker.inference_failed",
+                "The local reranker did not score the complete candidate set. Original retrieval order is returned.",
+            ),
+        };
+    }
+
+    let spec = qwen_model_spec(&reranker.model).expect("validated reranker preset");
+    let snapshot = match default_prepared_qwen_model_store().and_then(|store| store.inspect(&spec))
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => return rerank_error_report(&error),
+    };
+    let documents = candidates
+        .iter()
+        .take(candidate_count)
+        .map(rerank_document)
+        .collect::<Vec<_>>();
+    match production_rerank_scores(reranker, &snapshot, query, &documents) {
+        Ok((scores, runtime_profile)) => {
+            if scores.len() != candidate_count || scores.iter().any(|score| !score.is_finite()) {
+                return rerank_failure(
+                    "inference_failed",
+                    "reranker.inference_failed",
+                    "The local reranker did not score the complete candidate set. Original retrieval order is returned.",
+                );
+            }
+            apply_rerank_scores(candidates, scores);
+            let warning = (runtime_profile == "cpu_f32").then(|| {
+                reranker_warning(
+                    "reranker.cpu_slow_path",
+                    "The explicitly selected CPU reranker path is experimental and may be slow.",
+                )
+            });
+            rerank_applied_report(runtime_profile, candidate_count, warning)
+        }
+        Err(error) => rerank_error_report(&error),
+    }
+}
+
+fn rerank_applied_report(
+    runtime_profile: &str,
+    candidate_count: usize,
+    warning: Option<Value>,
+) -> RerankReport {
+    RerankReport {
+        status: json!({
+            "requested": true,
+            "applied": true,
+            "model": QWEN_RERANKER_PRESET_ID,
+            "runtime_profile": runtime_profile,
+            "candidate_count": candidate_count,
+            "max_candidates": LOCAL_RERANK_DEPTH,
+            "max_tokens": LOCAL_RERANK_MAX_TOKENS
+        }),
+        warning,
+    }
+}
+
+fn rerank_failure(reason: &'static str, code: &'static str, message: &'static str) -> RerankReport {
+    RerankReport {
+        status: json!({
             "requested": true,
             "applied": false,
-            "reason": "runtime_unavailable"
+            "reason": reason
         }),
-        reranker_warning(
+        warning: Some(reranker_warning(code, message)),
+    }
+}
+
+fn rerank_error_report(error: &QghError) -> RerankReport {
+    match error.code.as_str() {
+        "model.not_installed" => rerank_failure(
+            "model_not_installed",
+            "reranker.model_not_installed",
+            "Reranking was requested but the configured local model is not installed. Original retrieval order is returned.",
+        ),
+        "model.snapshot_invalid" | "model.artifact_invalid" => rerank_failure(
+            "model_corrupt",
+            "reranker.model_corrupt",
+            "The configured local reranker failed integrity validation. Original retrieval order is returned.",
+        ),
+        "reranker.device_unavailable" => rerank_failure(
+            "device_unavailable",
+            "reranker.device_unavailable",
+            "The configured local reranker device is unavailable. Original retrieval order is returned.",
+        ),
+        "reranker.inference_failed" | "reranker.contract_invalid" => rerank_failure(
+            "inference_failed",
+            "reranker.inference_failed",
+            "The local reranker did not score the complete candidate set. Original retrieval order is returned.",
+        ),
+        _ => rerank_failure(
+            "runtime_unavailable",
             "reranker.runtime_unavailable",
             "Reranking was requested but the configured local runtime is unavailable. Original retrieval order is returned.",
         ),
+    }
+}
+
+fn apply_rerank_scores(candidates: &mut Vec<ResolvedQueryCandidate>, scores: Vec<f32>) {
+    let depth = scores.len();
+    let drained = candidates.drain(..depth).collect::<Vec<_>>();
+    let mut head = drained
+        .into_iter()
+        .zip(scores)
+        .enumerate()
+        .map(|(index, (mut candidate, score))| {
+            candidate.rerank = Some(RerankMetadata {
+                score,
+                pre_rerank_rank: index + 1,
+            });
+            candidate
+        })
+        .collect::<Vec<_>>();
+    head.sort_by(|left, right| {
+        let left = left.rerank.expect("rerank metadata assigned");
+        let right = right.rerank.expect("rerank metadata assigned");
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.pre_rerank_rank.cmp(&right.pre_rerank_rank))
+    });
+    head.append(candidates);
+    *candidates = head;
+}
+
+#[cfg(debug_assertions)]
+fn test_rerank_scores(
+    candidates: &[ResolvedQueryCandidate],
+    candidate_count: usize,
+) -> Option<Result<Vec<f32>, ()>> {
+    let raw = std::env::var(TEST_RERANK_SCORES_ENV).ok()?;
+    let scores: HashMap<String, f32> = match serde_json::from_str(&raw) {
+        Ok(scores) => scores,
+        Err(_) => return Some(Err(())),
+    };
+    Some(
+        candidates
+            .iter()
+            .take(candidate_count)
+            .map(|candidate| {
+                scores
+                    .get(source_id(&candidate.source))
+                    .copied()
+                    .filter(|score| score.is_finite())
+                    .ok_or(())
+            })
+            .collect(),
     )
+}
+
+#[cfg(debug_assertions)]
+fn source_id(source: &StoredSource) -> &str {
+    match source {
+        StoredSource::Issue(issue) => &issue.source_id,
+        StoredSource::Comment(comment) => &comment.source_id,
+    }
+}
+
+fn rerank_document(candidate: &ResolvedQueryCandidate) -> String {
+    let evidence_body = candidate
+        .hit
+        .vector_evidence
+        .as_ref()
+        .or(candidate.hit.lexical_evidence.as_ref())
+        .map(|evidence| evidence.chunk.body.as_str());
+    match &candidate.source {
+        StoredSource::Issue(issue) => prepare_embedding_input(
+            EmbeddingSourceContext::Issue {
+                repository: &issue.repo,
+                issue_number: issue.number,
+                title: &issue.title,
+            },
+            evidence_body.unwrap_or(&issue.body),
+        )
+        .as_str()
+        .to_string(),
+        StoredSource::Comment(comment) => prepare_embedding_input(
+            EmbeddingSourceContext::Comment {
+                repository: &comment.repo,
+                parent_issue_number: comment.issue_number,
+                parent_issue_title: &comment.parent_issue.title,
+            },
+            evidence_body.unwrap_or(&comment.body),
+        )
+        .as_str()
+        .to_string(),
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn production_rerank_scores(
+    reranker: &crate::config::RerankerConfig,
+    snapshot: &crate::local_models::PreparedQwenModelSnapshot,
+    query: &str,
+    documents: &[String],
+) -> Result<(Vec<f32>, &'static str), QghError> {
+    let crate::config::RerankerProviderKind::Local = reranker.provider;
+    debug_assert_eq!(LOCAL_RERANK_DEPTH, QWEN_RERANK_DEPTH);
+    debug_assert_eq!(LOCAL_RERANK_MAX_TOKENS, QWEN_RERANK_MAX_LENGTH);
+    let cache_key = format!(
+        "{}:{}:{:?}",
+        reranker.model, snapshot.manifest_hash, reranker.device
+    );
+    let runtime = runtime_cache_get_or_try_init(
+        RERANKER_RUNTIME_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+        &cache_key,
+        "",
+        || load_qwen_reranker(snapshot, reranker.device).map(Arc::new),
+    )?;
+    let runtime_profile = runtime.runtime_profile.as_str();
+    runtime
+        .score(query, documents)
+        .map(|scores| (scores, runtime_profile))
+}
+
+#[cfg(not(feature = "fastembed-provider"))]
+fn production_rerank_scores(
+    _reranker: &crate::config::RerankerConfig,
+    _snapshot: &crate::local_models::PreparedQwenModelSnapshot,
+    _query: &str,
+    _documents: &[String],
+) -> Result<(Vec<f32>, &'static str), QghError> {
+    Err(QghError::validation(
+        "reranker.runtime_unavailable",
+        "This qgh binary was built without the local reranker runtime.",
+    ))
 }
 
 fn effective_repo(
@@ -4391,6 +4777,7 @@ impl QueryResults {
         ranking: Ranking,
         profile_id: &str,
         evidence: Option<&MatchedChunkEvidence>,
+        rerank: Option<RerankMetadata>,
     ) {
         if matches!(&source, StoredSource::Issue(issue) if issue.state == "open") {
             self.includes_open_issue = true;
@@ -4402,8 +4789,14 @@ impl QueryResults {
         if !self.repos.contains(repo) {
             self.repos.push(repo.clone());
         }
-        self.items
-            .push(source_result(source, ranking, profile_id, evidence));
+        let mut result = source_result(source, ranking, profile_id, evidence);
+        if let Some(rerank) = rerank {
+            if let Some(ranking) = result.get_mut("ranking").and_then(Value::as_object_mut) {
+                ranking.insert("rerank_score".to_string(), json!(rerank.score));
+                ranking.insert("pre_rerank_rank".to_string(), json!(rerank.pre_rerank_rank));
+            }
+        }
+        self.items.push(result);
     }
 }
 
@@ -4490,7 +4883,7 @@ fn configured_embedding_model_json(
                 format!("hf:{}", configured_hf_model_reference(embedding).model_id)
             }))
         };
-    json!({
+    let mut data = json!({
         "provider": embedding_provider_name(embedding.provider),
         "model": model,
         "model_id": configured.model_id,
@@ -4500,7 +4893,12 @@ fn configured_embedding_model_json(
             .as_ref()
             .or(embedding.manifest_path.as_ref())
             .map(|path| path.to_string_lossy().into_owned())
-    })
+    });
+    if is_qwen_embedding_config(embedding) {
+        data["device"] = json!(embedding.device.as_str());
+        data["runtime_profile"] = json!(configured_qwen_runtime_profile_id(embedding.device));
+    }
+    data
 }
 
 fn embedding_fingerprint_status_json(
@@ -4543,6 +4941,9 @@ fn embedding_fingerprint_expectation_from_snapshot(
 }
 
 fn configured_embedding_snapshot(embedding: &EmbeddingConfig) -> ConfiguredEmbeddingSnapshot {
+    if is_qwen_embedding_config(embedding) {
+        return configured_qwen_embedding_snapshot(embedding);
+    }
     let mut configured = configured_embedding_contract_snapshot(embedding);
     configured.prepared_runtime = match default_prepared_model_store() {
         Ok(store) => store
@@ -4565,6 +4966,9 @@ fn configured_embedding_snapshot(embedding: &EmbeddingConfig) -> ConfiguredEmbed
 fn configured_embedding_contract_snapshot(
     embedding: &EmbeddingConfig,
 ) -> ConfiguredEmbeddingSnapshot {
+    if is_qwen_embedding_config(embedding) {
+        return configured_qwen_embedding_snapshot(embedding);
+    }
     let options = embedding.fastembed_options();
     if let Ok(store) = default_prepared_model_store() {
         if let Ok(inspection) = store.inspect_prepared_alias_contract(&options) {
@@ -4598,6 +5002,59 @@ fn configured_embedding_contract_snapshot(
         pooling: embedding.pooling,
         query_prefix: embedding.query_prefix.clone(),
         prepared_runtime: PreparedRuntimeAvailability::Missing,
+    }
+}
+
+fn configured_qwen_embedding_snapshot(embedding: &EmbeddingConfig) -> ConfiguredEmbeddingSnapshot {
+    let spec =
+        qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).expect("Qwen embedding preset is registered");
+    let runtime_profile = configured_qwen_runtime_profile_id(embedding.device);
+    let (model_revision, prepared_runtime) =
+        match default_prepared_qwen_model_store().and_then(|store| store.inspect(&spec)) {
+            Ok(snapshot) => (
+                Some(format!("{}:{runtime_profile}", snapshot.manifest_hash)),
+                configured_available_runtime(),
+            ),
+            Err(error) if error.code == "model.not_installed" => (
+                Some(format!("{QWEN_EMBEDDING_REVISION}:{runtime_profile}")),
+                PreparedRuntimeAvailability::Missing,
+            ),
+            Err(_) => (
+                Some(format!("{QWEN_EMBEDDING_REVISION}:{runtime_profile}")),
+                PreparedRuntimeAvailability::Corrupt,
+            ),
+        };
+    ConfiguredEmbeddingSnapshot {
+        model_id: Some(QWEN_EMBEDDING_MODEL_ID.to_string()),
+        model_revision,
+        pooling: Some(PoolingKind::LastToken),
+        query_prefix: Some(QWEN_EMBEDDING_QUERY_PREFIX.to_string()),
+        prepared_runtime,
+    }
+}
+
+fn is_qwen_embedding_config(embedding: &EmbeddingConfig) -> bool {
+    embedding.model.as_deref() == Some(QWEN_EMBEDDING_PRESET_ID)
+}
+
+fn configured_qwen_runtime_profile_id(device: crate::config::LocalModelDevice) -> &'static str {
+    #[cfg(feature = "fastembed-provider")]
+    {
+        qwen_embedding_runtime_profile_id(device)
+    }
+    #[cfg(not(feature = "fastembed-provider"))]
+    {
+        match device {
+            crate::config::LocalModelDevice::Cpu => "cpu_f32",
+            crate::config::LocalModelDevice::Metal => "metal_f16",
+            crate::config::LocalModelDevice::Auto => {
+                if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                    "metal_f16"
+                } else {
+                    "cpu_f32"
+                }
+            }
+        }
     }
 }
 
@@ -4659,6 +5116,12 @@ fn configured_available_runtime() -> PreparedRuntimeAvailability {
 fn configured_embedding_model_revision_without_snapshot(
     embedding: &EmbeddingConfig,
 ) -> Option<String> {
+    if is_qwen_embedding_config(embedding) {
+        return Some(format!(
+            "{QWEN_EMBEDDING_REVISION}:{}",
+            configured_qwen_runtime_profile_id(embedding.device)
+        ));
+    }
     if embedding.model_path.is_some() {
         return Some(LOCAL_MODEL_REVISION.to_string());
     }
@@ -4728,7 +5191,7 @@ fn exact_results(
     if let Some(source) = exact_url_result(store, query_text)? {
         let mut results = QueryResults::default();
         if filters.matches(&source) {
-            results.push(source, Ranking::Exact, profile_id, None);
+            results.push(source, Ranking::Exact, profile_id, None, None);
         }
         return Ok(Some(results));
     }
@@ -4753,7 +5216,7 @@ fn exact_results(
     let mut results = QueryResults::default();
     for source in matches.into_iter().map(StoredSource::Issue) {
         if filters.matches(&source) {
-            results.push(source, Ranking::Exact, profile_id, None);
+            results.push(source, Ranking::Exact, profile_id, None, None);
         }
     }
     Ok(Some(results))
@@ -5286,16 +5749,28 @@ pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
 fn doctor_embedding_checks(embedding: &EmbeddingConfig, store: &Store) -> [Value; 3] {
     #[cfg(feature = "fastembed-provider")]
     let (artifacts_ok, runtime_ok) = {
-        let snapshot = default_prepared_model_store().and_then(|prepared_store| {
-            prepared_store
-                .inspect(&embedding.fastembed_options())
-                .and_then(|inspection| prepared_store.verify(inspection))
-        });
-        let artifacts_ok = snapshot.is_ok();
-        let runtime_ok = snapshot
-            .as_ref()
-            .is_ok_and(|snapshot| build_embedding_runtime(embedding, snapshot).is_ok());
-        (artifacts_ok, runtime_ok)
+        if is_qwen_embedding_config(embedding) {
+            let spec = qwen_model_spec(QWEN_EMBEDDING_PRESET_ID)
+                .expect("Qwen embedding preset is registered");
+            let snapshot = default_prepared_qwen_model_store()
+                .and_then(|prepared_store| prepared_store.inspect(&spec));
+            let artifacts_ok = snapshot.is_ok();
+            let runtime_ok = snapshot
+                .as_ref()
+                .is_ok_and(|snapshot| build_qwen_embedding_runtime(embedding, snapshot).is_ok());
+            (artifacts_ok, runtime_ok)
+        } else {
+            let snapshot = default_prepared_model_store().and_then(|prepared_store| {
+                prepared_store
+                    .inspect(&embedding.fastembed_options())
+                    .and_then(|inspection| prepared_store.verify(inspection))
+            });
+            let artifacts_ok = snapshot.is_ok();
+            let runtime_ok = snapshot
+                .as_ref()
+                .is_ok_and(|snapshot| build_embedding_runtime(embedding, snapshot).is_ok());
+            (artifacts_ok, runtime_ok)
+        }
     };
     #[cfg(not(feature = "fastembed-provider"))]
     let (artifacts_ok, runtime_ok) = {
@@ -5825,6 +6300,7 @@ mod tests {
             query_prefix: None,
             quantization: None,
             token_source: None,
+            device: crate::config::LocalModelDevice::Auto,
         };
 
         reset_tokenizer_only_artifact_bytes();
@@ -5963,7 +6439,9 @@ mod tests {
                 query_prefix: Some(crate::embedding::DEFAULT_QUERY_PREFIX.to_string()),
                 quantization: None,
                 token_source: None,
+                device: crate::config::LocalModelDevice::Auto,
             }),
+            reranker: None,
             reconcile_after_seconds: None,
             freshness: crate::config::FreshnessSettings {
                 query_max_age_seconds: 1,
@@ -7330,6 +7808,7 @@ mod tests {
                 name: "repo".to_string(),
             }],
             embedding: None,
+            reranker: None,
             reconcile_after_seconds: None,
             freshness: crate::config::FreshnessSettings {
                 query_max_age_seconds: 1,

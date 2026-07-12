@@ -3567,6 +3567,24 @@ fn requested_rerank_bypasses_exact_locator_without_warning() {
     );
     assert!(warning_codes(&exact_json).is_empty());
     assert_eq!(exact_json["data"]["results"][0]["ranking"]["kind"], "exact");
+
+    for output in [
+        fixture.qgh(["query", "#42", "--repo", "owner/repo", "--rerank", "--json"]),
+        fixture.qgh([
+            "query",
+            "https://github.com/owner/repo/issues/42#issuecomment-5001",
+            "--rerank",
+            "--json",
+        ]),
+    ] {
+        assert_success(&output);
+        let output = stdout_json(&output);
+        assert_eq!(output["data"]["rerank"]["reason"], "exact_bypass");
+        assert_eq!(output["data"]["results"][0]["ranking"]["kind"], "exact");
+        assert!(output["data"]["results"][0]["ranking"]
+            .get("rerank_score")
+            .is_none());
+    }
 }
 
 #[test]
@@ -3610,6 +3628,317 @@ device = "auto"
         request_count_after_sync,
         "local query must not download a model"
     );
+}
+
+#[test]
+fn corrupt_reranker_snapshot_preserves_retrieval_order_without_content_leakage() {
+    let fixture = TestFixture::new("reranker-corrupt-snapshot-fallback");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config_with_reranker(
+        &server.base_url,
+        r#"
+provider = "local"
+model = "qwen3-reranker-0.6b"
+device = "auto"
+"#,
+    );
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let snapshot = fixture
+        .cache_home
+        .join("qgh/prepared-qwen-models/qwen3-reranker-0.6b");
+    fs::create_dir_all(&snapshot).unwrap();
+    fs::write(snapshot.join("manifest.json"), b"private malformed payload").unwrap();
+    let baseline =
+        stdout_json(&fixture.qgh(["query", "BM25 tracer", "--json"]))["data"]["results"].clone();
+
+    let output = fixture.qgh(["query", "BM25 tracer", "--rerank", "--json"]);
+
+    assert_success(&output);
+    let stderr = stderr_text(&output);
+    let output = stdout_json(&output);
+    assert_eq!(output["data"]["results"], baseline);
+    assert_eq!(output["data"]["rerank"]["reason"], "model_corrupt");
+    assert_eq!(warning_codes(&output), vec!["reranker.model_corrupt"]);
+    assert!(!serde_json::to_string(&output)
+        .unwrap()
+        .contains("private malformed payload"));
+    assert!(!stderr.contains("private malformed payload"));
+}
+
+#[test]
+fn configured_reranker_reorders_only_resolved_candidates_and_exposes_scores() {
+    let fixture = TestFixture::new("reranker-applied-contract");
+    let server = FakeGitHub::start(limit_policy_issue_payload());
+    fixture.write_config_with_reranker(
+        &server.base_url,
+        r#"
+provider = "local"
+model = "qwen3-reranker-0.6b"
+device = "auto"
+"#,
+    );
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let baseline = fixture.qgh([
+        "query",
+        "repo policy limit tracer",
+        "--limit",
+        "5",
+        "--json",
+    ]);
+    assert_success(&baseline);
+    let baseline_json = stdout_json(&baseline);
+    let baseline_ids = result_source_ids(&baseline_json);
+    let scores = baseline_ids
+        .iter()
+        .enumerate()
+        .map(|(index, source_id)| (source_id.clone(), json!(index as f32)))
+        .collect::<serde_json::Map<_, _>>();
+
+    let reranked = fixture.qgh_with_rerank_scores(
+        [
+            "query",
+            "repo policy limit tracer",
+            "--limit",
+            "5",
+            "--rerank",
+            "--json",
+        ],
+        &Value::Object(scores),
+    );
+
+    assert_success(&reranked);
+    let reranked_json = stdout_json(&reranked);
+    let mut expected = baseline_ids.clone();
+    expected.reverse();
+    assert_eq!(result_source_ids(&reranked_json), expected);
+    assert_eq!(
+        reranked_json["data"]["rerank"],
+        json!({
+            "requested": true,
+            "applied": true,
+            "model": "qwen3-reranker-0.6b",
+            "runtime_profile": "cpu_f32",
+            "candidate_count": 5,
+            "max_candidates": 10,
+            "max_tokens": 384
+        })
+    );
+    assert!(warning_codes(&reranked_json).is_empty());
+    for result in reranked_json["data"]["results"].as_array().unwrap() {
+        assert!(result["ranking"]["rerank_score"].is_number());
+        assert!(result["ranking"]["pre_rerank_rank"].is_number());
+        let source_id = result["get_args"]["source_id"].as_str().unwrap();
+        let get = fixture.qgh(["get", source_id, "--json"]);
+        assert_success(&get);
+        assert_eq!(stdout_json(&get)["data"]["source"]["source_id"], source_id);
+    }
+}
+
+#[test]
+fn reranker_never_touches_candidates_beyond_the_fixed_top_ten() {
+    let fixture = TestFixture::new("reranker-fixed-depth");
+    let server = FakeGitHub::start(rerank_depth_issue_payload());
+    fixture.write_config_with_reranker(
+        &server.base_url,
+        r#"
+provider = "local"
+model = "qwen3-reranker-0.6b"
+device = "auto"
+"#,
+    );
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let baseline = stdout_json(&fixture.qgh([
+        "query",
+        "fixed rerank depth tracer",
+        "--limit",
+        "12",
+        "--json",
+    ]));
+    let baseline_ids = result_source_ids(&baseline);
+    assert_eq!(baseline_ids.len(), 12);
+    let scores = baseline_ids
+        .iter()
+        .take(10)
+        .enumerate()
+        .map(|(index, source_id)| (source_id.clone(), json!(index as f32)))
+        .collect::<serde_json::Map<_, _>>();
+
+    let output = fixture.qgh_with_rerank_scores(
+        [
+            "query",
+            "fixed rerank depth tracer",
+            "--limit",
+            "12",
+            "--rerank",
+            "--json",
+        ],
+        &Value::Object(scores),
+    );
+
+    assert_success(&output);
+    let output = stdout_json(&output);
+    let mut expected_head = baseline_ids[..10].to_vec();
+    expected_head.reverse();
+    expected_head.extend_from_slice(&baseline_ids[10..]);
+    assert_eq!(result_source_ids(&output), expected_head);
+    assert_eq!(output["data"]["rerank"]["candidate_count"], 10);
+    let results = output["data"]["results"].as_array().unwrap();
+    assert!(results[..10]
+        .iter()
+        .all(|result| result["ranking"].get("rerank_score").is_some()));
+    assert!(results[10..]
+        .iter()
+        .all(|result| result["ranking"].get("rerank_score").is_none()));
+}
+
+#[test]
+fn human_query_reports_rerank_application_and_fallback_on_stdout() {
+    let fixture = TestFixture::new("reranker-human-output");
+    let server = FakeGitHub::start(limit_policy_issue_payload());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let fallback = fixture.qgh(["query", "repo policy limit tracer", "--rerank"]);
+    assert_success(&fallback);
+    assert!(stdout_text(&fallback).contains("rerank: not applied (not_configured)"));
+    assert!(stderr_text(&fallback).contains("reranker.not_configured"));
+
+    fixture.write_config_with_reranker(
+        &server.base_url,
+        r#"
+provider = "local"
+model = "qwen3-reranker-0.6b"
+device = "auto"
+"#,
+    );
+    let baseline = stdout_json(&fixture.qgh([
+        "query",
+        "repo policy limit tracer",
+        "--limit",
+        "5",
+        "--json",
+    ]));
+    let scores = result_source_ids(&baseline)
+        .into_iter()
+        .enumerate()
+        .map(|(index, source_id)| (source_id, json!(index as f32)))
+        .collect::<serde_json::Map<_, _>>();
+    let applied = fixture.qgh_with_rerank_scores(
+        [
+            "query",
+            "repo policy limit tracer",
+            "--limit",
+            "5",
+            "--rerank",
+        ],
+        &Value::Object(scores),
+    );
+    assert_success(&applied);
+    assert!(stdout_text(&applied)
+        .contains("rerank: applied qwen3-reranker-0.6b to 5 candidates (cpu_f32)"));
+    assert!(stderr_text(&applied).is_empty());
+}
+
+#[test]
+fn mcp_query_accepts_boolean_rerank_without_adding_a_write_tool() {
+    let fixture = TestFixture::new("reranker-mcp-query");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let output = fixture.mcp([
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "qgh-test", "version": "0"}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {"query": "BM25 tracer", "rerank": true}
+            }
+        }),
+    ]);
+
+    assert_success(&output);
+    assert!(stderr_text(&output).is_empty());
+    let messages = stdout_json_lines(&output);
+    assert_eq!(messages.len(), 2);
+    assert_eq!(
+        messages[1]["result"]["structuredContent"]["data"]["rerank"],
+        json!({"requested": true, "applied": false, "reason": "not_configured"})
+    );
+    assert_eq!(
+        messages[1]["result"]["structuredContent"]["warnings"][0]["code"],
+        "reranker.not_configured"
+    );
+}
+
+#[test]
+fn partial_reranker_failure_discards_all_scores_and_preserves_original_order() {
+    let fixture = TestFixture::new("reranker-partial-failure");
+    let server = FakeGitHub::start(limit_policy_issue_payload());
+    fixture.write_config_with_reranker(
+        &server.base_url,
+        r#"
+provider = "local"
+model = "qwen3-reranker-0.6b"
+device = "auto"
+"#,
+    );
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let baseline = fixture.qgh([
+        "query",
+        "repo policy limit tracer",
+        "--limit",
+        "5",
+        "--json",
+    ]);
+    assert_success(&baseline);
+    let baseline_json = stdout_json(&baseline);
+    let baseline_results = baseline_json["data"]["results"].clone();
+    let first_id = baseline_results[0]["source_id"].as_str().unwrap();
+
+    let reranked = fixture.qgh_with_rerank_scores(
+        [
+            "query",
+            "repo policy limit tracer",
+            "--limit",
+            "5",
+            "--rerank",
+            "--json",
+        ],
+        &json!({first_id: 1.0}),
+    );
+
+    assert_success(&reranked);
+    let reranked_json = stdout_json(&reranked);
+    assert_eq!(reranked_json["data"]["results"], baseline_results);
+    assert_eq!(
+        reranked_json["data"]["rerank"],
+        json!({
+            "requested": true,
+            "applied": false,
+            "reason": "inference_failed"
+        })
+    );
+    assert_eq!(
+        warning_codes(&reranked_json),
+        vec!["reranker.inference_failed"]
+    );
+    assert!(reranked_json["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|result| result["ranking"].get("rerank_score").is_none()));
 }
 
 #[test]
@@ -4186,6 +4515,33 @@ model_path = "/tmp/model.onnx"
 "#,
             "only one of `model` or `model_path`",
         ),
+        (
+            "qwen-embedding-contract-override",
+            r#"
+provider = "local"
+model = "qwen3-embedding-0.6b"
+pooling = "mean"
+"#,
+            "cannot be combined",
+        ),
+        (
+            "qwen-embedding-invalid-device",
+            r#"
+provider = "local"
+model = "qwen3-embedding-0.6b"
+device = "cuda"
+"#,
+            "unknown variant",
+        ),
+        (
+            "onnx-embedding-device-forbidden",
+            r#"
+provider = "local"
+model = "arctic-m-v2-fp32"
+device = "cpu"
+"#,
+            "only valid with the Qwen embedding preset",
+        ),
     ] {
         let fixture = TestFixture::new(fixture_name);
         fixture.write_config_with_embedding("http://127.0.0.1:1", embedding);
@@ -4203,6 +4559,68 @@ model_path = "/tmp/model.onnx"
             "unexpected embedding config error: {status_json}"
         );
     }
+}
+
+#[test]
+fn qwen_embedding_preset_is_strict_and_status_stays_local_only() {
+    let fixture = TestFixture::new("qwen-embedding-config-status");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        r#"
+provider = "local"
+model = "qwen3-embedding-0.6b"
+device = "auto"
+"#,
+    );
+
+    let status = fixture.qgh(["status", "--json"]);
+
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(
+        status_json["data"]["embedding"]["configured_model"]["model"],
+        "qwen3-embedding-0.6b"
+    );
+    assert_eq!(
+        status_json["data"]["embedding"]["configured_model"]["model_id"],
+        "Qwen/Qwen3-Embedding-0.6B"
+    );
+    assert_eq!(
+        server.request_count(),
+        0,
+        "status must not download a model"
+    );
+}
+
+#[test]
+fn model_install_cli_rejects_unknown_presets_before_profile_resolution() {
+    let fixture = TestFixture::new("model-install-strict-preset");
+
+    let output = fixture.qgh(["model", "install", "unknown-model", "--json"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let output_json = stdout_json(&output);
+    assert_eq!(output_json["error"]["code"], "validation.cli");
+    let message = output_json["error"]["message"].as_str().unwrap();
+    assert!(message.contains("qwen3-embedding-0.6b"));
+    assert!(message.contains("qwen3-reranker-0.6b"));
+}
+
+#[cfg(not(feature = "fastembed-provider"))]
+#[test]
+fn bm25_binary_reports_unavailable_model_installer_without_resolving_a_profile() {
+    let fixture = TestFixture::new("model-install-bm25-binary");
+
+    let output = fixture.qgh(["model", "install", "qwen3-embedding-0.6b", "--json"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let output_json = stdout_json(&output);
+    assert_eq!(output_json["error"]["code"], "model.provider_unavailable");
+    assert!(output_json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("without local Qwen model installation support"));
 }
 
 #[test]
@@ -5338,11 +5756,23 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
                 }
             }
         }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {
+                    "query": "anything",
+                    "rerank": "yes"
+                }
+            }
+        }),
     ]);
     assert_success(&output);
     assert!(stderr_text(&output).is_empty());
     let messages = stdout_json_lines(&output);
-    assert_eq!(messages.len(), 9);
+    assert_eq!(messages.len(), 10);
     assert_eq!(messages[0]["id"], 1);
     assert_eq!(messages[0]["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(
@@ -5381,6 +5811,10 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
             assert_eq!(
                 tool["inputSchema"]["properties"]["repo"]["pattern"],
                 "^[^/]+/[^/]+$"
+            );
+            assert_eq!(
+                tool["inputSchema"]["properties"]["rerank"]["type"],
+                "boolean"
             );
         }
         if tool["name"] == "status" {
@@ -5433,6 +5867,7 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
         &messages[6]["result"],
         &messages[7]["result"],
         &messages[8]["result"],
+        &messages[9]["result"],
     ] {
         assert_eq!(validation["isError"], true);
         assert_eq!(
@@ -7353,6 +7788,32 @@ fn limit_policy_issue_payload() -> &'static str {
     ]"#
 }
 
+fn rerank_depth_issue_payload() -> &'static str {
+    let issues = (1..=12)
+        .map(|number| {
+            json!({
+                "id": 5_000 + number,
+                "node_id": format!("I_RERANK_DEPTH_{number}"),
+                "number": number,
+                "title": format!("Fixed rerank depth {number}"),
+                "body": format!("fixed rerank depth tracer result {number}."),
+                "state": "open",
+                "locked": false,
+                "comments": 0,
+                "html_url": format!("https://github.com/owner/repo/issues/{number}"),
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": format!("2026-01-02T03:04:{number:02}Z"),
+                "closed_at": null,
+                "user": {"login": "bob"},
+                "labels": [],
+                "milestone": null,
+                "assignees": []
+            })
+        })
+        .collect::<Vec<_>>();
+    Box::leak(serde_json::to_string(&issues).unwrap().into_boxed_str())
+}
+
 fn issue_comments_payload() -> &'static str {
     r#"[
       {
@@ -8022,6 +8483,14 @@ limit = 10
         )
         .args(["--profile", "work"])
         .args(args);
+        cmd.output().unwrap()
+    }
+
+    fn qgh_with_rerank_scores<const N: usize>(&self, args: [&str; N], scores: &Value) -> Output {
+        let mut cmd = self.base_command();
+        cmd.env("QGH_TEST_RERANK_SCORES", scores.to_string())
+            .args(["--profile", "work"])
+            .args(args);
         cmd.output().unwrap()
     }
 
@@ -10093,6 +10562,15 @@ fn warning_codes(output_json: &Value) -> Vec<&str> {
         .expect("warnings array")
         .iter()
         .map(|warning| warning["code"].as_str().expect("warning code"))
+        .collect()
+}
+
+fn result_source_ids(output_json: &Value) -> Vec<String> {
+    output_json["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["source_id"].as_str().unwrap().to_string())
         .collect()
 }
 

@@ -528,6 +528,14 @@
         },
         "model_path": {
           "type": ["string", "null"]
+        },
+        "device": {
+          "type": "string",
+          "enum": ["auto", "cpu", "metal"]
+        },
+        "runtime_profile": {
+          "type": "string",
+          "enum": ["cpu_f32", "metal_f16"]
         }
       },
       "additionalProperties": false
@@ -569,7 +577,7 @@
           "minimum": 1
         },
         "pooling": {
-          "enum": ["cls", "mean"]
+          "enum": ["cls", "mean", "last_token"]
         },
         "query_prefix": {
           "type": "string"

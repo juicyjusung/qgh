@@ -91,6 +91,16 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
             meta: outcome.meta,
         });
     }
+    if let crate::cli::Command::Model(args) = &cli.command {
+        let outcome = commands::install_model(args)?;
+        return Ok(CommandOutcome {
+            output_kind: SuccessOutputKind::Model,
+            json_mode,
+            data: outcome.data,
+            warnings: outcome.warnings,
+            meta: json!({}),
+        });
+    }
 
     let context = resolve_command_context(&cli)?;
     let profile_id = context.profile_id.clone();
@@ -132,6 +142,9 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
         crate::cli::Command::Embed(args) => {
             let outcome = commands::embed(&profile_id, &args)?;
             (outcome.data, outcome.warnings)
+        }
+        crate::cli::Command::Model(_) => {
+            unreachable!("model is handled before normal resolution")
         }
         crate::cli::Command::Query(args) | crate::cli::Command::Search(args) => {
             let outcome = commands::query(&profile_id, args, context.repo_scope.as_ref())?;
@@ -183,6 +196,7 @@ fn success_output_kind(command: &crate::cli::Command) -> SuccessOutputKind {
     match command {
         crate::cli::Command::Sync(_) => SuccessOutputKind::Sync,
         crate::cli::Command::Embed(_) => SuccessOutputKind::Embed,
+        crate::cli::Command::Model(_) => SuccessOutputKind::Model,
         crate::cli::Command::Query(_) | crate::cli::Command::Search(_) => SuccessOutputKind::Query,
         crate::cli::Command::Get { .. } => SuccessOutputKind::Get,
         crate::cli::Command::Status(_) => SuccessOutputKind::Status,
@@ -257,6 +271,9 @@ fn effective_repo_scope_for_command(
         | crate::cli::Command::Embed(_)
         | crate::cli::Command::Status(_)
         | crate::cli::Command::Doctor { .. } => repo_scope_from_worktree(),
+        crate::cli::Command::Model(_) => {
+            unreachable!("model is handled before normal resolution")
+        }
         crate::cli::Command::Sync(args) => {
             if let Some(crate::cli::SyncTarget::Issue(issue_args)) = &args.target {
                 if let Some(repo) = &issue_args.repo {

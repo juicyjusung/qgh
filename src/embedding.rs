@@ -348,6 +348,7 @@ impl<E> LocalEmbeddingProvider<E> {
 pub enum PoolingKind {
     Cls,
     Mean,
+    LastToken,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -582,6 +583,12 @@ impl ModelManifestV1 {
             return Err(EmbeddingProviderError::structured(
                 "embedding.dynamic_quantization_unsupported",
                 "Dynamic quantization is not supported for persistent embedding generations.",
+            ));
+        }
+        if self.pooling == PoolingKind::LastToken {
+            return Err(EmbeddingProviderError::structured(
+                "embedding.manifest_contract_invalid",
+                "The ONNX prepared-model manifest does not support last-token pooling.",
             ));
         }
         let graph_count = self
@@ -3750,6 +3757,7 @@ impl PoolingKind {
         match self {
             PoolingKind::Cls => "cls",
             PoolingKind::Mean => "mean",
+            PoolingKind::LastToken => "last_token",
         }
     }
 }
@@ -4362,6 +4370,12 @@ fn fastembed_user_defined_model(
             .with_pooling(match snapshot.manifest.pooling {
                 PoolingKind::Cls => fastembed::Pooling::Cls,
                 PoolingKind::Mean => fastembed::Pooling::Mean,
+                PoolingKind::LastToken => {
+                    return Err(EmbeddingProviderError::structured(
+                        "embedding.pooling_unsupported",
+                        "The ONNX embedding runtime does not support last-token pooling.",
+                    ));
+                }
             })
             .with_quantization(match snapshot.manifest.quantization {
                 QuantizationKind::None => QuantizationMode::None,
@@ -4435,6 +4449,12 @@ impl FastembedEngine {
             .with_pooling(match snapshot.pooling {
                 PoolingKind::Cls => fastembed::Pooling::Cls,
                 PoolingKind::Mean => fastembed::Pooling::Mean,
+                PoolingKind::LastToken => {
+                    return Err(EmbeddingProviderError::structured(
+                        "embedding.pooling_unsupported",
+                        "The legacy ONNX embedding runtime does not support last-token pooling.",
+                    ));
+                }
             });
         if snapshot.model_file.contains("quant") {
             model = model.with_quantization(QuantizationMode::Dynamic);

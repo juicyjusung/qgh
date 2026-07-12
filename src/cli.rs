@@ -19,6 +19,7 @@ impl Cli {
         match &self.command {
             Command::Sync(args) => args.wants_json(),
             Command::Embed(args) => args.json,
+            Command::Model(args) => args.wants_json(),
             Command::Init(args) => args.wants_json(),
             Command::Status(args) => args.json,
             Command::Doctor { json } => *json,
@@ -33,6 +34,7 @@ impl Cli {
 pub enum Command {
     Sync(SyncArgs),
     Embed(EmbedArgs),
+    Model(ModelArgs),
     Init(InitArgs),
     Query(QueryArgs),
     Search(QueryArgs),
@@ -55,6 +57,50 @@ pub enum Command {
         json: bool,
     },
     Mcp,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ModelArgs {
+    #[command(subcommand)]
+    pub command: ModelCommand,
+}
+
+impl ModelArgs {
+    pub fn wants_json(&self) -> bool {
+        match &self.command {
+            ModelCommand::Install(args) => args.json,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ModelCommand {
+    Install(ModelInstallArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ModelInstallArgs {
+    #[arg(value_enum)]
+    pub model: ModelPresetArg,
+    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ModelPresetArg {
+    #[value(name = "qwen3-embedding-0.6b")]
+    Qwen3Embedding06b,
+    #[value(name = "qwen3-reranker-0.6b")]
+    Qwen3Reranker06b,
+}
+
+impl ModelPresetArg {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Qwen3Embedding06b => "qwen3-embedding-0.6b",
+            Self::Qwen3Reranker06b => "qwen3-reranker-0.6b",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]

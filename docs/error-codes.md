@@ -61,6 +61,23 @@ preparation; qgh does not accept a mismatched artifact as validated. Separately,
 `embedding.vector_integrity_failed` is a content-free warning, not an error
 envelope code: hybrid vector use is skipped and BM25 results are returned.
 
+Explicit local Qwen installation may return `model.not_installed`,
+`model.snapshot_invalid`, `model.artifact_missing`, or
+`model.artifact_invalid` when the pinned snapshot is absent or fails strict
+tree, size, or SHA-256 validation. `model.download_failed` and
+`model.install_failed` distinguish network acquisition from atomic local
+publication, while `model.provider_unavailable` means the binary was built
+without local model support. `model.unknown` is reserved for unsupported
+programmatic preset requests; CLI spelling errors remain `validation.cli`.
+
+Qwen embedding initialization may return `embedding.model_not_installed` or a
+content-free `embedding.qwen_*` code for snapshot, device, tokenizer, runtime,
+or inference failure. These failures never authorize a Qwen model download
+during `sync`, `embed`, `query`, `get`, `status`, `doctor`, or MCP query
+handling.
+`embedding.pooling_unsupported` rejects a pooling contract the selected runtime
+cannot execute.
+
 Typed GitHub lifecycle adapters may return `github.invalid_issue_json` or
 `github.invalid_comment_json` when a successful response cannot be decoded.
 `sync.commit_page_failed` and `validation.lifecycle_failed` are content-free

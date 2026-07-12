@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/model-output.schema.json",
+  "title": "qgh model install response",
+  "type": "object",
+  "required": [
+    "model",
+    "purpose",
+    "model_id",
+    "resolved_revision",
+    "action",
+    "artifact_count",
+    "verified_bytes",
+    "manifest_hash",
+    "weights_bundled"
+  ],
+  "properties": {
+    "model": {
+      "type": "string",
+      "enum": ["qwen3-embedding-0.6b", "qwen3-reranker-0.6b"]
+    },
+    "purpose": {
+      "type": "string",
+      "enum": ["embedding", "reranker"]
+    },
+    "model_id": {
+      "type": "string",
+      "enum": ["Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Reranker-0.6B"]
+    },
+    "resolved_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "action": {
+      "type": "string",
+      "enum": ["installed", "already_installed"]
+    },
+    "artifact_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "verified_bytes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "manifest_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "weights_bundled": {
+      "const": false
+    }
+  },
+  "additionalProperties": false
+}

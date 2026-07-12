@@ -24,6 +24,14 @@ qgh query "search terms"
 
 Use `qgh get` with a returned `source_id` before citing a result. Search snippets are source candidates, not citation evidence.
 
+## Optional Local Qwen Search
+
+BM25 remains the complete default path. An experimental local Qwen embedding
+adapter and per-query reranker are available as explicit, separately downloaded
+options; model weights are not bundled with qgh. See
+[Local Qwen models](docs/local-qwen-models.md) for the pinned install,
+configuration, device, privacy, and fallback contracts.
+
 ## Verify
 
 ```sh

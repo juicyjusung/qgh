@@ -57,6 +57,7 @@ Released schema snapshots:
 - `docs/schemas/error.schema.json`: stable error taxonomy and exit-code classes.
 - `docs/schemas/init-output.schema.json`: CLI-only `init` data payload.
 - `docs/schemas/sync-output.schema.json`: `sync` data payload.
+- `docs/schemas/model-output.schema.json`: CLI-only `model install` data payload.
 - `docs/schemas/query-result.schema.json`: `query`/`search` data payload.
 - `docs/schemas/get-output.schema.json`: `get` data payload.
 - `docs/schemas/status-output.schema.json`: `status` data payload.
@@ -186,6 +187,15 @@ When no profile is explicit, `init repo` may still create repo policy, but the
 success envelope includes a `config.profile_not_checked` warning. Commands that
 use the policy later still apply normal profile resolution and allowlist checks.
 
+## Model Install Output
+
+`qgh model install <preset> --json` is CLI-only and resolves before profiles.
+Its closed payload records `model`, `purpose`, immutable upstream `model_id`
+and `resolved_revision`, `action`, verified artifact count and bytes,
+`manifest_hash`, and `weights_bundled: false`. It never includes a cache path,
+token, repository content, query text, or downloaded file contents. Model
+management is not exposed through MCP.
+
 ## Query Results
 
 `query` and `search` return source candidates, not answers. Each result identifies a GitHub Issue or issue comment that can be fetched through `get`.
@@ -197,9 +207,17 @@ with lexical evidence, otherwise `null`. `ranking.vector_distance` is populated
 for internal vector-ranked results and for hybrid results with vector evidence,
 otherwise `null`; lower distance is closer. Hybrid results also include
 `ranking.rrf_rank_score` and `ranking.final_order_score`; in hybrid v1,
-`final_order_score` is the score used for final ordering after RRF fusion.
-BM25, vector, and exact ranking objects keep their existing field set and do
-not include hybrid-only fields.
+`final_order_score` is the retrieval-stage ordering signal after RRF fusion and
+before optional bounded reranking.
+
+When `--rerank` or MCP `"rerank": true` is requested, `data.rerank` reports
+whether the fixed top-10 local stage was applied. Applied BM25, vector, and
+hybrid head results add `ranking.rerank_score` and
+`ranking.pre_rerank_rank` together. `rerank_score` is the raw local
+cross-encoder ordering logit used within that bounded head; it is not a
+probability or calibrated confidence. Exact locator results bypass reranking
+and never contain those fields. Results below the fixed head keep their
+retrieval order and do not contain rerank metadata.
 Ranking fields are not confidence or probability. Vector-only ranking is not a
 user-facing CLI or MCP mode.
 
@@ -214,8 +232,8 @@ Every result includes:
 - `parent_issue`: issue context for comments, or `null` for issue bodies.
 - `source_version`: body hash, GitHub updated timestamp, indexed timestamp, sync run, and lifecycle state.
 - `ranking`: typed ordering evidence. `lexical_score`, `vector_distance`,
-  `rrf_rank_score`, and `final_order_score` are ranking signals, not confidence
-  or probability.
+  `rrf_rank_score`, `final_order_score`, and optional `rerank_score` are ranking
+  signals, not confidence or probability.
 
 Query results intentionally omit `body`. Use the `get` response when source text, canonical URL, and source identity are needed for a citation.
 

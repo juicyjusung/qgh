@@ -255,7 +255,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert!(help_text.contains("human output by default"));
     assert!(help_text.contains("use --json for qgh.v1 envelopes"));
     for command in [
-        "init", "sync", "embed", "query", "search", "get", "status", "doctor", "mcp",
+        "init", "sync", "embed", "model", "query", "search", "get", "status", "doctor", "mcp",
     ] {
         assert!(
             help_text.contains(command),
@@ -274,6 +274,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         &["init", "repo", "--help"][..],
         &["sync", "--help"][..],
         &["embed", "--help"][..],
+        &["model", "--help"][..],
+        &["model", "install", "--help"][..],
         &["query", "--help"][..],
         &["get", "--help"][..],
         &["status", "--help"][..],
@@ -336,6 +338,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
                         "limit".to_string(),
                         "max_age".to_string(),
                         "query".to_string(),
+                        "rerank".to_string(),
                         "repo".to_string(),
                         "require_fresh".to_string(),
                         "state".to_string(),
@@ -348,6 +351,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
                 );
                 assert_eq!(tool["inputSchema"]["properties"]["limit"]["minimum"], 1);
                 assert_eq!(tool["inputSchema"]["properties"]["issue"]["minimum"], 1);
+                assert_eq!(
+                    tool["inputSchema"]["properties"]["rerank"]["type"],
+                    "boolean"
+                );
                 assert_eq!(
                     tool["inputSchema"]["properties"]["repo"]["pattern"],
                     "^[^/]+/[^/]+$"
@@ -434,15 +441,17 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         artifact["contract"]["cli_commands"],
-        json!(["init", "sync", "embed", "query", "search", "get", "status", "doctor", "mcp"])
+        json!([
+            "init", "sync", "embed", "model", "query", "search", "get", "status", "doctor", "mcp"
+        ])
     );
     assert_eq!(
         artifact["contract"]["canonical_cli_commands"],
-        json!(["init", "sync", "embed", "query", "get", "status", "doctor"])
+        json!(["init", "sync", "embed", "model", "query", "get", "status", "doctor"])
     );
     assert_eq!(
         artifact["contract"]["cli_only_commands"],
-        json!(["init", "sync", "embed", "doctor"])
+        json!(["init", "sync", "embed", "model", "doctor"])
     );
     assert_eq!(
         artifact["contract"]["product_core"],
@@ -696,6 +705,11 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         .unwrap()
         .iter()
         .any(|command| command == "init"));
+    assert!(artifact["contract"]["not_exposed_to_mcp"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|command| command == "model"));
     assert_eq!(
         artifact["schema_snapshots"],
         json!([
@@ -703,6 +717,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "docs/schemas/error.schema.json",
             "docs/schemas/init-output.schema.json",
             "docs/schemas/sync-output.schema.json",
+            "docs/schemas/model-output.schema.json",
             "docs/schemas/query-result.schema.json",
             "docs/schemas/get-output.schema.json",
             "docs/schemas/status-output.schema.json",
@@ -728,6 +743,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         &fs::read_to_string(root.join("docs/schemas/sync-output.schema.json")).unwrap(),
     )
     .unwrap();
+    let model_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/model-output.schema.json")).unwrap(),
+    )
+    .unwrap();
     let status_schema: Value = serde_json::from_str(
         &fs::read_to_string(root.join("docs/schemas/status-output.schema.json")).unwrap(),
     )
@@ -744,6 +763,29 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         &fs::read_to_string(root.join("docs/schemas/doctor-output.schema.json")).unwrap(),
     )
     .unwrap();
+    assert_eq!(model_schema["additionalProperties"], false);
+    assert_eq!(
+        model_schema["required"],
+        json!([
+            "model",
+            "purpose",
+            "model_id",
+            "resolved_revision",
+            "action",
+            "artifact_count",
+            "verified_bytes",
+            "manifest_hash",
+            "weights_bundled"
+        ])
+    );
+    assert_eq!(
+        model_schema["properties"]["weights_bundled"]["const"],
+        false
+    );
+    assert_eq!(
+        model_schema["properties"]["manifest_hash"]["pattern"],
+        "^[0-9a-f]{64}$"
+    );
     for required in [
         "profile_config_path",
         "profile_id",
@@ -1383,10 +1425,12 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         schema_property_names(embedding_configured_model),
         BTreeSet::from([
             "model".to_string(),
+            "device".to_string(),
             "model_id".to_string(),
             "model_path".to_string(),
             "model_revision".to_string(),
             "provider".to_string(),
+            "runtime_profile".to_string(),
         ])
     );
     assert_eq!(
@@ -1455,7 +1499,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         embedding_fingerprint["properties"]["pooling"]["enum"],
-        json!(["cls", "mean"])
+        json!(["cls", "mean", "last_token"])
     );
     assert_eq!(
         embedding_fingerprint["properties"]["matches_config"]["type"],
@@ -1494,6 +1538,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "coverage".to_string(),
             "freshness".to_string(),
             "profile_id".to_string(),
+            "rerank".to_string(),
             "result_filtering".to_string(),
             "results".to_string(),
         ])
@@ -1508,6 +1553,12 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert_eq!(
         query_schema["properties"]["results"]["items"]["$ref"],
         "#/$defs/query_result"
+    );
+    let query_rerank = &query_schema["$defs"]["rerank"];
+    assert_eq!(query_rerank["oneOf"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        query_rerank["oneOf"][0]["properties"]["runtime_profile"]["enum"],
+        json!(["metal_f32", "cpu_f32"])
     );
     let query_result = &query_schema["$defs"]["query_result"];
     assert_eq!(
@@ -1633,6 +1684,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         BTreeSet::from([
             "kind".to_string(),
             "lexical_score".to_string(),
+            "pre_rerank_rank".to_string(),
+            "rerank_score".to_string(),
             "vector_distance".to_string()
         ])
     );
@@ -1649,6 +1702,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         .as_str()
         .unwrap()
         .contains("not confidence or probability"));
+    assert_eq!(
+        bm25_ranking["dependentRequired"]["rerank_score"],
+        json!(["pre_rerank_rank"])
+    );
 
     let vector_ranking = ranking_variant(query_ranking, "vector");
     assert_eq!(
@@ -1656,6 +1713,16 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         json!(["kind", "lexical_score", "vector_distance"])
     );
     assert_eq!(vector_ranking["additionalProperties"], false);
+    assert_eq!(
+        schema_property_names(vector_ranking),
+        BTreeSet::from([
+            "kind".to_string(),
+            "lexical_score".to_string(),
+            "pre_rerank_rank".to_string(),
+            "rerank_score".to_string(),
+            "vector_distance".to_string(),
+        ])
+    );
     assert_eq!(vector_ranking["properties"]["kind"]["const"], "vector");
     assert_eq!(
         vector_ranking["properties"]["lexical_score"]["type"],
@@ -1690,6 +1757,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "final_order_score".to_string(),
             "kind".to_string(),
             "lexical_score".to_string(),
+            "pre_rerank_rank".to_string(),
+            "rerank_score".to_string(),
             "rrf_rank_score".to_string(),
             "vector_distance".to_string(),
         ])
@@ -1711,6 +1780,12 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         hybrid_ranking["properties"]["final_order_score"]["type"],
         "number"
     );
+    assert!(
+        hybrid_ranking["properties"]["final_order_score"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("before optional bounded reranking")
+    );
     for field in [
         "lexical_score",
         "vector_distance",
@@ -1722,6 +1797,14 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             .unwrap()
             .contains("not confidence or probability"));
     }
+    assert!(hybrid_ranking["properties"]["rerank_score"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("not confidence or probability"));
+    assert_eq!(
+        hybrid_ranking["dependentRequired"]["pre_rerank_rank"],
+        json!(["rerank_score"])
+    );
 
     let exact_ranking = ranking_variant(query_ranking, "exact");
     assert_eq!(
@@ -1735,6 +1818,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         exact_ranking["properties"]["vector_distance"]["type"],
         "null"
     );
+    assert!(exact_ranking["properties"].get("rerank_score").is_none());
+    assert!(exact_ranking["properties"].get("pre_rerank_rank").is_none());
     assert_eq!(
         status_schema["properties"]["resolution"]["$ref"],
         "#/$defs/resolution"
@@ -2771,7 +2856,14 @@ fn stable_external_error_codes_from_source(root: &std::path::Path) -> BTreeSet<S
         "publication.incomplete_snapshot_deferred",
     ];
     const DEBUG_OR_TEST_ONLY_CODES: &[&str] = &["embedding.generation_cleanup_injected_failure"];
-    const NON_ERROR_LITERALS: &[&str] = &["config.json", "config.toml", "github.com"];
+    const NON_ERROR_LITERALS: &[&str] = &[
+        "config.json",
+        "config.toml",
+        "github.com",
+        "model.onnx",
+        "model.onnx_data",
+        "model.safetensors",
+    ];
     let warning_codes = WARNING_CODES.iter().copied().collect::<BTreeSet<_>>();
     let debug_or_test_only_codes = DEBUG_OR_TEST_ONLY_CODES
         .iter()
@@ -2836,6 +2928,7 @@ fn stable_error_prefixes() -> &'static [&'static str] {
         "github.",
         "index.",
         "internal.",
+        "model.",
         "publication.",
         "purge.",
         "source.",

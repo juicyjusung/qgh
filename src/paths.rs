@@ -33,6 +33,10 @@ impl ProfilePaths {
     }
 }
 
+pub fn qgh_cache_dir() -> Result<PathBuf, QghError> {
+    Ok(xdg_or_home("XDG_CACHE_HOME", ".cache")?.join("qgh"))
+}
+
 pub fn config_file_path() -> Result<PathBuf, QghError> {
     Ok(xdg_or_home("XDG_CONFIG_HOME", ".config")?
         .join("qgh")

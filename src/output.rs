@@ -7,6 +7,7 @@ pub enum SuccessOutputKind {
     Init,
     Sync,
     Embed,
+    Model,
     Query,
     Get,
     Status,
@@ -52,6 +53,7 @@ pub fn print_human_success(
         SuccessOutputKind::Init => render_init(data, warnings),
         SuccessOutputKind::Sync => render_sync(data, meta),
         SuccessOutputKind::Embed => render_embed(data),
+        SuccessOutputKind::Model => render_model(data),
         SuccessOutputKind::Query => render_query(data),
         SuccessOutputKind::Get => render_get(data),
         SuccessOutputKind::Status => render_status(data),
@@ -100,6 +102,28 @@ fn render_embed(data: &Value) -> String {
             display_at(data, &["chunks", "refreshed"]),
             display_at(data, &["chunks", "embedded"])
         ),
+    );
+    out
+}
+
+fn render_model(data: &Value) -> String {
+    let mut out = String::new();
+    line(&mut out, format_args!("qgh model install complete"));
+    line(
+        &mut out,
+        format_args!("model: {}", display_at(data, &["model"])),
+    );
+    line(
+        &mut out,
+        format_args!("action: {}", display_at(data, &["action"])),
+    );
+    line(
+        &mut out,
+        format_args!("revision: {}", display_at(data, &["resolved_revision"])),
+    );
+    line(
+        &mut out,
+        format_args!("verified bytes: {}", display_at(data, &["verified_bytes"])),
     );
     out
 }
@@ -273,6 +297,28 @@ fn render_query(data: &Value) -> String {
         format_args!("profile: {}", display_at(data, &["profile_id"])),
     );
     line(&mut out, format_args!("results: {}", results.len()));
+    if let Some(rerank) = data.get("rerank") {
+        if rerank
+            .get("applied")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            line(
+                &mut out,
+                format_args!(
+                    "rerank: applied {} to {} candidates ({})",
+                    display_at(rerank, &["model"]),
+                    display_at(rerank, &["candidate_count"]),
+                    display_at(rerank, &["runtime_profile"])
+                ),
+            );
+        } else {
+            line(
+                &mut out,
+                format_args!("rerank: not applied ({})", display_at(rerank, &["reason"])),
+            );
+        }
+    }
     line(
         &mut out,
         format_args!(

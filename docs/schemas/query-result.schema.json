@@ -31,6 +31,9 @@
       "items": {
         "$ref": "#/$defs/query_result"
       }
+    },
+    "rerank": {
+      "$ref": "#/$defs/rerank"
     }
   },
   "additionalProperties": false,
@@ -242,6 +245,57 @@
       },
       "additionalProperties": false
     },
+    "rerank": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "requested",
+            "applied",
+            "model",
+            "runtime_profile",
+            "candidate_count",
+            "max_candidates",
+            "max_tokens"
+          ],
+          "properties": {
+            "requested": { "const": true },
+            "applied": { "const": true },
+            "model": { "const": "qwen3-reranker-0.6b" },
+            "runtime_profile": {
+              "type": "string",
+              "enum": ["metal_f32", "cpu_f32"]
+            },
+            "candidate_count": { "type": "integer", "minimum": 1, "maximum": 10 },
+            "max_candidates": { "const": 10 },
+            "max_tokens": { "const": 384 }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["requested", "applied", "reason"],
+          "properties": {
+            "requested": { "const": true },
+            "applied": { "const": false },
+            "reason": {
+              "type": "string",
+              "enum": [
+                "exact_bypass",
+                "no_candidates",
+                "not_configured",
+                "model_not_installed",
+                "model_corrupt",
+                "device_unavailable",
+                "runtime_unavailable",
+                "inference_failed"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "ranking": {
       "oneOf": [
         {
@@ -257,7 +311,20 @@
             },
             "vector_distance": {
               "type": "null"
+            },
+            "rerank_score": {
+              "type": "number",
+              "description": "Raw local cross-encoder ordering logit for the bounded rerank head. It is not confidence or probability."
+            },
+            "pre_rerank_rank": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10
             }
+          },
+          "dependentRequired": {
+            "rerank_score": ["pre_rerank_rank"],
+            "pre_rerank_rank": ["rerank_score"]
           },
           "additionalProperties": false
         },
@@ -274,7 +341,20 @@
             "vector_distance": {
               "type": "number",
               "description": "Vector ordering signal where lower is closer. It is not confidence or probability."
+            },
+            "rerank_score": {
+              "type": "number",
+              "description": "Raw local cross-encoder ordering logit for the bounded rerank head. It is not confidence or probability."
+            },
+            "pre_rerank_rank": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10
             }
+          },
+          "dependentRequired": {
+            "rerank_score": ["pre_rerank_rank"],
+            "pre_rerank_rank": ["rerank_score"]
           },
           "additionalProperties": false
         },
@@ -305,8 +385,21 @@
             },
             "final_order_score": {
               "type": "number",
-              "description": "Final ordering signal used for this result order. It is not confidence or probability."
+              "description": "Retrieval-stage ordering signal after RRF and before optional bounded reranking. It is not confidence or probability."
+            },
+            "rerank_score": {
+              "type": "number",
+              "description": "Raw local cross-encoder ordering logit for the bounded rerank head. When present, it determines order within that head. It is not confidence or probability."
+            },
+            "pre_rerank_rank": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10
             }
+          },
+          "dependentRequired": {
+            "rerank_score": ["pre_rerank_rank"],
+            "pre_rerank_rank": ["rerank_score"]
           },
           "additionalProperties": false
         },

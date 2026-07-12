@@ -512,6 +512,7 @@ fn query_input_schema() -> Value {
         "required": ["query"],
         "properties": {
             "query": { "type": "string" },
+            "rerank": { "type": "boolean" },
             "limit": { "type": "integer", "minimum": 1 },
             "repo": { "type": "string", "pattern": "^[^/]+/[^/]+$" },
             "label": {

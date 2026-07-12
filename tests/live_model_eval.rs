@@ -9,6 +9,25 @@ use tantivy::schema::{Field, IndexRecordOption, Schema, Value, STORED, STRING, T
 use tantivy::{Index, TantivyDocument, Term};
 
 #[cfg(feature = "fastembed-provider")]
+use qgh::chunking::{chunk_markdown, chunker_fingerprint_for_tokenizer_identity};
+#[cfg(feature = "fastembed-provider")]
+use qgh::context::{
+    prepare_embedding_input, EmbeddingSourceContext, METADATA_CONTEXT_TEMPLATE_VERSION,
+};
+#[cfg(feature = "fastembed-provider")]
+use qgh::embedding::EmbeddingProvider;
+#[cfg(feature = "fastembed-provider")]
+use qgh::search_eval::{
+    load_qwen_embedding, production_lexical_profile_for_eval, qwen_model_spec,
+    rebuild_lexical_index_for_eval, search_with_lexical_profile_for_eval, EvalIndexSource,
+    LocalModelDevice, PreparedQwenModelStore, SearchFilters, QWEN_EMBEDDING_PRESET_ID,
+};
+#[cfg(feature = "fastembed-provider")]
+use std::path::PathBuf;
+#[cfg(feature = "fastembed-provider")]
+use std::time::Instant;
+
+#[cfg(feature = "fastembed-provider")]
 #[path = "support/live_model_eval_runtime.rs"]
 mod live_model_eval_runtime;
 
@@ -18,6 +37,17 @@ const TEST_QRELS_JSONL: &str = include_str!("fixtures/live-model-eval/qrels-test
 const PROVENANCE_JSON: &str = include_str!("fixtures/live-model-eval/provenance.json");
 const MODEL_PREP_SCRIPT: &str = include_str!("support/prepare_live_model_eval_models.py");
 const RUNTIME_SUPPORT: &str = include_str!("support/live_model_eval_runtime.rs");
+
+#[cfg(feature = "fastembed-provider")]
+const FRESH_CORPUS_SHA256: &str =
+    "992b375ef47f31f36caef54d2798c5315d734754146528cd60a78ce5e7153ef0";
+#[cfg(feature = "fastembed-provider")]
+const FRESH_TEST_QRELS_SHA256: &str =
+    "1a639489b0d19f5f31a3f7065335ab34815af3b3a58d1de1b04047bc497c7c2c";
+#[cfg(feature = "fastembed-provider")]
+const FRESH_BM25_SELECTION_NDCG_AT_10: f64 = 0.724_385_049_485_093_4;
+#[cfg(feature = "fastembed-provider")]
+const FRESH_BM25_SELECTION_MRR_AT_10: f64 = 0.702_420_634_920_635;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -516,6 +546,330 @@ fn fresh_blind_runtime_entrypoint_is_explicitly_opt_in() {
     assert!(!fresh_blind_eval_opt_in(None));
     assert!(!fresh_blind_eval_opt_in(Some("true")));
     assert!(fresh_blind_eval_opt_in(Some("1")));
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+fn qwen_eval_context_matches_the_production_host_and_comment_title_contract() {
+    let corpus = parse_jsonl::<CorpusRecord>(CORPUS_JSONL);
+    let comment = corpus
+        .iter()
+        .find(|source| source.entity_type == "issue_comment")
+        .expect("fixture includes a comment");
+    let repository = format!("github.com/{}", comment.repo);
+    let parent_issue_title = qwen_eval_parent_issue_title(comment);
+
+    let prepared = prepare_embedding_input(
+        EmbeddingSourceContext::Comment {
+            repository: &repository,
+            parent_issue_number: comment.issue_number as i64,
+            parent_issue_title,
+        },
+        "public fixture chunk",
+    );
+
+    assert!(prepared.as_str().starts_with(&format!(
+        "Repository: github.com/{}\nComment on issue #{}: {}\n\n",
+        comment.repo, comment.issue_number, parent_issue_title
+    )));
+    assert!(!prepared.as_str().contains(&format!(
+        "Comment on issue #{}: Comment on issue #{}:",
+        comment.issue_number, comment.issue_number
+    )));
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+#[ignore = "requires explicit pinned Qwen snapshots and writes a machine-only eval artifact"]
+fn qwen_production_adapter_runs_canonical_window_multilingual_qrels() {
+    if std::env::var("QGH_QWEN_RUNTIME_EVAL").as_deref() != Ok("1") {
+        eprintln!("skipped: set QGH_QWEN_RUNTIME_EVAL=1 for the explicit live adapter run");
+        return;
+    }
+    let prepared_root = PathBuf::from(
+        std::env::var("QGH_QWEN_PREPARED_MODELS")
+            .expect("QGH_QWEN_PREPARED_MODELS must point to the prepared model store"),
+    );
+    let fixture_root = PathBuf::from(
+        std::env::var("QGH_QWEN_RUNTIME_EVAL_FIXTURE_ROOT")
+            .expect("QGH_QWEN_RUNTIME_EVAL_FIXTURE_ROOT must point to the frozen public fixture"),
+    );
+    let output_path = PathBuf::from(
+        std::env::var("QGH_QWEN_RUNTIME_EVAL_OUTPUT")
+            .expect("QGH_QWEN_RUNTIME_EVAL_OUTPUT must be under target/qgh-eval"),
+    );
+    assert!(output_path
+        .components()
+        .any(|component| component.as_os_str() == "target"));
+
+    let corpus_jsonl = std::fs::read_to_string(fixture_root.join("corpus.jsonl"))
+        .expect("read the frozen public corpus");
+    let qrels_jsonl = std::fs::read_to_string(fixture_root.join("qrels-test.jsonl"))
+        .expect("read the frozen public held-out qrels");
+    let provenance_json = std::fs::read_to_string(fixture_root.join("provenance.json"))
+        .expect("read the frozen public provenance");
+    assert_eq!(digest_hex(&corpus_jsonl), FRESH_CORPUS_SHA256);
+    assert_eq!(digest_hex(&qrels_jsonl), FRESH_TEST_QRELS_SHA256);
+    let provenance: serde_json::Value =
+        serde_json::from_str(&provenance_json).expect("parse frozen public provenance");
+    assert_eq!(provenance["corpus_sha256"], FRESH_CORPUS_SHA256);
+    assert_eq!(provenance["qrels_test_sha256"], FRESH_TEST_QRELS_SHA256);
+    assert_eq!(provenance["acquisition"]["authentication"], "none");
+
+    let corpus = parse_jsonl::<CorpusRecord>(&corpus_jsonl);
+    let qrels = parse_jsonl::<QrelRecord>(&qrels_jsonl);
+    assert_eq!(corpus.len(), 566);
+    assert_eq!(qrels.len(), 80);
+    let source_map = corpus
+        .iter()
+        .map(|source| (source.source_id.as_str(), source))
+        .collect::<BTreeMap<_, _>>();
+    let lexical_index_root = output_path
+        .parent()
+        .expect("Qwen eval output has a parent")
+        .join(format!(
+            ".production-bm25-index-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    let lexical_sources = qwen_eval_index_sources(&corpus);
+    let lexical_index = rebuild_lexical_index_for_eval(&lexical_index_root, 1, &lexical_sources)
+        .expect("build the production Tantivy BM25 index");
+    let bm25_rankings = qrels
+        .iter()
+        .map(|qrel| {
+            (
+                qrel.query_id.clone(),
+                qwen_eval_production_bm25(&lexical_index, &corpus, qrel, 80),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    qwen_eval_assert_fresh_bm25_parity(&qwen_eval_metrics(&qrels, &bm25_rankings));
+    let spec = qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).unwrap();
+    let snapshot = PreparedQwenModelStore::new(prepared_root)
+        .inspect(&spec)
+        .expect("verify prepared Qwen embedding snapshot");
+    let load_started = Instant::now();
+    let runtime = load_qwen_embedding(&snapshot, LocalModelDevice::Auto)
+        .expect("load the production Qwen embedding adapter");
+    let cold_load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+    let runtime_profile = runtime.runtime_profile.as_str();
+    let chunker_fingerprint = chunker_fingerprint_for_tokenizer_identity(&format!(
+        "qgh.qwen_tokenizer.v1:{}",
+        snapshot.manifest_hash
+    ));
+    let (git_head, git_dirty) = qwen_eval_git_identity();
+
+    let mut chunk_source_ids = Vec::new();
+    let mut chunk_texts = Vec::new();
+    for source in &corpus {
+        let repository = format!("github.com/{}", source.repo);
+        let parent_issue_title = qwen_eval_parent_issue_title(source);
+        let chunks = chunk_markdown(&source.body, &runtime.tokenizer)
+            .expect("production Qwen tokenizer chunks the public corpus");
+        for chunk in chunks {
+            let context = if source.entity_type == "issue_comment" {
+                EmbeddingSourceContext::Comment {
+                    repository: &repository,
+                    parent_issue_number: source.issue_number as i64,
+                    parent_issue_title,
+                }
+            } else {
+                EmbeddingSourceContext::Issue {
+                    repository: &repository,
+                    issue_number: source.issue_number as i64,
+                    title: &source.title,
+                }
+            };
+            chunk_source_ids.push(source.source_id.clone());
+            chunk_texts.push(
+                prepare_embedding_input(context, &chunk.body)
+                    .as_str()
+                    .to_string(),
+            );
+        }
+    }
+    let embedding_started = Instant::now();
+    let chunk_refs = chunk_texts.iter().map(String::as_str).collect::<Vec<_>>();
+    let chunk_vectors = runtime
+        .provider
+        .embed_documents(&chunk_refs)
+        .expect("production Qwen adapter embeds the public corpus");
+    let embedding_seconds = embedding_started.elapsed().as_secs_f64();
+    assert_eq!(chunk_vectors.len(), chunk_source_ids.len());
+    assert!(chunk_vectors
+        .iter()
+        .all(|vector| vector.len() == 384 && vector.iter().all(|value| value.is_finite())));
+
+    let mut hybrid_rankings = BTreeMap::new();
+    let mut query_embedding_latencies_ms = Vec::new();
+    let mut hybrid_retrieval_latencies_ms = Vec::new();
+    let mut events = Vec::new();
+    let mut hard_filter_violations = 0usize;
+    for qrel in &qrels {
+        let retrieval_started = Instant::now();
+        let bm25 = qwen_eval_production_bm25(&lexical_index, &corpus, qrel, 80);
+        assert_eq!(bm25, bm25_rankings[&qrel.query_id]);
+        let query_started = Instant::now();
+        let query_vector = runtime
+            .provider
+            .embed_query(&qrel.query)
+            .expect("production Qwen adapter embeds a public qrel query");
+        query_embedding_latencies_ms.push(query_started.elapsed().as_secs_f64() * 1000.0);
+        let mut source_scores = BTreeMap::<String, f32>::new();
+        for (source_id, vector) in chunk_source_ids.iter().zip(&chunk_vectors) {
+            let source = source_map
+                .get(source_id.as_str())
+                .expect("chunk source must round-trip");
+            if !qwen_eval_source_matches(source, qrel) {
+                continue;
+            }
+            let score = query_vector
+                .iter()
+                .zip(vector)
+                .map(|(left, right)| left * right)
+                .sum::<f32>();
+            source_scores
+                .entry(source_id.clone())
+                .and_modify(|current| *current = current.max(score))
+                .or_insert(score);
+        }
+        let mut dense = source_scores.into_iter().collect::<Vec<_>>();
+        dense.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let dense = dense
+            .into_iter()
+            .take(80)
+            .map(|(source_id, _)| source_id)
+            .collect::<Vec<_>>();
+        let hybrid = qwen_eval_rrf(
+            &bm25,
+            &dense,
+            qrel.query_class == QueryClass::ExactIdentifier,
+        );
+        hybrid_retrieval_latencies_ms.push(retrieval_started.elapsed().as_secs_f64() * 1000.0);
+        for source_id in &hybrid {
+            let source = source_map
+                .get(source_id.as_str())
+                .expect("hybrid source must round-trip");
+            hard_filter_violations += usize::from(!qwen_eval_source_matches(source, qrel));
+        }
+        events.push(json!({
+            "query_id": qrel.query_id,
+            "query_sha256": digest_hex(&qrel.query),
+            "class": qrel.query_class,
+            "bm25": &bm25,
+            "hybrid": &hybrid
+        }));
+        hybrid_rankings.insert(qrel.query_id.clone(), hybrid);
+    }
+    query_embedding_latencies_ms.sort_by(f64::total_cmp);
+    hybrid_retrieval_latencies_ms.sort_by(f64::total_cmp);
+    let bm25_metrics = qwen_eval_metrics(&qrels, &bm25_rankings);
+    let hybrid_metrics = qwen_eval_metrics(&qrels, &hybrid_rankings);
+    qwen_eval_assert_fresh_bm25_parity(&bm25_metrics);
+    let complement = qwen_eval_complement(&qrels, &bm25_rankings, &hybrid_rankings);
+    let exact_top_1 = qwen_eval_exact_top_1(&qrels, &hybrid_rankings);
+    let embedding_chunks_per_second = chunk_vectors.len() as f64 / embedding_seconds;
+    let mut promotion_blockers = vec![
+        "held_out_was_previously_opened",
+        "resource_protocol_is_diagnostic_only",
+        "fresh_blind_qualification_not_run",
+    ];
+    if hybrid_metrics["per_class"]["en_query_ko_source"]["recall_at_5"]
+        .as_f64()
+        .is_none_or(|recall| recall < 0.60)
+    {
+        promotion_blockers.push("en_query_ko_source_recall_at_5_below_0_60");
+    }
+    if embedding_chunks_per_second < 3.0 {
+        promotion_blockers.push("embedding_throughput_upper_bound_below_3_chunks_per_second");
+    }
+    let report = json!({
+        "schema_version": "qgh.qwen_runtime_eval.v1",
+        "evaluation_state": "production_adapter_previously_opened_heldout",
+        "promotion_eligible": false,
+        "promotion_blockers": promotion_blockers,
+        "git": {
+            "head": git_head,
+            "dirty": git_dirty
+        },
+        "runtime_profile": runtime_profile,
+        "model": {
+            "preset_id": QWEN_EMBEDDING_PRESET_ID,
+            "resolved_revision": spec.resolved_revision,
+            "manifest_hash": snapshot.manifest_hash,
+            "output_dimension": 384
+        },
+        "inputs": {
+            "corpus_sha256": digest_hex(&corpus_jsonl),
+            "qrels_test_sha256": digest_hex(&qrels_jsonl),
+            "provenance_sha256": digest_hex(&provenance_json),
+            "source_count": corpus.len(),
+            "query_count": qrels.len(),
+            "chunk_count": chunk_vectors.len(),
+            "candidate_window": 80,
+            "return_limit": 20,
+            "rrf_k": 60,
+            "rrf_dense_weight": 1.0,
+            "lexical_profile": "production_v1",
+            "chunker_fingerprint": chunker_fingerprint,
+            "context_template_version": METADATA_CONTEXT_TEMPLATE_VERSION
+        },
+        "quality": {
+            "bm25": bm25_metrics,
+            "hybrid": hybrid_metrics,
+            "bm25_complement": complement,
+            "exact_top_1": exact_top_1,
+            "hard_filter_violations": hard_filter_violations,
+            "source_identity_round_trip_failures": 0
+        },
+        "resources": {
+            "evidence_level": "single_process_diagnostic",
+            "qualification_protocol_complete": false,
+            "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "cold_load_ms": cold_load_ms,
+            "embedding_chunks_per_second": embedding_chunks_per_second,
+            "query_embedding_latency_p50_ms": percentile(&query_embedding_latencies_ms, 0.50),
+            "query_embedding_latency_p95_ms": percentile(&query_embedding_latencies_ms, 0.95),
+            "hybrid_retrieval_diagnostic_latency_p50_ms": percentile(&hybrid_retrieval_latencies_ms, 0.50),
+            "hybrid_retrieval_diagnostic_latency_p95_ms": percentile(&hybrid_retrieval_latencies_ms, 0.95),
+            "verified_snapshot_bytes": spec.artifacts.iter().map(|artifact| artifact.byte_size).sum::<u64>(),
+            "not_measured": [
+                "five_process_cold_start_p95",
+                "three_repetition_warm_query_latency",
+                "peak_rss",
+                "50k_chunk_backfill_and_publication",
+                "vector_db_bytes_per_chunk"
+            ]
+        },
+        "events": events
+    });
+    assert_eq!(hard_filter_violations, 0);
+    assert!(exact_top_1 >= 0.95);
+    assert_eq!(report["quality"]["source_identity_round_trip_failures"], 0);
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&output_path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    std::fs::remove_dir_all(&lexical_index_root).unwrap();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "artifact": output_path.file_name().unwrap().to_string_lossy(),
+            "runtime_profile": runtime_profile,
+            "quality": report["quality"],
+            "resources": report["resources"]
+        }))
+        .unwrap()
+    );
 }
 
 #[test]
@@ -3521,6 +3875,379 @@ fn metrics_for<R: AsRef<str>, S: AsRef<str>>(relevant: &[(R, u8)], ranked: &[S])
     }
 }
 
+#[cfg(feature = "fastembed-provider")]
+fn qwen_eval_source_matches(source: &CorpusRecord, qrel: &QrelRecord) -> bool {
+    source.repo == qrel.filters.repo
+        && qrel
+            .filters
+            .issue_number
+            .is_none_or(|issue_number| source.issue_number == issue_number)
+        && qrel
+            .filters
+            .source_type
+            .as_deref()
+            .is_none_or(|source_type| source.entity_type == source_type)
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_eval_index_sources(corpus: &[CorpusRecord]) -> Vec<EvalIndexSource> {
+    corpus
+        .iter()
+        .map(|source| {
+            let is_comment = source.entity_type == "issue_comment";
+            EvalIndexSource {
+                source_id: source.source_id.clone(),
+                entity_type: source.entity_type.clone(),
+                repo: source.repo.clone(),
+                issue_number: source.issue_number as i64,
+                state: if is_comment { "" } else { "open" }.to_string(),
+                labels: Vec::new(),
+                author: None,
+                title: if is_comment {
+                    String::new()
+                } else {
+                    source.title.clone()
+                },
+                body: source.body.clone(),
+                parent_issue_title: if is_comment {
+                    qwen_eval_parent_issue_title(source).to_string()
+                } else {
+                    String::new()
+                },
+                github_updated_at: source.github_updated_at.clone(),
+                indexed_at: source.snapshot_at.clone(),
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_eval_parent_issue_title(source: &CorpusRecord) -> &str {
+    let prefix = format!("Comment on issue #{}:", source.issue_number);
+    source
+        .title
+        .strip_prefix(&prefix)
+        .map(str::trim)
+        .unwrap_or(&source.title)
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_eval_production_bm25(
+    index_path: &std::path::Path,
+    corpus: &[CorpusRecord],
+    qrel: &QrelRecord,
+    limit: usize,
+) -> Vec<String> {
+    if qrel.query_class == QueryClass::ExactIdentifier {
+        return corpus
+            .iter()
+            .find(|source| {
+                source.entity_type == "issue"
+                    && source.repo == qrel.filters.repo
+                    && qrel
+                        .filters
+                        .issue_number
+                        .is_some_and(|number| source.issue_number == number)
+            })
+            .map(|source| source.source_id.clone())
+            .into_iter()
+            .collect();
+    }
+    let filters = SearchFilters {
+        repo: Some(qrel.filters.repo.clone()),
+        labels: Vec::new(),
+        state: None,
+        author: None,
+        issue: qrel.filters.issue_number.map(|number| number as i64),
+        source_types: qrel
+            .filters
+            .source_type
+            .clone()
+            .map(|source_type| vec![source_type])
+            .unwrap_or_else(|| vec!["issue".to_string(), "issue_comment".to_string()]),
+    };
+    search_with_lexical_profile_for_eval(
+        index_path,
+        &qrel.query,
+        &filters,
+        production_lexical_profile_for_eval(),
+        limit,
+    )
+    .expect("production Tantivy BM25 query")
+    .into_iter()
+    .map(|hit| hit.source_id)
+    .collect()
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_eval_rrf(bm25: &[String], dense: &[String], exact: bool) -> Vec<String> {
+    if exact {
+        return bm25.iter().take(20).cloned().collect();
+    }
+    let mut scores = BTreeMap::<String, (f64, usize)>::new();
+    for branch in [bm25, dense] {
+        for (index, source_id) in branch.iter().enumerate() {
+            let rank = index + 1;
+            let entry = scores.entry(source_id.clone()).or_insert((0.0, usize::MAX));
+            entry.0 += 1.0 / (60.0 + (index + 1) as f64);
+            entry.1 = entry.1.min(rank);
+        }
+    }
+    let mut ranked = scores.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+             .0
+            .total_cmp(&left.1 .0)
+            .then_with(|| left.1 .1.cmp(&right.1 .1))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    ranked
+        .into_iter()
+        .take(20)
+        .map(|(source_id, _)| source_id)
+        .collect()
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_eval_metrics(
+    qrels: &[QrelRecord],
+    rankings: &BTreeMap<String, Vec<String>>,
+) -> serde_json::Value {
+    let mut per_class = BTreeMap::<QueryClass, Vec<QueryMetrics>>::new();
+    let mut positive = Vec::new();
+    for qrel in qrels {
+        let relevant = qrel
+            .relevant
+            .iter()
+            .map(|relevant| (&relevant.source_id, relevant.grade))
+            .collect::<Vec<_>>();
+        let metrics = metrics_for(
+            &relevant,
+            rankings
+                .get(&qrel.query_id)
+                .expect("every qrel has a ranking"),
+        );
+        per_class.entry(qrel.query_class).or_default().push(metrics);
+        if !relevant.is_empty() {
+            positive.push(metrics);
+        }
+    }
+    let mean = |values: &[QueryMetrics], field: fn(QueryMetrics) -> f64| {
+        values.iter().copied().map(field).sum::<f64>() / values.len().max(1) as f64
+    };
+    let class_mean = |query_class: QueryClass, field: fn(QueryMetrics) -> f64| {
+        per_class
+            .get(&query_class)
+            .map(|values| mean(values, field))
+            .unwrap_or(0.0)
+    };
+    let selection_weighted = |field: fn(QueryMetrics) -> f64| {
+        0.50 * class_mean(QueryClass::EnglishSemantic, field)
+            + 0.20 * class_mean(QueryClass::KoreanSemantic, field)
+            + 0.15 * class_mean(QueryClass::KoQueryEnSource, field)
+            + 0.10 * class_mean(QueryClass::EnQueryKoSource, field)
+            + 0.025 * class_mean(QueryClass::CommentOnly, field)
+            + 0.025 * class_mean(QueryClass::LongContext, field)
+    };
+    let negative_non_empty_top_result_rate = rankings
+        .iter()
+        .filter(|(query_id, _)| {
+            qrels
+                .iter()
+                .any(|qrel| qrel.query_id == **query_id && qrel.query_class == QueryClass::Negative)
+        })
+        .filter(|(_, ranking)| !ranking.is_empty())
+        .count() as f64
+        / per_class
+            .get(&QueryClass::Negative)
+            .map(Vec::len)
+            .unwrap_or(1) as f64;
+    let classes = per_class
+        .iter()
+        .map(|(query_class, values)| {
+            (
+                *query_class,
+                json!({
+                    "query_count": values.len(),
+                    "ndcg_at_10": mean(values, |metrics| metrics.ndcg_at_10),
+                    "mrr_at_10": mean(values, |metrics| metrics.mrr_at_10),
+                    "recall_at_5": mean(values, |metrics| metrics.recall_at_5),
+                    "recall_at_10": mean(values, |metrics| metrics.recall_at_10),
+                    "recall_at_20": mean(values, |metrics| metrics.recall_at_20)
+                }),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    json!({
+        "macro_positive_ndcg_at_10": mean(&positive, |metrics| metrics.ndcg_at_10),
+        "macro_positive_mrr_at_10": mean(&positive, |metrics| metrics.mrr_at_10),
+        "macro_positive_recall_at_5": mean(&positive, |metrics| metrics.recall_at_5),
+        "macro_positive_recall_at_10": mean(&positive, |metrics| metrics.recall_at_10),
+        "macro_positive_recall_at_20": mean(&positive, |metrics| metrics.recall_at_20),
+        "selection_weighted_ndcg_at_10": selection_weighted(|metrics| metrics.ndcg_at_10),
+        "selection_weighted_mrr_at_10": selection_weighted(|metrics| metrics.mrr_at_10),
+        "negative_non_empty_top_result_rate": negative_non_empty_top_result_rate,
+        "per_class": classes
+    })
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_eval_assert_fresh_bm25_parity(metrics: &serde_json::Value) {
+    let selection_ndcg = metrics["selection_weighted_ndcg_at_10"]
+        .as_f64()
+        .expect("BM25 selection nDCG is numeric");
+    let selection_mrr = metrics["selection_weighted_mrr_at_10"]
+        .as_f64()
+        .expect("BM25 selection MRR is numeric");
+    assert!(
+        (selection_ndcg - FRESH_BM25_SELECTION_NDCG_AT_10).abs() < 1e-12,
+        "fresh BM25 selection nDCG parity failed: {selection_ndcg} != {FRESH_BM25_SELECTION_NDCG_AT_10}"
+    );
+    assert!(
+        (selection_mrr - FRESH_BM25_SELECTION_MRR_AT_10).abs() < 1e-12,
+        "fresh BM25 selection MRR parity failed: {selection_mrr} != {FRESH_BM25_SELECTION_MRR_AT_10}"
+    );
+    for (query_class, expected) in [
+        ("english_semantic", 0.95),
+        ("korean_semantic", 13.0 / 15.0),
+        ("ko_query_en_source", 0.20),
+        ("en_query_ko_source", 0.50),
+        ("exact_identifier", 1.0),
+        ("comment_only", 0.90),
+        ("long_context", 1.0),
+        ("negative", 0.0),
+    ] {
+        let actual = metrics["per_class"][query_class]["recall_at_5"]
+            .as_f64()
+            .expect("BM25 class Recall@5 is numeric");
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "fresh BM25 parity failed for {query_class}: {actual} != {expected}"
+        );
+    }
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_eval_complement(
+    qrels: &[QrelRecord],
+    bm25: &BTreeMap<String, Vec<String>>,
+    hybrid: &BTreeMap<String, Vec<String>>,
+) -> serde_json::Value {
+    let mut positive_query_count = 0usize;
+    let mut bm25_miss_at_5 = 0usize;
+    let mut rescued_at_5 = 0usize;
+    let mut bm25_hit_preserved_at_5 = 0usize;
+    let mut bm25_hit_harmed_at_5 = 0usize;
+    let mut bm25_miss_at_10 = 0usize;
+    let mut rescued_at_10 = 0usize;
+    let mut bm25_hit_preserved_at_10 = 0usize;
+    let mut bm25_hit_harmed_at_10 = 0usize;
+    for qrel in qrels {
+        let gold = qrel
+            .relevant
+            .iter()
+            .map(|relevant| relevant.source_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if gold.is_empty() {
+            continue;
+        }
+        positive_query_count += 1;
+        for (cutoff, misses, rescued, preserved, harmed) in [
+            (
+                5,
+                &mut bm25_miss_at_5,
+                &mut rescued_at_5,
+                &mut bm25_hit_preserved_at_5,
+                &mut bm25_hit_harmed_at_5,
+            ),
+            (
+                10,
+                &mut bm25_miss_at_10,
+                &mut rescued_at_10,
+                &mut bm25_hit_preserved_at_10,
+                &mut bm25_hit_harmed_at_10,
+            ),
+        ] {
+            let baseline_hit = bm25[&qrel.query_id]
+                .iter()
+                .take(cutoff)
+                .any(|source_id| gold.contains(source_id.as_str()));
+            let hybrid_hit = hybrid[&qrel.query_id]
+                .iter()
+                .take(cutoff)
+                .any(|source_id| gold.contains(source_id.as_str()));
+            match (baseline_hit, hybrid_hit) {
+                (false, true) => {
+                    *misses += 1;
+                    *rescued += 1;
+                }
+                (false, false) => *misses += 1,
+                (true, true) => *preserved += 1,
+                (true, false) => *harmed += 1,
+            }
+        }
+    }
+    json!({
+        "positive_query_count": positive_query_count,
+        "bm25_miss_at_5": bm25_miss_at_5,
+        "rescued_at_5": rescued_at_5,
+        "bm25_hit_preserved_at_5": bm25_hit_preserved_at_5,
+        "bm25_hit_harmed_at_5": bm25_hit_harmed_at_5,
+        "bm25_miss_at_10": bm25_miss_at_10,
+        "rescued_at_10": rescued_at_10,
+        "bm25_hit_preserved_at_10": bm25_hit_preserved_at_10,
+        "bm25_hit_harmed_at_10": bm25_hit_harmed_at_10
+    })
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_eval_exact_top_1(qrels: &[QrelRecord], rankings: &BTreeMap<String, Vec<String>>) -> f64 {
+    let exact = qrels
+        .iter()
+        .filter(|qrel| qrel.query_class == QueryClass::ExactIdentifier)
+        .collect::<Vec<_>>();
+    let hits = exact
+        .iter()
+        .filter(|qrel| {
+            rankings[&qrel.query_id].first().is_some_and(|source_id| {
+                qrel.relevant
+                    .iter()
+                    .any(|relevant| relevant.source_id == *source_id)
+            })
+        })
+        .count();
+    hits as f64 / exact.len().max(1) as f64
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn percentile(values: &[f64], quantile: f64) -> f64 {
+    let index = ((values.len().saturating_sub(1)) as f64 * quantile).round() as usize;
+    values.get(index).copied().unwrap_or(0.0)
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_eval_git_identity() -> (String, bool) {
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("read evaluation git HEAD");
+    assert!(head.status.success());
+    let head = String::from_utf8(head.stdout)
+        .expect("git HEAD is UTF-8")
+        .trim()
+        .to_string();
+    assert_eq!(head.len(), 40);
+    assert!(head.chars().all(|character| character.is_ascii_hexdigit()));
+
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .expect("read evaluation git worktree state");
+    assert!(status.status.success());
+    (head, !status.stdout.is_empty())
+}
+
 fn redacted_query_event(
     query_id: &str,
     query_class: QueryClass,
@@ -3644,7 +4371,8 @@ impl LexicalEvalIndex {
             &self.index,
             vec![self.fields.title, self.fields.body, self.fields.cjk_ngrams],
         );
-        let query_text = expand_cjk_query(&qrel.query);
+        let plain_query = qrel.query.replace("--", " ");
+        let query_text = expand_cjk_query(&plain_query);
         let text_query = parser.parse_query(&query_text)?;
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, text_query)];
         clauses.push((

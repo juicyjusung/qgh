@@ -5,6 +5,7 @@ use crate::embedding::{
 };
 use crate::error::QghError;
 use crate::freshness::{parse_duration_seconds, DEFAULT_QUERY_MAX_AGE_SECONDS};
+use crate::local_models::QWEN_EMBEDDING_PRESET_ID;
 use crate::paths::{config_file_path, ensure_private_dir, set_private_file, ProfilePaths};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -149,18 +150,28 @@ pub enum RerankerProviderKind {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RerankerDevice {
+pub enum LocalModelDevice {
     #[default]
     Auto,
     Cpu,
     Metal,
 }
 
+impl LocalModelDevice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::Metal => "metal",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RerankerConfig {
     pub provider: RerankerProviderKind,
     pub model: String,
-    pub device: RerankerDevice,
+    pub device: LocalModelDevice,
 }
 
 #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
@@ -175,6 +186,7 @@ pub struct EmbeddingConfig {
     pub query_prefix: Option<String>,
     pub quantization: Option<QuantizationKind>,
     pub token_source: Option<EmbeddingTokenSource>,
+    pub device: LocalModelDevice,
 }
 
 impl EmbeddingConfig {
@@ -235,7 +247,7 @@ struct RawRerankerConfig {
     provider: RerankerProviderKind,
     model: String,
     #[serde(default)]
-    device: RerankerDevice,
+    device: LocalModelDevice,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -258,6 +270,8 @@ struct RawEmbeddingConfig {
     quantization: Option<QuantizationKind>,
     #[serde(default)]
     token_source: Option<EmbeddingTokenSource>,
+    #[serde(default)]
+    device: Option<LocalModelDevice>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -703,6 +717,7 @@ fn embedding_config_from_raw(raw: &RawEmbeddingConfig) -> EmbeddingConfig {
         query_prefix: raw.query_prefix.clone(),
         quantization: raw.quantization,
         token_source: raw.token_source.clone(),
+        device: raw.device.unwrap_or_default(),
     }
 }
 
@@ -1151,9 +1166,10 @@ fn parse_embedding_config(raw: &RawEmbeddingConfig) -> Result<(), QghError> {
             || raw.query_prefix.is_some()
             || raw.quantization.is_some()
             || raw.token_source.is_some()
+            || raw.device.is_some()
         {
             return Err(QghError::config(
-                "Embedding manifest_path cannot be combined with legacy model, model_path, file, pooling, query_prefix, quantization, or token_source fields.",
+                "Embedding manifest_path cannot be combined with legacy model, model_path, file, pooling, query_prefix, quantization, token_source, or device fields.",
             ));
         }
         let options = FastembedProviderOptions {
@@ -1204,7 +1220,18 @@ fn parse_embedding_config(raw: &RawEmbeddingConfig) -> Result<(), QghError> {
         ));
     }
     if let Some(model) = raw.model.as_deref() {
-        if !is_builtin_preset_id(model) {
+        if model == QWEN_EMBEDDING_PRESET_ID {
+            if raw.file.is_some()
+                || raw.pooling.is_some()
+                || raw.query_prefix.is_some()
+                || raw.quantization.is_some()
+                || raw.token_source.is_some()
+            {
+                return Err(QghError::config(
+                    "Qwen embedding preset cannot be combined with file, pooling, query_prefix, quantization, or token_source overrides.",
+                ));
+            }
+        } else if !is_builtin_preset_id(model) {
             validate_hf_model_reference(model)?;
         }
     } else if raw.model_path.is_none() {
@@ -1227,6 +1254,11 @@ fn parse_embedding_config(raw: &RawEmbeddingConfig) -> Result<(), QghError> {
     }
     if let Some(token_source) = &raw.token_source {
         validate_embedding_token_source(token_source)?;
+    }
+    if raw.model.as_deref() != Some(QWEN_EMBEDDING_PRESET_ID) && raw.device.is_some() {
+        return Err(QghError::config(
+            "Embedding device is only valid with the Qwen embedding preset.",
+        ));
     }
     Ok(())
 }
@@ -1357,6 +1389,7 @@ mod tests {
             query_prefix: None,
             quantization: None,
             token_source: None,
+            device: None,
         };
         let mut with_model = base.clone();
         with_model.model = Some("arctic-m-v2-fp32".to_string());
@@ -1417,6 +1450,7 @@ mod tests {
             query_prefix: None,
             quantization: None,
             token_source: None,
+            device: None,
         }
     }
 
