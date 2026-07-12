@@ -9,7 +9,7 @@ use tantivy::schema::{Field, IndexRecordOption, Schema, Value, STORED, STRING, T
 use tantivy::{Index, TantivyDocument, Term};
 
 #[cfg(feature = "fastembed-provider")]
-use qgh::chunking::{chunk_markdown, chunker_fingerprint_for_tokenizer_identity};
+use qgh::chunking::{chunk_markdown, chunker_fingerprint_for_tokenizer_identity, CHUNKER_VERSION};
 #[cfg(feature = "fastembed-provider")]
 use qgh::context::{
     prepare_embedding_input, EmbeddingSourceContext, METADATA_CONTEXT_TEMPLATE_VERSION,
@@ -1049,9 +1049,10 @@ fn real_manifest_tokenizer_contract_drives_frozen_and_resource_chunker_identity(
             .expect("valid real manifest derives its exact tokenizer/chunker contract");
     let tokenizer_identity = contract["tokenizer_contract_identity"].as_str().unwrap();
     let chunker_fingerprint = contract["chunker_fingerprint"].as_str().unwrap();
+    let chunker_prefix = format!("{CHUNKER_VERSION}:");
     assert_eq!(tokenizer_identity.len(), 64);
-    assert!(chunker_fingerprint.starts_with("markdown-token-v2:"));
-    assert_eq!(chunker_fingerprint.len(), "markdown-token-v2:".len() + 64);
+    assert!(chunker_fingerprint.starts_with(&chunker_prefix));
+    assert_eq!(chunker_fingerprint.len(), chunker_prefix.len() + 64);
     assert_eq!(
         contract.as_object().unwrap().keys().collect::<Vec<_>>(),
         ["chunker_fingerprint", "tokenizer_contract_identity"]
@@ -2108,7 +2109,7 @@ fn backfill_success_requires_complete_generation_mapping_vec0_and_publication_co
             .as_nanos()
     ));
     let connection = rusqlite::Connection::open(&path).unwrap();
-    let chunker_fingerprint = format!("markdown-token-v2:{}", "a".repeat(64));
+    let chunker_fingerprint = format!("{CHUNKER_VERSION}:{}", "a".repeat(64));
     connection
         .execute_batch(&format!(
             "CREATE TABLE chunks(id INTEGER PRIMARY KEY, chunker_fingerprint TEXT NOT NULL);
@@ -2823,7 +2824,7 @@ fn candidate_hybrid_filter_evidence_is_complete_and_root_relative() {
     assert!(evidence["chunker_fingerprint"]
         .as_str()
         .unwrap()
-        .starts_with("markdown-token-v2:"));
+        .starts_with(&format!("{CHUNKER_VERSION}:")));
     assert_eq!(evidence["active_competing_sources"], 7);
     assert_eq!(evidence["embedded_chunks"], 7);
     assert_eq!(evidence["hybrid_filtered_queries"], 4);

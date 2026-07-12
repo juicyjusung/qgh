@@ -3,8 +3,9 @@ use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
 
-pub const CHUNKER_VERSION: &str = "markdown-token-v2";
-pub const CHUNKER_FINGERPRINT: &str = "markdown-token-v2:heading-code-fence-overlap";
+pub const CHUNKER_VERSION: &str = "markdown-token-v3";
+pub const CHUNKER_FINGERPRINT: &str =
+    "markdown-token-v3:heading-code-fence-forward-progress-overlap";
 pub const DEFAULT_TARGET_TOKENS: usize = 900;
 pub const DEFAULT_BOUNDARY_SEARCH_TOKENS: usize = 200;
 pub const DEFAULT_OVERLAP_TOKENS: usize = 135;
@@ -204,6 +205,15 @@ fn chunk_markdown_with_config_and_fingerprint(
         let overlap_tokens = config.overlap_tokens.min(token_end - token_start - 1);
         let mut next_start = token_end.saturating_sub(overlap_tokens);
         next_start = adjust_start_out_of_code_fence(next_start, &code_fence_token_ranges);
+        // Re-entering the prefix before the same fence can reduce progress to
+        // one token per chunk when the prefix is no longer than the overlap.
+        if next_start < token_end
+            && code_fence_token_ranges
+                .iter()
+                .any(|range| range.start == token_end)
+        {
+            next_start = token_end;
+        }
         if next_start <= token_start {
             next_start = token_end;
         }
@@ -569,6 +579,58 @@ mod tests {
     }
 
     #[test]
+    fn short_prefix_before_code_fence_has_bounded_chunk_count() {
+        let text = "pre00 pre01 pre02 pre03\n\n```text\nfence00 fence01 fence02 fence03 fence04 fence05 fence06 fence07\n```\n\ntail00 tail01";
+        let config = ChunkerConfig {
+            target_tokens: 6,
+            overlap_tokens: 4,
+            boundary_search_tokens: 0,
+        };
+
+        let chunks = chunk_markdown_with_config(text, &WhitespaceTokenizer, config).unwrap();
+
+        assert_eq!(chunks.len(), 3);
+    }
+
+    #[test]
+    fn pathological_fence_shapes_are_atomic_bounded_and_deterministic() {
+        fn tokens(prefix: &str, count: usize) -> String {
+            (0..count)
+                .map(|index| format!("{prefix}{index:05}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        fn fenced_shape(prefix_tokens: usize, fence_tokens: usize, tail_tokens: usize) -> String {
+            format!(
+                "{}\n\n```text\n{}\n```\n\n{}",
+                tokens("pre", prefix_tokens),
+                tokens("fence", fence_tokens),
+                tokens("tail", tail_tokens)
+            )
+        }
+
+        for text in [fenced_shape(135, 1_062, 24), fenced_shape(56, 6_188, 23)] {
+            let first =
+                chunk_markdown_with_config(&text, &WhitespaceTokenizer, ChunkerConfig::default())
+                    .unwrap();
+            let retry =
+                chunk_markdown_with_config(&text, &WhitespaceTokenizer, ChunkerConfig::default())
+                    .unwrap();
+
+            assert_eq!(first, retry);
+            assert_eq!(first.len(), 3);
+            for chunk in &first {
+                assert_eq!(chunk.body, text[chunk.byte_start..chunk.byte_end]);
+                assert_ne!(chunk.body.matches("```").count(), 1);
+            }
+            for adjacent in first.windows(2) {
+                assert!(adjacent[1].token_start > adjacent[0].token_start + 1);
+            }
+        }
+    }
+
+    #[test]
     fn chunk_size_uses_tokenizer_spans_not_character_count() {
         struct WholeInputTokenizer;
 
@@ -627,6 +689,19 @@ mod tests {
         assert_eq!(
             arctic[0].chunker_fingerprint,
             chunker_fingerprint_for_tokenizer_identity("arctic-tokenizer-contract")
+        );
+    }
+
+    #[test]
+    fn semantic_chunker_revision_invalidates_existing_generation_identity() {
+        assert_eq!(CHUNKER_VERSION, "markdown-token-v3");
+        assert_eq!(
+            CHUNKER_FINGERPRINT,
+            "markdown-token-v3:heading-code-fence-forward-progress-overlap"
+        );
+        assert!(
+            chunker_fingerprint_for_tokenizer_identity("fixture-tokenizer")
+                .starts_with("markdown-token-v3:")
         );
     }
 
