@@ -1,5 +1,6 @@
 use crate::cli::QueryArgs;
 use crate::commands;
+use crate::config::parse_repo;
 use crate::error::QghError;
 use crate::freshness;
 use crate::output::{error_envelope, success_envelope_with_meta_and_warnings};
@@ -50,7 +51,9 @@ async fn handle_message(session: &McpSession, message: Value) -> Option<Value> {
         Ok(request) => request,
         Err(error) => return Some(error),
     };
-    let error_id = request.id.clone().unwrap_or(Value::Null);
+    // JSON-RPC notifications never receive a response, including when their
+    // method or params are invalid. The envelope itself is validated above.
+    let id = request.id?;
 
     let params_valid = match request.method {
         "initialize" => valid_initialize_params(request.params),
@@ -59,10 +62,8 @@ async fn handle_message(session: &McpSession, message: Value) -> Option<Value> {
         _ => true,
     };
     if !params_valid {
-        return Some(protocol_error(error_id, -32602, "Invalid params"));
+        return Some(protocol_error(id, -32602, "Invalid params"));
     }
-
-    let id = request.id?;
 
     Some(match request.method {
         "initialize" => success_response(id, initialize_result()),
@@ -422,20 +423,15 @@ fn optional_query_state(object: &Map<String, Value>) -> Result<Option<String>, Q
 
 fn optional_repo(object: &Map<String, Value>) -> Result<Option<String>, QghError> {
     let repo = optional_string(object, "repo")?;
-    if repo.as_deref().is_some_and(|repo| !is_owner_repo(repo)) {
+    if repo
+        .as_deref()
+        .is_some_and(|repo| parse_repo(repo).is_err())
+    {
         return Err(validation_error(
             "MCP parameter `repo` must use owner/repo format.",
         ));
     }
     Ok(repo)
-}
-
-fn is_owner_repo(repo: &str) -> bool {
-    let mut parts = repo.split('/');
-    matches!(
-        (parts.next(), parts.next(), parts.next()),
-        (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty()
-    )
 }
 
 fn optional_duration_string(

@@ -5596,19 +5596,12 @@ fn parse_issue_number(query_text: &str) -> Option<i64> {
 }
 
 fn validate_repo(repo: &str) -> Result<(), QghError> {
-    let Some((owner, name)) = repo.split_once('/') else {
-        return Err(QghError::validation(
-            "validation.invalid_repo",
-            "Repo filter must use owner/repo format.",
-        ));
-    };
-    if owner.is_empty() || name.is_empty() || name.contains('/') || repo.contains('*') {
-        return Err(QghError::validation(
+    parse_repo(repo).map(|_| ()).map_err(|_| {
+        QghError::validation(
             "validation.invalid_repo",
             "Repo filter must use explicit owner/repo format.",
-        ));
-    }
-    Ok(())
+        )
+    })
 }
 
 fn enforce_source_scope(
@@ -8537,10 +8530,16 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let chunk_bodies = if issue.node_id == "I_VECTOR_ALLOWED" {
-                vec![
+                let mut chunks = vec![
                     test_chunk("far allowed chunk".to_string()),
                     test_chunk("best allowed chunk".to_string()),
-                ]
+                ];
+                chunks[1].chunk_index = 1;
+                chunks[1].token_start = 1;
+                chunks[1].token_end = 2;
+                chunks[1].byte_start = chunks[0].byte_end;
+                chunks[1].byte_end = chunks[1].byte_start + chunks[1].body.len();
+                chunks
             } else {
                 vec![test_chunk(format!("vector smoke chunk {}", issue.node_id))]
             };

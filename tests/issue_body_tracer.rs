@@ -6138,12 +6138,34 @@ fn mcp_rejects_malformed_envelopes_and_method_params() {
                 "_meta": {"trace": "opaque"}
             }
         }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {
+                    "query": "anything",
+                    "repo": "owner/repo?access_token=PRIVATE_MCP_REPO_MARKER"
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {"unexpected": "PRIVATE_NOTIFICATION_MARKER"}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "future/notification",
+            "params": "PRIVATE_UNKNOWN_NOTIFICATION_MARKER"
+        }),
     ]);
 
     assert_success(&output);
     assert!(stderr_text(&output).is_empty());
     let messages = stdout_json_lines(&output);
-    assert_eq!(messages.len(), 10);
+    assert_eq!(messages.len(), 11);
     for (message, id) in messages[..3].iter().zip([1, 2, 3]) {
         assert_eq!(message["id"], id);
         assert_eq!(message["error"]["code"], -32600);
@@ -6157,6 +6179,17 @@ fn mcp_rejects_malformed_envelopes_and_method_params() {
     assert_eq!(messages[7]["result"], json!({}));
     assert_eq!(messages[8]["result"]["tools"].as_array().unwrap().len(), 3);
     assert_eq!(messages[9]["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(messages[10]["result"]["isError"], true);
+    assert_eq!(
+        messages[10]["result"]["structuredContent"]["error"]["code"],
+        "validation.mcp"
+    );
+    assert!(!format!("{}{}", stdout_text(&output), stderr_text(&output))
+        .contains("PRIVATE_MCP_REPO_MARKER"));
+    assert!(!format!("{}{}", stdout_text(&output), stderr_text(&output))
+        .contains("PRIVATE_NOTIFICATION_MARKER"));
+    assert!(!format!("{}{}", stdout_text(&output), stderr_text(&output))
+        .contains("PRIVATE_UNKNOWN_NOTIFICATION_MARKER"));
 }
 
 #[test]
@@ -7065,6 +7098,47 @@ fn schema_snapshots_define_envelope_outputs_and_error_taxonomy() {
 }
 
 #[test]
+fn profile_config_rejects_cross_origin_api_and_secret_repo_values_content_free() {
+    for (name, api_base_url, repo, marker) in [
+        (
+            "config-cross-origin-api",
+            "https://attacker.invalid/PRIVATE_API_CONFIG_MARKER",
+            "owner/repo",
+            "PRIVATE_API_CONFIG_MARKER",
+        ),
+        (
+            "config-secret-repo",
+            "https://api.github.com",
+            "owner/repo?token=PRIVATE_REPO_CONFIG_MARKER",
+            "PRIVATE_REPO_CONFIG_MARKER",
+        ),
+    ] {
+        let fixture = TestFixture::new(name);
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["{repo}"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#
+        );
+        fs::write(fixture.config_home.join("qgh/config.toml"), config).unwrap();
+
+        let status = fixture.qgh(["status", "--json"]);
+        assert_eq!(status.status.code(), Some(2));
+        let output = format!("{}{}", stdout_text(&status), stderr_text(&status));
+        assert!(!output.contains(marker), "{output}");
+    }
+}
+
+#[test]
 fn query_filter_errors_are_versioned_json_envelopes() {
     let fixture = TestFixture::new("filter-errors");
     fixture.write_config("http://127.0.0.1:1");
@@ -7081,6 +7155,23 @@ fn query_filter_errors_are_versioned_json_envelopes() {
     assert_eq!(
         stdout_json(&malformed_repo)["error"]["code"],
         "validation.invalid_repo"
+    );
+
+    let secret_repo = fixture.qgh([
+        "query",
+        "anything",
+        "--repo",
+        "owner/repo?access_token=PRIVATE_CLI_REPO_MARKER",
+        "--json",
+    ]);
+    assert_eq!(secret_repo.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&secret_repo)["error"]["code"],
+        "validation.invalid_repo"
+    );
+    assert!(
+        !format!("{}{}", stdout_text(&secret_repo), stderr_text(&secret_repo))
+            .contains("PRIVATE_CLI_REPO_MARKER")
     );
 
     let wiki_filter = fixture.qgh(["query", "anything", "--wiki", "Home", "--json"]);

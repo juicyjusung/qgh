@@ -1,6 +1,6 @@
 use crate::config::{
     discover_repo_policy, load_profile, origin_remote_best_effort,
-    origin_remote_from_current_worktree, single_matching_profile_id, GitRemote,
+    origin_remote_from_current_worktree, parse_repo, single_matching_profile_id, GitRemote,
 };
 use crate::error::QghError;
 use serde_json::{json, Value};
@@ -159,19 +159,12 @@ fn repo_scope_from_explicit_arg(
 }
 
 fn validate_repo_scope(repo: &str) -> Result<(), QghError> {
-    let Some((owner, name)) = repo.split_once('/') else {
-        return Err(QghError::validation(
-            "validation.invalid_repo",
-            "Repo filter must use owner/repo format.",
-        ));
-    };
-    if owner.is_empty() || name.is_empty() || name.contains('/') || repo.contains('*') {
-        return Err(QghError::validation(
+    parse_repo(repo).map(|_| ()).map_err(|_| {
+        QghError::validation(
             "validation.invalid_repo",
             "Repo filter must use explicit owner/repo format.",
-        ));
-    }
-    Ok(())
+        )
+    })
 }
 
 impl ResolvedCommandContext {

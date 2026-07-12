@@ -417,15 +417,13 @@ pub fn bootstrap_profile_repo(
     input: ProfileBootstrapInput,
 ) -> Result<ProfileBootstrapOutcome, QghError> {
     validate_profile_id(&input.profile_id)?;
-    parse_repo(&input.repo).map_err(|message| {
+    parse_repo(&input.repo).map_err(|_| {
         QghError::validation(
             "validation.invalid_repo",
-            format!("Repo `{}` {message}", input.repo),
+            "Repo must be an explicit owner/repo allowlist entry.",
         )
     })?;
-    validate_remote_host(&input.host)?;
-    validate_base_url("api_base_url", &input.api_base_url)?;
-    validate_base_url("web_base_url", &input.web_base_url)?;
+    validate_profile_endpoints(&input.host, &input.api_base_url, &input.web_base_url)?;
     validate_token_source(&input.token_source)?;
 
     let config_path = config_file_path()?;
@@ -674,6 +672,7 @@ fn load_config_file() -> Result<ConfigFile, QghError> {
     if let Some(reranker) = &config.reranker {
         parse_reranker_config(reranker)?;
     }
+    validate_config_profile_endpoints(&config)?;
     validate_config_token_sources(&config)?;
     Ok(config)
 }
@@ -693,6 +692,7 @@ fn profile_from_raw(
     reranker: Option<RerankerConfig>,
 ) -> Result<Profile, QghError> {
     let paths = ProfilePaths::resolve(profile_id)?;
+    validate_profile_endpoints(&raw.host, &raw.api_base_url, &raw.web_base_url)?;
     if raw.repos.is_empty() {
         return Err(QghError::config("Profile repos must not be empty."));
     }
@@ -714,7 +714,9 @@ fn profile_from_raw(
         .repos
         .iter()
         .map(|repo| {
-            parse_repo(repo).map_err(|message| QghError::config(format!("Repo `{repo}` {message}")))
+            parse_repo(repo).map_err(|_| {
+                QghError::config("Profile repo must be an explicit owner/repo allowlist entry.")
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1089,7 +1091,18 @@ fn reject_local_path_like(field: &str, value: &str) -> Result<(), QghError> {
 }
 
 fn validate_remote_host(host: &str) -> Result<(), QghError> {
-    if host.is_empty() || host.contains('/') || host.contains('*') || host.contains('@') {
+    let parsed = reqwest::Url::parse(&format!("https://{host}"));
+    let valid = parsed.as_ref().is_ok_and(|url| {
+        url.host_str()
+            .is_some_and(|parsed_host| parsed_host.eq_ignore_ascii_case(host))
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none()
+    });
+    if !valid {
         return Err(QghError::validation(
             "validation.invalid_host",
             "Host must be a plain GitHub host name.",
@@ -1098,14 +1111,86 @@ fn validate_remote_host(host: &str) -> Result<(), QghError> {
     Ok(())
 }
 
-fn validate_base_url(field: &str, value: &str) -> Result<(), QghError> {
-    if !(value.starts_with("https://") || value.starts_with("http://")) {
+fn validate_profile_endpoints(
+    host: &str,
+    api_base_url: &str,
+    web_base_url: &str,
+) -> Result<(), QghError> {
+    validate_remote_host(host)?;
+    let api = parse_profile_base_url("api_base_url", api_base_url)?;
+    let web = parse_profile_base_url("web_base_url", web_base_url)?;
+    let api_is_loopback = url_host_is_loopback(&api);
+    let web_is_loopback = url_host_is_loopback(&web);
+    if (api.scheme() != "https" && !api_is_loopback)
+        || (web.scheme() != "https" && !web_is_loopback)
+    {
         return Err(QghError::validation(
             "validation.invalid_url",
-            format!("{field} must be an absolute HTTP(S) URL."),
+            "Profile base URLs must use HTTPS outside loopback development endpoints.",
+        ));
+    }
+    let expected_api_host = if host.eq_ignore_ascii_case("github.com") {
+        "api.github.com"
+    } else {
+        host
+    };
+    if !api_is_loopback
+        && !api
+            .host_str()
+            .is_some_and(|api_host| api_host.eq_ignore_ascii_case(expected_api_host))
+    {
+        return Err(QghError::validation(
+            "validation.invalid_url",
+            "Profile API base URL does not match the configured GitHub host.",
+        ));
+    }
+    if !web
+        .host_str()
+        .is_some_and(|web_host| web_host.eq_ignore_ascii_case(host))
+    {
+        return Err(QghError::validation(
+            "validation.invalid_url",
+            "Profile web base URL does not match the configured GitHub host.",
+        ));
+    }
+    if (!api_is_loopback && api.port().is_some()) || (!web_is_loopback && web.port().is_some()) {
+        return Err(QghError::validation(
+            "validation.invalid_url",
+            "Profile base URLs must not override the HTTPS port.",
         ));
     }
     Ok(())
+}
+
+fn parse_profile_base_url(field: &str, value: &str) -> Result<reqwest::Url, QghError> {
+    let url = reqwest::Url::parse(value).map_err(|_| {
+        QghError::validation(
+            "validation.invalid_url",
+            format!("{field} must be an absolute HTTP(S) URL."),
+        )
+    })?;
+    if !matches!(url.scheme(), "https" | "http")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(QghError::validation(
+            "validation.invalid_url",
+            format!("{field} must be a credential-free HTTP(S) base URL."),
+        ));
+    }
+    Ok(url)
+}
+
+fn url_host_is_loopback(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
 }
 
 fn validate_token_source(token_source: &TokenSource) -> Result<(), QghError> {
@@ -1180,6 +1265,13 @@ fn github_cli_token_args(host: &str) -> [&str; 4] {
 fn validate_config_token_sources(config: &ConfigFile) -> Result<(), QghError> {
     for raw in config.profiles.values() {
         validate_token_source(&raw.token_source)?;
+    }
+    Ok(())
+}
+
+fn validate_config_profile_endpoints(config: &ConfigFile) -> Result<(), QghError> {
+    for raw in config.profiles.values() {
+        validate_profile_endpoints(&raw.host, &raw.api_base_url, &raw.web_base_url)?;
     }
     Ok(())
 }
@@ -1412,6 +1504,49 @@ fn valid_repo_segment(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_endpoint_contract_blocks_token_exfiltration_without_echoing_urls() {
+        for (api_base_url, web_base_url) in [
+            (
+                "https://attacker.invalid/PRIVATE_API_ORIGIN",
+                "https://github.com",
+            ),
+            ("https://PRIVATE_USER@api.github.com", "https://github.com"),
+            (
+                "https://api.github.com?token=PRIVATE_QUERY",
+                "https://github.com",
+            ),
+            (
+                "https://api.github.com",
+                "https://attacker.invalid/PRIVATE_WEB_ORIGIN",
+            ),
+            (
+                "http://api.github.com/PRIVATE_PLAINTEXT",
+                "https://github.com",
+            ),
+        ] {
+            let error =
+                validate_profile_endpoints("github.com", api_base_url, web_base_url).unwrap_err();
+            assert_eq!(error.code, "validation.invalid_url");
+            let serialized = serde_json::to_string(&error).unwrap();
+            assert!(!serialized.contains("PRIVATE_"), "{serialized}");
+        }
+    }
+
+    #[test]
+    fn profile_endpoint_contract_accepts_github_ghes_and_tokenless_loopback_transports() {
+        validate_profile_endpoints("github.com", "https://api.github.com", "https://github.com")
+            .unwrap();
+        validate_profile_endpoints(
+            "ghe.internal.example",
+            "https://ghe.internal.example/api/v3",
+            "https://ghe.internal.example",
+        )
+        .unwrap();
+        validate_profile_endpoints("github.com", "http://127.0.0.1:43123", "https://github.com")
+            .unwrap();
+    }
 
     #[test]
     fn git_remote_query_and_fragment_secrets_are_rejected_and_redacted() {

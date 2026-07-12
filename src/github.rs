@@ -470,7 +470,7 @@ async fn fetch_issues_classified_with_client(
         let mut repo_skipped_pull_requests = 0;
         let mut last_progress_issue_count = 0;
         while let Some(url) = next_url.take() {
-            let mut request = github_get(client, &url, token);
+            let mut request = github_get(client, &url, token, &profile.api_base_url);
             if let Some(etag) = stored_cursor.and_then(|cursor| cursor.etag.as_ref()) {
                 request = request.header(IF_NONE_MATCH, etag);
             }
@@ -909,7 +909,10 @@ async fn fetch_backfill_issues_classified_inner(
                 all_reached_end = false;
                 break 'repos;
             }
-            let response = match github_get(&client, &url, token).send().await {
+            let response = match github_get(&client, &url, token, &profile.api_base_url)
+                .send()
+                .await
+            {
                 Ok(response) => response,
                 Err(error) => {
                     interruption = Some(LifecycleInterruption::Transient(
@@ -1323,7 +1326,10 @@ async fn fetch_target_issue_classified_with_client_and_transition_commit(
 
         let url = issue_object_url(profile, &current_repo, current_issue_number);
 
-        let response = match github_get(client, &url, token).send().await {
+        let response = match github_get(client, &url, token, &profile.api_base_url)
+            .send()
+            .await
+        {
             Ok(response) => response,
             Err(error) => {
                 finish_target!(ClassifiedTargetIssueTerminal::Transient(
@@ -1774,7 +1780,7 @@ async fn fetch_issue_comments(
     let mut endpoint_not_modified = false;
     let mut next_url = Some(comment_url(profile, repo, issue.number, stored_cursor));
     while let Some(url) = next_url.take() {
-        let mut request = github_get(client, &url, token);
+        let mut request = github_get(client, &url, token, &profile.api_base_url);
         if let Some(etag) = stored_cursor.and_then(|cursor| cursor.etag.as_ref()) {
             request = request.header(IF_NONE_MATCH, etag);
         }
@@ -2025,7 +2031,7 @@ async fn fetch_repo_comments_classified_inner(
         let mut blocked = false;
         let mut next_url = Some(repo_comment_url(profile, repo, stored_cursor));
         while let Some(url) = next_url.take() {
-            let mut request = github_get(&client, &url, token);
+            let mut request = github_get(&client, &url, token, &profile.api_base_url);
             if let Some(etag) = conditional_etag.take() {
                 request = request.header(IF_NONE_MATCH, etag);
             }
@@ -2235,7 +2241,10 @@ async fn classify_parent(
     progress: Option<&dyn ProgressReporter>,
 ) -> ParentClass {
     let url = issue_object_url(profile, repo, issue_number);
-    let response = match github_get(client, &url, token).send().await {
+    let response = match github_get(client, &url, token, &profile.api_base_url)
+        .send()
+        .await
+    {
         Ok(response) => response,
         Err(error) => return ParentClass::Transient(classify_transport_failure(&error)),
     };
@@ -2473,7 +2482,7 @@ async fn repository_access_attempt_at(
 ) -> ResponseDisposition {
     let url = repository_object_url_at(api_base_url, repo);
     let scope = format!("repository:{}", repo.full_name());
-    let response = match github_get(client, &url, token).send().await {
+    let response = match github_get(client, &url, token, api_base_url).send().await {
         Ok(response) => response,
         Err(error) => {
             return ResponseDisposition::Transient(classify_transport_failure(&error));
@@ -2720,7 +2729,10 @@ async fn check_candidate_lifecycle_classified(
     progress: Option<&dyn ProgressReporter>,
 ) -> Result<ClassifiedLifecycleCheck, QghError> {
     let url = source_check_url(profile, candidate)?;
-    let response = match github_get(client, &url, token).send().await {
+    let response = match github_get(client, &url, token, &profile.api_base_url)
+        .send()
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             return Ok(ClassifiedLifecycleCheck::Transient(
@@ -2905,13 +2917,49 @@ fn stable_error_identity(
     }
 }
 
-fn github_get(client: &reqwest::Client, url: &str, token: &str) -> reqwest::RequestBuilder {
-    client
-        .get(url)
-        .bearer_auth(token)
+fn github_get(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    trusted_api_base_url: &str,
+) -> reqwest::RequestBuilder {
+    let request = client.get(url);
+    let request = if github_request_may_receive_token(url, trusted_api_base_url) {
+        request.bearer_auth(token)
+    } else {
+        request
+    };
+    request
         .header("accept", "application/vnd.github+json")
         .header("user-agent", user_agent())
         .header("x-github-api-version", GITHUB_API_VERSION)
+}
+
+fn github_request_may_receive_token(url: &str, trusted_api_base_url: &str) -> bool {
+    let Ok(target) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Ok(trusted) = reqwest::Url::parse(trusted_api_base_url) else {
+        return false;
+    };
+    if target.scheme() != "https" || !same_url_origin(&target, &trusted) {
+        return false;
+    }
+    !target.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
+}
+
+fn same_url_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left
+            .host_str()
+            .zip(right.host_str())
+            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 fn source_check_url(
@@ -3251,6 +3299,26 @@ mod permission_classification_tests {
     const NOT_FOUND_RESPONSE: &str =
         "HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
     const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+
+    #[test]
+    fn github_token_is_bound_to_the_validated_https_api_origin() {
+        assert!(github_request_may_receive_token(
+            "https://api.github.com/repos/owner/repo/issues?page=2",
+            "https://api.github.com"
+        ));
+        assert!(github_request_may_receive_token(
+            "https://ghe.example/api/v3/repos/owner/repo",
+            "https://ghe.example/api/v3"
+        ));
+        assert!(!github_request_may_receive_token(
+            "https://attacker.invalid/repos/owner/repo?page=2",
+            "https://api.github.com"
+        ));
+        assert!(!github_request_may_receive_token(
+            "http://127.0.0.1:43123/repos/owner/repo",
+            "http://127.0.0.1:43123"
+        ));
+    }
 
     fn spawn_responses(
         responses: Vec<&'static str>,
