@@ -221,7 +221,7 @@ fn curated_search_quality_eval_gate_passes() {
         "model_ab_report",
         "dragonkue/snowflake-arctic-embed-l-v2.0-ko",
         "Alibaba-NLP/gte-modernbert-base",
-        "default model remains",
+        "default/baseline row remains",
         "candidate-specific deterministic source and query vectors",
         "qgh embed --force --json",
         "fingerprint_reembedding_checks",
@@ -1597,6 +1597,8 @@ query_prefix = "query: "
 
     fn seed_eval_chunks(&self, source_vectors: &BTreeMap<&'static str, Vec<f32>>) {
         let conn = Connection::open(self.db_path()).unwrap();
+        conn.execute("DELETE FROM source_chunk_manifests", [])
+            .unwrap();
         conn.execute("DELETE FROM chunks", []).unwrap();
 
         for source_id in source_vectors.keys() {
@@ -1631,6 +1633,19 @@ query_prefix = "query: "
                 ],
             )
             .unwrap();
+            conn.execute(
+                "INSERT INTO source_chunk_manifests (
+                    source_version_id, source_id, chunker_fingerprint,
+                    expected_count, chunk_digest, updated_at
+                 ) VALUES (?1, ?2, ?3, 1, ?4, '1970-01-01T00:00:00Z')",
+                params![
+                    source_version_id,
+                    *source_id,
+                    CHUNKER_FINGERPRINT,
+                    "0".repeat(64),
+                ],
+            )
+            .unwrap();
         }
     }
 
@@ -1662,7 +1677,9 @@ query_prefix = "query: "
         );
         assert_success(&status);
         let status_json = stdout_json(&status);
-        assert_eq!(status_json["data"]["embedding"]["state"], "complete");
+        // Status remains a pure local snapshot check and must not treat the
+        // debug-only vector env as an installed production model runtime.
+        assert_eq!(status_json["data"]["embedding"]["state"], "missing");
         assert_eq!(
             status_json["data"]["embedding"]["coverage"]["completed_chunks"],
             source_vectors.len()

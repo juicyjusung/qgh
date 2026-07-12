@@ -64,13 +64,13 @@ Current synthetic fixture result:
   "negative_abstention": 1.0,
   "hybrid_regression_path_queries": "15/15",
   "semantic_bm25_top5": 0.92,
-  "semantic_hybrid_top5": 1.0,
-  "semantic_hybrid_delta": 0.08,
+  "semantic_hybrid_top5": 0.92,
+  "semantic_hybrid_delta": 0.0,
   "semantic_hybrid_target": 0.7,
   "semantic_hybrid_path_queries": "20/20",
   "cross_language_bm25_top5": 0.5,
-  "cross_language_hybrid_top5": 1.0,
-  "cross_language_hybrid_delta": 0.5,
+  "cross_language_hybrid_top5": 0.88,
+  "cross_language_hybrid_delta": 0.38,
   "cross_language_hybrid_target": 0.6,
   "hard_filter_violations": 0,
   "get_round_trip": 1.0,
@@ -111,9 +111,9 @@ Current deterministic fixture result:
 
 | Candidate | Configured model id | Regression hybrid path | Semantic hybrid top-5 | Semantic delta vs BM25 | Cross-language hybrid top-5 | Cross-language delta vs BM25 | Section 8.3 triggers |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| arctic-embed-l-v2.0 | `Snowflake/snowflake-arctic-embed-l-v2.0` | 15/15 | 1.00 | 0.08 | 1.00 | 0.50 | `[]` |
-| dragonkue-ko | `dragonkue/snowflake-arctic-embed-l-v2.0-ko` | 15/15 | 1.00 | 0.08 | 1.00 | 0.50 | `[]` |
-| gte-modernbert-base | `Alibaba-NLP/gte-modernbert-base` | 15/15 | 1.00 | 0.08 | 0.75 | 0.25 | `[]` |
+| arctic-embed-l-v2.0 | `Snowflake/snowflake-arctic-embed-l-v2.0` | 15/15 | 0.92 | 0.00 | 0.88 | 0.38 | `[]` |
+| dragonkue-ko | `dragonkue/snowflake-arctic-embed-l-v2.0-ko` | 15/15 | 0.92 | 0.00 | 0.88 | 0.38 | `[]` |
+| gte-modernbert-base | `Alibaba-NLP/gte-modernbert-base` | 15/15 | 0.92 | 0.00 | 0.62 | 0.12 | `[]` |
 
 Additional checks:
 
