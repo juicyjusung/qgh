@@ -2,11 +2,15 @@
 
 ## Status
 
-Accepted. This decision supersedes ADR-0015 only where it describes Qwen
-embedding as a manually selected config preset that is never enabled by
-default. ADR-0015 remains authoritative for the pinned model/runtime contract,
-local-only acquisition boundary, evaluation evidence, unresolved quality and
-resource risks, and optional reranker behavior.
+Accepted. This decision supersedes ADR-0015 where it describes Qwen embedding
+as a manually selected preset, ADR-0012 where it names Snowflake and equal RRF
+as current defaults, and the corresponding default-model, automatic-download,
+dynamic-dimension, fusion, and reranker clauses in `qgh-hybrid-search-prd.md`.
+Those documents remain authoritative for their unaffected storage, privacy,
+citation, BM25, and historical-decision context. ADR-0015 remains authoritative
+for the pinned Qwen runtime contract, local-only acquisition boundary,
+evaluation evidence, unresolved quality and resource risks, and optional
+reranker behavior.
 
 ## Context
 
@@ -59,10 +63,12 @@ The following boundaries are normative:
   atomically published.
 - Normal foreground sync reuses vectors only from a fully validated compatible
   generation, infers only missing chunks in bounded batches, persists each
-  batch before continuing, and resumes validated staged work after interruption.
-  A no-change sync performs zero inference and does not initialize or mmap the
-  inference runtime. A new CLI process still hashes the complete installed
-  snapshot, including the 1.2 GB weights, before trusting it.
+  batch before continuing, and resumes validated staged work after interruption,
+  including when a later no-op sync has a new run identity. A no-change sync
+  proves Store-owned source chunk manifests and the compatible embedding
+  generation, performs zero inference, and does not initialize, mmap, or hash
+  the 1.2 GB model payload. Any changed, missing, or unattested chunk returns to
+  the fully verified tokenizer/runtime path.
 - Qwen inputs are explicitly fitted to the 1,024-token runtime window before
   inference. Metadata context at the beginning is retained, authoritative
   bodies/snippets are unchanged, and the input-adapter revision is part of the
@@ -91,12 +97,13 @@ The following boundaries are normative:
 - Initial indexing cost remains visible, while repeated and interrupted syncs
   avoid full-corpus recomputation. Apple Silicon `auto` uses Metal F16; other
   supported systems use CPU F32, with the resolved runtime in the fingerprint.
-- Cross-process snapshot verification continues to hash the complete model.
-  A persistent `(path, size, mtime)` stamp is not an integrity proof and is not
-  adopted. A future zero-read no-change path must first prove a reusable
-  generation against the pinned contract, source/context inventory, vector
-  dimensions and checksums, sqlite-vec mappings, and publication epoch; any
-  missing or changed chunk must still enter the fully verified runtime path.
+- Model installation, `doctor`, changed-chunk sync, inference, and semantic
+  query initialization continue to hash the complete snapshot before loading
+  it. `status`, exact-locator query, and a proven no-change sync use the pinned
+  manifest identity without reading the model payload. Store-owned per-source
+  chunk count/digest manifests are invalidated by SQLite triggers on any chunk
+  mutation; missing legacy evidence fails closed into re-chunking. A persistent
+  `(path, size, mtime)` stamp is still not treated as an integrity proof.
 - No-default-feature binaries remain model-free and keep the complete
   `sync -> query -> get -> cite -> status` workflow.
 - Qwen runtime, lifecycle, cross-language quality, resource, and abstention

@@ -85,9 +85,11 @@ Current synthetic fixture result:
 `model_ab_report` is report-only. All rows use the same
 `search-quality-eval` fixture and same H4a protocol. Each candidate uses
 candidate-specific deterministic source and query vectors so the harness
-compares model behavior without live model downloads. The default model remains
-`Snowflake/snowflake-arctic-embed-l-v2.0`; changing it still requires a
-PRD/ADR-backed human decision.
+compares model behavior without live model downloads. The report's
+default/baseline row remains the historical Snowflake synthetic control in this
+fixture. That label is not the current product default: ADR-0016 selects the separately
+installed `qwen3-embedding-0.6b` preset for newly created fastembed-capable
+configs. Product-default changes still require a PRD/ADR-backed human decision.
 
 This table is a deterministic contract test, not live-model evidence. It uses
 synthetic vectors and synthetic immutable revisions for non-default candidates,

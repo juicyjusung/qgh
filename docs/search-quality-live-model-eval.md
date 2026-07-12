@@ -19,7 +19,7 @@ split or incomplete resource protocol as fresh promotion evidence.
 | Fusion | `lexical_guard_v1`: BM25 top five protected, weighted RRF below |
 | Guarded quality | nDCG 0.6216; MRR 0.6023; Recall@5 0.7578; Recall@10 0.8667 |
 | BM25 complement | harm @5/@10 `0/0`; rescue @5/@10 `0/3` |
-| Runtime | Metal F16; 5.919 chunks/s; query embedding p95 35.9 ms |
+| Runtime | Metal F16; 5.921 chunks/s; query embedding p95 36.1 ms; hybrid p95 38.4 ms |
 | Reranker | optional per-query stage; off by default |
 | Formal promotion evidence | still blocked by opened split and incomplete resource protocol |
 | Full evidence | [production-adapter regression](search-quality-qwen-production-adapter-eval.md) |
@@ -112,7 +112,7 @@ The pinned Granite `model_quint8_avx2.onnx` artifacts contain `DynamicQuantizeLi
 
 ## Original Arctic/GTE decision
 
-The integrated live run completed against public GitHub Issues and comments with real local model artifacts. It selected neither a light nor a quality candidate, so no embedding preset is promoted. The existing optional `Snowflake/snowflake-arctic-embed-l-v2.0` default remains unchanged as a compatibility control; this evaluation does not newly approve it as a resource-qualified preset.
+The integrated live run completed against public GitHub Issues and comments with real local model artifacts. At that historical decision point it selected neither a light nor a quality candidate, so no embedding preset was promoted and the optional `Snowflake/snowflake-arctic-embed-l-v2.0` compatibility default remained unchanged. ADR-0016 later superseded that default for newly created fastembed-capable configs; this older evaluation still does not qualify Snowflake or Qwen as a fresh blind resource-qualified promotion.
 
 `metadata_boost_v1` is also not promoted. It improved dev weighted nDCG@10, but both lexical profiles failed the Korean Recall@5 quality gate. `production_v1` therefore remains the production lexical profile.
 

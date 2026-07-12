@@ -91,14 +91,18 @@ qgh --profile PROFILE sync
 The foreground command reports only content-free counts and timing on stderr:
 staged/reused/missing chunks, completed chunks, throughput, and ETA. A repeated
 sync with no content or context changes reuses the validated vectors, performs
-zero inference, and does not initialize or mmap the 1.2 GB inference runtime.
-A new CLI process still reads and hashes the complete installed snapshot before
-trusting it. Interrupted builds resume from validated staged batches. `qgh
-embed --force` remains available for an explicitly requested full rebuild; no
-background daemon or MCP write tool is required.
+zero inference, and does not initialize, mmap, or hash the 1.2 GB inference
+runtime. It uses the pinned manifest identity plus Store-owned per-source chunk
+count/digest manifests, vector checksums/mappings, and publication epoch.
+SQLite triggers invalidate a source manifest on any chunk insert, update, or
+delete; missing legacy evidence forces re-chunking. Interrupted builds resume
+validated staged batches even after a later no-op sync creates a new run
+identity. `qgh embed --force` remains available for an explicitly requested
+full rebuild; no background daemon or MCP write tool is required.
 
-The full hash is intentional until qgh can prove a reusable embedding
-generation from Store-owned source/context inventory and vector mappings. File
+Model installation, `doctor`, changed-chunk sync, inference, and semantic query
+initialization still hash the complete installed snapshot. `status`, exact
+locator queries, and proven no-change syncs use only the pinned contract. File
 size, path, and timestamp alone are not accepted as a persistent verification
 cache because they do not prove artifact contents.
 
