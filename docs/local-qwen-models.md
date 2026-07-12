@@ -80,12 +80,21 @@ The preset fixes the immutable upstream revision, query instruction,
 last-token pooling, L2 normalization, and 384-dimensional output. These fields
 cannot be overridden individually.
 
-After installation and configuration, publish embeddings for the current
-profile:
+After installation and configuration, normal sync chunks the active snapshot,
+embeds only missing or changed chunks, validates the generation, and publishes
+it with the lexical snapshot:
 
 ```sh
-qgh --profile PROFILE embed --force
+qgh --profile PROFILE sync
 ```
+
+The foreground command reports only content-free counts and timing on stderr:
+staged/reused/missing chunks, completed chunks, throughput, and ETA. A repeated
+sync with no content or context changes reuses the validated vectors, performs
+zero inference, and does not load the 1.2 GB model runtime. Interrupted builds
+resume from validated staged batches. `qgh embed --force` remains available for
+an explicitly requested full rebuild; no background daemon or MCP write tool is
+required.
 
 Until a complete embedding generation is validated and atomically published,
 queries keep using BM25. Missing, stale, corrupt, partial, or incompatible
@@ -138,10 +147,18 @@ published.
 
 The Metal F16 embedding adapter groups only short inputs, processes longer
 inputs as singletons, and uses fused Metal attention for supported sequences.
-Its adapter revision is also fingerprinted, so upgrading from the earlier
-adapter makes the old Metal generation incompatible and requires `qgh embed`
-to publish a replacement before hybrid search resumes. CPU F32 batching and
-Metal F32 reranking keep their existing execution paths.
+Before inference it explicitly fits input to Qwen's 1,024-token window at a
+complete token boundary. Repository and issue context at the beginning is
+preserved; only trailing body text is shortened, and the stored authoritative
+body and snippet remain unchanged. The input and Metal adapter revisions are
+fingerprinted, so incompatible generations are rebuilt instead of reused. CPU
+F32 batching and Metal F32 reranking keep their existing execution paths.
+
+Interactive query runtime skips the multi-document batch-comparability smoke
+that indexing and `doctor` still run. The pinned artifact identity, runtime
+fingerprint, query-vector dimension, and active generation validation remain
+fail closed. Long-lived MCP processes also reuse the already loaded runtime;
+one-shot CLI queries still pay snapshot verification and model-load cost.
 
 For reranking, `device = "auto"` resolves only to Apple Metal F32. It does not
 silently fall back to CPU. `device = "cpu"` enables an experimental slow path

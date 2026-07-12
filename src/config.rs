@@ -410,6 +410,7 @@ pub struct ProfileBootstrapOutcome {
     pub repo_allowlist_action: &'static str,
     pub token_source_kind: &'static str,
     pub duplicate_profile_ids: Vec<String>,
+    pub default_model_install: Option<String>,
 }
 
 pub fn bootstrap_profile_repo(
@@ -428,7 +429,12 @@ pub fn bootstrap_profile_repo(
     validate_token_source(&input.token_source)?;
 
     let config_path = config_file_path()?;
-    let mut config = config_for_bootstrap(load_config_file_optional()?);
+    let existing_config = load_config_file_optional()?;
+    let creates_config = existing_config.is_none();
+    let mut config = config_for_bootstrap(existing_config);
+    let default_model_install = creates_config
+        .then(|| config.embedding.as_ref()?.model.clone())
+        .flatten();
     let duplicate_profile_ids =
         profiles_allowlisting_repo(&config.profiles, &input.repo, Some(&input.profile_id));
     let profile_action;
@@ -500,6 +506,7 @@ pub fn bootstrap_profile_repo(
         repo_allowlist_action,
         token_source_kind: effective_token_source_kind,
         duplicate_profile_ids,
+        default_model_install,
     })
 }
 

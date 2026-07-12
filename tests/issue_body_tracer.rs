@@ -1870,10 +1870,16 @@ fn init_yes_bootstraps_profile_config_and_repo_policy_without_secret_or_store_pa
     assert_eq!(init_json["data"]["repo_allowlist_action"], "added");
     assert_eq!(init_json["data"]["repo_policy_action"], "created");
     assert_eq!(init_json["data"]["token_source"]["kind"], "env");
-    assert_eq!(
-        init_json["data"]["next_steps"],
+    let expected_next_steps = if cfg!(feature = "fastembed-provider") {
+        json!([
+            "qgh model install qwen3-embedding-0.6b",
+            "qgh sync",
+            "qgh query <terms>"
+        ])
+    } else {
         json!(["qgh sync", "qgh query <terms>"])
-    );
+    };
+    assert_eq!(init_json["data"]["next_steps"], expected_next_steps);
 
     let config_text = fs::read_to_string(fixture.config_home.join("qgh/config.toml")).unwrap();
     assert!(config_text.contains(r#"schema_version = "qgh.config.v1""#));
@@ -2049,6 +2055,10 @@ fn init_without_json_prints_human_summary_for_profile_and_repo_policy_paths() {
     assert!(stdout.contains("token source: github_cli"));
     assert!(stdout.contains("config:"));
     assert!(stdout.contains("repo policy: created at"));
+    assert_eq!(
+        stdout.contains("next: qgh model install qwen3-embedding-0.6b"),
+        cfg!(feature = "fastembed-provider")
+    );
     assert!(stdout.contains("next: qgh sync"));
     assert!(stdout.contains("next: qgh query <terms>"));
 
@@ -3444,6 +3454,43 @@ device = "auto"
     );
     assert_eq!(
         query_json["data"]["results"][0]["ranking"]["kind"],
+        "hybrid"
+    );
+    let source_id = query_json["data"]["results"][0]["get_args"]["source_id"]
+        .as_str()
+        .unwrap();
+    let mut get_command = fixture.base_command();
+    let get = get_command
+        .env("XDG_CACHE_HOME", cache_home)
+        .args(["--profile", "work", "get", source_id, "--json"])
+        .output()
+        .unwrap();
+    assert_success(&get);
+    assert_eq!(stdout_json(&get)["data"]["source"]["source_id"], source_id);
+
+    let mut second_sync_command = fixture.base_command();
+    let second_sync = second_sync_command
+        .env("XDG_CACHE_HOME", cache_home)
+        .args(["--profile", "work", "sync"])
+        .output()
+        .unwrap();
+    assert_success(&second_sync);
+    let second_stderr = stderr_text(&second_sync);
+    assert!(second_stderr.contains("reused="));
+    assert!(second_stderr.contains("missing=0"));
+    assert!(second_stderr.contains("embedded=0"));
+
+    let mut second_query_command = fixture.base_command();
+    let second_query = second_query_command
+        .env("XDG_CACHE_HOME", cache_home)
+        .args(["--profile", "work", "query", "BM25 tracer", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&second_query);
+    let second_query_json = stdout_json(&second_query);
+    assert!(warning_codes(&second_query_json).is_empty());
+    assert_eq!(
+        second_query_json["data"]["results"][0]["ranking"]["kind"],
         "hybrid"
     );
 }

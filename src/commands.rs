@@ -47,7 +47,8 @@ use crate::paths::ProfilePaths;
 #[cfg(feature = "fastembed-provider")]
 use crate::qwen::{
     load_qwen_embedding, load_qwen_embedding_tokenizer, load_qwen_reranker,
-    qwen_embedding_runtime_profile_id, QwenReranker, QWEN_RERANK_DEPTH, QWEN_RERANK_MAX_LENGTH,
+    qwen_embedding_runtime_profile_id, validate_qwen_embedding_device, QwenReranker,
+    QWEN_RERANK_DEPTH, QWEN_RERANK_MAX_LENGTH,
 };
 use crate::resolution::ResolvedRepoScope;
 use crate::store::{
@@ -63,8 +64,10 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 #[cfg(feature = "fastembed-provider")]
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 const GET_BATCH_SIZE_CAP: usize = 20;
+const QWEN_EMBEDDING_INPUT_ADAPTER_REVISION: &str = "explicit-window-v1";
 const QWEN_EMBEDDING_METAL_ADAPTER_REVISION: &str = "metal-sdpa-adaptive-batching-v2";
 const HYBRID_RRF_K: f32 = 60.0;
 const STALE_BUILDING_RETENTION_HOURS: i64 = 24;
@@ -1172,6 +1175,7 @@ fn rebuild_bm25_index(
                 .as_ref()
                 .expect("prepared embedding config"),
             &snapshot,
+            progress,
         ) {
             Ok((embedded_chunks, generation_id)) => {
                 progress.line(format_args!(
@@ -1867,21 +1871,92 @@ fn refresh_embedding_chunks(
     Ok(stats)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmbeddingGenerationContract {
+    model_manifest_hash: String,
+    fingerprint_seed: EmbeddingFingerprintSeed,
+    chunker_fingerprint: String,
+    output_dimension: usize,
+}
+
+impl EmbeddingGenerationContract {
+    fn from_runtime(runtime: &EmbeddingRuntime) -> Self {
+        Self {
+            model_manifest_hash: runtime.model_manifest_hash.clone(),
+            fingerprint_seed: runtime.fingerprint_seed.clone(),
+            chunker_fingerprint: runtime.chunker_fingerprint.clone(),
+            output_dimension: runtime.output_dimension,
+        }
+    }
+
+    fn generation_spec(&self) -> crate::store::EmbeddingGenerationSpec {
+        crate::store::EmbeddingGenerationSpec {
+            model_manifest_hash: self.model_manifest_hash.clone(),
+            runtime_fingerprint_hash: self
+                .fingerprint_seed
+                .clone()
+                .with_dimension(self.output_dimension)
+                .hash(),
+            chunker_fingerprint: self.chunker_fingerprint.clone(),
+            context_template_version: crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string(),
+            output_dimension: self.output_dimension,
+        }
+    }
+}
+
+struct EmbeddingGenerationPlan {
+    generation_id: i64,
+    missing_chunk_ids: BTreeSet<i64>,
+}
+
 fn refresh_incremental_chunk_embeddings_for_snapshot(
     store: &mut Store,
     embedding: &EmbeddingConfig,
     snapshot: &RetrievalBuildSnapshot,
+    progress: &StderrSyncProgress,
 ) -> Result<(usize, Option<i64>), QghError> {
-    let runtime = embedding_runtime_local_only(embedding, None)?;
-    let expectation = embedding_fingerprint_expectation(embedding);
-    refresh_incremental_chunk_embeddings_with_provider_and_generation(
+    #[cfg(debug_assertions)]
+    if let Some(runtime) = test_embedding_runtime(embedding)? {
+        let contract = EmbeddingGenerationContract::from_runtime(&runtime);
+        return refresh_incremental_chunk_embeddings_with_provider_and_contract(
+            store,
+            runtime.provider.as_ref(),
+            &contract,
+            snapshot,
+            progress,
+        );
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    if is_qwen_embedding_config(embedding) {
+        let contract = qwen_embedding_generation_contract_local_only(embedding)?;
+        return refresh_incremental_chunk_embeddings_with_runtime_loader(
+            store,
+            &contract,
+            snapshot,
+            progress,
+            || {
+                embedding_runtime_local_only(
+                    embedding,
+                    None,
+                    EmbeddingRuntimeValidation::BatchComparability,
+                )
+            },
+        );
+    }
+
+    let runtime = embedding_runtime_local_only(
+        embedding,
+        None,
+        EmbeddingRuntimeValidation::BatchComparability,
+    )?;
+    let contract = EmbeddingGenerationContract::from_runtime(&runtime);
+    refresh_incremental_chunk_embeddings_with_provider_and_contract(
         store,
         runtime.provider.as_ref(),
-        runtime.model_manifest_hash.clone(),
-        runtime.fingerprint_seed.clone(),
-        runtime.chunker_fingerprint.clone(),
-        &expectation,
+        &contract,
         snapshot,
+        progress,
     )
 }
 
@@ -1892,41 +1967,86 @@ fn refresh_incremental_chunk_embeddings_with_provider(
     model_manifest_hash: String,
     fingerprint_seed: EmbeddingFingerprintSeed,
     expected_chunker_fingerprint: String,
-    expectation: &EmbeddingFingerprintExpectation,
 ) -> Result<usize, QghError> {
     let Some(snapshot) = store.capture_retrieval_build_snapshot()? else {
         return Ok(0);
     };
+    let contract = EmbeddingGenerationContract {
+        model_manifest_hash,
+        fingerprint_seed,
+        chunker_fingerprint: expected_chunker_fingerprint,
+        output_dimension: 3,
+    };
     Ok(
-        refresh_incremental_chunk_embeddings_with_provider_and_generation(
+        refresh_incremental_chunk_embeddings_with_provider_and_contract(
             store,
             provider,
-            model_manifest_hash,
-            fingerprint_seed,
-            expected_chunker_fingerprint,
-            expectation,
+            &contract,
             &snapshot,
+            &StderrSyncProgress::new(false),
         )?
         .0,
     )
 }
 
-fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
+#[cfg(any(feature = "fastembed-provider", all(test, feature = "vector-search")))]
+fn refresh_incremental_chunk_embeddings_with_runtime_loader(
+    store: &mut Store,
+    contract: &EmbeddingGenerationContract,
+    snapshot: &RetrievalBuildSnapshot,
+    progress: &StderrSyncProgress,
+    load_runtime: impl FnOnce() -> Result<std::sync::Arc<EmbeddingRuntime>, QghError>,
+) -> Result<(usize, Option<i64>), QghError> {
+    let Some(plan) = plan_embedding_generation(store, contract, snapshot, progress)? else {
+        return Ok((0, None));
+    };
+    if plan.missing_chunk_ids.is_empty() {
+        store.validate_embedding_generation(plan.generation_id)?;
+        return Ok((0, Some(plan.generation_id)));
+    }
+    let runtime = load_runtime()?;
+    if EmbeddingGenerationContract::from_runtime(&runtime) != *contract {
+        return Err(QghError::validation(
+            "embedding.generation_runtime_mismatch",
+            "Loaded embedding runtime does not match the planned generation contract.",
+        ));
+    }
+    complete_embedding_generation(
+        store,
+        runtime.provider.as_ref(),
+        contract,
+        snapshot,
+        plan,
+        progress,
+    )
+}
+
+fn refresh_incremental_chunk_embeddings_with_provider_and_contract(
     store: &mut Store,
     provider: &dyn EmbeddingProvider,
-    model_manifest_hash: String,
-    fingerprint_seed: EmbeddingFingerprintSeed,
-    expected_chunker_fingerprint: String,
-    _expectation: &EmbeddingFingerprintExpectation,
+    contract: &EmbeddingGenerationContract,
     snapshot: &RetrievalBuildSnapshot,
+    progress: &StderrSyncProgress,
 ) -> Result<(usize, Option<i64>), QghError> {
+    let Some(plan) = plan_embedding_generation(store, contract, snapshot, progress)? else {
+        return Ok((0, None));
+    };
+    complete_embedding_generation(store, provider, contract, snapshot, plan, progress)
+}
+
+fn plan_embedding_generation(
+    store: &mut Store,
+    contract: &EmbeddingGenerationContract,
+    snapshot: &RetrievalBuildSnapshot,
+    progress: &StderrSyncProgress,
+) -> Result<Option<EmbeddingGenerationPlan>, QghError> {
     let chunks = snapshot.embedding_chunks();
     if chunks.is_empty() {
-        return Ok((0, None));
+        return Ok(None);
     }
     if chunks
         .iter()
-        .any(|chunk| chunk.chunk.chunker_fingerprint != expected_chunker_fingerprint)
+        .any(|chunk| chunk.chunk.chunker_fingerprint != contract.chunker_fingerprint)
     {
         return Err(QghError::validation(
             "embedding.generation_invalid_spec",
@@ -1934,37 +2054,80 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
         ));
     }
 
-    let texts = chunks
+    let spec = contract.generation_spec();
+    let build = store.start_or_resume_embedding_generation(snapshot, &spec)?;
+    let missing_chunk_ids = build
+        .missing_chunk_ids
         .iter()
-        .map(|chunk| chunk.prepared_input.as_str())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let missing_chunks = chunks
+        .iter()
+        .filter(|chunk| missing_chunk_ids.contains(&chunk.chunk.chunk_id))
         .collect::<Vec<_>>();
-    let vectors = provider.embed_documents(&texts).map_err(embedding_error)?;
-    if vectors.len() != chunks.len() {
+    if missing_chunks.len() != missing_chunk_ids.len() {
         return Err(QghError::validation(
-            "embedding.vector_count_mismatch",
-            "Embedding provider returned a different number of vectors than input chunks.",
-        )
-        .with_details(json!({
-            "chunk_count": chunks.len(),
-            "vector_count": vectors.len()
-        })));
+            "embedding.generation_inventory_mismatch",
+            "Embedding generation work does not match the captured chunk inventory.",
+        ));
     }
-    let dimension = embedding_dimension(&vectors)?;
-    let fingerprint = fingerprint_seed.with_dimension(dimension);
-    let runtime_fingerprint_hash = fingerprint.hash();
-    let context_template_version = crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string();
-    let spec = crate::store::EmbeddingGenerationSpec {
-        model_manifest_hash: model_manifest_hash.clone(),
-        runtime_fingerprint_hash,
-        chunker_fingerprint: expected_chunker_fingerprint.clone(),
-        context_template_version: context_template_version.clone(),
-        output_dimension: dimension,
-    };
-    let generation_id = store.begin_embedding_generation(snapshot, &spec)?;
-    let embeddings = chunks.iter().zip(vectors).collect::<Vec<_>>();
-    for batch in embeddings.chunks(32) {
+    progress.line(format_args!(
+        "qgh sync: embedding plan total={} staged={} reused={} missing={}",
+        chunks.len(),
+        build.already_staged,
+        build.reused,
+        missing_chunks.len()
+    ));
+    Ok(Some(EmbeddingGenerationPlan {
+        generation_id: build.generation_id,
+        missing_chunk_ids,
+    }))
+}
+
+fn complete_embedding_generation(
+    store: &mut Store,
+    provider: &dyn EmbeddingProvider,
+    contract: &EmbeddingGenerationContract,
+    snapshot: &RetrievalBuildSnapshot,
+    plan: EmbeddingGenerationPlan,
+    progress: &StderrSyncProgress,
+) -> Result<(usize, Option<i64>), QghError> {
+    let missing_chunks = snapshot
+        .embedding_chunks()
+        .iter()
+        .filter(|chunk| plan.missing_chunk_ids.contains(&chunk.chunk.chunk_id))
+        .collect::<Vec<_>>();
+    let started = Instant::now();
+    let mut embedded = 0usize;
+    for batch in missing_chunks.chunks(32) {
+        let texts = batch
+            .iter()
+            .map(|chunk| chunk.prepared_input.as_str())
+            .collect::<Vec<_>>();
+        let vectors = provider.embed_documents(&texts).map_err(embedding_error)?;
+        if vectors.len() != batch.len() {
+            return Err(QghError::validation(
+                "embedding.vector_count_mismatch",
+                "Embedding provider returned a different number of vectors than input chunks.",
+            )
+            .with_details(json!({
+                "chunk_count": batch.len(),
+                "vector_count": vectors.len()
+            })));
+        }
+        if embedding_dimension(&vectors)? != contract.output_dimension {
+            return Err(QghError::validation(
+                "embedding.vector_dimension_mismatch",
+                "Embedding provider output does not match the configured generation dimension.",
+            )
+            .with_details(json!({
+                "expected_dimension": contract.output_dimension,
+                "actual_dimension": vectors.first().map(Vec::len)
+            })));
+        }
         let staged = batch
             .iter()
+            .zip(vectors)
             .map(|(chunk, vector)| {
                 Ok(crate::store::EmbeddingGenerationChunk {
                     chunk_id: chunk.chunk.chunk_id,
@@ -1974,15 +2137,30 @@ fn refresh_incremental_chunk_embeddings_with_provider_and_generation(
                         .ok_or_else(|| QghError::storage("Missing source version hash."))?,
                     context_hash: chunk
                         .prepared_input
-                        .context_hash(&model_manifest_hash, &expected_chunker_fingerprint),
-                    vector: (*vector).clone(),
+                        .context_hash(&contract.model_manifest_hash, &contract.chunker_fingerprint),
+                    vector,
                 })
             })
             .collect::<Result<Vec<_>, QghError>>()?;
-        store.stage_embedding_generation_batch(generation_id, &staged)?;
+        let staged_count = store.stage_embedding_generation_batch(plan.generation_id, &staged)?;
+        embedded = embedded.saturating_add(staged_count);
+        let elapsed_seconds = started.elapsed().as_secs_f64().max(f64::EPSILON);
+        let chunks_per_second = embedded as f64 / elapsed_seconds;
+        let remaining = missing_chunks.len().saturating_sub(embedded);
+        let eta_seconds = if chunks_per_second > 0.0 {
+            (remaining as f64 / chunks_per_second).ceil() as u64
+        } else {
+            0
+        };
+        progress.line(format_args!(
+            "qgh sync: embedded chunks={embedded}/{} elapsed_seconds={:.1} chunks_per_second={:.2} eta_seconds={eta_seconds}",
+            missing_chunks.len(),
+            elapsed_seconds,
+            chunks_per_second,
+        ));
     }
-    store.validate_embedding_generation(generation_id)?;
-    Ok((chunks.len(), Some(generation_id)))
+    store.validate_embedding_generation(plan.generation_id)?;
+    Ok((embedded, Some(plan.generation_id)))
 }
 
 fn embedding_sync_warning(code: &'static str, message: &'static str) -> Value {
@@ -2273,6 +2451,7 @@ struct EmbeddingRuntime {
     provider: Box<dyn EmbeddingProvider>,
     model_manifest_hash: String,
     fingerprint_seed: EmbeddingFingerprintSeed,
+    output_dimension: usize,
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -2399,6 +2578,7 @@ fn test_embedding_runtime(
                 .query_prefix
                 .unwrap_or_else(|| DEFAULT_QUERY_PREFIX.to_string()),
         },
+        output_dimension: dimension,
     }))
 }
 
@@ -2440,19 +2620,48 @@ enum PreparedModelAccess {
     LoadLocal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingRuntimeValidation {
+    BatchComparability,
+    QueryOnly,
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn validate_embedding_runtime_if_required(
+    provider: &dyn EmbeddingProvider,
+    validation: EmbeddingRuntimeValidation,
+    smoke_text: &str,
+) -> Result<(), QghError> {
+    if validation == EmbeddingRuntimeValidation::BatchComparability {
+        validate_batch_comparability(provider, smoke_text).map_err(embedding_error)?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "fastembed-provider")]
 fn embedding_runtime_for_acquisition(
     embedding: &EmbeddingConfig,
 ) -> Result<Arc<EmbeddingRuntime>, QghError> {
-    embedding_runtime_with_access(embedding, PreparedModelAccess::Acquire, None)
+    embedding_runtime_with_access(
+        embedding,
+        PreparedModelAccess::Acquire,
+        None,
+        EmbeddingRuntimeValidation::BatchComparability,
+    )
 }
 
 #[cfg(feature = "fastembed-provider")]
 fn embedding_runtime_local_only(
     embedding: &EmbeddingConfig,
     cache_profile_id: Option<&str>,
+    validation: EmbeddingRuntimeValidation,
 ) -> Result<Arc<EmbeddingRuntime>, QghError> {
-    embedding_runtime_with_access(embedding, PreparedModelAccess::LoadLocal, cache_profile_id)
+    embedding_runtime_with_access(
+        embedding,
+        PreparedModelAccess::LoadLocal,
+        cache_profile_id,
+        validation,
+    )
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -2460,12 +2669,13 @@ fn embedding_runtime_with_access(
     embedding: &EmbeddingConfig,
     access: PreparedModelAccess,
     cache_profile_id: Option<&str>,
+    validation: EmbeddingRuntimeValidation,
 ) -> Result<Arc<EmbeddingRuntime>, QghError> {
     if let Some(runtime) = test_embedding_runtime(embedding)? {
         return Ok(Arc::new(runtime));
     }
     if is_qwen_embedding_config(embedding) {
-        return qwen_embedding_runtime_local_only(embedding, cache_profile_id);
+        return qwen_embedding_runtime_local_only(embedding, cache_profile_id, validation);
     }
     match embedding.provider {
         EmbeddingProviderKind::Local => {
@@ -2474,7 +2684,7 @@ fn embedding_runtime_with_access(
             match access {
                 PreparedModelAccess::Acquire => {
                     let snapshot = prepared_store.acquire(&options).map_err(embedding_error)?;
-                    build_embedding_runtime(embedding, &snapshot)
+                    build_embedding_runtime(embedding, &snapshot, validation)
                 }
                 PreparedModelAccess::LoadLocal => {
                     let inspection = prepared_store.inspect(&options).map_err(embedding_error)?;
@@ -2488,12 +2698,12 @@ fn embedding_runtime_with_access(
                             || {
                                 let snapshot =
                                     prepared_store.verify(inspection).map_err(embedding_error)?;
-                                build_embedding_runtime(embedding, &snapshot)
+                                build_embedding_runtime(embedding, &snapshot, validation)
                             },
                         );
                     }
                     let snapshot = prepared_store.verify(inspection).map_err(embedding_error)?;
-                    build_embedding_runtime(embedding, &snapshot)
+                    build_embedding_runtime(embedding, &snapshot, validation)
                 }
             }
         }
@@ -2504,10 +2714,30 @@ fn embedding_runtime_with_access(
 fn qwen_embedding_runtime_local_only(
     embedding: &EmbeddingConfig,
     cache_profile_id: Option<&str>,
+    validation: EmbeddingRuntimeValidation,
 ) -> Result<Arc<EmbeddingRuntime>, QghError> {
+    let snapshot = installed_qwen_embedding_snapshot()?;
+    let runtime_profile = qwen_embedding_runtime_profile_id(embedding.device);
+    if let Some(profile_id) = cache_profile_id {
+        let cache_key =
+            qwen_embedding_runtime_cache_key(profile_id, &snapshot.manifest_hash, runtime_profile);
+        let profile_prefix = format!("{profile_id}:");
+        return runtime_cache_get_or_try_init(
+            EMBEDDING_RUNTIME_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+            &cache_key,
+            &profile_prefix,
+            || build_qwen_embedding_runtime(embedding, &snapshot, validation),
+        );
+    }
+    build_qwen_embedding_runtime(embedding, &snapshot, validation)
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn installed_qwen_embedding_snapshot(
+) -> Result<crate::local_models::PreparedQwenModelSnapshot, QghError> {
     let spec =
         qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).expect("Qwen embedding preset is registered");
-    let snapshot = default_prepared_qwen_model_store()
+    default_prepared_qwen_model_store()
         .and_then(|store| store.inspect(&spec))
         .map_err(|error| {
             if error.code == "model.not_installed" {
@@ -2522,30 +2752,55 @@ fn qwen_embedding_runtime_local_only(
                     "The prepared Qwen embedding snapshot failed integrity validation.",
                 )
             }
-        })?;
+        })
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_embedding_generation_contract_local_only(
+    embedding: &EmbeddingConfig,
+) -> Result<EmbeddingGenerationContract, QghError> {
+    let snapshot = installed_qwen_embedding_snapshot()?;
+    validate_qwen_embedding_device(embedding.device).map_err(embedding_error)?;
     let runtime_profile = qwen_embedding_runtime_profile_id(embedding.device);
-    if let Some(profile_id) = cache_profile_id {
-        let cache_key =
-            qwen_embedding_runtime_cache_key(profile_id, &snapshot.manifest_hash, runtime_profile);
-        let profile_prefix = format!("{profile_id}:");
-        return runtime_cache_get_or_try_init(
-            EMBEDDING_RUNTIME_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
-            &cache_key,
-            &profile_prefix,
-            || build_qwen_embedding_runtime(embedding, &snapshot),
-        );
+    Ok(EmbeddingGenerationContract {
+        model_manifest_hash: snapshot.manifest_hash.clone(),
+        fingerprint_seed: qwen_embedding_fingerprint_seed(
+            embedding,
+            &snapshot.manifest_hash,
+            runtime_profile,
+        ),
+        chunker_fingerprint: qwen_embedding_chunker_fingerprint(&snapshot),
+        output_dimension: crate::qwen::QWEN_EMBEDDING_OUTPUT_DIMENSION,
+    })
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_embedding_fingerprint_seed(
+    embedding: &EmbeddingConfig,
+    manifest_hash: &str,
+    runtime_profile: &str,
+) -> EmbeddingFingerprintSeed {
+    EmbeddingFingerprintSeed {
+        provider: embedding_provider_name(embedding.provider).to_string(),
+        model_id: QWEN_EMBEDDING_MODEL_ID.to_string(),
+        model_revision: configured_qwen_runtime_identity(manifest_hash, runtime_profile),
+        pooling: PoolingKind::LastToken,
+        query_prefix: QWEN_EMBEDDING_QUERY_PREFIX.to_string(),
     }
-    build_qwen_embedding_runtime(embedding, &snapshot)
 }
 
 #[cfg(feature = "fastembed-provider")]
 fn build_qwen_embedding_runtime(
     embedding: &EmbeddingConfig,
     snapshot: &crate::local_models::PreparedQwenModelSnapshot,
+    validation: EmbeddingRuntimeValidation,
 ) -> Result<Arc<EmbeddingRuntime>, QghError> {
     let parts = load_qwen_embedding(snapshot, embedding.device).map_err(embedding_error)?;
-    validate_batch_comparability(&parts.provider, "qgh prepared Qwen model smoke")
-        .map_err(embedding_error)?;
+    validate_embedding_runtime_if_required(
+        &parts.provider,
+        validation,
+        "qgh prepared Qwen model smoke",
+    )?;
     let runtime_profile = parts.runtime_profile.as_str();
     let chunker_fingerprint = qwen_embedding_chunker_fingerprint(snapshot);
     Ok(Arc::new(EmbeddingRuntime {
@@ -2553,16 +2808,12 @@ fn build_qwen_embedding_runtime(
         chunker_fingerprint,
         provider: Box::new(parts.provider),
         model_manifest_hash: snapshot.manifest_hash.clone(),
-        fingerprint_seed: EmbeddingFingerprintSeed {
-            provider: embedding_provider_name(embedding.provider).to_string(),
-            model_id: QWEN_EMBEDDING_MODEL_ID.to_string(),
-            model_revision: configured_qwen_runtime_identity(
-                &snapshot.manifest_hash,
-                runtime_profile,
-            ),
-            pooling: PoolingKind::LastToken,
-            query_prefix: QWEN_EMBEDDING_QUERY_PREFIX.to_string(),
-        },
+        fingerprint_seed: qwen_embedding_fingerprint_seed(
+            embedding,
+            &snapshot.manifest_hash,
+            runtime_profile,
+        ),
+        output_dimension: crate::qwen::QWEN_EMBEDDING_OUTPUT_DIMENSION,
     }))
 }
 
@@ -2618,6 +2869,7 @@ fn runtime_cache_get_or_try_init<T, E>(
 fn build_embedding_runtime(
     embedding: &EmbeddingConfig,
     snapshot: &PreparedModelSnapshot,
+    validation: EmbeddingRuntimeValidation,
 ) -> Result<Arc<EmbeddingRuntime>, QghError> {
     let tokenizer_identity =
         tokenizer_contract_identity_from_manifest(&snapshot.manifest).map_err(embedding_error)?;
@@ -2629,13 +2881,14 @@ fn build_embedding_runtime(
     let provider =
         LocalEmbeddingProvider::with_contract(engine, snapshot.manifest.runtime_contract())
             .map_err(embedding_error)?;
-    validate_batch_comparability(&provider, "qgh prepared model smoke").map_err(embedding_error)?;
+    validate_embedding_runtime_if_required(&provider, validation, "qgh prepared model smoke")?;
     Ok(Arc::new(EmbeddingRuntime {
         tokenizer,
         chunker_fingerprint,
         provider: Box::new(provider),
         model_manifest_hash: snapshot.manifest.hash(),
         fingerprint_seed: embedding_fingerprint_seed(embedding, snapshot),
+        output_dimension: snapshot.manifest.output_dimension,
     }))
 }
 
@@ -2650,6 +2903,7 @@ fn embedding_runtime_for_acquisition(
 fn embedding_runtime_local_only(
     embedding: &EmbeddingConfig,
     _cache_profile_id: Option<&str>,
+    _validation: EmbeddingRuntimeValidation,
 ) -> Result<std::sync::Arc<EmbeddingRuntime>, QghError> {
     embedding_runtime_unavailable(embedding)
 }
@@ -3253,6 +3507,12 @@ fn finish_profile_init(
             )
         }));
     }
+    let mut next_steps = Vec::new();
+    if let Some(model) = bootstrap.default_model_install.as_deref() {
+        next_steps.push(format!("qgh model install {model}"));
+    }
+    next_steps.push("qgh sync".to_string());
+    next_steps.push("qgh query <terms>".to_string());
     Ok(InitCommandOutcome {
         data: json!({
             "profile_config_path": bootstrap.config_path.to_string_lossy(),
@@ -3265,7 +3525,7 @@ fn finish_profile_init(
             "token_source": {
                 "kind": bootstrap.token_source_kind
             },
-            "next_steps": ["qgh sync", "qgh query <terms>"]
+            "next_steps": next_steps
         }),
         warnings,
         meta: json!({
@@ -4032,7 +4292,11 @@ fn hybrid_vector_hits(
     if !coverage.hybrid_ready() {
         return Ok((None, Vec::new()));
     }
-    let runtime = match embedding_runtime_local_only(embedding, Some(&profile.id)) {
+    let runtime = match embedding_runtime_local_only(
+        embedding,
+        Some(&profile.id),
+        EmbeddingRuntimeValidation::QueryOnly,
+    ) {
         Ok(runtime) => runtime,
         Err(_) => {
             return Ok((
@@ -4924,13 +5188,6 @@ fn embedding_fingerprint_status_json(
     })
 }
 
-fn embedding_fingerprint_expectation(
-    embedding: &EmbeddingConfig,
-) -> EmbeddingFingerprintExpectation {
-    let configured = configured_embedding_contract_snapshot(embedding);
-    embedding_fingerprint_expectation_from_snapshot(embedding, &configured)
-}
-
 fn embedding_fingerprint_expectation_from_snapshot(
     embedding: &EmbeddingConfig,
     configured: &ConfiguredEmbeddingSnapshot,
@@ -5072,7 +5329,8 @@ fn configured_qwen_runtime_profile_id(device: crate::config::LocalModelDevice) -
 }
 
 fn configured_qwen_runtime_identity(base_revision: &str, runtime_profile: &str) -> String {
-    let identity = format!("{base_revision}:{runtime_profile}");
+    let identity =
+        format!("{base_revision}:{runtime_profile}:{QWEN_EMBEDDING_INPUT_ADAPTER_REVISION}");
     if runtime_profile == "metal_f16" {
         format!("{identity}:{QWEN_EMBEDDING_METAL_ADAPTER_REVISION}")
     } else {
@@ -5778,9 +6036,14 @@ fn doctor_embedding_checks(embedding: &EmbeddingConfig, store: &Store) -> [Value
             let snapshot = default_prepared_qwen_model_store()
                 .and_then(|prepared_store| prepared_store.inspect(&spec));
             let artifacts_ok = snapshot.is_ok();
-            let runtime_ok = snapshot
-                .as_ref()
-                .is_ok_and(|snapshot| build_qwen_embedding_runtime(embedding, snapshot).is_ok());
+            let runtime_ok = snapshot.as_ref().is_ok_and(|snapshot| {
+                build_qwen_embedding_runtime(
+                    embedding,
+                    snapshot,
+                    EmbeddingRuntimeValidation::BatchComparability,
+                )
+                .is_ok()
+            });
             (artifacts_ok, runtime_ok)
         } else {
             let snapshot = default_prepared_model_store().and_then(|prepared_store| {
@@ -5789,9 +6052,14 @@ fn doctor_embedding_checks(embedding: &EmbeddingConfig, store: &Store) -> [Value
                     .and_then(|inspection| prepared_store.verify(inspection))
             });
             let artifacts_ok = snapshot.is_ok();
-            let runtime_ok = snapshot
-                .as_ref()
-                .is_ok_and(|snapshot| build_embedding_runtime(embedding, snapshot).is_ok());
+            let runtime_ok = snapshot.as_ref().is_ok_and(|snapshot| {
+                build_embedding_runtime(
+                    embedding,
+                    snapshot,
+                    EmbeddingRuntimeValidation::BatchComparability,
+                )
+                .is_ok()
+            });
             (artifacts_ok, runtime_ok)
         }
     };
@@ -6236,7 +6504,30 @@ mod tests {
 
     #[cfg(feature = "fastembed-provider")]
     #[test]
-    fn metal_qwen_adapter_revision_invalidates_only_metal_generation_and_cache() {
+    fn query_runtime_skips_document_batch_comparability_smoke() {
+        let provider = RecordingEmbeddingProvider::default();
+
+        validate_embedding_runtime_if_required(
+            &provider,
+            EmbeddingRuntimeValidation::QueryOnly,
+            "public runtime smoke",
+        )
+        .unwrap();
+
+        assert!(provider.documents.lock().unwrap().is_empty());
+        validate_embedding_runtime_if_required(
+            &provider,
+            EmbeddingRuntimeValidation::BatchComparability,
+            "public runtime smoke",
+        )
+        .unwrap();
+        assert_eq!(provider.documents.lock().unwrap().len(), 6);
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn qwen_adapter_revisions_invalidate_affected_generation_and_cache() {
+        assert_eq!(QWEN_EMBEDDING_INPUT_ADAPTER_REVISION, "explicit-window-v1");
         assert_eq!(
             QWEN_EMBEDDING_METAL_ADAPTER_REVISION,
             "metal-sdpa-adaptive-batching-v2"
@@ -6263,7 +6554,9 @@ mod tests {
         let current_metal_revision = configured_qwen_runtime_identity("manifest", "metal_f16");
         assert_eq!(
             current_metal_revision,
-            format!("manifest:metal_f16:{QWEN_EMBEDDING_METAL_ADAPTER_REVISION}")
+            format!(
+                "manifest:metal_f16:{QWEN_EMBEDDING_INPUT_ADAPTER_REVISION}:{QWEN_EMBEDDING_METAL_ADAPTER_REVISION}"
+            )
         );
         assert!(!fingerprint(previous_metal_revision)
             .matches_expectation(&expectation(current_metal_revision.clone())));
@@ -6271,15 +6564,22 @@ mod tests {
             .matches_expectation(&expectation(current_metal_revision)));
         assert_eq!(
             qwen_embedding_runtime_cache_key("profile", "manifest", "metal_f16"),
-            format!("profile:qwen:manifest:metal_f16:{QWEN_EMBEDDING_METAL_ADAPTER_REVISION}")
+            format!(
+                "profile:qwen:manifest:metal_f16:{QWEN_EMBEDDING_INPUT_ADAPTER_REVISION}:{QWEN_EMBEDDING_METAL_ADAPTER_REVISION}"
+            )
         );
 
         let cpu_revision = configured_qwen_runtime_identity("manifest", "cpu_f32");
-        assert_eq!(cpu_revision, "manifest:cpu_f32");
-        assert!(fingerprint("manifest:cpu_f32").matches_expectation(&expectation(cpu_revision)));
+        assert_eq!(
+            cpu_revision,
+            format!("manifest:cpu_f32:{QWEN_EMBEDDING_INPUT_ADAPTER_REVISION}")
+        );
+        assert!(!fingerprint("manifest:cpu_f32")
+            .matches_expectation(&expectation(cpu_revision.clone())));
+        assert!(fingerprint(&cpu_revision).matches_expectation(&expectation(cpu_revision)));
         assert_eq!(
             qwen_embedding_runtime_cache_key("profile", "manifest", "cpu_f32"),
-            "profile:qwen:manifest:cpu_f32"
+            format!("profile:qwen:manifest:cpu_f32:{QWEN_EMBEDDING_INPUT_ADAPTER_REVISION}")
         );
     }
 
@@ -6309,7 +6609,12 @@ mod tests {
         };
 
         let sync_tokenizer = qwen_embedding_tokenizer_from_snapshot(&snapshot).unwrap();
-        let query_runtime = build_qwen_embedding_runtime(&embedding, &snapshot).unwrap();
+        let query_runtime = build_qwen_embedding_runtime(
+            &embedding,
+            &snapshot,
+            EmbeddingRuntimeValidation::QueryOnly,
+        )
+        .unwrap();
 
         assert_eq!(
             sync_tokenizer.chunker_fingerprint,
@@ -6888,6 +7193,7 @@ mod tests {
             provider: Box::new(PanicQueryEmbeddingProvider),
             model_manifest_hash: "manifest-query-runtime-check".to_string(),
             fingerprint_seed,
+            output_dimension: 3,
         };
         let publication = RetrievalPublicationView {
             publication_id: 1,
@@ -6945,6 +7251,7 @@ mod tests {
             provider: Box::new(RecordingEmbeddingProvider::default()),
             model_manifest_hash: model_manifest_hash.to_string(),
             fingerprint_seed,
+            output_dimension: 3,
         };
         let publication = RetrievalPublicationView {
             publication_id: 1,
@@ -6996,21 +7303,12 @@ mod tests {
             pooling: PoolingKind::Cls,
             query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
         };
-        let expectation = EmbeddingFingerprintExpectation {
-            provider: "local".to_string(),
-            model_id: Some("fixture/model".to_string()),
-            model_revision: Some("fixture-sha".to_string()),
-            pooling: Some(PoolingKind::Cls),
-            query_prefix: Some(crate::embedding::DEFAULT_QUERY_PREFIX.to_string()),
-        };
-
         refresh_incremental_chunk_embeddings_with_provider(
             &mut store,
             &provider,
             "manifest-context-sync".to_string(),
             seed,
             crate::chunking::CHUNKER_FINGERPRINT.to_string(),
-            &expectation,
         )
         .unwrap();
 
@@ -7704,35 +8002,27 @@ mod tests {
             pooling: PoolingKind::Cls,
             query_prefix: crate::embedding::DEFAULT_QUERY_PREFIX.to_string(),
         };
-        let expectation = EmbeddingFingerprintExpectation {
-            provider: "local".to_string(),
-            model_id: Some("Snowflake/snowflake-arctic-embed-l-v2.0".to_string()),
-            model_revision: Some("fixture-sha".to_string()),
-            pooling: Some(PoolingKind::Cls),
-            query_prefix: Some(crate::embedding::DEFAULT_QUERY_PREFIX.to_string()),
-        };
-
         let error = refresh_incremental_chunk_embeddings_with_provider(
             &mut store,
             &MockEmbeddingProvider,
             "manifest-sync-embed".to_string(),
             seed.clone(),
             chunker_fingerprint_for_tokenizer_identity("different-tokenizer-contract"),
-            &expectation,
         )
         .unwrap_err();
         assert_eq!(error.code, "embedding.generation_invalid_spec");
 
+        let provider = RecordingEmbeddingProvider::default();
         let embedded = refresh_incremental_chunk_embeddings_with_provider(
             &mut store,
-            &MockEmbeddingProvider,
+            &provider,
             "manifest-sync-embed".to_string(),
             seed.clone(),
             crate::chunking::CHUNKER_FINGERPRINT.to_string(),
-            &expectation,
         )
         .unwrap();
         assert_eq!(embedded, 2);
+        assert_eq!(provider.documents.lock().unwrap().len(), 2);
         assert_eq!(
             store
                 .latest_embedding_generation_state()
@@ -7741,16 +8031,42 @@ mod tests {
             Some("ready")
         );
 
+        provider.documents.lock().unwrap().clear();
         let skipped = refresh_incremental_chunk_embeddings_with_provider(
             &mut store,
-            &MockEmbeddingProvider,
+            &provider,
             "manifest-sync-embed".to_string(),
-            seed,
+            seed.clone(),
             crate::chunking::CHUNKER_FINGERPRINT.to_string(),
-            &expectation,
         )
         .unwrap();
-        assert_eq!(skipped, 2);
+        assert_eq!(skipped, 0);
+        assert!(provider.documents.lock().unwrap().is_empty());
+
+        let snapshot = store.capture_retrieval_build_snapshot().unwrap().unwrap();
+        let contract = EmbeddingGenerationContract {
+            model_manifest_hash: "manifest-sync-embed".to_string(),
+            fingerprint_seed: seed,
+            chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+            output_dimension: 3,
+        };
+        let runtime_loads = std::cell::Cell::new(0usize);
+        let lazy_skipped = refresh_incremental_chunk_embeddings_with_runtime_loader(
+            &mut store,
+            &contract,
+            &snapshot,
+            &StderrSyncProgress::new(false),
+            || {
+                runtime_loads.set(runtime_loads.get() + 1);
+                Err(QghError::validation(
+                    "embedding.test_runtime_loaded",
+                    "No-change sync must not load the embedding runtime.",
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(lazy_skipped.0, 0);
+        assert_eq!(runtime_loads.get(), 0);
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }

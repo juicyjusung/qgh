@@ -58,6 +58,15 @@ pub fn qwen_embedding_runtime_profile_id(requested: LocalModelDevice) -> &'stati
     }
 }
 
+pub fn validate_qwen_embedding_device(
+    requested: LocalModelDevice,
+) -> Result<(), EmbeddingProviderError> {
+    if resolve_embedding_profile(requested)? == QwenEmbeddingRuntimeProfile::MetalF16 {
+        metal_device()?;
+    }
+    Ok(())
+}
+
 pub struct QwenEmbeddingParts {
     pub tokenizer: QwenEmbeddingTokenizer,
     pub provider: LocalEmbeddingProvider<QwenEmbeddingEngine>,
@@ -72,6 +81,12 @@ pub struct QwenEmbeddingEngine {
 
 pub struct QwenEmbeddingTokenizer {
     tokenizer: Tokenizer,
+}
+
+impl QwenEmbeddingTokenizer {
+    pub fn fit_input(&self, text: &str) -> Result<String, EmbeddingProviderError> {
+        fit_qwen_embedding_input(&self.tokenizer, text)
+    }
 }
 
 pub fn load_qwen_embedding_tokenizer(
@@ -130,7 +145,7 @@ pub fn load_qwen_embedding(
             ..Default::default()
         }))
         .map_err(|_| embedding_tokenizer_error())?;
-    let batch_tokenizer = inference_tokenizer.clone();
+    let batch_tokenizer = chunk_tokenizer.clone();
     let engine = QwenEmbeddingEngine {
         model: Mutex::new(Qwen3TextEmbedding::new(model, inference_tokenizer)),
         batch_tokenizer,
@@ -182,6 +197,10 @@ fn resolve_embedding_profile(
 
 impl EmbeddingEngine for QwenEmbeddingEngine {
     fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingProviderError> {
+        let texts = texts
+            .iter()
+            .map(|text| fit_qwen_embedding_input(&self.batch_tokenizer, text))
+            .collect::<Result<Vec<_>, _>>()?;
         if self.runtime_profile == QwenEmbeddingRuntimeProfile::CpuF32 {
             let model = self.model.lock().map_err(|_| embedding_runtime_error())?;
             let mut vectors = Vec::with_capacity(texts.len());
@@ -227,6 +246,73 @@ impl EmbeddingEngine for QwenEmbeddingEngine {
             .map(|vector| vector.ok_or_else(embedding_inference_error))
             .collect()
     }
+}
+
+/// Fits one document or query to the pinned Qwen window before inference.
+///
+/// The context prefix is at the beginning of the input, so truncating at the
+/// last complete token preserves repository/issue identity and removes only
+/// the trailing body. The model tokenizer retains its own truncation as a
+/// defense in depth, but production inputs must already satisfy this bound.
+pub fn fit_qwen_embedding_input(
+    tokenizer: &Tokenizer,
+    text: &str,
+) -> Result<String, EmbeddingProviderError> {
+    let encoding = tokenizer
+        .encode(text, true)
+        .map_err(|_| embedding_tokenizer_error())?;
+    if encoding.len() <= QWEN_EMBEDDING_MAX_LENGTH {
+        return Ok(text.to_string());
+    }
+
+    let special_tokens = encoding
+        .get_special_tokens_mask()
+        .iter()
+        .filter(|special| **special != 0)
+        .count();
+    let regular_token_limit = QWEN_EMBEDDING_MAX_LENGTH
+        .checked_sub(special_tokens)
+        .ok_or_else(embedding_tokenizer_error)?;
+    let mut retained_tokens = 0usize;
+    let mut retained_byte_end = 0usize;
+    for ((start, end), special) in encoding
+        .get_offsets()
+        .iter()
+        .zip(encoding.get_special_tokens_mask())
+    {
+        if *special != 0 {
+            continue;
+        }
+        if retained_tokens == regular_token_limit {
+            break;
+        }
+        if start < end {
+            retained_byte_end = *end;
+        }
+        retained_tokens += 1;
+    }
+    if retained_byte_end == 0
+        || retained_byte_end > text.len()
+        || !text.is_char_boundary(retained_byte_end)
+    {
+        return Err(embedding_tokenizer_error());
+    }
+    let fitted = text[..retained_byte_end].to_string();
+    let fitted_length = tokenizer
+        .encode(fitted.as_str(), true)
+        .map_err(|_| embedding_tokenizer_error())?
+        .len();
+    if fitted_length > QWEN_EMBEDDING_MAX_LENGTH {
+        return Err(EmbeddingProviderError::structured(
+            "embedding.input_window_exceeded",
+            "Prepared embedding input could not be fitted to the local model window.",
+        )
+        .with_details(serde_json::json!({
+            "maximum_tokens": QWEN_EMBEDDING_MAX_LENGTH,
+            "actual_tokens": fitted_length
+        })));
+    }
+    Ok(fitted)
 }
 
 fn qwen_embedding_batch_plan(
@@ -663,6 +749,7 @@ mod tests {
 
     #[test]
     fn runtime_profiles_do_not_silently_cross_device_boundaries() {
+        validate_qwen_embedding_device(LocalModelDevice::Cpu).unwrap();
         assert_eq!(
             resolve_embedding_profile(LocalModelDevice::Cpu).unwrap(),
             QwenEmbeddingRuntimeProfile::CpuF32
@@ -672,6 +759,7 @@ mod tests {
             QwenRerankerRuntimeProfile::CpuF32
         );
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            validate_qwen_embedding_device(LocalModelDevice::Metal).unwrap();
             assert_eq!(
                 resolve_embedding_profile(LocalModelDevice::Auto).unwrap(),
                 QwenEmbeddingRuntimeProfile::MetalF16
@@ -680,6 +768,8 @@ mod tests {
                 resolve_reranker_profile(LocalModelDevice::Auto).unwrap(),
                 QwenRerankerRuntimeProfile::MetalF32
             );
+        } else {
+            assert!(validate_qwen_embedding_device(LocalModelDevice::Metal).is_err());
         }
     }
 

@@ -55,6 +55,16 @@ The following boundaries are normative:
   produces the existing typed diagnostic and preserves the safe BM25 path.
   Hybrid retrieval starts only after a complete compatible generation is
   atomically published.
+- Normal foreground sync reuses vectors only from a fully validated compatible
+  generation, infers only missing chunks in bounded batches, persists each
+  batch before continuing, and resumes validated staged work after interruption.
+  A no-change sync performs zero inference and does not load model weights.
+- Qwen inputs are explicitly fitted to the 1,024-token runtime window before
+  inference. Metadata context at the beginning is retained, authoritative
+  bodies/snippets are unchanged, and the input-adapter revision is part of the
+  generation fingerprint.
+- Content-free progress belongs on stderr for human foreground sync. qgh does
+  not add a background embedding daemon, TUI dependency, or MCP sync/write tool.
 - New configs do not contain `[reranker]`. Reranking remains separately
   configured, per-query opt-in, bounded to the existing candidate depth, and
   all-or-original on failure.
@@ -69,6 +79,9 @@ The following boundaries are normative:
   search can run, so the first download remains visible and user-controlled.
 - Existing BM25-only and non-Qwen users do not experience config churn or an
   implicit model download.
+- Initial indexing cost remains visible, while repeated and interrupted syncs
+  avoid full-corpus recomputation. Apple Silicon `auto` uses Metal F16; other
+  supported systems use CPU F32, with the resolved runtime in the fingerprint.
 - No-default-feature binaries remain model-free and keep the complete
   `sync -> query -> get -> cite -> status` workflow.
 - Qwen runtime, lifecycle, cross-language quality, resource, and abstention

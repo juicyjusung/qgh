@@ -15,12 +15,13 @@ use qgh::context::{
     prepare_embedding_input, EmbeddingSourceContext, METADATA_CONTEXT_TEMPLATE_VERSION,
 };
 #[cfg(feature = "fastembed-provider")]
-use qgh::embedding::EmbeddingProvider;
+use qgh::embedding::{EmbeddingProvider, EmbeddingTokenizer};
 #[cfg(feature = "fastembed-provider")]
 use qgh::search_eval::{
-    load_qwen_embedding, production_lexical_profile_for_eval, qwen_model_spec,
-    rebuild_lexical_index_for_eval, search_with_lexical_profile_for_eval, EvalIndexSource,
-    LocalModelDevice, PreparedQwenModelStore, SearchFilters, QWEN_EMBEDDING_PRESET_ID,
+    load_qwen_embedding, load_qwen_embedding_tokenizer, production_lexical_profile_for_eval,
+    qwen_model_spec, rebuild_lexical_index_for_eval, search_with_lexical_profile_for_eval,
+    EvalIndexSource, LocalModelDevice, PreparedQwenModelStore, SearchFilters,
+    QWEN_EMBEDDING_PRESET_ID,
 };
 #[cfg(feature = "fastembed-provider")]
 use std::path::PathBuf;
@@ -577,6 +578,79 @@ fn qwen_eval_context_matches_the_production_host_and_comment_title_contract() {
         "Comment on issue #{}: Comment on issue #{}:",
         comment.issue_number, comment.issue_number
     )));
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
+#[ignore = "requires the pinned Qwen tokenizer snapshot"]
+fn qwen_public_corpus_prepared_inputs_fit_model_window() {
+    let prepared_root = PathBuf::from(
+        std::env::var("QGH_QWEN_PREPARED_MODELS")
+            .expect("QGH_QWEN_PREPARED_MODELS must point to the prepared store"),
+    );
+    let spec = qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).unwrap();
+    let snapshot = PreparedQwenModelStore::new(prepared_root)
+        .inspect(&spec)
+        .expect("verify prepared Qwen embedding snapshot");
+    let tokenizer = load_qwen_embedding_tokenizer(&snapshot).expect("load pinned Qwen tokenizer");
+    let corpus = parse_jsonl::<CorpusRecord>(CORPUS_JSONL);
+    let mut original_token_lengths = Vec::new();
+    let mut fitted_token_lengths = Vec::new();
+    let mut truncated_inputs = 0usize;
+    for source in &corpus {
+        let repository = format!("github.com/{}", source.repo);
+        let parent_issue_title = qwen_eval_parent_issue_title(source);
+        for chunk in chunk_markdown(&source.body, &tokenizer).expect("chunk public source") {
+            let context = if source.entity_type == "issue_comment" {
+                EmbeddingSourceContext::Comment {
+                    repository: &repository,
+                    parent_issue_number: source.issue_number as i64,
+                    parent_issue_title,
+                }
+            } else {
+                EmbeddingSourceContext::Issue {
+                    repository: &repository,
+                    issue_number: source.issue_number as i64,
+                    title: &source.title,
+                }
+            };
+            let prepared = prepare_embedding_input(context, &chunk.body);
+            let original_tokens = tokenizer
+                .count_tokens(prepared.as_str())
+                .expect("count prepared input tokens");
+            let fitted = tokenizer
+                .fit_input(prepared.as_str())
+                .expect("fit prepared input to Qwen window");
+            let fitted_tokens = tokenizer
+                .count_tokens(&fitted)
+                .expect("count fitted input tokens");
+            original_token_lengths.push(original_tokens);
+            fitted_token_lengths.push(fitted_tokens);
+            truncated_inputs += usize::from(fitted.len() < prepared.as_str().len());
+        }
+    }
+    original_token_lengths.sort_unstable();
+    fitted_token_lengths.sort_unstable();
+    let original_maximum = *original_token_lengths
+        .last()
+        .expect("public corpus has chunks");
+    let fitted_maximum = *fitted_token_lengths
+        .last()
+        .expect("public corpus has chunks");
+    let p95 = fitted_token_lengths
+        [(fitted_token_lengths.len() * 95 / 100).min(fitted_token_lengths.len() - 1)];
+    eprintln!(
+        "qwen prepared-input token aggregate chunks={} truncated={} original_max={} fitted_p95={} fitted_max={}",
+        fitted_token_lengths.len(),
+        truncated_inputs,
+        original_maximum,
+        p95,
+        fitted_maximum
+    );
+    assert!(
+        fitted_maximum <= 1_023,
+        "prepared Qwen input exceeds the 1024-token model window after reserving one special token"
+    );
 }
 
 #[cfg(feature = "fastembed-provider")]

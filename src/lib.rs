@@ -39,8 +39,9 @@ pub mod search_eval {
     pub use crate::model::IndexSource as EvalIndexSource;
     #[cfg(feature = "fastembed-provider")]
     pub use crate::qwen::{
-        load_qwen_embedding, load_qwen_reranker, QwenEmbeddingParts, QwenReranker,
-        QWEN_EMBEDDING_OUTPUT_DIMENSION, QWEN_RERANK_DEPTH, QWEN_RERANK_MAX_LENGTH,
+        load_qwen_embedding, load_qwen_embedding_tokenizer, load_qwen_reranker, QwenEmbeddingParts,
+        QwenEmbeddingTokenizer, QwenReranker, QWEN_EMBEDDING_OUTPUT_DIMENSION, QWEN_RERANK_DEPTH,
+        QWEN_RERANK_MAX_LENGTH,
     };
 }
 
