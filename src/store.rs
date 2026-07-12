@@ -4801,19 +4801,32 @@ impl Store {
                   AND m.generation_id = ?
                 ORDER BY v.distance
              )
-             SELECT gc.vector_blob, gc.vector_dimension, gc.vector_checksum,
-                    c.id, c.source_id,
-                    c.source_version_id, c.body, c.chunk_index, c.token_start,
-                    c.token_end, c.byte_start, c.byte_end, c.chunker_version,
-                    c.chunker_fingerprint, c.heading_path_json, sv.body_hash,
-                    vector_candidates.distance
-             FROM vector_candidates
-             JOIN embedding_generation_chunks gc
-               ON gc.generation_id = {generation_id}
-              AND gc.chunk_id = vector_candidates.chunk_id
-             JOIN chunks c ON c.id = gc.chunk_id
-             JOIN source_versions sv ON sv.id = c.source_version_id
-             ORDER BY vector_candidates.distance, c.id
+             SELECT vector_blob, vector_dimension, vector_checksum,
+                    chunk_id, source_id, source_version_id, body, chunk_index,
+                    token_start, token_end, byte_start, byte_end,
+                    chunker_version, chunker_fingerprint, heading_path_json,
+                    source_version_hash, distance
+             FROM (
+                 SELECT gc.vector_blob, gc.vector_dimension, gc.vector_checksum,
+                        c.id AS chunk_id, c.source_id, c.source_version_id,
+                        c.body, c.chunk_index, c.token_start, c.token_end,
+                        c.byte_start, c.byte_end, c.chunker_version,
+                        c.chunker_fingerprint, c.heading_path_json,
+                        sv.body_hash AS source_version_hash,
+                        vector_candidates.distance,
+                        row_number() OVER (
+                            PARTITION BY c.source_id
+                            ORDER BY vector_candidates.distance ASC, c.id ASC
+                        ) AS source_rank
+                 FROM vector_candidates
+                 JOIN embedding_generation_chunks gc
+                   ON gc.generation_id = {generation_id}
+                  AND gc.chunk_id = vector_candidates.chunk_id
+                 JOIN chunks c ON c.id = gc.chunk_id
+                 JOIN source_versions sv ON sv.id = c.source_version_id
+             )
+             WHERE source_rank = 1
+             ORDER BY distance, source_id, chunk_id
              LIMIT ?",
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -20752,6 +20765,75 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, "embedding.generation_corrupt");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn generation_vector_search_limits_distinct_sources_after_best_chunk_selection() {
+        let paths = temp_profile_paths("vector-search-source-window");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let first_source_id = "qgh://github.com/issue/I_VECTOR_SOURCE_WINDOW_FIRST";
+        insert_test_issue_chunk(
+            &mut store,
+            first_source_id,
+            "sync-vector-source-window-first",
+        );
+        let first_source_version_id = store
+            .latest_source_version_id(first_source_id)
+            .unwrap()
+            .unwrap();
+        let first_chunks = [(0, 0, 5, "alpha"), (1, 6, 10, "beta"), (2, 11, 16, "gamma")]
+            .into_iter()
+            .map(|(chunk_index, byte_start, byte_end, body)| MarkdownChunk {
+                chunk_index,
+                byte_start,
+                byte_end,
+                token_start: chunk_index,
+                token_end: chunk_index + 1,
+                token_count: 1,
+                body: body.to_string(),
+                chunker_version: crate::chunking::CHUNKER_VERSION.to_string(),
+                chunker_fingerprint: crate::chunking::CHUNKER_FINGERPRINT.to_string(),
+                heading_path: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let first_chunk_ids = store
+            .replace_chunks_for_source_version(
+                first_source_id,
+                first_source_version_id,
+                &first_chunks,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|chunk| chunk.chunk_id)
+            .collect::<Vec<_>>();
+
+        let second_source_id = "qgh://github.com/issue/I_VECTOR_SOURCE_WINDOW_SECOND";
+        let second_chunk_id = insert_test_issue_chunk(
+            &mut store,
+            second_source_id,
+            "sync-vector-source-window-second",
+        );
+        let mut all_chunk_ids = first_chunk_ids.clone();
+        all_chunk_ids.push(second_chunk_id);
+        let generation_id =
+            stage_test_generation(&mut store, "manifest-vector-source-window", &all_chunk_ids);
+        let query = [1.0 + first_chunk_ids[0] as f32, 2.0];
+
+        let hits = store
+            .generation_vector_search(generation_id, &query, &VectorSearchFilters::default(), 2)
+            .unwrap();
+
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.source_id.as_str())
+                .collect::<Vec<_>>(),
+            [first_source_id, second_source_id]
+        );
+        assert_eq!(hits[0].chunk.chunk_id, first_chunk_ids[0]);
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }

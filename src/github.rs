@@ -184,6 +184,7 @@ pub enum ProgressEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifecycleFailure {
     pub source_id: String,
     pub repo: String,
@@ -241,6 +242,15 @@ pub struct ConfirmedSourceDeletion {
     pub issue_number: i64,
     pub http_status: u16,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmedFetchLifecycle {
+    RepositoryPermissionLoss(ConfirmedRepositoryPermissionLoss),
+    SourceDeletion(ConfirmedSourceDeletion),
+    ReconciliationFailure(LifecycleFailure),
+}
+
+type LifecycleCommit<'a> = &'a mut dyn FnMut(&ConfirmedFetchLifecycle) -> Result<(), QghError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepositoryAccessOutcome {
@@ -361,10 +371,36 @@ pub async fn fetch_issues_classified(
         fetch_comments,
         progress,
         commit_page,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_issues_classified_with_lifecycle_commit(
+    profile: &Profile,
+    token: &str,
+    cursors: &[StoredCursor],
+    fetch_comments: bool,
+    progress: Option<&dyn ProgressReporter>,
+    commit_page: &mut dyn FnMut(FetchPage) -> Result<(), QghError>,
+    commit_lifecycle: &mut dyn FnMut(&ConfirmedFetchLifecycle) -> Result<(), QghError>,
+) -> Result<ClassifiedFetchOutcome, QghError> {
+    let client = lifecycle_client()?;
+    fetch_issues_classified_with_client(
+        &client,
+        profile,
+        token,
+        cursors,
+        fetch_comments,
+        progress,
+        commit_page,
+        Some(commit_lifecycle),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn fetch_issues_classified_with_client(
     client: &reqwest::Client,
     profile: &Profile,
@@ -373,6 +409,7 @@ async fn fetch_issues_classified_with_client(
     fetch_comments: bool,
     progress: Option<&dyn ProgressReporter>,
     commit_page: &mut dyn FnMut(FetchPage) -> Result<(), QghError>,
+    mut commit_lifecycle: Option<LifecycleCommit<'_>>,
 ) -> Result<ClassifiedFetchOutcome, QghError> {
     let cursor_map = cursor_map(cursors);
     let mut total_issues = 0;
@@ -415,7 +452,7 @@ async fn fetch_issues_classified_with_client(
         };
     }
 
-    for repo in &profile.repos {
+    'repos: for repo in &profile.repos {
         let repo_name = repo.full_name();
         emit(
             progress,
@@ -432,7 +469,7 @@ async fn fetch_issues_classified_with_client(
         let mut repo_comment_count = 0;
         let mut repo_skipped_pull_requests = 0;
         let mut last_progress_issue_count = 0;
-        'repo_pages: while let Some(url) = next_url.take() {
+        while let Some(url) = next_url.take() {
             let mut request = github_get(client, &url, token);
             if let Some(etag) = stored_cursor.and_then(|cursor| cursor.etag.as_ref()) {
                 request = request.header(IF_NONE_MATCH, etag);
@@ -512,8 +549,16 @@ async fn fetch_issues_classified_with_client(
                         RepositoryAccessOutcome::ConfirmedPermissionLoss(confirmed) => {
                             confirmed_permission_lost_repos
                                 .entry(confirmed.repo.clone())
-                                .or_insert(confirmed);
-                            break;
+                                .or_insert_with(|| confirmed.clone());
+                            if let Some(commit) = commit_lifecycle.as_deref_mut() {
+                                if let Err(error) = commit(
+                                    &ConfirmedFetchLifecycle::RepositoryPermissionLoss(confirmed),
+                                ) {
+                                    fail_fetch!(content_free_commit_error(error));
+                                }
+                                continue 'repos;
+                            }
+                            finish_fetch!(None);
                         }
                         RepositoryAccessOutcome::Backoff(plan) => {
                             wait_for_backoff(&plan);
@@ -608,20 +653,37 @@ async fn fetch_issues_classified_with_client(
                         CommentFetchOutcome::ConfirmedRepositoryPermissionLoss(confirmed) => {
                             confirmed_permission_lost_repos
                                 .entry(confirmed.repo.clone())
-                                .or_insert(confirmed);
-                            break 'repo_pages;
+                                .or_insert_with(|| confirmed.clone());
+                            if let Some(commit) = commit_lifecycle.as_deref_mut() {
+                                if let Err(error) = commit(
+                                    &ConfirmedFetchLifecycle::RepositoryPermissionLoss(confirmed),
+                                ) {
+                                    fail_fetch!(content_free_commit_error(error));
+                                }
+                                continue 'repos;
+                            }
+                            finish_fetch!(None);
                         }
                         CommentFetchOutcome::SourceDeleted { http_status } => {
+                            let confirmed = ConfirmedSourceDeletion {
+                                source_id: issue.source_id.clone(),
+                                repo: issue.repo.clone(),
+                                entity_type: "issue".to_string(),
+                                issue_number: issue.number,
+                                http_status,
+                            };
                             confirmed_source_deletions
                                 .entry(issue.source_id.clone())
-                                .or_insert(ConfirmedSourceDeletion {
-                                    source_id: issue.source_id.clone(),
-                                    repo: issue.repo.clone(),
-                                    entity_type: "issue".to_string(),
-                                    issue_number: issue.number,
-                                    http_status,
-                                });
-                            break 'repo_pages;
+                                .or_insert_with(|| confirmed.clone());
+                            if let Some(commit) = commit_lifecycle.as_deref_mut() {
+                                if let Err(error) =
+                                    commit(&ConfirmedFetchLifecycle::SourceDeletion(confirmed))
+                                {
+                                    fail_fetch!(content_free_commit_error(error));
+                                }
+                                continue;
+                            }
+                            finish_fetch!(None);
                         }
                         CommentFetchOutcome::AuthenticationFailed => {
                             finish_fetch!(Some(LifecycleInterruption::AuthenticationFailed));
@@ -760,6 +822,54 @@ pub async fn fetch_backfill_issues_classified(
     progress: Option<&dyn ProgressReporter>,
     commit_page: &mut dyn FnMut(FetchPage) -> Result<(), QghError>,
 ) -> Result<BackfillOutcome, QghError> {
+    fetch_backfill_issues_classified_inner(
+        profile,
+        token,
+        cursors,
+        max_pages,
+        max_duration_seconds,
+        progress,
+        commit_page,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_backfill_issues_classified_with_lifecycle_commit(
+    profile: &Profile,
+    token: &str,
+    cursors: &[StoredCursor],
+    max_pages: Option<usize>,
+    max_duration_seconds: Option<i64>,
+    progress: Option<&dyn ProgressReporter>,
+    commit_page: &mut dyn FnMut(FetchPage) -> Result<(), QghError>,
+    commit_lifecycle: &mut dyn FnMut(&ConfirmedFetchLifecycle) -> Result<(), QghError>,
+) -> Result<BackfillOutcome, QghError> {
+    fetch_backfill_issues_classified_inner(
+        profile,
+        token,
+        cursors,
+        max_pages,
+        max_duration_seconds,
+        progress,
+        commit_page,
+        Some(commit_lifecycle),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_backfill_issues_classified_inner(
+    profile: &Profile,
+    token: &str,
+    cursors: &[StoredCursor],
+    max_pages: Option<usize>,
+    max_duration_seconds: Option<i64>,
+    progress: Option<&dyn ProgressReporter>,
+    commit_page: &mut dyn FnMut(FetchPage) -> Result<(), QghError>,
+    mut commit_lifecycle: Option<LifecycleCommit<'_>>,
+) -> Result<BackfillOutcome, QghError> {
     const EPOCH: &str = "1970-01-01T00:00:00Z";
     let client = lifecycle_client()?;
     let cursor_map = cursor_map(cursors);
@@ -791,7 +901,7 @@ pub async fn fetch_backfill_issues_classified(
             etag: None,
         };
         let mut next_url = Some(issue_url(profile, repo, Some(&synthetic)));
-        'backfill_pages: while let Some(url) = next_url.take() {
+        while let Some(url) = next_url.take() {
             if max_pages.is_some_and(|max| pages >= max)
                 || max_duration_seconds
                     .is_some_and(|secs| (Utc::now() - started).num_seconds() >= secs)
@@ -843,9 +953,18 @@ pub async fn fetch_backfill_issues_classified(
                         RepositoryAccessOutcome::ConfirmedPermissionLoss(confirmed) => {
                             confirmed_permission_lost_repos
                                 .entry(confirmed.repo.clone())
-                                .or_insert(confirmed);
+                                .or_insert_with(|| confirmed.clone());
                             all_reached_end = false;
-                            break;
+                            if let Some(commit) = commit_lifecycle.as_deref_mut() {
+                                if let Err(error) = commit(
+                                    &ConfirmedFetchLifecycle::RepositoryPermissionLoss(confirmed),
+                                ) {
+                                    terminal_error = Some(content_free_commit_error(error));
+                                    break 'repos;
+                                }
+                                continue 'repos;
+                            }
+                            break 'repos;
                         }
                         RepositoryAccessOutcome::Backoff(plan) => {
                             wait_for_backoff(&plan);
@@ -956,22 +1075,41 @@ pub async fn fetch_backfill_issues_classified(
                     CommentFetchOutcome::ConfirmedRepositoryPermissionLoss(confirmed) => {
                         confirmed_permission_lost_repos
                             .entry(confirmed.repo.clone())
-                            .or_insert(confirmed);
+                            .or_insert_with(|| confirmed.clone());
                         all_reached_end = false;
-                        break 'backfill_pages;
+                        if let Some(commit) = commit_lifecycle.as_deref_mut() {
+                            if let Err(error) = commit(
+                                &ConfirmedFetchLifecycle::RepositoryPermissionLoss(confirmed),
+                            ) {
+                                terminal_error = Some(content_free_commit_error(error));
+                                break 'repos;
+                            }
+                            continue 'repos;
+                        }
+                        break 'repos;
                     }
                     CommentFetchOutcome::SourceDeleted { http_status } => {
+                        let confirmed = ConfirmedSourceDeletion {
+                            source_id: issue.source_id.clone(),
+                            repo: issue.repo.clone(),
+                            entity_type: "issue".to_string(),
+                            issue_number: issue.number,
+                            http_status,
+                        };
                         confirmed_source_deletions
                             .entry(issue.source_id.clone())
-                            .or_insert(ConfirmedSourceDeletion {
-                                source_id: issue.source_id.clone(),
-                                repo: issue.repo.clone(),
-                                entity_type: "issue".to_string(),
-                                issue_number: issue.number,
-                                http_status,
-                            });
+                            .or_insert_with(|| confirmed.clone());
                         all_reached_end = false;
-                        break 'backfill_pages;
+                        if let Some(commit) = commit_lifecycle.as_deref_mut() {
+                            if let Err(error) =
+                                commit(&ConfirmedFetchLifecycle::SourceDeletion(confirmed))
+                            {
+                                terminal_error = Some(content_free_commit_error(error));
+                                break 'repos;
+                            }
+                            continue;
+                        }
+                        break 'repos;
                     }
                     CommentFetchOutcome::AuthenticationFailed => {
                         interruption = Some(LifecycleInterruption::AuthenticationFailed);
@@ -1092,6 +1230,31 @@ pub async fn fetch_target_issue_classified(
         .await
 }
 
+/// Fetches a targeted issue while durably committing each confirmed permanent
+/// transition before the next remote request is attempted. The callback is the
+/// fail-closed boundary used by command orchestration to queue the old source
+/// for purge before following its replacement location.
+pub async fn fetch_target_issue_classified_with_transition_commit(
+    profile: &Profile,
+    token: &str,
+    repo: &RepoRef,
+    issue_number: i64,
+    progress: Option<&dyn ProgressReporter>,
+    commit_transition: &mut dyn FnMut(&ConfirmedIssueTransition) -> Result<(), QghError>,
+) -> Result<ClassifiedTargetIssueFetchOutcome, QghError> {
+    let client = lifecycle_client()?;
+    fetch_target_issue_classified_with_client_and_transition_commit(
+        &client,
+        profile,
+        token,
+        repo,
+        issue_number,
+        progress,
+        commit_transition,
+    )
+    .await
+}
+
 async fn fetch_target_issue_classified_with_client(
     client: &reqwest::Client,
     profile: &Profile,
@@ -1099,6 +1262,28 @@ async fn fetch_target_issue_classified_with_client(
     repo: &RepoRef,
     issue_number: i64,
     progress: Option<&dyn ProgressReporter>,
+) -> Result<ClassifiedTargetIssueFetchOutcome, QghError> {
+    let mut ignore_transition = |_transition: &ConfirmedIssueTransition| Ok(());
+    fetch_target_issue_classified_with_client_and_transition_commit(
+        client,
+        profile,
+        token,
+        repo,
+        issue_number,
+        progress,
+        &mut ignore_transition,
+    )
+    .await
+}
+
+async fn fetch_target_issue_classified_with_client_and_transition_commit(
+    client: &reqwest::Client,
+    profile: &Profile,
+    token: &str,
+    repo: &RepoRef,
+    issue_number: i64,
+    progress: Option<&dyn ProgressReporter>,
+    commit_transition: &mut dyn FnMut(&ConfirmedIssueTransition) -> Result<(), QghError>,
 ) -> Result<ClassifiedTargetIssueFetchOutcome, QghError> {
     const TRANSFER_FOLLOW_LIMIT: usize = 8;
 
@@ -1277,14 +1462,20 @@ async fn fetch_target_issue_classified_with_client(
                 alias_chain.push(location);
                 confirmed_transition = Some(ConfirmedRemoteState::SourceTransferred);
                 confirmed_transition_http_status.get_or_insert(status.as_u16());
-                confirmed_transitions.push(ConfirmedIssueTransition {
+                let transition = ConfirmedIssueTransition {
                     source_repo: current_repo.full_name(),
                     source_issue_number: current_issue_number,
                     target_repo: next_repo.full_name(),
                     target_issue_number: next_issue_number,
                     state: ConfirmedRemoteState::SourceTransferred,
                     http_status: status.as_u16(),
-                });
+                };
+                confirmed_transitions.push(transition.clone());
+                if let Err(error) = commit_transition(&transition) {
+                    finish_target!(ClassifiedTargetIssueTerminal::Failed(
+                        content_free_commit_error(error)
+                    ));
+                }
                 if !profile.allows_repo(&next_repo.full_name()) {
                     finish_target!(ClassifiedTargetIssueTerminal::Confirmed {
                         state: ConfirmedRemoteState::SourceTransferred,
@@ -1384,11 +1575,32 @@ async fn fetch_target_issue_classified_with_client(
     }
 }
 
+#[allow(dead_code)]
 pub async fn reconcile_sources(
     profile: &Profile,
     token: &str,
     candidates: &[ReconciliationCandidate],
     progress: Option<&dyn ProgressReporter>,
+) -> Result<ReconciliationResult, QghError> {
+    reconcile_sources_inner(profile, token, candidates, progress, None).await
+}
+
+pub async fn reconcile_sources_with_lifecycle_commit(
+    profile: &Profile,
+    token: &str,
+    candidates: &[ReconciliationCandidate],
+    progress: Option<&dyn ProgressReporter>,
+    commit_lifecycle: &mut dyn FnMut(&ConfirmedFetchLifecycle) -> Result<(), QghError>,
+) -> Result<ReconciliationResult, QghError> {
+    reconcile_sources_inner(profile, token, candidates, progress, Some(commit_lifecycle)).await
+}
+
+async fn reconcile_sources_inner(
+    profile: &Profile,
+    token: &str,
+    candidates: &[ReconciliationCandidate],
+    progress: Option<&dyn ProgressReporter>,
+    mut commit_lifecycle: Option<LifecycleCommit<'_>>,
 ) -> Result<ReconciliationResult, QghError> {
     let client = lifecycle_client()?;
     let mut unavailable_sources = Vec::new();
@@ -1397,7 +1609,7 @@ pub async fn reconcile_sources(
     let mut terminal_error = None;
     let total = candidates.len();
     let mut checked_sources = 0;
-    for (index, candidate) in candidates.iter().enumerate() {
+    'candidates: for (index, candidate) in candidates.iter().enumerate() {
         if confirmed_permission_lost_repos.contains_key(&candidate.repo) {
             let covered = index + 1;
             if should_report_reconciliation_progress(covered, total) {
@@ -1431,7 +1643,7 @@ pub async fn reconcile_sources(
                     | ConfirmedRemoteState::SourceTransferred),
                 http_status,
             } => {
-                unavailable_sources.push(LifecycleFailure {
+                let failure = LifecycleFailure {
                     source_id: candidate.source_id.clone(),
                     repo: candidate.repo.clone(),
                     entity_type: candidate.entity_type.clone(),
@@ -1439,18 +1651,40 @@ pub async fn reconcile_sources(
                     reason: state.reason().to_string(),
                     state,
                     http_status,
-                });
+                };
+                unavailable_sources.push(failure.clone());
+                if let Some(commit) = commit_lifecycle.as_deref_mut() {
+                    if let Err(error) =
+                        commit(&ConfirmedFetchLifecycle::ReconciliationFailure(failure))
+                    {
+                        terminal_error = Some(content_free_commit_error(error));
+                        break 'candidates;
+                    }
+                } else {
+                    break 'candidates;
+                }
             }
             ClassifiedLifecycleCheck::Confirmed {
                 state: ConfirmedRemoteState::RepositoryPermissionLoss,
                 http_status,
             } => {
+                let confirmed = ConfirmedRepositoryPermissionLoss {
+                    repo: candidate.repo.clone(),
+                    http_status,
+                };
                 confirmed_permission_lost_repos
                     .entry(candidate.repo.clone())
-                    .or_insert(ConfirmedRepositoryPermissionLoss {
-                        repo: candidate.repo.clone(),
-                        http_status,
-                    });
+                    .or_insert_with(|| confirmed.clone());
+                if let Some(commit) = commit_lifecycle.as_deref_mut() {
+                    if let Err(error) = commit(&ConfirmedFetchLifecycle::RepositoryPermissionLoss(
+                        confirmed,
+                    )) {
+                        terminal_error = Some(content_free_commit_error(error));
+                        break 'candidates;
+                    }
+                } else {
+                    break 'candidates;
+                }
             }
             ClassifiedLifecycleCheck::AuthenticationFailed => {
                 interruption = Some(LifecycleInterruption::AuthenticationFailed);
@@ -1724,6 +1958,50 @@ pub async fn fetch_repo_comments_classified(
     resolve_parent: &dyn Fn(&str, i64) -> Option<CommentParent>,
     progress: Option<&dyn ProgressReporter>,
 ) -> Result<RepoCommentsResult, QghError> {
+    fetch_repo_comments_classified_inner(
+        profile,
+        token,
+        cursors,
+        parent_resolution_budget,
+        resolve_parent,
+        progress,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_repo_comments_classified_with_lifecycle_commit(
+    profile: &Profile,
+    token: &str,
+    cursors: &[StoredCursor],
+    parent_resolution_budget: usize,
+    resolve_parent: &dyn Fn(&str, i64) -> Option<CommentParent>,
+    progress: Option<&dyn ProgressReporter>,
+    commit_lifecycle: &mut dyn FnMut(&ConfirmedFetchLifecycle) -> Result<(), QghError>,
+) -> Result<RepoCommentsResult, QghError> {
+    fetch_repo_comments_classified_inner(
+        profile,
+        token,
+        cursors,
+        parent_resolution_budget,
+        resolve_parent,
+        progress,
+        Some(commit_lifecycle),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_repo_comments_classified_inner(
+    profile: &Profile,
+    token: &str,
+    cursors: &[StoredCursor],
+    parent_resolution_budget: usize,
+    resolve_parent: &dyn Fn(&str, i64) -> Option<CommentParent>,
+    progress: Option<&dyn ProgressReporter>,
+    mut commit_lifecycle: Option<LifecycleCommit<'_>>,
+) -> Result<RepoCommentsResult, QghError> {
     let client = lifecycle_client()?;
     let cursor_map = cursor_map(cursors);
     let mut comments = Vec::new();
@@ -1793,8 +2071,17 @@ pub async fn fetch_repo_comments_classified(
                         RepositoryAccessOutcome::ConfirmedPermissionLoss(confirmed) => {
                             confirmed_permission_lost_repos
                                 .entry(confirmed.repo.clone())
-                                .or_insert(confirmed);
-                            break;
+                                .or_insert_with(|| confirmed.clone());
+                            if let Some(commit) = commit_lifecycle.as_deref_mut() {
+                                if let Err(error) = commit(
+                                    &ConfirmedFetchLifecycle::RepositoryPermissionLoss(confirmed),
+                                ) {
+                                    terminal_error = Some(content_free_commit_error(error));
+                                    break 'repos;
+                                }
+                                continue 'repos;
+                            }
+                            break 'repos;
                         }
                         RepositoryAccessOutcome::AuthenticationFailed => {
                             interruption = Some(LifecycleInterruption::AuthenticationFailed);
@@ -2592,7 +2879,7 @@ fn transfer_chain_too_long_error(
 
 fn content_free_commit_error(error: QghError) -> QghError {
     let (code, exit_code) = stable_error_identity(&error, "sync.commit_page_failed", 6);
-    QghError::new(code, "Local page commit failed.", exit_code)
+    QghError::new(code, "Local fetch checkpoint commit failed.", exit_code)
 }
 
 fn content_free_validation_error(error: QghError) -> QghError {
@@ -3003,30 +3290,6 @@ mod permission_classification_tests {
                     .write_all(response.as_bytes())
                     .expect("write test response");
             }
-        });
-        (format!("http://{address}"), count, handle)
-    }
-
-    fn spawn_confirm_then_timeout() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let address = listener.local_addr().expect("test server address");
-        let count = Arc::new(AtomicUsize::new(0));
-        let thread_count = Arc::clone(&count);
-        let handle = thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().expect("accept confirmation request");
-                let mut request = [0_u8; 4096];
-                let _ = stream.read(&mut request);
-                thread_count.fetch_add(1, Ordering::SeqCst);
-                stream
-                    .write_all(NOT_FOUND_RESPONSE.as_bytes())
-                    .expect("write confirmation response");
-            }
-            let (mut stream, _) = listener.accept().expect("accept timeout request");
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
-            thread_count.fetch_add(1, Ordering::SeqCst);
-            thread::sleep(StdDuration::from_millis(100));
         });
         (format!("http://{address}"), count, handle)
     }
@@ -3643,6 +3906,7 @@ mod permission_classification_tests {
                 .unwrap();
         handle.join().unwrap();
         assert!(outcome.interruption.is_none());
+        assert!(outcome.terminal_error.is_none());
         let fetched = outcome.result;
         assert_eq!(fetched.confirmed_permission_lost_repos.len(), 1);
         assert_eq!(
@@ -3668,6 +3932,7 @@ mod permission_classification_tests {
             .unwrap();
         handle.join().unwrap();
         assert!(outcome.interruption.is_none());
+        assert!(outcome.terminal_error.is_none());
         let fetched = outcome.result;
         assert_eq!(fetched.issues, 0);
         assert_eq!(fetched.confirmed_source_deletions.len(), 1);
@@ -3681,78 +3946,23 @@ mod permission_classification_tests {
     }
 
     #[tokio::test]
-    async fn full_fetch_retains_prior_confirmation_with_later_interruption() {
-        let cases = [
-            (
-                json_response("500 Internal Server Error", "", "{}"),
-                LifecycleInterruption::Transient(GitHubTransientKind::Server),
-            ),
-            (
-                json_response("429 Too Many Requests", "retry-after: 0\r\n", "{}"),
-                LifecycleInterruption::Backoff(BackoffPlan {
-                    reason: "secondary_rate_limit".to_string(),
-                    scope: "issues:owner/b".to_string(),
-                    retry_after_seconds: 0,
-                    reset_at: None,
-                }),
-            ),
-            (
-                json_response("401 Unauthorized", "", "{}"),
-                LifecycleInterruption::AuthenticationFailed,
-            ),
-        ];
-        for (later_response, expected_interruption) in cases {
-            let (base_url, request_count, handle) = spawn_owned_responses(vec![
-                NOT_FOUND_RESPONSE.to_string(),
-                NOT_FOUND_RESPONSE.to_string(),
-                later_response,
-            ]);
-            let profile = two_repo_profile(&base_url);
-            let mut commit = |_page: FetchPage| Ok(());
-
-            let outcome =
-                fetch_issues_classified(&profile, "test-token", &[], false, None, &mut commit)
-                    .await
-                    .unwrap();
-
-            handle.join().unwrap();
-            assert_eq!(request_count.load(Ordering::SeqCst), 3);
-            assert_eq!(outcome.interruption, Some(expected_interruption));
-            assert_eq!(outcome.result.confirmed_permission_lost_repos.len(), 1);
-            assert_eq!(
-                outcome.result.confirmed_permission_lost_repos[0].repo,
-                "owner/a"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn full_fetch_retains_prior_confirmation_with_later_timeout() {
-        let (base_url, request_count, handle) = spawn_confirm_then_timeout();
+    async fn full_fetch_stops_before_an_unrelated_repo_after_confirmation() {
+        let (base_url, request_count, handle) = spawn_owned_responses(vec![
+            NOT_FOUND_RESPONSE.to_string(),
+            NOT_FOUND_RESPONSE.to_string(),
+        ]);
         let profile = two_repo_profile(&base_url);
-        let client = lifecycle_client_with_timeout(StdDuration::from_millis(10)).unwrap();
         let mut commit = |_page: FetchPage| Ok(());
 
-        let outcome = fetch_issues_classified_with_client(
-            &client,
-            &profile,
-            "test-token",
-            &[],
-            false,
-            None,
-            &mut commit,
-        )
-        .await
-        .unwrap();
+        let outcome =
+            fetch_issues_classified(&profile, "test-token", &[], false, None, &mut commit)
+                .await
+                .unwrap();
 
         handle.join().unwrap();
-        assert_eq!(request_count.load(Ordering::SeqCst), 3);
-        assert_eq!(
-            outcome.interruption,
-            Some(LifecycleInterruption::Transient(
-                GitHubTransientKind::Timeout
-            ))
-        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert!(outcome.interruption.is_none());
+        assert!(outcome.terminal_error.is_none());
         assert_eq!(outcome.result.confirmed_permission_lost_repos.len(), 1);
         assert_eq!(
             outcome.result.confirmed_permission_lost_repos[0].repo,
@@ -3761,13 +3971,12 @@ mod permission_classification_tests {
     }
 
     #[tokio::test]
-    async fn full_fetch_retains_prior_source_deletion_with_later_server_failure() {
+    async fn full_fetch_stops_before_an_unrelated_repo_after_source_deletion() {
         const ISSUE_PAGE: &str = r#"[{"id":1,"node_id":"I_A","number":1,"title":"Public title","body":"Public body","state":"open","labels":[],"milestone":null,"assignees":[],"user":{"login":"alice"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","closed_at":null,"html_url":"https://example.test/owner/a/issues/1"}]"#;
         let responses = vec![
             json_response("200 OK", "", ISSUE_PAGE),
             json_response("404 Not Found", "", "{}"),
             json_response("200 OK", "", "{}"),
-            json_response("500 Internal Server Error", "", "{}"),
         ];
         let (base_url, request_count, handle) = spawn_owned_responses(responses);
         let profile = two_repo_profile(&base_url);
@@ -3778,13 +3987,9 @@ mod permission_classification_tests {
             .unwrap();
 
         handle.join().unwrap();
-        assert_eq!(request_count.load(Ordering::SeqCst), 4);
-        assert_eq!(
-            outcome.interruption,
-            Some(LifecycleInterruption::Transient(
-                GitHubTransientKind::Server
-            ))
-        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert!(outcome.interruption.is_none());
+        assert!(outcome.terminal_error.is_none());
         assert_eq!(outcome.result.confirmed_source_deletions.len(), 1);
         assert_eq!(
             outcome.result.confirmed_source_deletions[0].source_id,
@@ -3793,52 +3998,81 @@ mod permission_classification_tests {
     }
 
     #[tokio::test]
-    async fn full_fetch_retains_prior_confirmation_with_later_content_free_failures() {
+    async fn full_fetch_confirmation_short_circuits_page_commit() {
         let (base_url, request_count, handle) = spawn_owned_responses(vec![
             NOT_FOUND_RESPONSE.to_string(),
             NOT_FOUND_RESPONSE.to_string(),
-            json_response("200 OK", "", "{}"),
         ]);
         let profile = two_repo_profile(&base_url);
-        let mut commit = |_page: FetchPage| Ok(());
+        let mut commit_calls = 0usize;
+        let mut commit = |_page: FetchPage| {
+            commit_calls += 1;
+            Ok(())
+        };
         let outcome =
             fetch_issues_classified(&profile, "test-token", &[], false, None, &mut commit)
                 .await
                 .unwrap();
         handle.join().unwrap();
-        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(commit_calls, 0);
         assert_eq!(outcome.result.confirmed_permission_lost_repos.len(), 1);
         assert!(outcome.interruption.is_none());
-        let error = outcome.terminal_error.expect("typed invalid JSON failure");
-        assert_eq!(error.code, "github.invalid_issue_json");
-
-        let private_message = "private callback content must not escape";
-        let (base_url, request_count, handle) = spawn_owned_responses(vec![
-            NOT_FOUND_RESPONSE.to_string(),
-            NOT_FOUND_RESPONSE.to_string(),
-            json_response("204 No Content", "", ""),
-        ]);
-        let profile = two_repo_profile(&base_url);
-        let mut commit =
-            |_page: FetchPage| Err(QghError::new("storage.commit_failed", private_message, 6));
-        let outcome =
-            fetch_issues_classified(&profile, "test-token", &[], false, None, &mut commit)
-                .await
-                .unwrap();
-        handle.join().unwrap();
-        assert_eq!(request_count.load(Ordering::SeqCst), 3);
-        assert_eq!(outcome.result.confirmed_permission_lost_repos.len(), 1);
-        let error = outcome.terminal_error.expect("typed commit failure");
-        assert_eq!(error.code, "storage.commit_failed");
-        assert!(!format!("{error:?}").contains(private_message));
+        assert!(outcome.terminal_error.is_none());
     }
 
     #[tokio::test]
-    async fn classified_bulk_paths_retain_confirmation_before_later_typed_failure() {
+    async fn full_fetch_commits_lifecycle_before_continuing_other_repositories() {
         let responses = vec![
             NOT_FOUND_RESPONSE.to_string(),
             NOT_FOUND_RESPONSE.to_string(),
-            json_response("200 OK", "", "{}"),
+            json_response("200 OK", "", "[]"),
+        ];
+        let (base_url, request_count, handle) = spawn_owned_responses(responses);
+        let profile = two_repo_profile(&base_url);
+        let lifecycle_committed = std::cell::Cell::new(false);
+        let mut commit_lifecycle = |evidence: &ConfirmedFetchLifecycle| {
+            assert!(matches!(
+                evidence,
+                ConfirmedFetchLifecycle::RepositoryPermissionLoss(confirmed)
+                    if confirmed.repo == "owner/a"
+            ));
+            lifecycle_committed.set(true);
+            Ok(())
+        };
+        let mut commit_page = |_page: FetchPage| {
+            assert!(
+                lifecycle_committed.get(),
+                "the next repository page must follow the durable lifecycle callback"
+            );
+            Ok(())
+        };
+
+        let outcome = fetch_issues_classified_with_lifecycle_commit(
+            &profile,
+            "test-token",
+            &[],
+            false,
+            None,
+            &mut commit_page,
+            &mut commit_lifecycle,
+        )
+        .await
+        .unwrap();
+
+        handle.join().unwrap();
+        assert!(lifecycle_committed.get());
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(outcome.result.confirmed_permission_lost_repos.len(), 1);
+        assert!(outcome.terminal_error.is_none());
+        assert!(outcome.interruption.is_none());
+    }
+
+    #[tokio::test]
+    async fn classified_bulk_paths_stop_immediately_after_confirmation() {
+        let responses = vec![
+            NOT_FOUND_RESPONSE.to_string(),
+            NOT_FOUND_RESPONSE.to_string(),
         ];
         let (base_url, _, handle) = spawn_owned_responses(responses);
         let profile = two_repo_profile(&base_url);
@@ -3856,18 +4090,12 @@ mod permission_classification_tests {
         .unwrap();
         handle.join().unwrap();
         assert_eq!(backfill.confirmed_permission_lost_repos.len(), 1);
-        assert_eq!(
-            backfill
-                .terminal_error
-                .as_ref()
-                .map(|error| error.code.as_str()),
-            Some("github.invalid_issue_json")
-        );
+        assert!(backfill.terminal_error.is_none());
+        assert!(backfill.interruption.is_none());
 
         let responses = vec![
             NOT_FOUND_RESPONSE.to_string(),
             NOT_FOUND_RESPONSE.to_string(),
-            json_response("200 OK", "", "{}"),
         ];
         let (base_url, _, handle) = spawn_owned_responses(responses);
         let profile = two_repo_profile(&base_url);
@@ -3877,13 +4105,8 @@ mod permission_classification_tests {
                 .unwrap();
         handle.join().unwrap();
         assert_eq!(repo_comments.confirmed_permission_lost_repos.len(), 1);
-        assert_eq!(
-            repo_comments
-                .terminal_error
-                .as_ref()
-                .map(|error| error.code.as_str()),
-            Some("github.invalid_comment_json")
-        );
+        assert!(repo_comments.terminal_error.is_none());
+        assert!(repo_comments.interruption.is_none());
 
         let (base_url, _, handle) = spawn_owned_responses(vec![
             NOT_FOUND_RESPONSE.to_string(),
@@ -3911,13 +4134,8 @@ mod permission_classification_tests {
             .unwrap();
         handle.join().unwrap();
         assert_eq!(reconciliation.unavailable_sources.len(), 1);
-        assert_eq!(
-            reconciliation
-                .terminal_error
-                .as_ref()
-                .map(|error| error.code.as_str()),
-            Some("validation.unsupported_source_type")
-        );
+        assert!(reconciliation.terminal_error.is_none());
+        assert!(reconciliation.interruption.is_none());
     }
 
     #[tokio::test]
@@ -3979,6 +4197,44 @@ mod permission_classification_tests {
         assert_eq!(fetched.lifecycle.status, "transferred");
         assert_eq!(fetched.lifecycle.http_status, Some(301));
         assert_eq!(request_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn permanent_transfer_commits_purge_before_following_target() {
+        const REDIRECT: &str = "HTTP/1.1 301 Moved Permanently\r\nlocation: /repos/owner/repo/issues/99\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+        let (base_url, request_count, handle) = spawn_responses(vec![REDIRECT]);
+        let profile = test_profile(&base_url);
+        let mut committed = Vec::new();
+        let mut commit = |transition: &ConfirmedIssueTransition| {
+            committed.push(transition.clone());
+            Err(QghError::new(
+                "purge.fixture_commit_failed",
+                "sensitive fixture detail must be redacted",
+                6,
+            ))
+        };
+
+        let outcome = fetch_target_issue_classified_with_transition_commit(
+            &profile,
+            "test-token",
+            &test_repo(),
+            42,
+            None,
+            &mut commit,
+        )
+        .await
+        .unwrap();
+
+        handle.join().unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(committed.len(), 1);
+        assert_eq!(outcome.confirmed_transitions, committed);
+        let ClassifiedTargetIssueTerminal::Failed(error) = outcome.terminal else {
+            panic!("failed purge commit must stop before the transfer target request");
+        };
+        assert_eq!(error.code, "purge.fixture_commit_failed");
+        assert_eq!(error.message, "Local fetch checkpoint commit failed.");
+        assert!(!error.message.contains("sensitive fixture detail"));
     }
 
     #[tokio::test]

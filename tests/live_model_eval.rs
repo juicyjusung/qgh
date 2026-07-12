@@ -808,6 +808,7 @@ fn qwen_production_adapter_runs_canonical_window_multilingual_qrels() {
         .map(|policy| (policy.id(), BTreeMap::<String, Vec<String>>::new()))
         .collect::<BTreeMap<_, _>>();
     let mut hybrid_rankings = BTreeMap::new();
+    let mut default_query_rankings = BTreeMap::new();
     let mut query_embedding_latencies_ms = Vec::new();
     let mut hybrid_retrieval_latencies_ms = Vec::new();
     let mut events = Vec::new();
@@ -856,11 +857,19 @@ fn qwen_production_adapter_runs_canonical_window_multilingual_qrels() {
         for policy in fusion_policies {
             fusion_rankings.get_mut(policy.id()).unwrap().insert(
                 qrel.query_id.clone(),
-                qwen_eval_fuse_with_policy(&bm25, &dense, exact, policy),
+                qwen_eval_fuse_with_policy(&bm25, &dense, exact, policy, 20),
             );
         }
         let equal_rrf_diagnostic = fusion_rankings["equal"][&qrel.query_id].clone();
         let hybrid = fusion_rankings[LEXICAL_GUARD_V1.id()][&qrel.query_id].clone();
+        let default_candidate_window = LEXICAL_GUARD_V1.candidate_window(10);
+        let default_hybrid = qwen_eval_fuse_with_policy(
+            &bm25[..bm25.len().min(default_candidate_window)],
+            &dense[..dense.len().min(default_candidate_window)],
+            exact,
+            LEXICAL_GUARD_V1,
+            10,
+        );
         hybrid_retrieval_latencies_ms.push(retrieval_started.elapsed().as_secs_f64() * 1000.0);
         for source_id in &hybrid {
             let source = source_map
@@ -874,14 +883,17 @@ fn qwen_production_adapter_runs_canonical_window_multilingual_qrels() {
             "class": qrel.query_class,
             "bm25": &bm25,
             "hybrid": &hybrid,
+            "default_query_hybrid": &default_hybrid,
             "equal_rrf_diagnostic": &equal_rrf_diagnostic
         }));
+        default_query_rankings.insert(qrel.query_id.clone(), default_hybrid);
         hybrid_rankings.insert(qrel.query_id.clone(), hybrid);
     }
     query_embedding_latencies_ms.sort_by(f64::total_cmp);
     hybrid_retrieval_latencies_ms.sort_by(f64::total_cmp);
     let bm25_metrics = qwen_eval_metrics(&qrels, &bm25_rankings);
     let hybrid_metrics = qwen_eval_metrics(&qrels, &hybrid_rankings);
+    let default_query_metrics = qwen_eval_metrics(&qrels, &default_query_rankings);
     let equal_rrf_metrics = qwen_eval_metrics(&qrels, &fusion_rankings["equal"]);
     let fusion_evaluations = fusion_policies
         .iter()
@@ -904,6 +916,8 @@ fn qwen_production_adapter_runs_canonical_window_multilingual_qrels() {
         .collect::<BTreeMap<_, _>>();
     qwen_eval_assert_fresh_bm25_parity(&bm25_metrics);
     let complement = qwen_eval_complement(&qrels, &bm25_rankings, &hybrid_rankings);
+    let default_query_complement =
+        qwen_eval_complement(&qrels, &bm25_rankings, &default_query_rankings);
     let exact_top_1 = qwen_eval_exact_top_1(&qrels, &hybrid_rankings);
     let embedding_chunks_per_second = chunk_vectors.len() as f64 / embedding_seconds;
     let mut promotion_blockers = vec![
@@ -945,6 +959,8 @@ fn qwen_production_adapter_runs_canonical_window_multilingual_qrels() {
             "chunk_count": chunk_vectors.len(),
             "candidate_window": 80,
             "return_limit": 20,
+            "default_query_candidate_window": LEXICAL_GUARD_V1.candidate_window(10),
+            "default_query_return_limit": 10,
             "fusion_policy_id": LEXICAL_GUARD_V1.id(),
             "rrf_k": LEXICAL_GUARD_V1.rrf_k(),
             "rrf_lexical_weight": LEXICAL_GUARD_V1.lexical_weight(),
@@ -958,12 +974,14 @@ fn qwen_production_adapter_runs_canonical_window_multilingual_qrels() {
         "quality": {
             "bm25": bm25_metrics,
             "hybrid": hybrid_metrics,
+            "default_query_hybrid": default_query_metrics,
             "equal_rrf_diagnostic": equal_rrf_metrics,
             "bm25_complement": complement,
+            "default_query_bm25_complement": default_query_complement,
             "fusion_profiles": fusion_evaluations,
             "exact_top_1": exact_top_1,
             "hard_filter_violations": hard_filter_violations,
-            "source_identity_round_trip_failures": 0
+            "source_map_resolution_failures": 0
         },
         "resources": {
             "evidence_level": "single_process_diagnostic",
@@ -991,6 +1009,11 @@ fn qwen_production_adapter_runs_canonical_window_multilingual_qrels() {
     assert_eq!(complement["bm25_hit_harmed_at_5"], 0);
     assert_eq!(complement["bm25_hit_harmed_at_10"], 0);
     assert!(complement["rescued_at_10"]
+        .as_u64()
+        .is_some_and(|count| count > 0));
+    assert_eq!(default_query_complement["bm25_hit_harmed_at_5"], 0);
+    assert_eq!(default_query_complement["bm25_hit_harmed_at_10"], 0);
+    assert!(default_query_complement["rescued_at_10"]
         .as_u64()
         .is_some_and(|count| count > 0));
     assert!(hybrid_metrics["selection_weighted_ndcg_at_10"]
@@ -1021,7 +1044,7 @@ fn qwen_production_adapter_runs_canonical_window_multilingual_qrels() {
             "Recall@5 regressed for {class}"
         );
     }
-    assert_eq!(report["quality"]["source_identity_round_trip_failures"], 0);
+    assert_eq!(report["quality"]["source_map_resolution_failures"], 0);
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
@@ -4153,11 +4176,12 @@ fn qwen_eval_fuse_with_policy(
     dense: &[String],
     exact: bool,
     policy: FusionPolicy,
+    limit: usize,
 ) -> Vec<String> {
     if exact {
-        return bm25.iter().take(20).cloned().collect();
+        return bm25.iter().take(limit).cloned().collect();
     }
-    fuse_ranked(bm25, dense, 20, policy)
+    fuse_ranked(bm25, dense, limit, policy)
         .into_iter()
         .map(|candidate| candidate.key)
         .collect()

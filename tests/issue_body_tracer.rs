@@ -7642,6 +7642,42 @@ fn sync_issue_permission_loss_purges_entire_repo_and_preserves_unrelated_repo() 
 }
 
 #[test]
+fn full_sync_permission_loss_queues_then_continues_other_repositories() {
+    let fixture = TestFixture::new("full-sync-repo-permission-short-circuit");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    fixture.set_last_sync_age_seconds(3_600);
+    let before =
+        stdout_json(&fixture.qgh(["status", "--json"]))["data"]["sync"]["last_sync_at"].clone();
+
+    server.clear_requests();
+    server.set_mode(MULTI_REPO_OWNER_BULK_PERMISSION_LOSS);
+    let sync = fixture.qgh(["sync", "--json"]);
+    let requests = server.requests();
+    assert_success(&sync);
+
+    assert!(requests
+        .iter()
+        .any(|line| line.starts_with("GET /repos/owner/repo/issues?")));
+    assert!(requests
+        .iter()
+        .any(|line| line.starts_with("GET /repos/owner/repo ")));
+    assert!(requests
+        .iter()
+        .any(|line| line.starts_with("GET /repos/other/repo/issues?")));
+
+    let after = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_ne!(after["data"]["sync"]["last_sync_at"], before);
+    assert_eq!(after["data"]["purge"]["pending_count"], 0);
+
+    let removed = fixture.qgh(["get", "qgh://github.com/issue/I_POLICY_OWNER", "--json"]);
+    assert_eq!(removed.status.code(), Some(4));
+    let unrelated = fixture.qgh(["get", "qgh://github.com/issue/I_POLICY_OTHER", "--json"]);
+    assert_success(&unrelated);
+}
+
+#[test]
 fn sync_issue_auth_failure_does_not_tombstone_local_sources() {
     let fixture = TestFixture::new("targeted-refresh-auth-failed");
     let server = TargetedRefreshFakeGitHub::start();
@@ -9562,6 +9598,7 @@ impl Drop for MultiRepoFakeGitHub {
 const MULTI_REPO_ACTIVE: usize = 1;
 const MULTI_REPO_OWNER_TWO_ISSUES: usize = 2;
 const MULTI_REPO_OWNER_PERMISSION_LOSS: usize = 3;
+const MULTI_REPO_OWNER_BULK_PERMISSION_LOSS: usize = 4;
 
 fn handle_multi_repo_connection(
     mut stream: TcpStream,
@@ -9578,7 +9615,9 @@ fn handle_multi_repo_connection(
     let (status, body) = if request_line.starts_with("GET /repos/owner/repo/issues?")
         && request_line.contains("state=all")
     {
-        if mode == MULTI_REPO_OWNER_TWO_ISSUES {
+        if mode == MULTI_REPO_OWNER_BULK_PERMISSION_LOSS {
+            ("404 Not Found", r#"{"message":"not found"}"#)
+        } else if mode == MULTI_REPO_OWNER_TWO_ISSUES {
             ("200 OK", multi_repo_owner_two_issue_payload())
         } else {
             ("200 OK", multi_repo_owner_issue_payload())
@@ -9586,7 +9625,9 @@ fn handle_multi_repo_connection(
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?") {
         ("200 OK", "[]")
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42 ") {
-        if mode == MULTI_REPO_OWNER_PERMISSION_LOSS {
+        if mode == MULTI_REPO_OWNER_BULK_PERMISSION_LOSS {
+            ("404 Not Found", r#"{"message":"not found"}"#)
+        } else if mode == MULTI_REPO_OWNER_PERMISSION_LOSS {
             ("403 Forbidden", r#"{"message":"resource not accessible"}"#)
         } else {
             ("200 OK", multi_repo_owner_issue_object_payload())
@@ -9596,7 +9637,9 @@ fn handle_multi_repo_connection(
     } else if request_line.starts_with("GET /repos/owner/repo/issues/43 ") {
         ("200 OK", multi_repo_owner_second_issue_object_payload())
     } else if request_line.starts_with("GET /repos/owner/repo ") {
-        if mode == MULTI_REPO_OWNER_PERMISSION_LOSS {
+        if mode == MULTI_REPO_OWNER_BULK_PERMISSION_LOSS {
+            ("404 Not Found", r#"{"message":"not found"}"#)
+        } else if mode == MULTI_REPO_OWNER_PERMISSION_LOSS {
             ("403 Forbidden", r#"{"message":"resource not accessible"}"#)
         } else {
             ("200 OK", r#"{"full_name":"owner/repo"}"#)

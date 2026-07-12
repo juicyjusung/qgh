@@ -72,7 +72,6 @@ const QWEN_EMBEDDING_INPUT_ADAPTER_REVISION: &str = "explicit-window-v1";
 const QWEN_EMBEDDING_METAL_ADAPTER_REVISION: &str = "metal-sdpa-adaptive-batching-v2";
 const STALE_BUILDING_RETENTION_HOURS: i64 = 24;
 const PREVIOUS_READY_RETENTION_DAYS: i64 = 7;
-const HYBRID_OVERFETCH_FACTOR: usize = 4;
 const LOCAL_RERANK_DEPTH: usize = 10;
 const LOCAL_RERANK_MAX_TOKENS: usize = 384;
 
@@ -260,24 +259,44 @@ pub async fn sync(
     let sync_run_id = Store::new_sync_run_id();
     let mut summary = None;
     let fetched = {
+        let store_cell = std::cell::RefCell::new(&mut store);
+        let lifecycle_pending = std::cell::Cell::new(false);
         let mut commit_page = |page: github::FetchPage| -> Result<(), QghError> {
-            let page_summary = store.upsert_sources_for_run(
-                &sync_run_id,
-                &page.issues,
-                &page.comments,
-                page.skipped_pull_requests,
-                &page.cursor_updates,
-            )?;
+            let mut store = store_cell.borrow_mut();
+            let page_summary = if lifecycle_pending.get() {
+                store.upsert_sources_for_run_under_pending_purge(
+                    &sync_run_id,
+                    &page.issues,
+                    &page.comments,
+                    page.skipped_pull_requests,
+                    &page.cursor_updates,
+                )?
+            } else {
+                store.upsert_sources_for_run(
+                    &sync_run_id,
+                    &page.issues,
+                    &page.comments,
+                    page.skipped_pull_requests,
+                    &page.cursor_updates,
+                )?
+            };
             merge_sync_summary(&mut summary, page_summary);
             Ok(())
         };
-        github::fetch_issues_classified(
+        let mut commit_lifecycle = |evidence: &github::ConfirmedFetchLifecycle| {
+            let mut store = store_cell.borrow_mut();
+            queue_confirmed_fetch_lifecycle(&mut store, evidence)?;
+            lifecycle_pending.set(true);
+            Ok(())
+        };
+        github::fetch_issues_classified_with_lifecycle_commit(
             &fetch_profile,
             &token,
             &cursors,
             per_issue_comments,
             Some(&progress),
             &mut commit_page,
+            &mut commit_lifecycle,
         )
         .await?
     };
@@ -361,8 +380,10 @@ pub async fn sync(
         let comment_cursors = store.sync_cursors()?;
         let budget = profile.comment_parent_resolution_budget;
         let outcome = {
+            let store_cell = std::cell::RefCell::new(&mut store);
             let resolve = |repo_name: &str, number: i64| -> Option<github::CommentParent> {
-                store
+                store_cell
+                    .borrow()
                     .find_issue_by_repo_number(repo_name, number)
                     .ok()
                     .flatten()
@@ -373,13 +394,17 @@ pub async fn sync(
                         canonical_url: issue.canonical_url,
                     })
             };
-            github::fetch_repo_comments_classified(
+            let mut commit_lifecycle = |evidence: &github::ConfirmedFetchLifecycle| {
+                queue_confirmed_fetch_lifecycle(&mut store_cell.borrow_mut(), evidence)
+            };
+            github::fetch_repo_comments_classified_with_lifecycle_commit(
                 &fetch_profile,
                 &token,
                 &comment_cursors,
                 budget,
                 &resolve,
                 Some(&progress),
+                &mut commit_lifecycle,
             )
             .await?
         };
@@ -528,9 +553,19 @@ pub async fn sync(
                 "qgh sync: reconciling sources={} mode={mode_str}",
                 candidates.len()
             ));
-            let result =
-                github::reconcile_sources(&fetch_profile, &token, &candidates, Some(&progress))
-                    .await?;
+            let result = {
+                let mut commit_lifecycle = |evidence: &github::ConfirmedFetchLifecycle| {
+                    queue_confirmed_fetch_lifecycle(&mut store, evidence)
+                };
+                github::reconcile_sources_with_lifecycle_commit(
+                    &fetch_profile,
+                    &token,
+                    &candidates,
+                    Some(&progress),
+                    &mut commit_lifecycle,
+                )
+                .await?
+            };
             let purge_evidence = reconciliation_purge_requests(
                 &result.unavailable_sources,
                 &result.confirmed_permission_lost_repos,
@@ -685,18 +720,37 @@ async fn backfill_sync(
     let cursors = store.sync_cursors()?;
     let mut summary = None;
     let outcome = {
+        let store_cell = std::cell::RefCell::new(&mut *store);
+        let lifecycle_pending = std::cell::Cell::new(false);
         let mut commit_page = |page: github::FetchPage| -> Result<(), QghError> {
-            let page_summary = store.upsert_sources_for_run(
-                &backfill_run_id,
-                &page.issues,
-                &page.comments,
-                page.skipped_pull_requests,
-                &page.cursor_updates,
-            )?;
+            let mut store = store_cell.borrow_mut();
+            let page_summary = if lifecycle_pending.get() {
+                store.upsert_sources_for_run_under_pending_purge(
+                    &backfill_run_id,
+                    &page.issues,
+                    &page.comments,
+                    page.skipped_pull_requests,
+                    &page.cursor_updates,
+                )?
+            } else {
+                store.upsert_sources_for_run(
+                    &backfill_run_id,
+                    &page.issues,
+                    &page.comments,
+                    page.skipped_pull_requests,
+                    &page.cursor_updates,
+                )?
+            };
             merge_sync_summary(&mut summary, page_summary);
             Ok(())
         };
-        github::fetch_backfill_issues_classified(
+        let mut commit_lifecycle = |evidence: &github::ConfirmedFetchLifecycle| {
+            let mut store = store_cell.borrow_mut();
+            queue_confirmed_fetch_lifecycle(&mut store, evidence)?;
+            lifecycle_pending.set(true);
+            Ok(())
+        };
+        github::fetch_backfill_issues_classified_with_lifecycle_commit(
             fetch_profile,
             token,
             &cursors,
@@ -704,6 +758,7 @@ async fn backfill_sync(
             max_duration_seconds,
             Some(progress),
             &mut commit_page,
+            &mut commit_lifecycle,
         )
         .await?
     };
@@ -860,14 +915,24 @@ pub async fn sync_issue(
         repo.full_name()
     ));
 
-    let outcome = github::fetch_target_issue_classified(
-        &profile,
-        &token,
-        &repo,
-        issue_number,
-        Some(&progress),
-    )
-    .await?;
+    let outcome = {
+        let mut commit_transition = |transition: &github::ConfirmedIssueTransition| {
+            let evidence = target_transition_purge_requests(std::slice::from_ref(transition));
+            if let Some(error) = evidence.deferred_error {
+                return Err(error);
+            }
+            queue_purge_requests(&mut store, &evidence.requests).map(|_| ())
+        };
+        github::fetch_target_issue_classified_with_transition_commit(
+            &profile,
+            &token,
+            &repo,
+            issue_number,
+            Some(&progress),
+            &mut commit_transition,
+        )
+        .await?
+    };
     let transition_evidence = target_transition_purge_requests(&outcome.confirmed_transitions);
     let mut purge_requests = transition_evidence.requests;
     if let github::ClassifiedTargetIssueTerminal::Confirmed {
@@ -1505,6 +1570,27 @@ fn purge_retry_error(remaining: &[PendingPurgeView]) -> QghError {
 struct PurgeEvidenceRequests {
     requests: Vec<(PurgeTarget, PurgeTrigger)>,
     deferred_error: Option<QghError>,
+}
+
+fn queue_confirmed_fetch_lifecycle(
+    store: &mut Store,
+    evidence: &github::ConfirmedFetchLifecycle,
+) -> Result<(), QghError> {
+    let purge = match evidence {
+        github::ConfirmedFetchLifecycle::RepositoryPermissionLoss(confirmed) => {
+            confirmed_fetch_purge_requests(std::slice::from_ref(confirmed), &[])
+        }
+        github::ConfirmedFetchLifecycle::SourceDeletion(confirmed) => {
+            confirmed_fetch_purge_requests(&[], std::slice::from_ref(confirmed))
+        }
+        github::ConfirmedFetchLifecycle::ReconciliationFailure(failure) => {
+            reconciliation_purge_requests(std::slice::from_ref(failure), &[])
+        }
+    };
+    if let Some(error) = purge.deferred_error {
+        return Err(error);
+    }
+    queue_purge_requests(store, &purge.requests).map(|_| ())
 }
 
 fn confirmed_fetch_purge_requests(
@@ -3727,7 +3813,6 @@ pub fn query(
                 publication.as_ref(),
                 &args.query,
                 &filters,
-                limit,
             )?
         } else {
             (None, vector_open_warnings)
@@ -3780,6 +3865,7 @@ pub fn query(
                 continue;
             }
             hit.lexical_evidence = lexical_evidence(&store, &source, &args.query)?;
+            set_final_order_score(&mut hit.ranking, candidates.len() + 1);
             candidates.push(ResolvedQueryCandidate {
                 source,
                 hit,
@@ -4182,7 +4268,11 @@ impl HybridAccumulator {
 }
 
 fn hybrid_candidate_limit(limit: usize) -> usize {
-    limit.saturating_mul(HYBRID_OVERFETCH_FACTOR).max(limit)
+    LEXICAL_GUARD_V1.candidate_window(limit)
+}
+
+fn hybrid_vector_candidate_limit() -> usize {
+    LEXICAL_GUARD_V1.dense_candidate_window()
 }
 
 fn fuse_hybrid_hits(
@@ -4266,7 +4356,6 @@ fn hybrid_vector_hits(
     publication: Option<&RetrievalPublicationView>,
     query_text: &str,
     filters: &QueryFilters,
-    limit: usize,
 ) -> Result<(Option<Vec<crate::model::VectorSearchHit>>, Vec<Value>), QghError> {
     let Some(embedding) = profile.embedding.as_ref() else {
         return Ok((None, Vec::new()));
@@ -4333,7 +4422,7 @@ fn hybrid_vector_hits(
         generation_id,
         &query_vector,
         &filters.vector_search_filters(),
-        hybrid_candidate_limit(limit),
+        hybrid_vector_candidate_limit(),
     ) {
         Ok(hits) => Ok((Some(hits), Vec::new())),
         Err(error) => Ok((None, vec![vector_search_failure_warning(&error)])),
@@ -6162,6 +6251,15 @@ enum Ranking {
     Exact,
 }
 
+fn set_final_order_score(ranking: &mut Ranking, result_rank: usize) {
+    if let Ranking::Hybrid {
+        final_order_score, ..
+    } = ranking
+    {
+        *final_order_score = 1.0 / result_rank.max(1) as f32;
+    }
+}
+
 fn source_result(
     source: StoredSource,
     ranking: Ranking,
@@ -7585,6 +7683,27 @@ mod tests {
         assert!((ranking["final_order_score"].as_f64().unwrap() - 0.032).abs() < 1e-6);
         assert!(ranking.get("confidence").is_none());
         assert!(ranking.get("probability").is_none());
+    }
+
+    #[test]
+    fn hybrid_final_order_score_tracks_the_post_resolution_result_rank() {
+        let mut hybrid = Ranking::Hybrid {
+            lexical_score: Some(1.0),
+            vector_distance: Some(0.1),
+            rrf_rank_score: 0.03,
+            final_order_score: 1.0,
+        };
+        set_final_order_score(&mut hybrid, 2);
+        match hybrid {
+            Ranking::Hybrid {
+                final_order_score, ..
+            } => assert_eq!(final_order_score, 0.5),
+            _ => unreachable!(),
+        }
+
+        let mut bm25 = Ranking::Bm25(2.0);
+        set_final_order_score(&mut bm25, 2);
+        assert!(matches!(bm25, Ranking::Bm25(2.0)));
     }
 
     #[cfg(feature = "vector-search")]

@@ -81,7 +81,8 @@ cannot execute.
 Typed GitHub lifecycle adapters may return `github.invalid_issue_json` or
 `github.invalid_comment_json` when a successful response cannot be decoded.
 `sync.commit_page_failed` and `validation.lifecycle_failed` are content-free
-fallbacks for local page-commit and lifecycle-candidate validation failures.
+fallbacks for local fetch-checkpoint and lifecycle-candidate validation
+failures.
 Targeted issue refresh may return `sync.transfer_cycle` or
 `sync.transfer_chain_too_long`; confirmed transitions observed before either
 terminal failure are queued for purge before the error is surfaced. The

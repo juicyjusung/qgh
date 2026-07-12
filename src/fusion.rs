@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+const CANDIDATE_OVERFETCH_FACTOR: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FusionPolicy {
     id: &'static str,
@@ -51,6 +53,17 @@ impl FusionPolicy {
 
     pub const fn protected_lexical_head(self) -> usize {
         self.protected_lexical_head
+    }
+
+    pub fn candidate_window(self, result_limit: usize) -> usize {
+        result_limit
+            .saturating_mul(CANDIDATE_OVERFETCH_FACTOR)
+            .max(self.dense_window)
+            .max(result_limit)
+    }
+
+    pub const fn dense_candidate_window(self) -> usize {
+        self.dense_window
     }
 }
 
@@ -205,6 +218,14 @@ mod tests {
 
         assert!(fused.iter().any(|candidate| candidate.key == "d80"));
         assert!(!fused.iter().any(|candidate| candidate.key == "d81"));
+    }
+
+    #[test]
+    fn lexical_guard_owns_the_default_and_expanded_candidate_windows() {
+        assert_eq!(LEXICAL_GUARD_V1.candidate_window(10), 80);
+        assert_eq!(LEXICAL_GUARD_V1.candidate_window(20), 80);
+        assert_eq!(LEXICAL_GUARD_V1.candidate_window(100), 400);
+        assert_eq!(LEXICAL_GUARD_V1.dense_candidate_window(), 80);
     }
 
     #[test]
