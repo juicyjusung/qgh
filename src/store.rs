@@ -2101,6 +2101,8 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let has_chunks = table_exists(&tx, "chunks")?;
+        let chunks_have_source_version_id =
+            has_chunks && table_has_column(&tx, "chunks", "source_version_id")?;
         let mut affected_generations = BTreeSet::new();
         if table_exists(&tx, "embedding_generations")? {
             let building_generations = tx
@@ -2123,13 +2125,20 @@ impl Store {
                     .collect::<Result<Vec<_>, _>>()?;
                 affected_generations.extend(generation_ids);
                 if table_exists(&tx, "embedding_generation_vector_rows")? {
+                    let sql = if chunks_have_source_version_id {
+                        "SELECT DISTINCT m.generation_id
+                         FROM embedding_generation_vector_rows m
+                         JOIN chunks c ON c.id = m.chunk_id
+                         LEFT JOIN source_versions sv ON sv.id = c.source_version_id
+                         WHERE c.source_id = ?1 OR sv.source_id = ?1"
+                    } else {
+                        "SELECT DISTINCT m.generation_id
+                         FROM embedding_generation_vector_rows m
+                         JOIN chunks c ON c.id = m.chunk_id
+                         WHERE c.source_id = ?1"
+                    };
                     let mapped_generation_ids = tx
-                        .prepare(
-                            "SELECT DISTINCT m.generation_id
-                             FROM embedding_generation_vector_rows m
-                             JOIN chunks c ON c.id = m.chunk_id
-                             WHERE c.source_id = ?1",
-                        )?
+                        .prepare(sql)?
                         .query_map(params![source_id], |row| row.get::<_, i64>(0))?
                         .collect::<Result<Vec<_>, _>>()?;
                     affected_generations.extend(mapped_generation_ids);
@@ -2148,15 +2157,20 @@ impl Store {
                 if found {
                     return Ok::<bool, QghError>(true);
                 }
+                let sql = if chunks_have_source_version_id {
+                    "SELECT 1
+                     FROM chunk_embeddings ce
+                     JOIN chunks c ON c.id = ce.chunk_id
+                     LEFT JOIN source_versions sv ON sv.id = c.source_version_id
+                     WHERE c.source_id = ?1 OR sv.source_id = ?1 LIMIT 1"
+                } else {
+                    "SELECT 1
+                     FROM chunk_embeddings ce
+                     JOIN chunks c ON c.id = ce.chunk_id
+                     WHERE c.source_id = ?1 LIMIT 1"
+                };
                 Ok(tx
-                    .query_row(
-                        "SELECT 1
-                         FROM chunk_embeddings ce
-                         JOIN chunks c ON c.id = ce.chunk_id
-                         WHERE c.source_id = ?1 LIMIT 1",
-                        params![source_id],
-                        |_| Ok(()),
-                    )
+                    .query_row(sql, params![source_id], |_| Ok(()))
                     .optional()?
                     .is_some())
             })?;
@@ -2167,13 +2181,24 @@ impl Store {
                 if found {
                     return Ok::<bool, QghError>(true);
                 }
+                let ownership = if chunks_have_source_version_id {
+                    "c.source_id = ?1 OR sv.source_id = ?1"
+                } else {
+                    "c.source_id = ?1"
+                };
+                let source_version_join = if chunks_have_source_version_id {
+                    "LEFT JOIN source_versions sv ON sv.id = c.source_version_id"
+                } else {
+                    ""
+                };
                 Ok(tx
                     .query_row(
                         &format!(
                             "SELECT 1
                              FROM {CHUNK_EMBEDDING_VECTORS_TABLE} v
                              JOIN chunks c ON c.id = v.rowid
-                             WHERE c.source_id = ?1 LIMIT 1"
+                             {source_version_join}
+                             WHERE {ownership} LIMIT 1"
                         ),
                         params![source_id],
                         |_| Ok(()),
@@ -2201,8 +2226,15 @@ impl Store {
             }
         } else if has_chunks && table_exists(&tx, "chunk_embeddings")? {
             for source_id in &source_ids {
+                let sql = if chunks_have_source_version_id {
+                    "SELECT c.id FROM chunks c
+                     LEFT JOIN source_versions sv ON sv.id = c.source_version_id
+                     WHERE c.source_id = ?1 OR sv.source_id = ?1"
+                } else {
+                    "SELECT id FROM chunks WHERE source_id = ?1"
+                };
                 let chunk_ids = tx
-                    .prepare("SELECT id FROM chunks WHERE source_id = ?1")?
+                    .prepare(sql)?
                     .query_map(params![source_id], |row| row.get::<_, i64>(0))?
                     .collect::<Result<Vec<_>, _>>()?;
                 for chunk_id in chunk_ids {
@@ -2279,15 +2311,25 @@ impl Store {
             let tombstone_reason = purge_tombstone_reason(&tx, source_id, trigger)?;
             if table_exists(&tx, "source_chunk_manifests")? {
                 tx.execute(
-                    "DELETE FROM source_chunk_manifests WHERE source_id = ?1",
+                    "DELETE FROM source_chunk_manifests
+                     WHERE source_id = ?1
+                        OR source_version_id IN (
+                            SELECT id FROM source_versions WHERE source_id = ?1
+                        )",
                     params![source_id],
                 )?;
             }
             if has_chunks {
-                tx.execute(
-                    "DELETE FROM chunks WHERE source_id = ?1",
-                    params![source_id],
-                )?;
+                let sql = if chunks_have_source_version_id {
+                    "DELETE FROM chunks
+                     WHERE source_id = ?1
+                        OR source_version_id IN (
+                            SELECT id FROM source_versions WHERE source_id = ?1
+                        )"
+                } else {
+                    "DELETE FROM chunks WHERE source_id = ?1"
+                };
+                tx.execute(sql, params![source_id])?;
             }
             tx.execute(
                 "DELETE FROM issue_metadata WHERE source_id = ?1",
@@ -4028,7 +4070,7 @@ impl Store {
             )));
         }
 
-        if stored_chunks_match(&tx, source_version_id, chunks)? {
+        if stored_chunks_match(&tx, source_id, source_version_id, chunks)? {
             write_source_chunk_manifest(&tx, source_id, source_version_id, manifest.as_ref())?;
             tx.commit()?;
             return self.chunks_for_source_version(source_version_id);
@@ -4116,24 +4158,34 @@ impl Store {
         let manifest = self
             .conn
             .query_row(
-                "SELECT expected_count, chunk_digest
-                 FROM source_chunk_manifests
-                 WHERE source_version_id = ?1 AND chunker_fingerprint = ?2",
+                "SELECT m.source_id, m.expected_count, m.chunk_digest
+                 FROM source_chunk_manifests m
+                 JOIN source_versions sv
+                   ON sv.id = m.source_version_id
+                  AND sv.source_id = m.source_id
+                 WHERE m.source_version_id = ?1 AND m.chunker_fingerprint = ?2",
                 params![source_version_id, expected_fingerprint],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((expected_count, expected_digest)) = manifest else {
+        let Some((expected_source_id, expected_count, expected_digest)) = manifest else {
             return Ok(false);
         };
         if chunk_manifest_invalidation_triggers_present(&self.conn)? {
             let (actual_count, mismatched): (i64, i64) = self.conn.query_row(
                 "SELECT count(*),
                         coalesce(sum(
-                            CASE WHEN chunker_fingerprint IS ?2 THEN 0 ELSE 1 END
+                            CASE WHEN chunker_fingerprint IS ?2 AND source_id = ?3
+                                 THEN 0 ELSE 1 END
                         ), 0)
                  FROM chunks WHERE source_version_id = ?1",
-                params![source_version_id, expected_fingerprint],
+                params![source_version_id, expected_fingerprint, expected_source_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             return Ok(actual_count == expected_count && mismatched == 0);
@@ -4178,11 +4230,15 @@ impl Store {
                        AND m.expected_count = (
                          SELECT count(*) FROM chunks c
                          WHERE c.source_version_id = av.source_version_id
+                           AND c.source_id = av.source_id
                        )
                        AND NOT EXISTS (
                          SELECT 1 FROM chunks c
                          WHERE c.source_version_id = av.source_version_id
-                           AND c.chunker_fingerprint IS NOT ?1
+                           AND (
+                             c.source_id IS NOT av.source_id
+                             OR c.chunker_fingerprint IS NOT ?1
+                           )
                        )
                       THEN 1 ELSE 0 END), 0)
              FROM active_versions av
@@ -5150,8 +5206,17 @@ impl Store {
         )?;
         // Tombstoned content must fail closed and must not remain in qgh-managed
         // derived storage. Keep only the minimal identity/tombstone metadata.
+        let chunks_have_source_version_id =
+            table_exists(&tx, "chunks")? && table_has_column(&tx, "chunks", "source_version_id")?;
         let chunk_ids = if table_exists(&tx, "chunks")? {
-            tx.prepare("SELECT id FROM chunks WHERE source_id = ?1")?
+            let sql = if chunks_have_source_version_id {
+                "SELECT c.id FROM chunks c
+                 LEFT JOIN source_versions sv ON sv.id = c.source_version_id
+                 WHERE c.source_id = ?1 OR sv.source_id = ?1"
+            } else {
+                "SELECT id FROM chunks WHERE source_id = ?1"
+            };
+            tx.prepare(sql)?
                 .query_map(params![source_id], |row| row.get::<_, i64>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         } else {
@@ -5179,14 +5244,24 @@ impl Store {
             }
         }
         if table_exists(&tx, "chunks")? {
-            tx.execute(
-                "DELETE FROM chunks WHERE source_id = ?1",
-                params![source_id],
-            )?;
+            let sql = if chunks_have_source_version_id {
+                "DELETE FROM chunks
+                 WHERE source_id = ?1
+                    OR source_version_id IN (
+                        SELECT id FROM source_versions WHERE source_id = ?1
+                    )"
+            } else {
+                "DELETE FROM chunks WHERE source_id = ?1"
+            };
+            tx.execute(sql, params![source_id])?;
         }
         if table_exists(&tx, "source_chunk_manifests")? {
             tx.execute(
-                "DELETE FROM source_chunk_manifests WHERE source_id = ?1",
+                "DELETE FROM source_chunk_manifests
+                 WHERE source_id = ?1
+                    OR source_version_id IN (
+                        SELECT id FROM source_versions WHERE source_id = ?1
+                    )",
                 params![source_id],
             )?;
         }
@@ -6518,7 +6593,7 @@ impl Store {
                 mark_embedding_generation_failed(
                     &tx,
                     predecessor_id,
-                    "embedding.generation_snapshot_mismatch",
+                    "embedding.generation_validation_failed",
                 )?;
                 continue;
             }
@@ -11267,6 +11342,7 @@ fn hash_chunk_manifest_entry(hasher: &mut Sha256, entry: &ChunkManifestEntry<'_>
 
 fn stored_chunks_match(
     conn: &Connection,
+    source_id: &str,
     source_version_id: i64,
     expected: &[MarkdownChunk],
 ) -> Result<bool, QghError> {
@@ -11283,7 +11359,8 @@ fn stored_chunks_match(
         return Ok(false);
     }
     Ok(stored.iter().zip(expected).all(|(stored, expected)| {
-        stored.body == expected.body
+        stored.source_id == source_id
+            && stored.body == expected.body
             && stored.chunk_index == expected.chunk_index
             && stored.token_start == expected.token_start
             && stored.token_end == expected.token_end
@@ -11414,6 +11491,17 @@ fn ensure_column(
         [],
     )?;
     Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, QghError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -13663,6 +13751,14 @@ mod tests {
             .replace_all_chunk_embeddings(
                 &embedding_fingerprint("Example/purge-model"),
                 &[(chunks[0].chunk_id, vec![0.1, 0.2, 0.3])],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE chunks SET source_id = 'qgh://github.com/issue/I_DRIFTED_OWNER'
+                 WHERE source_version_id = ?1",
+                params![source_version_id],
             )
             .unwrap();
         let wal_path = PathBuf::from(format!("{}-wal", paths.db_path.display()));
@@ -17720,6 +17816,31 @@ mod tests {
         store
             .replace_chunks_for_source_version(source_id, source_version_id, &chunks)
             .unwrap();
+
+        store
+            .conn
+            .execute(
+                "UPDATE chunks SET source_id = 'qgh://github.com/issue/I_WRONG_OWNER'
+                 WHERE source_version_id = ?1",
+                params![source_version_id],
+            )
+            .unwrap();
+        assert!(!store
+            .source_version_chunks_match_fingerprint(
+                source_version_id,
+                crate::chunking::CHUNKER_FINGERPRINT
+            )
+            .unwrap());
+        assert_eq!(
+            store
+                .verified_active_source_chunk_manifest_count(crate::chunking::CHUNKER_FINGERPRINT)
+                .unwrap(),
+            None
+        );
+        let repaired = store
+            .replace_chunks_for_source_version(source_id, source_version_id, &chunks)
+            .unwrap();
+        assert!(repaired.iter().all(|chunk| chunk.source_id == source_id));
 
         store
             .conn
