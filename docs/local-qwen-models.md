@@ -91,10 +91,16 @@ qgh --profile PROFILE sync
 The foreground command reports only content-free counts and timing on stderr:
 staged/reused/missing chunks, completed chunks, throughput, and ETA. A repeated
 sync with no content or context changes reuses the validated vectors, performs
-zero inference, and does not load the 1.2 GB model runtime. Interrupted builds
-resume from validated staged batches. `qgh embed --force` remains available for
-an explicitly requested full rebuild; no background daemon or MCP write tool is
-required.
+zero inference, and does not initialize or mmap the 1.2 GB inference runtime.
+A new CLI process still reads and hashes the complete installed snapshot before
+trusting it. Interrupted builds resume from validated staged batches. `qgh
+embed --force` remains available for an explicitly requested full rebuild; no
+background daemon or MCP write tool is required.
+
+The full hash is intentional until qgh can prove a reusable embedding
+generation from Store-owned source/context inventory and vector mappings. File
+size, path, and timestamp alone are not accepted as a persistent verification
+cache because they do not prove artifact contents.
 
 Until a complete embedding generation is validated and atomically published,
 queries keep using BM25. Missing, stale, corrupt, partial, or incompatible

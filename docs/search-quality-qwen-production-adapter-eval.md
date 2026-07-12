@@ -96,7 +96,8 @@ is confidence or probability.
 Among 75 positive queries, BM25 had 14 misses at rank 5 and 11 at rank 10.
 The guarded path preserved all 61 BM25 hits at rank 5 and all 64 at rank 10,
 and rescued three of the rank-10 misses. Exact top-1 was `1.00`; hard-filter
-violations and source-identity round-trip failures were both zero.
+violations and source-map resolution failures were both zero. Actual `get`
+round-trip is recorded by the separate CLI lifecycle smoke below.
 
 The five negative queries have no relevant source and are excluded from the
 weighted aggregate. Their hybrid non-empty rate is `1.00`, so Qwen does not
@@ -133,7 +134,9 @@ The resource protocol remains diagnostic. Five-process cold p95, three warm
 CLI repetitions, peak RSS for this exact run, 50k backfill/publication, and
 vector DB bytes per chunk are still unmeasured. Normal sync mitigates practical
 cost by embedding only missing chunks in bounded durable batches; a no-change
-sync performs zero inference and does not load the model.
+sync performs zero inference and does not initialize the inference runtime. A
+new CLI process still verifies the complete snapshot hash, which remains a
+visible optimization opportunity.
 
 ## Privacy and product boundaries
 
