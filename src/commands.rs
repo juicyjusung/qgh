@@ -5338,10 +5338,12 @@ fn configured_embedding_contract_snapshot(
     if let Some(manifest_path) = options.manifest_path.as_deref() {
         match PreparedModelStore::new(PathBuf::new()).inspect_manifest_contract(manifest_path) {
             Ok(inspection) => {
-                return configured_snapshot_from_contract(
-                    &inspection,
-                    PreparedRuntimeAvailability::Available,
-                );
+                let availability = if prepared_runtime == PreparedRuntimeAvailability::Corrupt {
+                    PreparedRuntimeAvailability::Corrupt
+                } else {
+                    PreparedRuntimeAvailability::Available
+                };
+                return configured_snapshot_from_contract(&inspection, availability);
             }
             Err(error) if error.code() == "embedding.prepared_manifest_missing" => {}
             Err(_) => prepared_runtime = PreparedRuntimeAvailability::Corrupt,
