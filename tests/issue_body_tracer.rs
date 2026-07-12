@@ -3503,6 +3503,170 @@ fn embedding_config_without_vector_artifacts_keeps_bm25_query_available() {
     );
 }
 
+#[test]
+fn requested_rerank_without_configuration_preserves_bm25_results() {
+    let fixture = TestFixture::new("reranker-not-configured-fallback");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let baseline = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&baseline);
+    let baseline_results = stdout_json(&baseline)["data"]["results"].clone();
+
+    let reranked = fixture.qgh(["query", "BM25 tracer", "--rerank", "--json"]);
+    assert_success(&reranked);
+    let reranked_json = stdout_json(&reranked);
+
+    assert_eq!(reranked_json["data"]["results"], baseline_results);
+    assert_eq!(
+        reranked_json["data"]["rerank"],
+        json!({
+            "requested": true,
+            "applied": false,
+            "reason": "not_configured"
+        })
+    );
+    assert_eq!(
+        warning_codes(&reranked_json),
+        vec!["reranker.not_configured"]
+    );
+    assert_eq!(
+        json_object_keys(&reranked_json["warnings"][0]),
+        BTreeSet::from([
+            "code".to_string(),
+            "message".to_string(),
+            "severity".to_string(),
+        ])
+    );
+}
+
+#[test]
+fn requested_rerank_bypasses_exact_locator_without_warning() {
+    let fixture = TestFixture::new("reranker-exact-locator-bypass");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let exact = fixture.qgh([
+        "query",
+        "https://github.com/owner/repo/issues/42",
+        "--rerank",
+        "--json",
+    ]);
+    assert_success(&exact);
+    let exact_json = stdout_json(&exact);
+
+    assert_eq!(
+        exact_json["data"]["rerank"],
+        json!({
+            "requested": true,
+            "applied": false,
+            "reason": "exact_bypass"
+        })
+    );
+    assert!(warning_codes(&exact_json).is_empty());
+    assert_eq!(exact_json["data"]["results"][0]["ranking"]["kind"], "exact");
+}
+
+#[test]
+fn configured_but_uninstalled_reranker_preserves_retrieval_order() {
+    let fixture = TestFixture::new("reranker-model-not-installed-fallback");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config_with_reranker(
+        &server.base_url,
+        r#"
+provider = "local"
+model = "qwen3-reranker-0.6b"
+device = "auto"
+"#,
+    );
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    let request_count_after_sync = server.request_count();
+
+    let baseline = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&baseline);
+    let baseline_results = stdout_json(&baseline)["data"]["results"].clone();
+
+    let reranked = fixture.qgh(["query", "BM25 tracer", "--rerank", "--json"]);
+    assert_success(&reranked);
+    let reranked_json = stdout_json(&reranked);
+
+    assert_eq!(reranked_json["data"]["results"], baseline_results);
+    assert_eq!(
+        reranked_json["data"]["rerank"],
+        json!({
+            "requested": true,
+            "applied": false,
+            "reason": "model_not_installed"
+        })
+    );
+    assert_eq!(
+        warning_codes(&reranked_json),
+        vec!["reranker.model_not_installed"]
+    );
+    assert_eq!(
+        server.request_count(),
+        request_count_after_sync,
+        "local query must not download a model"
+    );
+}
+
+#[test]
+fn reranker_config_rejects_unknown_keys_remote_providers_models_and_devices() {
+    for (fixture_name, reranker, expected_message_fragment) in [
+        (
+            "reranker-unknown-key",
+            r#"
+provider = "local"
+model = "qwen3-reranker-0.6b"
+depth = 20
+"#,
+            "unknown field",
+        ),
+        (
+            "reranker-remote-provider",
+            r#"
+provider = "remote"
+model = "qwen3-reranker-0.6b"
+"#,
+            "unknown variant",
+        ),
+        (
+            "reranker-unsupported-model",
+            r#"
+provider = "local"
+model = "unapproved-reranker"
+"#,
+            "qwen3-reranker-0.6b",
+        ),
+        (
+            "reranker-invalid-device",
+            r#"
+provider = "local"
+model = "qwen3-reranker-0.6b"
+device = "cuda"
+"#,
+            "unknown variant",
+        ),
+    ] {
+        let fixture = TestFixture::new(fixture_name);
+        fixture.write_config_with_reranker("http://127.0.0.1:1", reranker);
+
+        let status = fixture.qgh(["status", "--json"]);
+        assert_eq!(status.status.code(), Some(2));
+        let status_json = stdout_json(&status);
+        assert_eq!(status_json["error"]["code"], "config.invalid");
+        assert!(
+            status_json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected_message_fragment),
+            "unexpected reranker config error: {status_json}"
+        );
+    }
+}
+
 #[cfg(not(feature = "vector-search"))]
 #[test]
 fn bm25_build_with_embedding_config_warns_and_keeps_query_available() {
@@ -7339,6 +7503,28 @@ env = "QGH_TEST_TOKEN"
 
 [embedding]
 {embedding}
+"#
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
+    }
+
+    fn write_config_with_reranker(&self, api_base_url: &str, reranker: &str) {
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[reranker]
+{reranker}
+
+[profiles.work]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
 "#
         );
         fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();

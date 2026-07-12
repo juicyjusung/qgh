@@ -3311,8 +3311,7 @@ pub fn query(
             if vector_enabled {
                 warnings.extend(embedding_warnings(&profile, &store)?);
             }
-            return Ok(LocalReadOutcome {
-                data: json!({
+            let mut data = json!({
                 "profile_id": profile.id,
                 "freshness": freshness.block,
                 "coverage": coverage.block,
@@ -3320,9 +3319,15 @@ pub fn query(
                     "unresolvable_hits": 0
                 },
                 "results": results.items
-                }),
-                warnings,
             });
+            if args.rerank {
+                data["rerank"] = json!({
+                    "requested": true,
+                    "applied": false,
+                    "reason": "exact_bypass"
+                });
+            }
+            return Ok(LocalReadOutcome { data, warnings });
         }
         let (hybrid_vector_hits, mut hybrid_warnings) = if vector_enabled {
             hybrid_vector_hits(
@@ -3410,8 +3415,7 @@ pub fn query(
         if vector_enabled {
             warnings.extend(embedding_warnings(&profile, &store)?);
         }
-        Ok(LocalReadOutcome {
-            data: json!({
+        let mut data = json!({
             "profile_id": profile.id,
             "freshness": freshness.block,
             "coverage": coverage.block,
@@ -3419,9 +3423,13 @@ pub fn query(
                 "unresolvable_hits": unresolvable_hits
             },
             "results": results.items
-            }),
-            warnings,
-        })
+        });
+        if args.rerank {
+            let (status, warning) = unavailable_rerank_outcome(&profile);
+            data["rerank"] = status;
+            warnings.push(warning);
+        }
+        Ok(LocalReadOutcome { data, warnings })
     })();
     match outcome {
         Ok(outcome) => {
@@ -4195,6 +4203,64 @@ fn embedding_warning(code: &'static str, message: &'static str) -> Value {
         "severity": "warn",
         "message": message
     })
+}
+
+fn reranker_warning(code: &'static str, message: &'static str) -> Value {
+    json!({
+        "code": code,
+        "severity": "warn",
+        "message": message
+    })
+}
+
+fn rerank_not_configured_status() -> Value {
+    json!({
+        "requested": true,
+        "applied": false,
+        "reason": "not_configured"
+    })
+}
+
+fn unavailable_rerank_outcome(profile: &Profile) -> (Value, Value) {
+    let Some(reranker) = &profile.reranker else {
+        return (
+            rerank_not_configured_status(),
+            reranker_warning(
+                "reranker.not_configured",
+                "Reranking was requested but no local reranker is configured. Original retrieval order is returned.",
+            ),
+        );
+    };
+    let manifest_path = profile
+        .paths
+        .cache_dir
+        .join("prepared-rerankers")
+        .join(&reranker.model)
+        .join("manifest.json");
+    if !manifest_path.is_file() {
+        return (
+            json!({
+                "requested": true,
+                "applied": false,
+                "reason": "model_not_installed"
+            }),
+            reranker_warning(
+                "reranker.model_not_installed",
+                "Reranking was requested but the configured local model is not installed. Original retrieval order is returned.",
+            ),
+        );
+    }
+    (
+        json!({
+            "requested": true,
+            "applied": false,
+            "reason": "runtime_unavailable"
+        }),
+        reranker_warning(
+            "reranker.runtime_unavailable",
+            "Reranking was requested but the configured local runtime is unavailable. Original retrieval order is returned.",
+        ),
+    )
 }
 
 fn effective_repo(

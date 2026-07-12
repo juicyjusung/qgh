@@ -20,6 +20,7 @@ pub struct Profile {
     pub web_base_url: String,
     pub repos: Vec<RepoRef>,
     pub embedding: Option<EmbeddingConfig>,
+    pub reranker: Option<RerankerConfig>,
     pub reconcile_after_seconds: Option<i64>,
     pub freshness: FreshnessSettings,
     pub bootstrap: BootstrapSettings,
@@ -140,6 +141,28 @@ pub enum EmbeddingProviderKind {
     Local,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankerProviderKind {
+    Local,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankerDevice {
+    #[default]
+    Auto,
+    Cpu,
+    Metal,
+}
+
+#[derive(Debug, Clone)]
+pub struct RerankerConfig {
+    pub provider: RerankerProviderKind,
+    pub model: String,
+    pub device: RerankerDevice,
+}
+
 #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct EmbeddingConfig {
@@ -201,7 +224,18 @@ struct ConfigFile {
     schema_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     embedding: Option<RawEmbeddingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reranker: Option<RawRerankerConfig>,
     profiles: BTreeMap<String, RawProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawRerankerConfig {
+    provider: RerankerProviderKind,
+    model: String,
+    #[serde(default)]
+    device: RerankerDevice,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -311,6 +345,7 @@ pub fn load_profile(profile_id: &str) -> Result<Profile, QghError> {
         profile_id,
         raw,
         config.embedding.as_ref().map(embedding_config_from_raw),
+        config.reranker.as_ref().map(reranker_config_from_raw),
     )
 }
 
@@ -350,6 +385,7 @@ pub fn bootstrap_profile_repo(
     let mut config = load_config_file_optional()?.unwrap_or_else(|| ConfigFile {
         schema_version: "qgh.config.v1".to_string(),
         embedding: None,
+        reranker: None,
         profiles: BTreeMap::new(),
     });
     let duplicate_profile_ids =
@@ -587,6 +623,9 @@ fn load_config_file() -> Result<ConfigFile, QghError> {
     if let Some(embedding) = &config.embedding {
         parse_embedding_config(embedding)?;
     }
+    if let Some(reranker) = &config.reranker {
+        parse_reranker_config(reranker)?;
+    }
     validate_config_token_sources(&config)?;
     Ok(config)
 }
@@ -603,6 +642,7 @@ fn profile_from_raw(
     profile_id: &str,
     raw: &RawProfile,
     embedding: Option<EmbeddingConfig>,
+    reranker: Option<RerankerConfig>,
 ) -> Result<Profile, QghError> {
     let paths = ProfilePaths::resolve(profile_id)?;
     if raw.repos.is_empty() {
@@ -637,6 +677,7 @@ fn profile_from_raw(
         web_base_url: raw.web_base_url.trim_end_matches('/').to_string(),
         repos,
         embedding,
+        reranker,
         reconcile_after_seconds,
         freshness,
         bootstrap,
@@ -662,6 +703,14 @@ fn embedding_config_from_raw(raw: &RawEmbeddingConfig) -> EmbeddingConfig {
         query_prefix: raw.query_prefix.clone(),
         quantization: raw.quantization,
         token_source: raw.token_source.clone(),
+    }
+}
+
+fn reranker_config_from_raw(raw: &RawRerankerConfig) -> RerankerConfig {
+    RerankerConfig {
+        provider: raw.provider,
+        model: raw.model.clone(),
+        device: raw.device,
     }
 }
 
@@ -1178,6 +1227,16 @@ fn parse_embedding_config(raw: &RawEmbeddingConfig) -> Result<(), QghError> {
     }
     if let Some(token_source) = &raw.token_source {
         validate_embedding_token_source(token_source)?;
+    }
+    Ok(())
+}
+
+fn parse_reranker_config(raw: &RawRerankerConfig) -> Result<(), QghError> {
+    let RerankerProviderKind::Local = raw.provider;
+    if raw.model != "qwen3-reranker-0.6b" {
+        return Err(QghError::config(
+            "Reranker model must be `qwen3-reranker-0.6b`.",
+        ));
     }
     Ok(())
 }

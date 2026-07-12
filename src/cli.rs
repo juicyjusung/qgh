@@ -222,6 +222,11 @@ pub enum ReconcileMode {
 #[derive(Debug, Clone, Args)]
 pub struct QueryArgs {
     pub query: String,
+    #[arg(
+        long,
+        help = "Rerank the top fused candidates with a configured local model"
+    )]
+    pub rerank: bool,
     #[arg(long)]
     pub limit: Option<usize>,
     #[arg(long)]

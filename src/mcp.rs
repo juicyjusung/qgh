@@ -228,6 +228,7 @@ fn parse_query_args(arguments: &Value) -> Result<QueryArgs, QghError> {
         object,
         &[
             "query",
+            "rerank",
             "limit",
             "repo",
             "label",
@@ -240,6 +241,7 @@ fn parse_query_args(arguments: &Value) -> Result<QueryArgs, QghError> {
     )?;
     Ok(QueryArgs {
         query: required_string(object, "query")?,
+        rerank: optional_bool(object, "rerank")?.unwrap_or(false),
         limit: optional_positive_usize(object, "limit")?,
         repo: optional_repo(object)?,
         label: optional_string_array(object, "label")?,
