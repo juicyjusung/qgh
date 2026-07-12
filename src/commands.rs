@@ -1,6 +1,6 @@
-use crate::chunking::{
-    chunk_markdown_with_fingerprint, chunker_fingerprint_for_tokenizer_identity,
-};
+use crate::chunking::chunk_markdown_with_fingerprint;
+#[cfg(any(feature = "fastembed-provider", all(test, feature = "vector-search")))]
+use crate::chunking::chunker_fingerprint_for_tokenizer_identity;
 use crate::cli::{
     EmbedArgs, InitArgs, InitRepoArgs, InitTokenSourceArg, ModelArgs, ModelCommand, QueryArgs,
     ReconcileMode,
@@ -18,12 +18,13 @@ use crate::embedding::{
     parse_hf_model_reference, EmbeddingFingerprint, EmbeddingFingerprintExpectation,
     EmbeddingFingerprintSeed, EmbeddingProvider, EmbeddingProviderError, EmbeddingTokenizer,
     EmbeddingVector, ModelManifestV1, ModelSourceV1, PoolingKind, PreparedManifestInspection,
-    PreparedModelInspection, PreparedModelStore, LOCAL_MODEL_REVISION,
+    PreparedModelStore, LOCAL_MODEL_REVISION,
 };
 #[cfg(feature = "fastembed-provider")]
 use crate::embedding::{
     tokenizer_contract_identity_from_manifest, validate_batch_comparability, FastembedEngine,
-    FastembedTokenizer, LocalEmbeddingProvider, PreparedEmbeddingTokenizer, PreparedModelSnapshot,
+    FastembedTokenizer, LocalEmbeddingProvider, PreparedEmbeddingTokenizer,
+    PreparedModelInspection, PreparedModelSnapshot,
 };
 #[cfg(debug_assertions)]
 use crate::embedding::{TokenSpan, DEFAULT_QUERY_PREFIX};
@@ -1863,23 +1864,6 @@ fn refresh_embedding_chunks(
     Ok(stats)
 }
 
-fn refresh_incremental_chunk_embeddings(
-    store: &mut Store,
-    embedding: &EmbeddingConfig,
-) -> Result<usize, QghError> {
-    Ok(refresh_incremental_chunk_embeddings_with_generation(store, embedding)?.0)
-}
-
-fn refresh_incremental_chunk_embeddings_with_generation(
-    store: &mut Store,
-    embedding: &EmbeddingConfig,
-) -> Result<(usize, Option<i64>), QghError> {
-    let Some(snapshot) = store.capture_retrieval_build_snapshot()? else {
-        return Ok((0, None));
-    };
-    refresh_incremental_chunk_embeddings_for_snapshot(store, embedding, &snapshot)
-}
-
 fn refresh_incremental_chunk_embeddings_for_snapshot(
     store: &mut Store,
     embedding: &EmbeddingConfig,
@@ -1898,6 +1882,7 @@ fn refresh_incremental_chunk_embeddings_for_snapshot(
     )
 }
 
+#[cfg(all(test, feature = "vector-search"))]
 fn refresh_incremental_chunk_embeddings_with_provider(
     store: &mut Store,
     provider: &dyn EmbeddingProvider,
@@ -2748,43 +2733,6 @@ fn refresh_chunk_embeddings(
         "embedded_chunks": embedded_chunks,
         "usable_embeddings": usable_embeddings
     }))
-}
-
-fn ensure_vector_only_smoke(
-    store: &Store,
-    profile_id: &str,
-    query_vector: &[f32],
-) -> Result<(), QghError> {
-    let hits = store.vector_only_search(query_vector, &VectorSearchFilters::default(), 1)?;
-    let Some(hit) = hits.first() else {
-        return Err(QghError::storage(
-            "Vector-only smoke returned no source candidates.",
-        ));
-    };
-    let source = store.get_source(&hit.source_id)?.ok_or_else(|| {
-        QghError::storage(format!(
-            "Vector-only smoke hit `{}` could not round-trip through local get.",
-            hit.source_id
-        ))
-    })?;
-    let result = source_result(
-        source,
-        Ranking::Vector {
-            vector_distance: hit.vector_distance,
-        },
-        profile_id,
-        None,
-    );
-    let get_source = get_source_base(store, &hit.source_id, None)?;
-    for key in ["source_id", "canonical_url", "source_version"] {
-        if result[key] != get_source[key] {
-            return Err(QghError::storage(format!(
-                "Vector-only smoke hit `{}` lost {key} round-trip metadata.",
-                hit.source_id
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn embedding_dimension(vectors: &[EmbeddingVector]) -> Result<usize, QghError> {
@@ -5873,6 +5821,7 @@ fn freshness_error(freshness: Value, warnings: Vec<Value>) -> QghError {
 #[derive(Debug)]
 enum Ranking {
     Bm25(f32),
+    #[cfg(all(test, feature = "vector-search"))]
     Vector {
         vector_distance: f32,
     },
@@ -5954,6 +5903,7 @@ fn ranking_json(ranking: Ranking) -> Value {
             "lexical_score": score,
             "vector_distance": Value::Null
         }),
+        #[cfg(all(test, feature = "vector-search"))]
         Ranking::Vector { vector_distance } => json!({
             "kind": "vector",
             "lexical_score": Value::Null,

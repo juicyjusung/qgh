@@ -58,6 +58,7 @@ pub struct FetchPage {
     pub cursor_updates: Vec<CursorUpdate>,
 }
 
+#[allow(dead_code)]
 pub enum FetchOutcome {
     Fetched(FetchResult),
     Backoff(BackoffPlan),
@@ -86,9 +87,11 @@ pub struct TargetIssueFetch {
     pub issue: IssueRecord,
     pub comments: Vec<CommentRecord>,
     pub lifecycle: TargetIssueLifecycle,
+    #[allow(dead_code)]
     pub confirmed_transition: Option<ConfirmedRemoteState>,
 }
 
+#[allow(dead_code)]
 pub enum TargetIssueFetchOutcome {
     Fetched(Box<TargetIssueFetch>),
     Unavailable(TargetIssueLifecycle),
@@ -113,6 +116,7 @@ pub enum ClassifiedTargetIssueTerminal {
     },
     AuthenticationFailed,
     Backoff(BackoffPlan),
+    #[allow(dead_code)]
     Transient(GitHubTransientKind),
     AmbiguousForbidden,
     Failed(QghError),
@@ -185,11 +189,14 @@ pub struct LifecycleFailure {
     pub repo: String,
     pub entity_type: String,
     pub issue_number: i64,
+    #[allow(dead_code)]
     pub reason: String,
     pub state: ConfirmedRemoteState,
+    #[allow(dead_code)]
     pub http_status: u16,
 }
 
+#[allow(dead_code)]
 pub enum LifecycleCheck {
     Active,
     Unavailable { reason: String },
@@ -293,6 +300,7 @@ enum ResponseDisposition {
     AmbiguousForbidden,
 }
 
+#[allow(dead_code)]
 pub async fn fetch_issues(
     profile: &Profile,
     token: &str,
@@ -314,6 +322,7 @@ pub async fn fetch_issues(
     )
 }
 
+#[allow(dead_code)]
 fn legacy_fetch_outcome(outcome: ClassifiedFetchOutcome) -> Result<FetchOutcome, QghError> {
     if !outcome.result.confirmed_permission_lost_repos.is_empty()
         || !outcome.result.confirmed_source_deletions.is_empty()
@@ -696,6 +705,7 @@ pub struct BackfillOutcome {
 /// its own watermark without skipping later repos. Bounded by `max_pages`
 /// (issue-list pages) and `max_duration_seconds`. Does not touch the live cursor.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub async fn fetch_backfill_issues(
     profile: &Profile,
     token: &str,
@@ -719,6 +729,7 @@ pub async fn fetch_backfill_issues(
     )
 }
 
+#[allow(dead_code)]
 fn legacy_backfill_outcome(outcome: BackfillOutcome) -> Result<BackfillOutcome, QghError> {
     if !outcome.confirmed_permission_lost_repos.is_empty()
         || !outcome.confirmed_source_deletions.is_empty()
@@ -1027,6 +1038,7 @@ fn backfill_endpoint(repo: &RepoRef) -> String {
     format!("history:{}", repo.full_name())
 }
 
+#[allow(dead_code)]
 pub async fn fetch_target_issue(
     profile: &Profile,
     token: &str,
@@ -1039,6 +1051,7 @@ pub async fn fetch_target_issue(
     )
 }
 
+#[allow(dead_code)]
 fn legacy_target_issue_outcome(
     outcome: ClassifiedTargetIssueFetchOutcome,
 ) -> Result<TargetIssueFetchOutcome, QghError> {
@@ -1472,6 +1485,7 @@ pub async fn reconcile_sources(
     })
 }
 
+#[allow(dead_code)]
 pub async fn check_source_lifecycle(
     profile: &Profile,
     token: &str,
@@ -1483,6 +1497,7 @@ pub async fn check_source_lifecycle(
     )
 }
 
+#[allow(dead_code)]
 fn legacy_lifecycle_check(check: ClassifiedLifecycleCheck) -> Result<LifecycleCheck, QghError> {
     match check {
         ClassifiedLifecycleCheck::Active => Ok(LifecycleCheck::Active),
@@ -1659,6 +1674,7 @@ pub struct RepoCommentsResult {
 /// handled with no preceding deferral, so a deferred comment (e.g. its parent
 /// issue has not synced yet) is re-fetched next run instead of being silently
 /// skipped.
+#[allow(dead_code)]
 pub async fn fetch_repo_comments(
     profile: &Profile,
     token: &str,
@@ -1679,6 +1695,7 @@ pub async fn fetch_repo_comments(
     legacy_repo_comments_outcome(outcome)
 }
 
+#[allow(dead_code)]
 fn legacy_repo_comments_outcome(
     outcome: RepoCommentsResult,
 ) -> Result<RepoCommentsResult, QghError> {
@@ -2218,6 +2235,7 @@ async fn confirm_repository_after_prior_denial(
 /// responses are confirmed exactly once, so this function performs at most two
 /// authenticated HTTP attempts. Callers that already have source-level denial
 /// evidence must use the single-confirmation path instead.
+#[allow(dead_code)]
 pub async fn check_repository_access(
     profile: &Profile,
     token: &str,
@@ -2231,6 +2249,7 @@ pub async fn check_repository_access(
     )
 }
 
+#[allow(dead_code)]
 async fn check_repository_access_with_client(
     client: &reqwest::Client,
     api_base_url: &str,
@@ -2491,16 +2510,19 @@ fn candidate_repo(candidate: &ReconciliationCandidate) -> Result<RepoRef, QghErr
     })
 }
 
+#[allow(dead_code)]
 fn authentication_failure() -> QghError {
     QghError::auth("GitHub authentication failed.")
         .with_hint("Refresh the configured GitHub token source, then retry.")
 }
 
+#[allow(dead_code)]
 fn github_unavailable() -> QghError {
     QghError::github("GitHub request did not produce a confirmed lifecycle result.")
         .with_hint("Retry later; local content was not removed.")
 }
 
+#[allow(dead_code)]
 fn confirmed_lifecycle_requires_typed_handling() -> QghError {
     QghError::new(
         "github.confirmed_lifecycle_requires_typed_handling",

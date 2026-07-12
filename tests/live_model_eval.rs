@@ -164,6 +164,7 @@ struct JudgmentPoolProvenance {
     method: String,
     complete: bool,
     multi_source_query_count: usize,
+    #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
     count_definition: String,
 }
 
@@ -4457,6 +4458,7 @@ fn live_eval_opt_in(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
+#[cfg(feature = "fastembed-provider")]
 fn fresh_blind_eval_opt_in(value: Option<&str>) -> bool {
     value == Some("1")
 }

@@ -169,8 +169,10 @@ impl LocalModelDevice {
 
 #[derive(Debug, Clone)]
 pub struct RerankerConfig {
+    #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
     pub provider: RerankerProviderKind,
     pub model: String,
+    #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
     pub device: LocalModelDevice,
 }
 

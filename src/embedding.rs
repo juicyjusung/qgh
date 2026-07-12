@@ -13,18 +13,22 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fastembed-provider"))]
 thread_local! {
     static TOKENIZER_ONLY_ARTIFACT_BYTES: std::cell::RefCell<BTreeMap<ArtifactRole, u64>> =
         const { std::cell::RefCell::new(BTreeMap::new()) };
     static SNAPSHOT_DIRECTORY_SYNC_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    static SNAPSHOT_FILE_SYNC_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
     static DURABLE_CREATE_SYNC_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
     static DURABLE_CREATE_SYNC_PATHS: std::cell::RefCell<Vec<PathBuf>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    static SNAPSHOT_FILE_SYNC_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
-        const { std::cell::Cell::new(None) };
 }
 
 pub use crate::context::{
@@ -389,24 +393,24 @@ pub enum ArtifactRole {
     TokenizerConfig,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fastembed-provider"))]
 pub(crate) fn reset_tokenizer_only_artifact_bytes() {
     TOKENIZER_ONLY_ARTIFACT_BYTES.with(|bytes| bytes.borrow_mut().clear());
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fastembed-provider"))]
 pub(crate) fn tokenizer_only_artifact_bytes() -> BTreeMap<ArtifactRole, u64> {
     TOKENIZER_ONLY_ARTIFACT_BYTES.with(|bytes| bytes.borrow().clone())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fastembed-provider"))]
 fn record_tokenizer_only_artifact_bytes(role: ArtifactRole, bytes: u64) {
     TOKENIZER_ONLY_ARTIFACT_BYTES.with(|recorded| {
         *recorded.borrow_mut().entry(role).or_default() += bytes;
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fastembed-provider"))]
 fn fail_snapshot_directory_sync_after(successful_syncs: usize) {
     SNAPSHOT_DIRECTORY_SYNC_FAILURE_AFTER.set(Some(successful_syncs));
 }
@@ -426,7 +430,7 @@ fn durable_create_sync_paths() -> Vec<PathBuf> {
     DURABLE_CREATE_SYNC_PATHS.with(|paths| paths.borrow().clone())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fastembed-provider"))]
 fn fail_snapshot_file_sync_after(successful_syncs: usize) {
     SNAPSHOT_FILE_SYNC_FAILURE_AFTER.set(Some(successful_syncs));
 }
@@ -1504,7 +1508,7 @@ impl PreparedModelStore {
         let mut runtime_artifacts = Vec::with_capacity(inspection.artifacts.len());
         for artifact in &inspection.artifacts {
             let mut file = File::open(&artifact.canonical_path)?;
-            let (opened_identity, contains_dynamic_quantization) =
+            let (_opened_identity, contains_dynamic_quantization) =
                 verify_streamed_prepared_artifact(&mut file, artifact)?;
             if artifact.role == ArtifactRole::OnnxModel {
                 validate_onnx_quantization_contract(
@@ -1522,7 +1526,7 @@ impl PreparedModelStore {
                 relative_path: artifact.relative_path.clone(),
                 expected_sha256: artifact.expected_sha256.clone(),
                 expected_byte_size: artifact.expected_byte_size,
-                identity: opened_identity,
+                identity: _opened_identity,
                 file,
             });
         }
@@ -3345,6 +3349,7 @@ fn read_bounded_file(
     Ok(bytes)
 }
 
+#[cfg(feature = "fastembed-provider")]
 fn stream_sha256(reader: &mut impl Read) -> Result<(String, u64), EmbeddingProviderError> {
     const BUFFER_BYTES: usize = 1024 * 1024;
     let mut buffer = vec![0_u8; BUFFER_BYTES];
@@ -3604,7 +3609,7 @@ fn sync_durable_directory(
 }
 
 fn sync_snapshot_directory(path: &Path) -> Result<(), EmbeddingProviderError> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "fastembed-provider"))]
     {
         let fail = SNAPSHOT_DIRECTORY_SYNC_FAILURE_AFTER.with(|remaining| match remaining.get() {
             Some(0) => {
@@ -3644,7 +3649,7 @@ fn sync_snapshot_file(path: &Path) -> Result<(), EmbeddingProviderError> {
             "Prepared model snapshot durability requires regular files.",
         ));
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "fastembed-provider"))]
     {
         let fail = SNAPSHOT_FILE_SYNC_FAILURE_AFTER.with(|remaining| match remaining.get() {
             Some(0) => {
@@ -3802,6 +3807,7 @@ pub fn builtin_preset_hf_reference(value: &str) -> Option<HfModelReference> {
     })
 }
 
+#[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 struct BuiltinPresetSpec {
     id: &'static str,
@@ -3885,6 +3891,7 @@ fn builtin_preset(id: &str) -> Option<BuiltinPresetSpec> {
     }
 }
 
+#[cfg(feature = "fastembed-provider")]
 fn preset_for_compatible_legacy_hf(
     reference: &HfModelReference,
     options: &FastembedProviderOptions,

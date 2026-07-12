@@ -395,6 +395,7 @@ env = "QGH_TEST_TOKEN"
         command.output().unwrap()
     }
 
+    #[cfg(feature = "fastembed-provider")]
     fn embed(&self, json: bool) -> Output {
         let mut command = self.base_command();
         command.args(["--profile", "work", "embed", "--force"]);

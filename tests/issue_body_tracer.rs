@@ -7,6 +7,7 @@ use qgh::embedding::{
     ModelSourceV1, NormalizationKind, QuantizationKind, TokenizerKind,
     MODEL_MANIFEST_SCHEMA_VERSION,
 };
+#[cfg(feature = "vector-search")]
 use qgh::embedding::{
     EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_HF_MODEL_REVISION,
     DEFAULT_QUERY_PREFIX,
@@ -8756,6 +8757,7 @@ limit = 10
         .unwrap()
     }
 
+    #[cfg(feature = "vector-search")]
     fn insert_chunk_for_source(&self, source_id: &str, body: &str) -> i64 {
         let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
         let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -8779,7 +8781,7 @@ limit = 10
         conn.last_insert_rowid()
     }
 
-    #[cfg(feature = "fastembed-provider")]
+    #[cfg(feature = "vector-search")]
     fn sqlite_chunk_ids_for_source(&self, source_id: &str) -> Vec<i64> {
         let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
         let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -8792,10 +8794,12 @@ limit = 10
             .unwrap()
     }
 
+    #[cfg(feature = "vector-search")]
     fn insert_active_embedding_fingerprint(&self, model_id: &str) {
         self.insert_active_embedding_fingerprint_with_revision(model_id, "fixture-sha");
     }
 
+    #[cfg(feature = "vector-search")]
     fn insert_matching_active_embedding_fingerprint(&self) {
         self.insert_active_embedding_fingerprint_with_revision(
             DEFAULT_HF_MODEL_ID,
@@ -8803,6 +8807,7 @@ limit = 10
         );
     }
 
+    #[cfg(feature = "vector-search")]
     fn corrupt_active_embedding_fingerprint_json(&self) {
         let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
         let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -8815,6 +8820,7 @@ limit = 10
         .unwrap();
     }
 
+    #[cfg(feature = "vector-search")]
     fn create_mismatched_vector_table(&self) {
         let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
         let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -8875,6 +8881,7 @@ limit = 10
         }
     }
 
+    #[cfg(feature = "vector-search")]
     fn insert_active_embedding_fingerprint_with_revision(
         &self,
         model_id: &str,
@@ -10549,6 +10556,7 @@ fn json_object_keys(value: &Value) -> BTreeSet<String> {
         .collect()
 }
 
+#[cfg(feature = "fastembed-provider")]
 fn doctor_check_ok(checks: &[Value], name: &str) -> Option<bool> {
     checks
         .iter()

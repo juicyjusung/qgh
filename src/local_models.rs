@@ -143,13 +143,17 @@ impl LocalModelManifestV1 {
 
 #[derive(Debug, Clone)]
 pub struct PreparedQwenModelSnapshot {
+    #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
     pub root: PathBuf,
     pub manifest_hash: String,
+    #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
     paths: BTreeMap<String, PathBuf>,
+    #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
     identities: BTreeMap<String, FileIdentity>,
 }
 
 impl PreparedQwenModelSnapshot {
+    #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
     pub fn artifact_path(&self, relative_path: &str) -> Result<&Path, QghError> {
         self.paths
             .get(relative_path)
@@ -162,6 +166,7 @@ impl PreparedQwenModelSnapshot {
             })
     }
 
+    #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
     pub fn revalidate_artifact_identities(&self) -> Result<(), QghError> {
         for (relative_path, expected) in &self.identities {
             let path = self
@@ -180,6 +185,7 @@ impl PreparedQwenModelSnapshot {
     }
 }
 
+#[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelInstallAction {
     Installed,
@@ -191,6 +197,7 @@ pub struct ModelInstallOutcome {
     pub snapshot: PreparedQwenModelSnapshot,
 }
 
+#[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
 pub trait ModelArtifactFetcher {
     fn fetch(&mut self, spec: &QwenModelSpec, relative_path: &str) -> Result<PathBuf, QghError>;
 }
@@ -205,6 +212,7 @@ impl PreparedQwenModelStore {
         Self { root }
     }
 
+    #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
     pub fn install_with_fetcher(
         &self,
         spec: &QwenModelSpec,
@@ -361,6 +369,7 @@ impl PreparedQwenModelStore {
         self.root.join(&spec.preset_id)
     }
 
+    #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
     fn staging_root(&self, spec: &QwenModelSpec) -> Result<PathBuf, QghError> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -373,6 +382,7 @@ impl PreparedQwenModelStore {
         )))
     }
 
+    #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
     fn quarantine_root(&self, spec: &QwenModelSpec) -> Result<PathBuf, QghError> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -385,6 +395,7 @@ impl PreparedQwenModelStore {
         )))
     }
 
+    #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
     fn populate_staging(
         &self,
         spec: &QwenModelSpec,
@@ -565,6 +576,7 @@ fn reject_symlink_components(root: &Path, relative_path: &Path) -> Result<(), Qg
     Ok(())
 }
 
+#[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
 fn copy_verified_artifact(
     source: &Path,
     destination: &Path,
@@ -729,6 +741,7 @@ fn collect_snapshot_tree(
     Ok(())
 }
 
+#[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
 fn restore_quarantine(destination: &Path, quarantine: Option<&Path>) {
     let Some(quarantine) = quarantine else {
         return;
@@ -740,6 +753,7 @@ fn restore_quarantine(destination: &Path, quarantine: Option<&Path>) {
     }
 }
 
+#[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
 fn remove_quarantine(quarantine: Option<&Path>) {
     let Some(path) = quarantine else {
         return;
@@ -754,6 +768,7 @@ fn remove_quarantine(quarantine: Option<&Path>) {
     }
 }
 
+#[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
 fn sync_directory_tree(root: &Path) -> Result<(), QghError> {
     fn collect(path: &Path, directories: &mut Vec<PathBuf>) -> Result<(), QghError> {
         directories.push(path.to_path_buf());
@@ -776,6 +791,7 @@ fn sync_directory_tree(root: &Path) -> Result<(), QghError> {
     Ok(())
 }
 
+#[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
 fn sync_directory(path: &Path) -> Result<(), QghError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
@@ -807,6 +823,7 @@ fn model_artifact_invalid() -> QghError {
     )
 }
 
+#[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
 fn model_download_error() -> QghError {
     let mut error = QghError::new(
         "model.download_failed",
@@ -817,14 +834,17 @@ fn model_download_error() -> QghError {
     error
 }
 
+#[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
 fn model_install_error(message: &'static str) -> QghError {
     QghError::new("model.install_failed", message, 6)
 }
 
+#[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
 fn model_storage_error(_error: std::io::Error) -> QghError {
     model_install_error("Could not write the prepared local model snapshot.")
 }
 
+#[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
 fn model_qgh_storage_error(_error: QghError) -> QghError {
     model_install_error("Could not secure the prepared local model snapshot.")
 }

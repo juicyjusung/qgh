@@ -622,6 +622,7 @@ fn digest_hex(hasher: Sha256) -> String {
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn search(
     active_path: &Path,
     query_text: &str,

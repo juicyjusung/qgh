@@ -167,6 +167,7 @@ pub struct EmbeddingGenerationChunk {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct EmbeddingGenerationChunkBlob {
     pub bytes: Vec<u8>,
     pub dimension: usize,
@@ -416,6 +417,7 @@ impl Store {
         format!("sync-{}", now_run_id_suffix())
     }
 
+    #[allow(dead_code)]
     pub fn begin_read_snapshot(&self) -> Result<ReadSnapshotFence, QghError> {
         self.begin_read_snapshot_with_repository_allowlist(None)
     }
@@ -1046,6 +1048,7 @@ impl Store {
     /// Completion retains only the stable identity fields in `source_entities`
     /// (`source_id`, type, host, repo, node/GitHub IDs), lifecycle timestamps,
     /// and a content-free tombstone reason; content and derived data are removed.
+    #[allow(dead_code)]
     pub fn purge(
         &mut self,
         target: PurgeTarget,
@@ -2197,16 +2200,20 @@ impl Store {
                 let mappings = owned_generation_vector_mappings
                     .get(generation_id)
                     .ok_or_else(purge_error)?;
-                for (table, _dimension, rowid) in mappings {
+                for mapping in mappings {
+                    debug_assert_eq!(
+                        mapping.table,
+                        generation_vector_table_name(mapping.dimension)
+                    );
                     #[cfg(feature = "vector-search")]
                     {
                         tx.execute(
-                            &format!("DELETE FROM {table} WHERE rowid = ?1"),
-                            params![rowid],
+                            &format!("DELETE FROM {} WHERE rowid = ?1", mapping.table),
+                            params![mapping.rowid],
                         )?;
                     }
                     #[cfg(not(feature = "vector-search"))]
-                    delete_vec0_shadow_row(&tx, table, *_dimension, *rowid)?;
+                    delete_vec0_shadow_row(&tx, &mapping.table, mapping.dimension, mapping.rowid)?;
                 }
                 tx.execute(
                     "DELETE FROM embedding_generation_vector_rows WHERE generation_id = ?1",
@@ -3798,6 +3805,7 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
     pub fn tombstone_target_issue_refresh(
         &mut self,
         repo: &str,
@@ -3821,6 +3829,7 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
     pub fn tombstone_target_issue_sources(
         &mut self,
         repo: &str,
@@ -4043,6 +4052,7 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
     }
 
+    #[allow(dead_code)]
     pub fn source_version_has_chunks(&self, source_version_id: i64) -> Result<bool, QghError> {
         if !embedding_schema_exists(&self.conn)? {
             return Ok(false);
@@ -4226,6 +4236,7 @@ impl Store {
             .map_err(QghError::from)
     }
 
+    #[allow(dead_code)]
     pub fn active_chunks_missing_embedding_for_fingerprint(
         &self,
         fingerprint: &EmbeddingFingerprint,
@@ -4280,6 +4291,7 @@ impl Store {
             .transpose()
     }
 
+    #[allow(dead_code)]
     pub fn replace_all_chunk_embeddings(
         &mut self,
         fingerprint: &EmbeddingFingerprint,
@@ -4356,6 +4368,7 @@ impl Store {
         Ok(embeddings.len())
     }
 
+    #[allow(dead_code)]
     pub fn upsert_chunk_embeddings(
         &mut self,
         fingerprint: &EmbeddingFingerprint,
@@ -4520,6 +4533,7 @@ impl Store {
         Ok(vector_chunks > 0)
     }
 
+    #[allow(dead_code)]
     pub fn ensure_vector_storage_for_fingerprint(
         &mut self,
         fingerprint: &EmbeddingFingerprint,
@@ -4527,6 +4541,7 @@ impl Store {
         self.ensure_vector_storage_for_fingerprint_inner(fingerprint, || {})
     }
 
+    #[allow(dead_code)]
     fn ensure_vector_storage_for_fingerprint_inner<F>(
         &mut self,
         fingerprint: &EmbeddingFingerprint,
@@ -4576,6 +4591,7 @@ impl Store {
         Ok(rows.len())
     }
 
+    #[allow(dead_code)]
     pub fn vector_only_search(
         &self,
         query_vector: &[f32],
@@ -4947,6 +4963,7 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
     }
 
+    #[allow(dead_code)]
     pub fn tombstone_source(
         &mut self,
         source_id: &str,
@@ -5241,6 +5258,7 @@ impl Store {
         Ok(oldest)
     }
 
+    #[allow(dead_code)]
     pub fn mark_index_published(
         &mut self,
         generation: i64,
@@ -5374,6 +5392,7 @@ impl Store {
             .map_err(QghError::from)
     }
 
+    #[allow(dead_code)]
     pub fn index_path_for_generation(&self, generation: i64) -> Result<Option<String>, QghError> {
         self.conn
             .query_row(
@@ -5465,6 +5484,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn record_empty_sync_run(&self) -> Result<String, QghError> {
         let sync_run_id = format!("sync-{}", now_run_id_suffix());
         let now = now_rfc3339();
@@ -5477,6 +5497,7 @@ impl Store {
         Ok(sync_run_id)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn reserve_index_generation(
         &mut self,
         index_root: &Path,
@@ -5772,6 +5793,7 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
     pub fn active_index_generation(&self) -> Result<Option<i64>, QghError> {
         self.conn
             .query_row(
@@ -6272,6 +6294,7 @@ impl Store {
         Ok(chunks.len())
     }
 
+    #[allow(dead_code)]
     pub fn embedding_generation_chunk_blob(
         &self,
         generation_id: i64,
@@ -6446,6 +6469,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn embedding_generation_state(&self, generation_id: i64) -> Result<String, QghError> {
         self.conn
             .query_row(
@@ -6456,6 +6480,7 @@ impl Store {
             .map_err(QghError::from)
     }
 
+    #[allow(dead_code)]
     pub fn latest_embedding_generation_state(&self) -> Result<Option<String>, QghError> {
         self.conn
             .query_row(
@@ -7527,6 +7552,7 @@ impl Store {
         Ok(removed)
     }
 
+    #[allow(dead_code)]
     fn ensure_vector_storage(&mut self, dimension: usize) -> Result<(), QghError> {
         if dimension == 0 {
             return Err(QghError::storage(
@@ -7548,6 +7574,7 @@ impl Store {
         }
     }
 
+    #[allow(dead_code)]
     fn ensure_vector_storage_inner(conn: &Connection, dimension: usize) -> Result<(), QghError> {
         if dimension == 0 {
             return Err(QghError::storage(
@@ -9144,10 +9171,18 @@ fn validate_generation_vector_mapping_ownership(
     Ok(expected_table)
 }
 
+struct ValidatedPurgeVectorRow {
+    table: String,
+    dimension: usize,
+    rowid: i64,
+}
+
+type ValidatedPurgeVectorMappings = BTreeMap<i64, Vec<ValidatedPurgeVectorRow>>;
+
 fn validate_purge_generation_vector_mapping_ownership(
     conn: &Connection,
     generation_ids: &BTreeSet<i64>,
-) -> Result<BTreeMap<i64, Vec<(String, usize, i64)>>, QghError> {
+) -> Result<ValidatedPurgeVectorMappings, QghError> {
     let mut validated = BTreeMap::new();
     for generation_id in generation_ids {
         let stored_generation_dimension: i64 = conn.query_row(
@@ -9218,7 +9253,11 @@ fn validate_purge_generation_vector_mapping_ownership(
             }
             #[cfg(not(feature = "vector-search"))]
             validate_vec0_shadow_row_ownership(conn, &owned_table, generation_dimension, rowid)?;
-            owned.push((owned_table, generation_dimension, rowid));
+            owned.push(ValidatedPurgeVectorRow {
+                table: owned_table,
+                dimension: generation_dimension,
+                rowid,
+            });
         }
         validated.insert(*generation_id, owned);
     }
@@ -9779,6 +9818,7 @@ fn parse_vector_table_dimension(sql: &str) -> Result<usize, QghError> {
         })
 }
 
+#[allow(dead_code)]
 fn embedding_vector_blob(vector: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
     for value in vector {
@@ -9787,6 +9827,7 @@ fn embedding_vector_blob(vector: &[f32]) -> Vec<u8> {
     bytes
 }
 
+#[allow(dead_code)]
 fn upsert_vector_row(
     tx: &rusqlite::Transaction<'_>,
     chunk_id: i64,
@@ -20549,6 +20590,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "vector-search")]
     fn test_chunk(private_marker: &str) -> MarkdownChunk {
         MarkdownChunk {
             chunk_index: 0,
