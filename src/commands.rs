@@ -2606,6 +2606,22 @@ impl EmbeddingTokenizer for TestEmbeddingTokenizer {
     }
 }
 
+#[cfg(all(test, feature = "vector-search"))]
+struct ByteEmbeddingTokenizer;
+
+#[cfg(all(test, feature = "vector-search"))]
+impl EmbeddingTokenizer for ByteEmbeddingTokenizer {
+    fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError> {
+        Ok(text
+            .char_indices()
+            .map(|(start, character)| TokenSpan {
+                start,
+                end: start + character.len_utf8(),
+            })
+            .collect())
+    }
+}
+
 #[cfg(debug_assertions)]
 fn test_embedding_runtime(
     embedding: &EmbeddingConfig,
@@ -7780,7 +7796,7 @@ mod tests {
             github_id: 906,
             number: 906,
             title: "Stale chunk fingerprint".to_string(),
-            body: "raw body must remain byte-for-byte stable".to_string(),
+            body: "public synthetic chunk inventory ".repeat(100),
             state: "open".to_string(),
             labels: Vec::new(),
             milestone: None,
@@ -7808,7 +7824,7 @@ mod tests {
         let gte_fingerprint = chunker_fingerprint_for_tokenizer_identity("gte-tokenizer-contract");
         refresh_embedding_chunks(
             &mut store,
-            &TestEmbeddingTokenizer,
+            &ByteEmbeddingTokenizer,
             &arctic_fingerprint,
             &progress,
         )
@@ -7826,7 +7842,7 @@ mod tests {
 
         let refreshed = refresh_embedding_chunks(
             &mut store,
-            &TestEmbeddingTokenizer,
+            &ByteEmbeddingTokenizer,
             &arctic_fingerprint,
             &progress,
         )
@@ -7849,7 +7865,7 @@ mod tests {
 
         let second = refresh_embedding_chunks(
             &mut store,
-            &TestEmbeddingTokenizer,
+            &ByteEmbeddingTokenizer,
             &arctic_fingerprint,
             &progress,
         )
@@ -7865,6 +7881,57 @@ mod tests {
                 .map(|chunk| chunk.chunk_id)
                 .collect::<Vec<_>>(),
             refreshed_ids
+        );
+        let expected_chunk_count = refreshed_ids.len();
+        assert!(expected_chunk_count > 1);
+        rusqlite::Connection::open(&paths.db_path)
+            .unwrap()
+            .execute(
+                "DELETE FROM chunks WHERE id = (
+                    SELECT max(id) FROM chunks WHERE source_version_id = ?1
+                 )",
+                rusqlite::params![source_version_id],
+            )
+            .unwrap();
+
+        let repaired = refresh_embedding_chunks(
+            &mut store,
+            &ByteEmbeddingTokenizer,
+            &arctic_fingerprint,
+            &progress,
+        )
+        .unwrap();
+
+        assert_eq!(repaired.skipped_sources, 0);
+        assert_eq!(
+            store
+                .chunks_for_source_version(source_version_id)
+                .unwrap()
+                .len(),
+            expected_chunk_count
+        );
+        let repaired_ids = store
+            .chunks_for_source_version(source_version_id)
+            .unwrap()
+            .into_iter()
+            .map(|chunk| chunk.chunk_id)
+            .collect::<Vec<_>>();
+        let stable_after_repair = refresh_embedding_chunks(
+            &mut store,
+            &ByteEmbeddingTokenizer,
+            &arctic_fingerprint,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(stable_after_repair.skipped_sources, 1);
+        assert_eq!(
+            store
+                .chunks_for_source_version(source_version_id)
+                .unwrap()
+                .into_iter()
+                .map(|chunk| chunk.chunk_id)
+                .collect::<Vec<_>>(),
+            repaired_ids
         );
         store
             .mark_sync_run_completed("sync-stale-chunk-fingerprint")
@@ -7882,7 +7949,7 @@ mod tests {
             .unwrap();
         let switched = refresh_embedding_chunks(
             &mut store,
-            &TestEmbeddingTokenizer,
+            &ByteEmbeddingTokenizer,
             &gte_fingerprint,
             &progress,
         )
@@ -7930,7 +7997,7 @@ mod tests {
             .unwrap();
         let mixed = refresh_embedding_chunks(
             &mut store,
-            &TestEmbeddingTokenizer,
+            &ByteEmbeddingTokenizer,
             &gte_fingerprint,
             &progress,
         )
@@ -7974,7 +8041,7 @@ mod tests {
 
         let null_fingerprint = refresh_embedding_chunks(
             &mut store,
-            &TestEmbeddingTokenizer,
+            &ByteEmbeddingTokenizer,
             &gte_fingerprint,
             &progress,
         )

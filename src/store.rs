@@ -1525,6 +1525,19 @@ impl Store {
         {
             return Ok(true);
         }
+        if table_exists(&self.conn, "source_chunk_manifests")?
+            && self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM source_chunk_manifests WHERE source_id = ?1 LIMIT 1",
+                    params![source_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+        {
+            return Ok(true);
+        }
         Ok(false)
     }
 
@@ -2264,6 +2277,12 @@ impl Store {
         let observed_at = now_rfc3339();
         for source_id in &source_ids {
             let tombstone_reason = purge_tombstone_reason(&tx, source_id, trigger)?;
+            if table_exists(&tx, "source_chunk_manifests")? {
+                tx.execute(
+                    "DELETE FROM source_chunk_manifests WHERE source_id = ?1",
+                    params![source_id],
+                )?;
+            }
             if has_chunks {
                 tx.execute(
                     "DELETE FROM chunks WHERE source_id = ?1",
@@ -3993,6 +4012,7 @@ impl Store {
         source_version_id: i64,
         chunks: &[MarkdownChunk],
     ) -> Result<Vec<StoredChunk>, QghError> {
+        let manifest = expected_chunk_manifest(source_id, chunks)?;
         let tx = self.content_write_transaction()?;
         let version_exists = tx
             .query_row(
@@ -4009,6 +4029,7 @@ impl Store {
         }
 
         if stored_chunks_match(&tx, source_version_id, chunks)? {
+            write_source_chunk_manifest(&tx, source_id, source_version_id, manifest.as_ref())?;
             tx.commit()?;
             return self.chunks_for_source_version(source_version_id);
         }
@@ -4043,6 +4064,7 @@ impl Store {
                 ],
             )?;
         }
+        write_source_chunk_manifest(&tx, source_id, source_version_id, manifest.as_ref())?;
         bump_source_snapshot_epoch(&tx)?;
         tx.commit()?;
         self.chunks_for_source_version(source_version_id)
@@ -4088,19 +4110,40 @@ impl Store {
         if !embedding_schema_exists(&self.conn)? {
             return Ok(false);
         }
-        let (count, mismatched): (i64, i64) = self.conn.query_row(
-            "SELECT count(*),
-                    coalesce(sum(
-                        CASE
-                            WHEN chunker_fingerprint IS ?2 THEN 0
-                            ELSE 1
-                        END
-                    ), 0)
-             FROM chunks WHERE source_version_id = ?1",
-            params![source_version_id, expected_fingerprint],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        Ok(count > 0 && mismatched == 0)
+        if !table_exists(&self.conn, "source_chunk_manifests")? {
+            return Ok(false);
+        }
+        let manifest = self
+            .conn
+            .query_row(
+                "SELECT expected_count, chunk_digest
+                 FROM source_chunk_manifests
+                 WHERE source_version_id = ?1 AND chunker_fingerprint = ?2",
+                params![source_version_id, expected_fingerprint],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((expected_count, expected_digest)) = manifest else {
+            return Ok(false);
+        };
+        if chunk_manifest_invalidation_triggers_present(&self.conn)? {
+            let (actual_count, mismatched): (i64, i64) = self.conn.query_row(
+                "SELECT count(*),
+                        coalesce(sum(
+                            CASE WHEN chunker_fingerprint IS ?2 THEN 0 ELSE 1 END
+                        ), 0)
+                 FROM chunks WHERE source_version_id = ?1",
+                params![source_version_id, expected_fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            return Ok(actual_count == expected_count && mismatched == 0);
+        }
+        let Some((actual_count, actual_digest)) =
+            stored_chunk_manifest(&self.conn, source_version_id)?
+        else {
+            return Ok(false);
+        };
+        Ok(actual_count == expected_count && actual_digest == expected_digest)
     }
 
     pub fn cleanup_inactive_embedding_artifacts(&mut self) -> Result<usize, QghError> {
@@ -4169,6 +4212,16 @@ impl Store {
             &format!("DELETE FROM chunks WHERE id IN ({stale_chunk_filter})"),
             [],
         )?;
+        if table_exists(&tx, "source_chunk_manifests")? {
+            tx.execute(
+                "DELETE FROM source_chunk_manifests
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM chunks
+                    WHERE chunks.source_version_id = source_chunk_manifests.source_version_id
+                 )",
+                [],
+            )?;
+        }
         tx.commit()?;
         Ok(deleted_chunks)
     }
@@ -4199,6 +4252,16 @@ impl Store {
             &format!("DELETE FROM chunks WHERE id IN ({TOMBSTONED_CHUNKS})"),
             [],
         )?;
+        if table_exists(&tx, "source_chunk_manifests")? {
+            tx.execute(
+                "DELETE FROM source_chunk_manifests
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM chunks
+                    WHERE chunks.source_version_id = source_chunk_manifests.source_version_id
+                 )",
+                [],
+            )?;
+        }
         tx.commit()?;
         Ok(deleted)
     }
@@ -5065,6 +5128,12 @@ impl Store {
         if table_exists(&tx, "chunks")? {
             tx.execute(
                 "DELETE FROM chunks WHERE source_id = ?1",
+                params![source_id],
+            )?;
+        }
+        if table_exists(&tx, "source_chunk_manifests")? {
+            tx.execute(
+                "DELETE FROM source_chunk_manifests WHERE source_id = ?1",
                 params![source_id],
             )?;
         }
@@ -7989,6 +8058,39 @@ impl Store {
                 heading_path_json TEXT NOT NULL DEFAULT '[]'
             );
 
+            CREATE TABLE IF NOT EXISTS source_chunk_manifests (
+                source_version_id INTEGER PRIMARY KEY,
+                source_id TEXT NOT NULL,
+                chunker_fingerprint TEXT NOT NULL,
+                expected_count INTEGER NOT NULL,
+                chunk_digest TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunks_source_version_id
+                ON chunks(source_version_id);
+
+            CREATE TRIGGER IF NOT EXISTS invalidate_chunk_manifest_after_insert
+            AFTER INSERT ON chunks
+            BEGIN
+                DELETE FROM source_chunk_manifests
+                WHERE source_version_id = NEW.source_version_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS invalidate_chunk_manifest_after_update
+            AFTER UPDATE ON chunks
+            BEGIN
+                DELETE FROM source_chunk_manifests
+                WHERE source_version_id IN (OLD.source_version_id, NEW.source_version_id);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS invalidate_chunk_manifest_after_delete
+            AFTER DELETE ON chunks
+            BEGIN
+                DELETE FROM source_chunk_manifests
+                WHERE source_version_id = OLD.source_version_id;
+            END;
+
             CREATE TABLE IF NOT EXISTS embedding_fingerprints (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 fingerprint_hash TEXT NOT NULL UNIQUE,
@@ -10855,6 +10957,209 @@ fn stored_chunk_from_row(row: &rusqlite::Row<'_>) -> Result<StoredChunk, rusqlit
     })
 }
 
+struct SourceChunkManifest {
+    chunker_fingerprint: String,
+    expected_count: i64,
+    chunk_digest: String,
+}
+
+struct ChunkManifestEntry<'a> {
+    source_id: &'a str,
+    body: &'a str,
+    chunk_index: i64,
+    token_start: i64,
+    token_end: i64,
+    byte_start: i64,
+    byte_end: i64,
+    chunker_version: &'a str,
+    chunker_fingerprint: &'a str,
+    heading_path_json: &'a str,
+}
+
+struct StoredChunkManifestEntry {
+    source_id: String,
+    body: String,
+    chunk_index: i64,
+    token_start: i64,
+    token_end: i64,
+    byte_start: i64,
+    byte_end: i64,
+    chunker_version: String,
+    chunker_fingerprint: String,
+    heading_path_json: String,
+}
+
+fn expected_chunk_manifest(
+    source_id: &str,
+    chunks: &[MarkdownChunk],
+) -> Result<Option<SourceChunkManifest>, QghError> {
+    let Some(first) = chunks.first() else {
+        return Ok(None);
+    };
+    if first.chunker_fingerprint.is_empty()
+        || chunks.iter().enumerate().any(|(index, chunk)| {
+            chunk.chunk_index != index
+                || chunk.chunker_fingerprint != first.chunker_fingerprint
+                || chunk.token_start >= chunk.token_end
+                || chunk.byte_start >= chunk.byte_end
+        })
+    {
+        return Err(QghError::storage(
+            "Embedding chunk inventory does not satisfy the manifest contract.",
+        ));
+    }
+    let mut hasher = chunk_manifest_hasher(chunks.len());
+    for chunk in chunks {
+        let heading_path_json = serde_json::to_string(&chunk.heading_path).map_err(|_| {
+            QghError::storage("Failed to encode embedding chunk manifest metadata.")
+        })?;
+        hash_chunk_manifest_entry(
+            &mut hasher,
+            &ChunkManifestEntry {
+                source_id,
+                body: &chunk.body,
+                chunk_index: chunk.chunk_index as i64,
+                token_start: chunk.token_start as i64,
+                token_end: chunk.token_end as i64,
+                byte_start: chunk.byte_start as i64,
+                byte_end: chunk.byte_end as i64,
+                chunker_version: &chunk.chunker_version,
+                chunker_fingerprint: &chunk.chunker_fingerprint,
+                heading_path_json: &heading_path_json,
+            },
+        );
+    }
+    Ok(Some(SourceChunkManifest {
+        chunker_fingerprint: first.chunker_fingerprint.clone(),
+        expected_count: chunks.len() as i64,
+        chunk_digest: digest_hex(hasher),
+    }))
+}
+
+fn stored_chunk_manifest(
+    conn: &Connection,
+    source_version_id: i64,
+) -> Result<Option<(i64, String)>, QghError> {
+    let mut stmt = conn.prepare(
+        "SELECT source_id, body, chunk_index, token_start, token_end,
+                byte_start, byte_end, chunker_version,
+                coalesce(chunker_fingerprint, ''), heading_path_json
+         FROM chunks WHERE source_version_id = ?1 ORDER BY chunk_index, id",
+    )?;
+    let entries = stmt
+        .query_map(params![source_version_id], |row| {
+            Ok(StoredChunkManifestEntry {
+                source_id: row.get(0)?,
+                body: row.get(1)?,
+                chunk_index: row.get(2)?,
+                token_start: row.get(3)?,
+                token_end: row.get(4)?,
+                byte_start: row.get(5)?,
+                byte_end: row.get(6)?,
+                chunker_version: row.get(7)?,
+                chunker_fingerprint: row.get(8)?,
+                heading_path_json: row.get(9)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let mut hasher = chunk_manifest_hasher(entries.len());
+    for entry in &entries {
+        hash_chunk_manifest_entry(
+            &mut hasher,
+            &ChunkManifestEntry {
+                source_id: &entry.source_id,
+                body: &entry.body,
+                chunk_index: entry.chunk_index,
+                token_start: entry.token_start,
+                token_end: entry.token_end,
+                byte_start: entry.byte_start,
+                byte_end: entry.byte_end,
+                chunker_version: &entry.chunker_version,
+                chunker_fingerprint: &entry.chunker_fingerprint,
+                heading_path_json: &entry.heading_path_json,
+            },
+        );
+    }
+    Ok(Some((entries.len() as i64, digest_hex(hasher))))
+}
+
+fn chunk_manifest_invalidation_triggers_present(conn: &Connection) -> Result<bool, QghError> {
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master
+         WHERE type = 'trigger' AND tbl_name = 'chunks'
+           AND name IN (
+             'invalidate_chunk_manifest_after_insert',
+             'invalidate_chunk_manifest_after_update',
+             'invalidate_chunk_manifest_after_delete'
+           )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count == 3)
+}
+
+fn write_source_chunk_manifest(
+    conn: &Connection,
+    source_id: &str,
+    source_version_id: i64,
+    manifest: Option<&SourceChunkManifest>,
+) -> Result<(), QghError> {
+    if !table_exists(conn, "source_chunk_manifests")? {
+        return Ok(());
+    }
+    let Some(manifest) = manifest else {
+        conn.execute(
+            "DELETE FROM source_chunk_manifests WHERE source_version_id = ?1",
+            params![source_version_id],
+        )?;
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT INTO source_chunk_manifests
+            (source_version_id, source_id, chunker_fingerprint,
+             expected_count, chunk_digest, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(source_version_id) DO UPDATE SET
+            source_id = excluded.source_id,
+            chunker_fingerprint = excluded.chunker_fingerprint,
+            expected_count = excluded.expected_count,
+            chunk_digest = excluded.chunk_digest,
+            updated_at = excluded.updated_at",
+        params![
+            source_version_id,
+            source_id,
+            manifest.chunker_fingerprint,
+            manifest.expected_count,
+            manifest.chunk_digest,
+            now_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn chunk_manifest_hasher(count: usize) -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"qgh.source_chunk_manifest.v1");
+    hasher.update((count as u64).to_le_bytes());
+    hasher
+}
+
+fn hash_chunk_manifest_entry(hasher: &mut Sha256, entry: &ChunkManifestEntry<'_>) {
+    hash_text(hasher, entry.source_id);
+    hash_text(hasher, entry.body);
+    hasher.update(entry.chunk_index.to_le_bytes());
+    hasher.update(entry.token_start.to_le_bytes());
+    hasher.update(entry.token_end.to_le_bytes());
+    hasher.update(entry.byte_start.to_le_bytes());
+    hasher.update(entry.byte_end.to_le_bytes());
+    hash_text(hasher, entry.chunker_version);
+    hash_text(hasher, entry.chunker_fingerprint);
+    hash_text(hasher, entry.heading_path_json);
+}
+
 fn stored_chunks_match(
     conn: &Connection,
     source_version_id: i64,
@@ -13279,6 +13584,7 @@ mod tests {
             "source_versions",
             "source_aliases",
             "chunks",
+            "source_chunk_manifests",
             "chunk_embeddings",
         ] {
             let count: i64 = store
@@ -17213,6 +17519,103 @@ mod tests {
                 "base store unexpectedly created vector table `{excluded}`: {tables:?}"
             );
         }
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn source_chunk_manifest_fails_closed_on_row_loss_or_tampering() {
+        let paths = temp_profile_paths("source-chunk-manifest-integrity");
+        let mut store = Store::open(&paths).unwrap();
+        store.enable_vector().unwrap();
+        let source_id = "qgh://github.com/issue/I_CHUNK_MANIFEST_INTEGRITY";
+        store
+            .upsert_sources_for_run(
+                "sync-chunk-manifest-integrity",
+                &[test_issue(source_id, "owner/repo", "public-chunk-manifest")],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let source_version_id = store.latest_source_version_id(source_id).unwrap().unwrap();
+        let mut chunks = vec![test_chunk("public-alpha"), test_chunk("public-beta")];
+        chunks[1].chunk_index = 1;
+        chunks[1].token_start = 1;
+        chunks[1].token_end = 2;
+        chunks[1].byte_start = chunks[0].byte_end;
+        chunks[1].byte_end = chunks[1].byte_start + chunks[1].body.len();
+
+        store
+            .replace_chunks_for_source_version(source_id, source_version_id, &chunks)
+            .unwrap();
+        assert!(store
+            .source_version_chunks_match_fingerprint(
+                source_version_id,
+                crate::chunking::CHUNKER_FINGERPRINT
+            )
+            .unwrap());
+
+        store
+            .conn
+            .execute(
+                "DELETE FROM chunks WHERE source_version_id = ?1 AND chunk_index = 1",
+                params![source_version_id],
+            )
+            .unwrap();
+        assert!(!store
+            .source_version_chunks_match_fingerprint(
+                source_version_id,
+                crate::chunking::CHUNKER_FINGERPRINT
+            )
+            .unwrap());
+        store
+            .replace_chunks_for_source_version(source_id, source_version_id, &chunks)
+            .unwrap();
+
+        store
+            .conn
+            .execute(
+                "UPDATE chunks SET body = 'public-tampered' 
+                 WHERE source_version_id = ?1 AND chunk_index = 0",
+                params![source_version_id],
+            )
+            .unwrap();
+        assert!(!store
+            .source_version_chunks_match_fingerprint(
+                source_version_id,
+                crate::chunking::CHUNKER_FINGERPRINT
+            )
+            .unwrap());
+        store
+            .replace_chunks_for_source_version(source_id, source_version_id, &chunks)
+            .unwrap();
+
+        store
+            .conn
+            .execute(
+                "DELETE FROM source_chunk_manifests WHERE source_version_id = ?1",
+                params![source_version_id],
+            )
+            .unwrap();
+        assert!(!store
+            .source_version_chunks_match_fingerprint(
+                source_version_id,
+                crate::chunking::CHUNKER_FINGERPRINT
+            )
+            .unwrap());
+
+        let private_marker = "PRIVATE_CHUNK_BODY_MARKER";
+        let mut malformed = chunks;
+        malformed[0].body = private_marker.to_string();
+        malformed[1].chunker_fingerprint = "mismatched-fingerprint".to_string();
+        let error = store
+            .replace_chunks_for_source_version(source_id, source_version_id, &malformed)
+            .unwrap_err();
+        assert!(!serde_json::to_string(&error)
+            .unwrap()
+            .contains(private_marker));
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -21240,7 +21643,7 @@ mod tests {
 
     #[cfg(not(feature = "vector-search"))]
     #[test]
-    fn bm25_store_treats_null_and_mixed_chunk_fingerprints_as_stale() {
+    fn bm25_store_without_chunk_manifest_never_reuses_legacy_rows() {
         let paths = temp_profile_paths("bm25-stale-chunk-fingerprints");
         let mut store = Store::open(&paths).unwrap();
         let source_id = "qgh://github.com/issue/I_BM25_STALE_CHUNK_FINGERPRINT";
@@ -21284,7 +21687,7 @@ mod tests {
                 params![crate::chunking::CHUNKER_FINGERPRINT],
             )
             .unwrap();
-        assert!(store
+        assert!(!store
             .source_version_chunks_match_fingerprint(
                 source_version_id,
                 crate::chunking::CHUNKER_FINGERPRINT
