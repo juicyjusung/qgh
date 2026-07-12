@@ -6113,6 +6113,53 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
 }
 
 #[test]
+fn mcp_rejects_malformed_envelopes_and_method_params() {
+    let fixture = TestFixture::new("mcp-strict-envelope");
+    fixture.write_config("http://127.0.0.1:1");
+
+    let output = fixture.mcp([
+        json!({"id": 1, "method": "ping"}),
+        json!({"jsonrpc": "1.0", "id": 2, "method": "ping"}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "ping", "extra": true}),
+        json!([]),
+        json!({"jsonrpc": "2.0", "id": 5, "method": "initialize", "params": {}}),
+        json!({"jsonrpc": "2.0", "id": 6, "method": "ping", "params": "bad"}),
+        json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {"bogus": true}}),
+        json!({"jsonrpc": "2.0", "id": 8, "method": "ping", "params": null}),
+        json!({"jsonrpc": "2.0", "id": 9, "method": "tools/list", "params": {"_meta": {}}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2099-01-01",
+                "capabilities": {"futureCapability": true},
+                "clientInfo": {"name": "future-client", "version": "1", "futureField": true},
+                "_meta": {"trace": "opaque"}
+            }
+        }),
+    ]);
+
+    assert_success(&output);
+    assert!(stderr_text(&output).is_empty());
+    let messages = stdout_json_lines(&output);
+    assert_eq!(messages.len(), 10);
+    for (message, id) in messages[..3].iter().zip([1, 2, 3]) {
+        assert_eq!(message["id"], id);
+        assert_eq!(message["error"]["code"], -32600);
+    }
+    assert_eq!(messages[3]["id"], Value::Null);
+    assert_eq!(messages[3]["error"]["code"], -32600);
+    for (message, id) in messages[4..7].iter().zip([5, 6, 7]) {
+        assert_eq!(message["id"], id);
+        assert_eq!(message["error"]["code"], -32602);
+    }
+    assert_eq!(messages[7]["result"], json!({}));
+    assert_eq!(messages[8]["result"]["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(messages[9]["result"]["protocolVersion"], "2025-11-25");
+}
+
+#[test]
 fn mcp_query_get_status_round_trips_issue_and_comment_sources() {
     let fixture = TestFixture::new("mcp-workflow");
     let server = FakeGitHub::start(issue_payload_with_pr());

@@ -46,24 +46,119 @@ struct McpSession {
 }
 
 async fn handle_message(session: &McpSession, message: Value) -> Option<Value> {
-    let id = message.get("id").cloned();
-    let method = message.get("method").and_then(Value::as_str);
-    let Some(method) = method else {
-        return Some(protocol_error(
-            id.unwrap_or(Value::Null),
-            -32600,
-            "Invalid Request",
-        ));
+    let request = match parse_request_envelope(&message) {
+        Ok(request) => request,
+        Err(error) => return Some(error),
     };
+    let error_id = request.id.clone().unwrap_or(Value::Null);
 
-    let id = id?;
+    let params_valid = match request.method {
+        "initialize" => valid_initialize_params(request.params),
+        "ping" | "notifications/initialized" => valid_meta_only_params(request.params),
+        "tools/list" => valid_tools_list_params(request.params),
+        _ => true,
+    };
+    if !params_valid {
+        return Some(protocol_error(error_id, -32602, "Invalid params"));
+    }
 
-    Some(match method {
+    let id = request.id?;
+
+    Some(match request.method {
         "initialize" => success_response(id, initialize_result()),
         "ping" => success_response(id, json!({})),
+        "notifications/initialized" => success_response(id, json!({})),
         "tools/list" => success_response(id, json!({ "tools": tool_list() })),
-        "tools/call" => call_tool(session, id, message.get("params")).await,
+        "tools/call" => call_tool(session, id, request.params).await,
         _ => protocol_error(id, -32601, "Method not found"),
+    })
+}
+
+struct RequestEnvelope<'a> {
+    id: Option<Value>,
+    method: &'a str,
+    params: Option<&'a Value>,
+}
+
+fn parse_request_envelope(message: &Value) -> Result<RequestEnvelope<'_>, Value> {
+    let Some(object) = message.as_object() else {
+        return Err(protocol_error(Value::Null, -32600, "Invalid Request"));
+    };
+    let error_id = object
+        .get("id")
+        .filter(|id| id.is_string() || id.is_number())
+        .cloned()
+        .unwrap_or(Value::Null);
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "jsonrpc" | "id" | "method" | "params"))
+        || object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+    {
+        return Err(protocol_error(error_id, -32600, "Invalid Request"));
+    }
+    let Some(method) = object.get("method").and_then(Value::as_str) else {
+        return Err(protocol_error(error_id, -32600, "Invalid Request"));
+    };
+    if method.is_empty()
+        || object
+            .get("id")
+            .is_some_and(|id| !id.is_string() && !id.is_number())
+    {
+        return Err(protocol_error(error_id, -32600, "Invalid Request"));
+    }
+    Ok(RequestEnvelope {
+        id: object.get("id").cloned(),
+        method,
+        params: object.get("params"),
+    })
+}
+
+fn valid_initialize_params(params: Option<&Value>) -> bool {
+    let Some(object) = params.and_then(Value::as_object) else {
+        return false;
+    };
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "protocolVersion" | "capabilities" | "clientInfo" | "_meta"
+        )
+    }) {
+        return false;
+    }
+    object
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .is_some_and(|version| !version.is_empty())
+        && object.get("capabilities").is_some_and(Value::is_object)
+        && object.get("clientInfo").is_some_and(Value::is_object)
+        && object.get("_meta").is_none_or(Value::is_object)
+}
+
+fn valid_meta_only_params(params: Option<&Value>) -> bool {
+    let Some(params) = params else {
+        return true;
+    };
+    if params.is_null() {
+        return true;
+    }
+    params.as_object().is_some_and(|object| {
+        object.keys().all(|key| key == "_meta") && object.get("_meta").is_none_or(Value::is_object)
+    })
+}
+
+fn valid_tools_list_params(params: Option<&Value>) -> bool {
+    let Some(params) = params else {
+        return true;
+    };
+    if params.is_null() {
+        return true;
+    }
+    params.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .all(|key| matches!(key.as_str(), "cursor" | "_meta"))
+            && object.get("cursor").is_none_or(Value::is_null)
+            && object.get("_meta").is_none_or(Value::is_object)
     })
 }
 
@@ -84,18 +179,19 @@ fn initialize_result() -> Value {
 }
 
 async fn call_tool(session: &McpSession, id: Value, params: Option<&Value>) -> Value {
-    let result = match parse_call(params) {
-        Ok(call) => match call.name.as_str() {
-            "query" => tool_query(session, &call.arguments).unwrap_or_else(tool_error),
-            "get" => tool_get(session, &call.arguments)
-                .await
-                .unwrap_or_else(tool_error),
-            "status" => tool_status(session, &call.arguments).unwrap_or_else(tool_error),
-            _ => {
-                return protocol_error(id, -32601, "Tool not found");
-            }
-        },
-        Err(error) => tool_error(error),
+    let call = match parse_call(params) {
+        Ok(call) => call,
+        Err(_) => return protocol_error(id, -32602, "Invalid params"),
+    };
+    let result = match call.name.as_str() {
+        "query" => tool_query(session, &call.arguments).unwrap_or_else(tool_error),
+        "get" => tool_get(session, &call.arguments)
+            .await
+            .unwrap_or_else(tool_error),
+        "status" => tool_status(session, &call.arguments).unwrap_or_else(tool_error),
+        _ => {
+            return protocol_error(id, -32601, "Tool not found");
+        }
     };
     success_response(id, result)
 }
