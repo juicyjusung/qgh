@@ -68,7 +68,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 const GET_BATCH_SIZE_CAP: usize = 20;
-const QWEN_EMBEDDING_INPUT_ADAPTER_REVISION: &str = "explicit-window-v1";
+const QWEN_EMBEDDING_INPUT_ADAPTER_REVISION: &str = "explicit-window-v2";
 const QWEN_EMBEDDING_METAL_ADAPTER_REVISION: &str = "metal-sdpa-adaptive-batching-v2";
 const STALE_BUILDING_RETENTION_HOURS: i64 = 24;
 const PREVIOUS_READY_RETENTION_DAYS: i64 = 7;
@@ -1248,11 +1248,8 @@ fn rebuild_bm25_index(
                 ));
                 generation_id
             }
-            Err(_) => {
-                warnings.push(embedding_sync_warning(
-                    "embedding.sync_refresh_failed",
-                    "Embedding refresh failed during sync. BM25 index refresh remains available.",
-                ));
+            Err(error) => {
+                warnings.push(embedding_refresh_failure_warning(&error));
                 None
             }
         }
@@ -2278,12 +2275,19 @@ fn complete_embedding_generation(
     Ok((embedded, Some(plan.generation_id)))
 }
 
-fn embedding_sync_warning(code: &'static str, message: &'static str) -> Value {
+fn embedding_sync_warning(code: &str, message: &'static str) -> Value {
     json!({
         "code": code,
         "severity": "warn",
         "message": message
     })
+}
+
+fn embedding_refresh_failure_warning(error: &QghError) -> Value {
+    embedding_sync_warning(
+        &error.code,
+        "Embedding refresh failed during sync. BM25 index refresh remains available.",
+    )
 }
 
 fn cleanup_old_embedding_generations(store: &mut Store) -> Result<usize, QghError> {
@@ -6588,7 +6592,7 @@ mod tests {
     #[cfg(feature = "fastembed-provider")]
     #[test]
     fn qwen_adapter_revisions_invalidate_affected_generation_and_cache() {
-        assert_eq!(QWEN_EMBEDDING_INPUT_ADAPTER_REVISION, "explicit-window-v1");
+        assert_eq!(QWEN_EMBEDDING_INPUT_ADAPTER_REVISION, "explicit-window-v2");
         assert_eq!(
             QWEN_EMBEDDING_METAL_ADAPTER_REVISION,
             "metal-sdpa-adaptive-batching-v2"
@@ -6611,7 +6615,8 @@ mod tests {
             query_prefix: Some(QWEN_EMBEDDING_QUERY_PREFIX.to_string()),
         };
 
-        let previous_metal_revision = "manifest:metal_f16";
+        let previous_metal_revision =
+            "manifest:metal_f16:explicit-window-v1:metal-sdpa-adaptive-batching-v2";
         let current_metal_revision = configured_qwen_runtime_identity("manifest", "metal_f16");
         assert_eq!(
             current_metal_revision,
@@ -6635,7 +6640,7 @@ mod tests {
             cpu_revision,
             format!("manifest:cpu_f32:{QWEN_EMBEDDING_INPUT_ADAPTER_REVISION}")
         );
-        assert!(!fingerprint("manifest:cpu_f32")
+        assert!(!fingerprint("manifest:cpu_f32:explicit-window-v1")
             .matches_expectation(&expectation(cpu_revision.clone())));
         assert!(fingerprint(&cpu_revision).matches_expectation(&expectation(cpu_revision)));
         assert_eq!(
@@ -7317,6 +7322,25 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("BM25 results are still returned"));
+        assert!(!warning.to_string().contains(private_marker));
+    }
+
+    #[test]
+    fn embedding_refresh_failure_warning_preserves_code_without_content() {
+        let private_marker = "PRIVATE_EMBEDDING_INPUT_MARKER_90";
+        let error = QghError::validation("embedding.input_window_exceeded", private_marker)
+            .with_details(json!({ "private_input": private_marker }))
+            .with_hint(private_marker);
+
+        let warning = embedding_refresh_failure_warning(&error);
+
+        assert_eq!(warning["code"], "embedding.input_window_exceeded");
+        assert_eq!(warning["severity"], "warn");
+        assert!(warning["message"]
+            .as_str()
+            .unwrap()
+            .contains("BM25 index refresh remains available"));
+        assert_eq!(warning.as_object().unwrap().len(), 3);
         assert!(!warning.to_string().contains(private_marker));
     }
 

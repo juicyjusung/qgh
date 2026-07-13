@@ -250,10 +250,11 @@ impl EmbeddingEngine for QwenEmbeddingEngine {
 
 /// Fits one document or query to the pinned Qwen window before inference.
 ///
-/// The context prefix is at the beginning of the input, so truncating at the
-/// last complete token preserves repository/issue identity and removes only
-/// the trailing body. The model tokenizer retains its own truncation as a
-/// defense in depth, but production inputs must already satisfy this bound.
+/// The context prefix is at the beginning of the input, so choosing the longest
+/// validated token-boundary prefix that fits after independent re-tokenization
+/// preserves repository/issue identity and removes only the trailing body. The
+/// model tokenizer retains its own truncation as a defense in depth, but
+/// production inputs must already satisfy this bound.
 pub fn fit_qwen_embedding_input(
     tokenizer: &Tokenizer,
     text: &str,
@@ -274,7 +275,7 @@ pub fn fit_qwen_embedding_input(
         .checked_sub(special_tokens)
         .ok_or_else(embedding_tokenizer_error)?;
     let mut retained_tokens = 0usize;
-    let mut retained_byte_end = 0usize;
+    let mut candidate_byte_ends = Vec::with_capacity(regular_token_limit);
     for ((start, end), special) in encoding
         .get_offsets()
         .iter()
@@ -286,33 +287,45 @@ pub fn fit_qwen_embedding_input(
         if retained_tokens == regular_token_limit {
             break;
         }
-        if start < end {
-            retained_byte_end = *end;
+        if start < end
+            && *end <= text.len()
+            && text.is_char_boundary(*end)
+            && candidate_byte_ends
+                .last()
+                .is_none_or(|previous| end > previous)
+        {
+            candidate_byte_ends.push(*end);
         }
         retained_tokens += 1;
     }
-    if retained_byte_end == 0
-        || retained_byte_end > text.len()
-        || !text.is_char_boundary(retained_byte_end)
-    {
+    if candidate_byte_ends.is_empty() {
         return Err(embedding_tokenizer_error());
     }
-    let fitted = text[..retained_byte_end].to_string();
-    let fitted_length = tokenizer
-        .encode(fitted.as_str(), true)
-        .map_err(|_| embedding_tokenizer_error())?
-        .len();
-    if fitted_length > QWEN_EMBEDDING_MAX_LENGTH {
-        return Err(EmbeddingProviderError::structured(
-            "embedding.input_window_exceeded",
-            "Prepared embedding input could not be fitted to the local model window.",
-        )
-        .with_details(serde_json::json!({
-            "maximum_tokens": QWEN_EMBEDDING_MAX_LENGTH,
-            "actual_tokens": fitted_length
-        })));
+
+    let mut smallest_observed_length = encoding.len();
+    for retained_byte_end in candidate_byte_ends.into_iter().rev() {
+        if retained_byte_end == text.len() {
+            continue;
+        }
+        let fitted = &text[..retained_byte_end];
+        let fitted_length = tokenizer
+            .encode(fitted, true)
+            .map_err(|_| embedding_tokenizer_error())?
+            .len();
+        if fitted_length <= QWEN_EMBEDDING_MAX_LENGTH {
+            return Ok(fitted.to_string());
+        }
+        smallest_observed_length = smallest_observed_length.min(fitted_length);
     }
-    Ok(fitted)
+
+    Err(EmbeddingProviderError::structured(
+        "embedding.input_window_exceeded",
+        "Prepared embedding input could not be fitted to the local model window.",
+    )
+    .with_details(serde_json::json!({
+        "maximum_tokens": QWEN_EMBEDDING_MAX_LENGTH,
+        "actual_tokens": smallest_observed_length
+    })))
 }
 
 fn qwen_embedding_batch_plan(
@@ -746,6 +759,122 @@ mod tests {
         qwen_model_spec, PreparedQwenModelStore, QWEN_EMBEDDING_PRESET_ID, QWEN_RERANKER_PRESET_ID,
     };
     use std::path::PathBuf;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::normalizers::Replace;
+    use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+    use tokenizers::processors::bert::BertProcessing;
+    use tokenizers::SplitDelimiterBehavior;
+
+    fn expanding_boundary_tokenizer(source: &str, expansion: &str) -> Tokenizer {
+        let model = WordLevel::builder()
+            .vocab(
+                [
+                    ("<unk>".to_string(), 0),
+                    ("z".to_string(), 1),
+                    ("a".to_string(), 2),
+                    ("b".to_string(), 3),
+                    ("c".to_string(), 4),
+                    ("[CLS]".to_string(), 5),
+                    ("[SEP]".to_string(), 6),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unk_token("<unk>".to_string())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_normalizer(Some(Replace::new(source, expansion).unwrap()));
+        tokenizer.with_pre_tokenizer(Some(
+            Split::new(
+                SplitPattern::Regex(".".to_string()),
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .unwrap(),
+        ));
+        tokenizer
+    }
+
+    #[test]
+    fn embedding_input_fitting_retreats_when_retokenized_prefix_expands() {
+        let tokenizer = expanding_boundary_tokenizer("x", "abc");
+        let expected = "z".repeat(QWEN_EMBEDDING_MAX_LENGTH - 1);
+        let input = format!("{expected}x");
+        assert_eq!(
+            tokenizer.encode(input.as_str(), true).unwrap().len(),
+            QWEN_EMBEDDING_MAX_LENGTH + 2
+        );
+
+        let fitted = fit_qwen_embedding_input(&tokenizer, input.as_str()).unwrap();
+
+        assert_eq!(fitted, expected);
+        assert!(input.starts_with(&fitted));
+        assert!(tokenizer.encode(fitted, true).unwrap().len() <= QWEN_EMBEDDING_MAX_LENGTH);
+    }
+
+    #[test]
+    fn embedding_input_fitting_preserves_multibyte_original_prefix() {
+        let tokenizer = expanding_boundary_tokenizer("한", "abc");
+        let expected = "z".repeat(QWEN_EMBEDDING_MAX_LENGTH - 1);
+        let input = format!("{expected}한");
+
+        let fitted = fit_qwen_embedding_input(&tokenizer, input.as_str()).unwrap();
+
+        assert_eq!(fitted, expected);
+        assert!(input.starts_with(&fitted));
+        assert!(input.is_char_boundary(fitted.len()));
+        assert_eq!(
+            fit_qwen_embedding_input(&tokenizer, input.as_str()).unwrap(),
+            fitted
+        );
+    }
+
+    #[test]
+    fn embedding_input_fitting_fails_closed_when_no_nonempty_prefix_fits() {
+        let private_marker = "PRIVATE90";
+        let tokenizer = expanding_boundary_tokenizer(private_marker, &"a".repeat(1_025));
+
+        let error = fit_qwen_embedding_input(&tokenizer, private_marker).unwrap_err();
+
+        assert_eq!(error.code(), "embedding.input_window_exceeded");
+        assert_eq!(error.details()["maximum_tokens"], 1_024);
+        assert_eq!(error.details()["actual_tokens"], 1_025);
+        assert!(!error.details().to_string().contains(private_marker));
+    }
+
+    #[test]
+    fn embedding_input_fitting_keeps_short_original_input_unchanged() {
+        let tokenizer = expanding_boundary_tokenizer("x", "abc");
+
+        let fitted = fit_qwen_embedding_input(&tokenizer, "zx").unwrap();
+
+        assert_eq!(fitted, "zx");
+    }
+
+    #[test]
+    fn embedding_input_fitting_reserves_fixed_special_token_budget() {
+        let mut tokenizer = expanding_boundary_tokenizer("x", "abc");
+        tokenizer.with_post_processor(Some(BertProcessing::new(
+            ("[SEP]".to_string(), 6),
+            ("[CLS]".to_string(), 5),
+        )));
+        let input = "z".repeat(QWEN_EMBEDDING_MAX_LENGTH - 1);
+
+        let fitted = fit_qwen_embedding_input(&tokenizer, input.as_str()).unwrap();
+        let fitted_encoding = tokenizer.encode(fitted.as_str(), true).unwrap();
+
+        assert_eq!(fitted.len(), QWEN_EMBEDDING_MAX_LENGTH - 2);
+        assert_eq!(fitted_encoding.len(), QWEN_EMBEDDING_MAX_LENGTH);
+        assert_eq!(
+            fitted_encoding
+                .get_special_tokens_mask()
+                .iter()
+                .filter(|special| **special != 0)
+                .count(),
+            2
+        );
+    }
 
     #[test]
     fn runtime_profiles_do_not_silently_cross_device_boundaries() {
@@ -817,6 +946,47 @@ mod tests {
         let tokens = tokenizer.tokenize("public sync tokenizer smoke").unwrap();
 
         assert!(!tokens.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires explicitly installed pinned Qwen model snapshots"]
+    fn live_prepared_embedding_input_fits_public_multilingual_window() {
+        let root = PathBuf::from(
+            std::env::var("QGH_QWEN_PREPARED_MODELS")
+                .expect("QGH_QWEN_PREPARED_MODELS must point to the prepared store"),
+        );
+        let spec = qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).unwrap();
+        let snapshot = PreparedQwenModelStore::new(root).inspect(&spec).unwrap();
+        let tokenizer = load_qwen_embedding_tokenizer(&snapshot).unwrap();
+        let context = "Repository: public/example\nIssue #42: tokenizer window\n\n";
+        let input = format!("{context}{}", "검색 retrieval ".repeat(2_000));
+        let original_encoding = tokenizer.tokenizer.encode(input.as_str(), true).unwrap();
+        assert!(original_encoding.len() > QWEN_EMBEDDING_MAX_LENGTH);
+        assert_eq!(
+            original_encoding
+                .get_special_tokens_mask()
+                .iter()
+                .filter(|special| **special != 0)
+                .count(),
+            1
+        );
+
+        let fitted = tokenizer.fit_input(input.as_str()).unwrap();
+        let repeated = tokenizer.fit_input(input.as_str()).unwrap();
+        let fitted_encoding = tokenizer.tokenizer.encode(fitted.as_str(), true).unwrap();
+
+        assert_eq!(fitted, repeated);
+        assert!(fitted.starts_with(context));
+        assert!(input.starts_with(&fitted));
+        assert!(fitted_encoding.len() <= QWEN_EMBEDDING_MAX_LENGTH);
+        assert_eq!(
+            fitted_encoding
+                .get_special_tokens_mask()
+                .iter()
+                .filter(|special| **special != 0)
+                .count(),
+            1
+        );
     }
 
     #[test]

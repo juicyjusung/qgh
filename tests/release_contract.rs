@@ -2863,7 +2863,6 @@ fn stable_external_error_codes_from_source(root: &std::path::Path) -> BTreeSet<S
         "embedding.query_encoding_failed",
         "embedding.runtime_unavailable",
         "embedding.sync_chunking_failed",
-        "embedding.sync_refresh_failed",
         "embedding.sync_tokenizer_failed",
         "embedding.sync_vector_init_failed",
         "embedding.tombstone_cleanup_failed",

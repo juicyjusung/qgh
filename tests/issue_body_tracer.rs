@@ -3644,6 +3644,55 @@ quantization = "none"
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
+fn embedding_sync_preserves_refresh_error_code_without_content() {
+    let fixture = TestFixture::new("embedding-sync-refresh-error-code");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    let model_dir = fixture.write_local_embedding_tokenizer_model();
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        &format!(
+            r#"
+provider = "local"
+model_path = "{}"
+file = "onnx/model.onnx"
+pooling = "cls"
+query_prefix = "query: "
+quantization = "none"
+"#,
+            model_dir.display()
+        ),
+    );
+    let private_marker = "PRIVATE_TEST_DOCUMENT_90";
+    let output = fixture.qgh_with_document_vectors(
+        ["sync", "--json"],
+        &json!({ private_marker: [0.1, 0.2, 0.3] }),
+    );
+
+    assert_success(&output);
+    let output_json = stdout_json(&output);
+    let warning = embedding_sync_warning(&output_json);
+    assert_eq!(warning["code"], "embedding.generation_invalid_spec");
+    assert_eq!(
+        json_object_keys(warning),
+        BTreeSet::from([
+            "code".to_string(),
+            "message".to_string(),
+            "severity".to_string(),
+        ])
+    );
+    assert!(!stdout_text(&output).contains(private_marker));
+    assert!(!stderr_text(&output).contains(private_marker));
+
+    let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    let results = query_json["data"]["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0]["ranking"]["kind"], "bm25");
+}
+
+#[cfg(feature = "fastembed-provider")]
+#[test]
 fn embedding_sync_skips_when_body_hash_matches_despite_new_github_timestamp() {
     let fixture = TestFixture::new("embedding-sync-body-hash-skip");
     let server = EditingFakeGitHub::start();
@@ -11137,12 +11186,21 @@ fn result_source_ids(output_json: &Value) -> Vec<String> {
 }
 
 #[cfg(feature = "fastembed-provider")]
-fn assert_embedding_sync_warning(output_json: &Value) {
+fn embedding_sync_warning(output_json: &Value) -> &Value {
     let warnings = output_json["warnings"].as_array().unwrap();
-    let warning = warnings
+    warnings
         .iter()
-        .find(|warning| warning["code"] == "embedding.sync_refresh_failed")
-        .expect("embedding sync warning");
+        .find(|warning| {
+            warning["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("BM25 index refresh remains available"))
+        })
+        .expect("embedding sync warning")
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn assert_embedding_sync_warning(output_json: &Value) {
+    let warning = embedding_sync_warning(output_json);
     assert_eq!(warning["severity"], "warn");
     assert!(warning["message"]
         .as_str()
