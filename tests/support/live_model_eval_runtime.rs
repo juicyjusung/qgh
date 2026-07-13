@@ -7636,7 +7636,7 @@ pub(super) fn timed_failure_evidence_for_test() -> Result<Value, DynError> {
     command
         .args([
             "-c",
-            "printf '{\"data\":{\"chunks\":{\"embedded\":12500}}}'; exit 7",
+            "printf '{\"data\":{\"chunks\":{\"embedded\":12500}}}'; sleep 0.5; exit 7",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
