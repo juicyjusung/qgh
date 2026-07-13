@@ -150,25 +150,18 @@ instead of silently falling back. See the
 [CLI JSON contract](docs/cli-json-contract.md) and released schemas under
 [`docs/schemas/`](docs/schemas/).
 
-## Optional Agent Skills
+## Optional qgh Agent Skill
 
-Agent skills teach an agent when and how to use qgh; they do not install the
-qgh binary, authenticate GitHub, create a profile, download a model, or run
-`init`, `sync`, or `doctor`. Install the CLI and prepare its local snapshot
-separately using the sections above.
+The optional `qgh` skill teaches an agent when and how to use qgh; it does not
+install the qgh binary, authenticate GitHub, create a profile, download a
+model, or run `init`, `sync`, or `doctor`. Install the CLI and prepare its local
+snapshot separately using the sections above.
 
-With Node.js 18 or newer, install the core retrieval/citation workflow into the
-current project's Codex configuration:
-
-```sh
-npx skills add juicyjusung/qgh --skill using-qgh-context --agent codex
-```
-
-Two optional workflows cover explicit operator setup/recovery and multi-source
-engineering research:
+With Node.js 18 or newer, install the single qgh workflow into the current
+project's Codex configuration:
 
 ```sh
-npx skills add juicyjusung/qgh --skill setting-up-qgh --skill researching-with-qgh --agent codex
+npx skills add juicyjusung/qgh --skill qgh --agent codex
 ```
 
 Project-local installation is the safer default because teammates can review
@@ -178,21 +171,31 @@ replace `--agent codex` with `--agent claude-code`.
 
 Always pass `--skill` so the selection is explicit. Maintainer-only workflows
 are hidden from the default catalog, but they can still be selected by name.
-Review the selected [`SKILL.md`](skills/using-qgh-context/SKILL.md) before
+Review the selected [`SKILL.md`](skills/qgh/SKILL.md) before
 installation; third-party skill review remains the user's responsibility.
 
-The public suite is role-based rather than one skill per command:
+The public skill routes the whole qgh lifecycle without making the user or
+agent choose among overlapping skills:
 
-| Skill | Use it for |
+| Route | Use it for |
 | --- | --- |
-| [`using-qgh-context`](skills/using-qgh-context/SKILL.md) | Proactively retrieve historical Issue/comment evidence and preserve `query -> get -> cite`. |
-| [`setting-up-qgh`](skills/setting-up-qgh/SKILL.md) | Explicit installation, initialization, sync/backfill, model, and repair guidance with side effects shown first. |
-| [`researching-with-qgh`](skills/researching-with-qgh/SKILL.md) | Triangulate multiple historical sources for planning, debugging, architecture, and review briefs. |
+| Retrieval | Proactively retrieve historical Issue/comment evidence and preserve `query -> get -> cite`. |
+| Research | Triangulate multiple historical sources for planning, debugging, architecture, and review briefs. |
+| Setup and recovery | Handle installation, initialization, sync/backfill, model, and repair tasks with side effects shown first. |
 
-All three distinguish qgh's local read-only retrieval/citation layer from
-`gh`, which is the path for live GitHub truth and authorized Issue writes. The
-core skill never automatically installs qgh or runs `qgh init`, `qgh sync`,
-`qgh doctor`, model downloads, or lifecycle verification. See
+A repo-scoped `#N`, GitHub Issue/comment URL, or `gh issue` task can invoke the
+skill even when qgh was not named; this includes an implementation request
+anchored to that Issue. Invocation does not force a local query: the
+skill uses qgh when synchronized history or source context helps, routes a
+live-only operation directly to `gh`, and keeps mixed local/live evidence
+separate.
+
+The skill distinguishes qgh's local read-only retrieval/citation layer from
+`gh`, which is the path for live GitHub truth and authorized Issue writes.
+Invoking the skill or asking for retrieval does not authorize installation,
+`qgh init`, `qgh sync`, `qgh doctor`, model downloads, or lifecycle
+verification. When the user explicitly requests one of those operations, the
+setup route states its boundary and performs only that scoped task. See
 [Agent skills](docs/agent-skills.md) for selection, installation scope, safety,
 and maintainer validation.
 

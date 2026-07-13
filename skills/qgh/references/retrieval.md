@@ -1,6 +1,6 @@
 # qgh Retrieval Contract
 
-Use this reference while running `using-qgh-context`. The released CLI and its `qgh.v1` JSON envelopes are authoritative; human terminal wording may evolve.
+Use this reference for direct lookup and as the evidence-opening contract for multi-source research. The released CLI and its `qgh.v1` JSON envelopes are authoritative; human terminal wording may evolve.
 
 ## Readiness
 
@@ -16,8 +16,8 @@ Check these fields before retrieval:
 | `data.freshness.decision` | `fresh`, `stale_warn`, `stale_fail`, or `never_synced`. |
 | `data.freshness.remote_checked` | Always `false`; freshness comes from local sync metadata. |
 | `data.coverage.mode` | `partial` permits retrieval but cannot claim exhaustive history. |
-| `data.coverage.next_action` | An operator recommendation, not permission for the core skill to execute it. |
-| `data.embedding.state` | Hybrid readiness when the optional `embedding` object is present. Its absence is a normal BM25-only profile, not a repair condition. |
+| `data.coverage.next_action` | An operator recommendation, not permission to execute it. |
+| `data.embedding.state` | Hybrid readiness when the optional `embedding` object is present. Its absence is normal for a BM25-only profile. |
 | `data.purge.retrieval_blocked` | Stop retrieval when true and ask an operator to repair the local state. |
 
 Do not copy local database, cache, index, or log paths from status into external reports.
@@ -32,7 +32,7 @@ qgh query '<distinctive identifier>' --repo owner/repo --json
 qgh query '<concise terms>' --repo owner/repo --json
 ```
 
-The current working repository policy may resolve scope, but never infer or discover an organization-wide scope. If the intended repo is ambiguous, ask for it or use an explicitly provided `owner/repo`.
+The current repository policy may resolve scope, but never infer or discover an organization-wide scope. If the intended repo is ambiguous, ask for it or use an explicitly provided `owner/repo`.
 
 For each result:
 
@@ -43,7 +43,7 @@ For each result:
 - `source_version` records the version represented by the local result.
 - ranking fields are ordering signals, not confidence or probability.
 
-`ok: true` with `data.results: []` is a valid no-result response. Describe it as “no match in the available local snapshot,” qualified by freshness and coverage.
+`ok: true` with `data.results: []` means “no match in the available local snapshot,” qualified by freshness and coverage. It does not prove that no GitHub source exists.
 
 ## Get and Cite
 
@@ -53,22 +53,20 @@ Use the two exact round-trip arguments emitted by the same query result:
 qgh get '<get_args.source_id>' --profile-id '<get_args.profile_id>' --json
 ```
 
-`status.meta.profile_id` validates readiness but is not a substitute for the query result's `get_args.profile_id`. This distinction preserves round trips across working directories and multi-profile stores.
+`status.meta.profile_id` validates readiness but is not a substitute for the query result's `get_args.profile_id`. This preserves round trips across working directories and multi-profile stores.
 
 Single-source `get` returns a full authoritative `data.source` object. Cite only after reading its `body`, `canonical_url`, `source_id`, `source_version`, and lifecycle metadata. CLI batch `get` accepts 1 to 20 source IDs and reports per-item failures.
 
-Default `get` is local-only. Never add `--verify-lifecycle` in this skill: it contacts GitHub and may purge content confirmed unavailable.
+Default `get` is local-only. Do not add `--verify-lifecycle` unless the user explicitly authorizes its GitHub request and possible purge.
 
 ## Actions and Errors
 
-Use stable JSON and structured codes:
-
 - Keep `--json` on every agent command.
-- Do not execute `coverage.next_action.json_command` or `retry_action.json_command` in this core skill. Present it to the operator with its side effect.
+- Do not execute `coverage.next_action.json_command` or `retry_action.json_command` unless the current operator task explicitly authorizes that action and scope.
 - Do not silently retry rate limits or network failures.
 - Do not treat stale, partial, BM25-only, or no-result states as equivalent.
 - Do not expose raw source content while reporting an error.
-- If the qgh executable is absent, do not infer that no old snapshot files exist; report only that qgh retrieval was unavailable.
+- If the executable is absent, report only that qgh retrieval is unavailable; do not infer that no old snapshot files exist.
 
 ## qgh versus gh
 
@@ -81,3 +79,14 @@ Use stable JSON and structured codes:
 | Search code, pull requests, Discussions, Projects, or Wiki | Another purpose-built path; not qgh |
 
 When both historical context and current state matter, report them as separate evidence layers.
+
+## Direct Retrieval Output
+
+```text
+Finding: <what the opened source establishes>
+Evidence: <repo>#<issue> — <canonical_url>
+Evidence basis: full get body; query snippet not used
+Source version: github_updated_at=<value>; lifecycle_state=<value>
+Snapshot limits: freshness=<decision>; coverage=<mode>; live GitHub not checked
+Inference: <clearly separated interpretation, or "none">
+```

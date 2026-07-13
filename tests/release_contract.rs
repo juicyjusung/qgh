@@ -2672,8 +2672,10 @@ fn readme_onboarding_matches_released_cli_and_mcp_contracts() {
         "qgh doctor",
         "qgh mcp",
         "`query`, `get`, and `status`",
-        "npx skills add juicyjusung/qgh --skill using-qgh-context --agent codex",
+        "npx skills add juicyjusung/qgh --skill qgh --agent codex",
         "Always pass `--skill`",
+        "repo-scoped `#N`",
+        "`gh issue` task can invoke",
         "qgh's local read-only retrieval/citation layer",
         "`gh`, which is the path for live GitHub truth",
         "brew upgrade juicyjusung/tap/qgh",
@@ -2737,177 +2739,262 @@ fn readme_onboarding_matches_released_cli_and_mcp_contracts() {
 #[test]
 fn public_agent_skills_are_discoverable_safe_and_evaluated() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let specs = [
-        (
-            "using-qgh-context",
-            "references/retrieval-contract.md",
-            [
-                "query -> get -> cite",
-                "get_args",
-                "canonical URL",
-                "source version",
-                "Never automatically run `init`, `sync`, `doctor`",
-                "Use `gh` for live GitHub state and mutations",
-                "Never cite a query snippet as evidence",
-            ],
-        ),
-        (
-            "setting-up-qgh",
-            "references/setup-and-recovery.md",
-            [
-                "explicit authorization",
-                "token source reference",
-                "BM25",
-                "qgh status --json",
-                "qgh sync",
-                "qgh doctor",
-                "qgh model install",
-            ],
-        ),
-        (
-            "researching-with-qgh",
-            "references/evidence-brief.md",
-            [
-                "multiple qgh Issue and comment sources",
-                "Label retrieved facts, inference, contradictions, and unknowns",
-                "canonical URLs and source versions",
-                "freshness",
-                "coverage",
-                "current GitHub truth",
-                "Never automatically run `init`, `sync`, `doctor`",
-            ],
-        ),
+    let mut public_skill_names = fs::read_dir(root.join("skills"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("SKILL.md").is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    public_skill_names.sort();
+    assert_eq!(
+        public_skill_names,
+        ["qgh"],
+        "the public Agent Skills catalog must expose one qgh workflow"
+    );
+
+    let name = "qgh";
+    let skill_dir = root.join("skills").join(name);
+    let skill_path = skill_dir.join("SKILL.md");
+    let skill = fs::read_to_string(&skill_path)
+        .unwrap_or_else(|error| panic!("missing public skill {name}: {error}"));
+
+    assert!(skill.starts_with("---\n"), "qgh must use YAML frontmatter");
+    assert!(
+        skill.lines().any(|line| line == "name: qgh"),
+        "qgh frontmatter name must match its directory"
+    );
+    assert!(
+        skill
+            .lines()
+            .any(|line| line.starts_with("description: ") && line.len() > 13),
+        "qgh must have a non-empty trigger description"
+    );
+    assert!(
+        skill.lines().count() < 500,
+        "qgh SKILL.md should stay within progressive-disclosure guidance"
+    );
+    assert!(
+        !skill.contains("metadata:\n  internal: true"),
+        "qgh must remain public and discoverable"
+    );
+
+    let references = [
+        "references/retrieval.md",
+        "references/setup-and-recovery.md",
+        "references/evidence-research.md",
     ];
-
-    for (name, reference, required_phrases) in specs {
-        let skill_dir = root.join("skills").join(name);
-        let skill_path = skill_dir.join("SKILL.md");
-        let skill = fs::read_to_string(&skill_path)
-            .unwrap_or_else(|error| panic!("missing public skill {name}: {error}"));
-
-        assert!(
-            skill.starts_with("---\n"),
-            "{name} must use YAML frontmatter"
-        );
-        assert!(
-            skill.lines().any(|line| line == format!("name: {name}")),
-            "{name} frontmatter name must match its directory"
-        );
-        assert!(
-            skill
-                .lines()
-                .any(|line| line.starts_with("description: ") && line.len() > 13),
-            "{name} must have a non-empty trigger description"
-        );
-        assert!(
-            skill.lines().count() < 500,
-            "{name} SKILL.md should stay within progressive-disclosure guidance"
-        );
-        assert!(
-            !skill.contains("metadata:\n  internal: true"),
-            "{name} must remain public and discoverable"
-        );
-        for phrase in required_phrases {
-            assert!(
-                skill.contains(phrase),
-                "{name} missing safety contract: {phrase}"
-            );
-        }
-
+    let mut packaged_contract = skill.clone();
+    for reference in references {
         let reference_path = skill_dir.join(reference);
         assert!(
             reference_path.is_file(),
-            "{name} must ship its referenced contract: {reference}"
+            "qgh must ship its routed contract: {reference}"
         );
         assert!(
             skill.contains(&format!("]({reference})")),
-            "{name} must link to its reference"
+            "qgh must link to its routed contract: {reference}"
         );
-        let reference_content = fs::read_to_string(&reference_path).unwrap();
-
-        let eval_path = skill_dir.join("evals/evals.json");
-        let evals: Value = serde_json::from_str(
-            &fs::read_to_string(&eval_path)
-                .unwrap_or_else(|error| panic!("missing evals for {name}: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("invalid eval JSON for {name}: {error}"));
-        assert_eq!(evals["skill_name"], name);
-        let cases = evals["evals"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{name} evals must be an array"));
-        assert!(
-            cases.len() >= 3,
-            "{name} must ship at least three eval cases"
-        );
-        assert!(cases.iter().all(|case| {
-            case["prompt"]
-                .as_str()
-                .is_some_and(|value| !value.is_empty())
-                && case["expected_output"]
-                    .as_str()
-                    .is_some_and(|value| !value.is_empty())
-                && case["files"].as_array().is_some()
-        }));
-
-        let trigger_path = skill_dir.join("evals/trigger-evals.json");
-        let trigger_cases: Value = serde_json::from_str(
-            &fs::read_to_string(&trigger_path)
-                .unwrap_or_else(|error| panic!("missing trigger evals for {name}: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("invalid trigger eval JSON for {name}: {error}"));
-        let trigger_cases = trigger_cases
-            .as_array()
-            .unwrap_or_else(|| panic!("{name} trigger evals must be an array"));
-        let positives = trigger_cases
-            .iter()
-            .filter(|case| case["should_trigger"] == true)
-            .count();
-        let negatives = trigger_cases
-            .iter()
-            .filter(|case| case["should_trigger"] == false)
-            .count();
-        assert!(
-            trigger_cases.len() >= 10 && positives >= 4 && negatives >= 4,
-            "{name} must ship balanced positive and near-miss trigger evals"
-        );
-        assert!(trigger_cases.iter().all(|case| {
-            case["query"]
-                .as_str()
-                .is_some_and(|value| !value.is_empty())
-                && case["should_trigger"].is_boolean()
-        }));
-
-        for private_marker in [
-            "ghp_",
-            "gho_",
-            "ghu_",
-            "ghs_",
-            "ghr_",
-            "github_pat_",
-            "Authorization: Bearer",
-        ] {
-            assert!(
-                !skill.contains(private_marker)
-                    && !reference_content.contains(private_marker)
-                    && !fs::read_to_string(&eval_path)
-                        .unwrap()
-                        .contains(private_marker)
-                    && !fs::read_to_string(&trigger_path)
-                        .unwrap()
-                        .contains(private_marker),
-                "{name} must not contain token-like fixture content"
-            );
-        }
+        packaged_contract.push_str(&fs::read_to_string(reference_path).unwrap());
     }
 
-    let skills_lock = fs::read_to_string(root.join("skills-lock.json")).unwrap_or_default();
+    for phrase in [
+        "query -> get -> cite",
+        "get_args.source_id",
+        "canonical URL",
+        "source version",
+        "explicit authorization",
+        "token source references",
+        "BM25 remains a complete path",
+        "Never cite a query snippet as evidence",
+        "Use `gh` separately for live GitHub state and authorized mutations",
+        "Facts, inference, contradictions, and unknowns are separated",
+        "freshness",
+        "coverage",
+        "qgh sync",
+        "qgh doctor",
+        "qgh model install",
+        "local databases, search indexes",
+        "Do not copy or share those artifacts",
+        "Issue-Aware Triggering",
+        "repository-scoped `#N`",
+        "`gh issue`",
+        "live-only state",
+    ] {
+        assert!(
+            packaged_contract.contains(phrase),
+            "qgh missing routed safety contract: {phrase}"
+        );
+    }
+
+    let eval_path = skill_dir.join("evals/evals.json");
+    let eval_content = fs::read_to_string(&eval_path)
+        .unwrap_or_else(|error| panic!("missing evals for qgh: {error}"));
+    let evals: Value = serde_json::from_str(&eval_content)
+        .unwrap_or_else(|error| panic!("invalid eval JSON for qgh: {error}"));
+    assert_eq!(evals["skill_name"], "qgh");
+    let cases = evals["evals"]
+        .as_array()
+        .unwrap_or_else(|| panic!("qgh evals must be an array"));
+    assert_eq!(
+        cases.len(),
+        7,
+        "qgh must cover retrieval, research, setup, recovery, missing binary, and live Issue read/write routing"
+    );
+    assert!(cases.iter().all(|case| {
+        case["prompt"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+            && case["expected_output"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+            && case["expectations"]
+                .as_array()
+                .is_some_and(|value| !value.is_empty())
+            && case["files"].as_array().is_some()
+    }));
+    assert!(cases.iter().all(|case| {
+        let expectations = case["expectations"].as_array().unwrap();
+        ["[GATE: route]", "[GATE: authorization]", "[GATE: privacy]"]
+            .iter()
+            .all(|gate| {
+                expectations
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|expectation| expectation.starts_with(gate))
+            })
+    }));
+    let eval_contract = fs::read_to_string(skill_dir.join("evals/README.md")).unwrap();
+    for phrase in [
+        "fails when any applicable expectation",
+        "regardless of its average expectation score",
+        "Check output artifacts directly",
+        "routing decision, not proof that a qgh command should run",
+        "check_hard_gates.py",
+        "run_benchmark.py",
+        "both stock workspace layouts",
+        "before aggregation",
+    ] {
+        assert!(
+            eval_contract.contains(phrase),
+            "qgh eval contract missing hard-gate rule: {phrase}"
+        );
+    }
+    let gate_checker = fs::read_to_string(skill_dir.join("evals/check_hard_gates.py"))
+        .expect("qgh must ship an executable hard-gate postprocessor");
+    for phrase in [
+        "GATE_PREFIX = \"[GATE:\"",
+        "load_expected_gates",
+        "target_configuration in path.relative_to(workspace).parts",
+        "missing = [text for text in expected if text not in graded]",
+        "missing_evals",
+        "type(eval_id) is not int",
+        "malformed hard gate",
+        "evidence.strip()",
+        "return 0 if report[\"ok\"] else 1",
+        "report_path(grading_path, workspace)",
+    ] {
+        assert!(
+            gate_checker.contains(phrase),
+            "qgh hard-gate postprocessor missing contract: {phrase}"
+        );
+    }
+    let benchmark_wrapper = fs::read_to_string(skill_dir.join("evals/run_benchmark.py"))
+        .expect("qgh must ship a gated benchmark wrapper");
+    for phrase in [
+        "check_workspace",
+        "target_configuration",
+        "hard gates failed; benchmark aggregation blocked",
+        "scripts/aggregate_benchmark.py",
+        "benchmark[\"hard_gates\"]",
+        "skill_path = \"skills/qgh\"",
+        "find_artifact_privacy_leaks",
+        "evaluation_output_paths",
+        "baseline_configuration",
+        "artifact privacy check failed",
+    ] {
+        assert!(
+            benchmark_wrapper.contains(phrase),
+            "qgh benchmark wrapper missing contract: {phrase}"
+        );
+    }
+    assert!(
+        skill_dir.join("evals/test_hard_gates.py").is_file(),
+        "qgh must ship executable regressions for its benchmark gates"
+    );
+    let gate_tests = fs::read_to_string(skill_dir.join("evals/test_hard_gates.py"))
+        .expect("qgh must ship readable benchmark gate regressions");
+
+    let trigger_path = skill_dir.join("evals/trigger-evals.json");
+    let trigger_content = fs::read_to_string(&trigger_path)
+        .unwrap_or_else(|error| panic!("missing trigger evals for qgh: {error}"));
+    let trigger_cases: Value = serde_json::from_str(&trigger_content)
+        .unwrap_or_else(|error| panic!("invalid trigger eval JSON for qgh: {error}"));
+    let trigger_cases = trigger_cases
+        .as_array()
+        .unwrap_or_else(|| panic!("qgh trigger evals must be an array"));
+    let positives = trigger_cases
+        .iter()
+        .filter(|case| case["should_trigger"] == true)
+        .count();
+    let negatives = trigger_cases
+        .iter()
+        .filter(|case| case["should_trigger"] == false)
+        .count();
+    assert_eq!(trigger_cases.len(), 30);
+    assert_eq!(positives, 15);
+    assert_eq!(negatives, 15);
+    assert!(trigger_cases.iter().all(|case| {
+        case["query"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+            && case["should_trigger"].is_boolean()
+    }));
+
+    for private_marker in [
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "Authorization: Bearer",
+    ] {
+        assert!(
+            !packaged_contract.contains(private_marker)
+                && !eval_content.contains(private_marker)
+                && !trigger_content.contains(private_marker)
+                && !eval_contract.contains(private_marker)
+                && !gate_checker.contains(private_marker)
+                && !benchmark_wrapper.contains(private_marker)
+                && !gate_tests.contains(private_marker),
+            "qgh must not contain token-like fixture content"
+        );
+    }
+    for local_path_marker in ["/Users/", "/home/", "/private/", "/var/folders/"] {
+        assert!(
+            !packaged_contract.contains(local_path_marker)
+                && !eval_content.contains(local_path_marker)
+                && !trigger_content.contains(local_path_marker)
+                && !eval_contract.contains(local_path_marker)
+                && !gate_checker.contains(local_path_marker)
+                && !benchmark_wrapper.contains(local_path_marker)
+                && !gate_tests.contains(local_path_marker),
+            "qgh must not contain user-local path fixture content"
+        );
+    }
+
+    let skills_lock: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("skills-lock.json")).unwrap_or_else(|_| "{}".into()),
+    )
+    .unwrap();
     for public_skill in [
+        "qgh",
         "using-qgh-context",
         "setting-up-qgh",
         "researching-with-qgh",
     ] {
         assert!(
-            !skills_lock.contains(public_skill),
+            skills_lock["skills"].get(public_skill).is_none(),
             "repo-owned public skill must not be recorded as an installed dependency: {public_skill}"
         );
     }
