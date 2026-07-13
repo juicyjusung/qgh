@@ -3,6 +3,8 @@ name: loop-constraints
 description: >
   Read loop-constraints.md at the start of every run and enforce every rule.
   This skill runs BEFORE triage or any action skill. Constraints are binding.
+metadata:
+  internal: true
 user_invocable: true
 ---
 

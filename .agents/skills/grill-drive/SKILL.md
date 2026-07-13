@@ -9,6 +9,8 @@ description: >-
   consolidated session at the end. Reach for `auto` when you want an unattended first pass that never
   stops and ends with a written report. Invoke as `/grill-drive [checkpoint|batch|auto] <plan or topic>`.
   Default mode when none is given is `batch`.
+metadata:
+  internal: true
 disable-model-invocation: true
 ---
 

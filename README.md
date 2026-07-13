@@ -101,9 +101,11 @@ qgh sync --backfill --all --profile PROFILE
 
 The first command completes open coverage across the profile. After that, each
 backfill command runs one bounded historical pass. Copy the exact `next:`
-command from human output; agents should execute
-`coverage.next_action.json_command`. Repeat only while qgh recommends another
-pass. A repo-scoped sync cannot claim completion for a multi-repo profile.
+command from human output for review. An agent may execute
+`coverage.next_action.json_command` only inside an already authorized
+setup/sync task after confirming its scope and side effects; the core retrieval
+workflow only presents it. Repeat only while qgh recommends another pass. A
+repo-scoped sync cannot claim completion for a multi-repo profile.
 `qgh embed --force` is an advanced repair or full recompute command, not part
 of the normal sync workflow.
 
@@ -139,12 +141,60 @@ qgh get '<source_id>' --profile-id '<profile_id>' --json
 qgh status --json
 ```
 
-Agents should copy both fields from `data.results[].get_args`. When qgh emits
-a recommended JSON action, execute its `json_command` so `--json` is
-preserved. CLI, config, and MCP schemas are strict: unknown fields and invalid
-enum values fail instead of silently falling back. See the
+Agents should copy both fields from `data.results[].get_args`. A recommended
+JSON action is a proposal, not implicit authorization: execute its
+`json_command` only inside an already authorized operator task after reviewing
+the exact scope and side effects; otherwise present it to the user. CLI,
+config, and MCP schemas are strict: unknown fields and invalid enum values fail
+instead of silently falling back. See the
 [CLI JSON contract](docs/cli-json-contract.md) and released schemas under
 [`docs/schemas/`](docs/schemas/).
+
+## Optional Agent Skills
+
+Agent skills teach an agent when and how to use qgh; they do not install the
+qgh binary, authenticate GitHub, create a profile, download a model, or run
+`init`, `sync`, or `doctor`. Install the CLI and prepare its local snapshot
+separately using the sections above.
+
+With Node.js 18 or newer, install the core retrieval/citation workflow into the
+current project's Codex configuration:
+
+```sh
+npx skills add juicyjusung/qgh --skill using-qgh-context --agent codex
+```
+
+Two optional workflows cover explicit operator setup/recovery and multi-source
+engineering research:
+
+```sh
+npx skills add juicyjusung/qgh --skill setting-up-qgh --skill researching-with-qgh --agent codex
+```
+
+Project-local installation is the safer default because teammates can review
+the selected instructions with the project. Add `--global` only when you
+intentionally want the skill available across projects. Claude Code users can
+replace `--agent codex` with `--agent claude-code`.
+
+Always pass `--skill` so the selection is explicit. Maintainer-only workflows
+are hidden from the default catalog, but they can still be selected by name.
+Review the selected [`SKILL.md`](skills/using-qgh-context/SKILL.md) before
+installation; third-party skill review remains the user's responsibility.
+
+The public suite is role-based rather than one skill per command:
+
+| Skill | Use it for |
+| --- | --- |
+| [`using-qgh-context`](skills/using-qgh-context/SKILL.md) | Proactively retrieve historical Issue/comment evidence and preserve `query -> get -> cite`. |
+| [`setting-up-qgh`](skills/setting-up-qgh/SKILL.md) | Explicit installation, initialization, sync/backfill, model, and repair guidance with side effects shown first. |
+| [`researching-with-qgh`](skills/researching-with-qgh/SKILL.md) | Triangulate multiple historical sources for planning, debugging, architecture, and review briefs. |
+
+All three distinguish qgh's local read-only retrieval/citation layer from
+`gh`, which is the path for live GitHub truth and authorized Issue writes. The
+core skill never automatically installs qgh or runs `qgh init`, `qgh sync`,
+`qgh doctor`, model downloads, or lifecycle verification. See
+[Agent skills](docs/agent-skills.md) for selection, installation scope, safety,
+and maintainer validation.
 
 ## MCP
 

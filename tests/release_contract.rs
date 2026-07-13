@@ -2672,6 +2672,10 @@ fn readme_onboarding_matches_released_cli_and_mcp_contracts() {
         "qgh doctor",
         "qgh mcp",
         "`query`, `get`, and `status`",
+        "npx skills add juicyjusung/qgh --skill using-qgh-context --agent codex",
+        "Always pass `--skill`",
+        "qgh's local read-only retrieval/citation layer",
+        "`gh`, which is the path for live GitHub truth",
         "brew upgrade juicyjusung/tap/qgh",
         "qgh --version",
     ] {
@@ -2687,6 +2691,7 @@ fn readme_onboarding_matches_released_cli_and_mcp_contracts() {
         "docs/release-checklist.md",
         "docs/local-qwen-models.md",
         "docs/error-codes.md",
+        "docs/agent-skills.md",
     ] {
         assert!(
             readme.contains(&format!("]({relative_path})")),
@@ -2718,10 +2723,209 @@ fn readme_onboarding_matches_released_cli_and_mcp_contracts() {
         remainder = &after_start[link_end + 1..];
     }
 
-    assert!(
-        !readme.contains("npx skills add"),
-        "README must not advertise the unreleased agent-skill install path"
-    );
+    for line in readme
+        .lines()
+        .filter(|line| line.contains("npx skills add juicyjusung/qgh"))
+    {
+        assert!(
+            line.contains("--skill") || line.contains("--list"),
+            "README must never advertise a bare repository skill install: {line}"
+        );
+    }
+}
+
+#[test]
+fn public_agent_skills_are_discoverable_safe_and_evaluated() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let specs = [
+        (
+            "using-qgh-context",
+            "references/retrieval-contract.md",
+            [
+                "query -> get -> cite",
+                "get_args",
+                "canonical URL",
+                "source version",
+                "Never automatically run `init`, `sync`, `doctor`",
+                "Use `gh` for live GitHub state and mutations",
+                "Never cite a query snippet as evidence",
+            ],
+        ),
+        (
+            "setting-up-qgh",
+            "references/setup-and-recovery.md",
+            [
+                "explicit authorization",
+                "token source reference",
+                "BM25",
+                "qgh status --json",
+                "qgh sync",
+                "qgh doctor",
+                "qgh model install",
+            ],
+        ),
+        (
+            "researching-with-qgh",
+            "references/evidence-brief.md",
+            [
+                "multiple qgh Issue and comment sources",
+                "Label retrieved facts, inference, contradictions, and unknowns",
+                "canonical URLs and source versions",
+                "freshness",
+                "coverage",
+                "current GitHub truth",
+                "Never automatically run `init`, `sync`, `doctor`",
+            ],
+        ),
+    ];
+
+    for (name, reference, required_phrases) in specs {
+        let skill_dir = root.join("skills").join(name);
+        let skill_path = skill_dir.join("SKILL.md");
+        let skill = fs::read_to_string(&skill_path)
+            .unwrap_or_else(|error| panic!("missing public skill {name}: {error}"));
+
+        assert!(
+            skill.starts_with("---\n"),
+            "{name} must use YAML frontmatter"
+        );
+        assert!(
+            skill.lines().any(|line| line == format!("name: {name}")),
+            "{name} frontmatter name must match its directory"
+        );
+        assert!(
+            skill
+                .lines()
+                .any(|line| line.starts_with("description: ") && line.len() > 13),
+            "{name} must have a non-empty trigger description"
+        );
+        assert!(
+            skill.lines().count() < 500,
+            "{name} SKILL.md should stay within progressive-disclosure guidance"
+        );
+        assert!(
+            !skill.contains("metadata:\n  internal: true"),
+            "{name} must remain public and discoverable"
+        );
+        for phrase in required_phrases {
+            assert!(
+                skill.contains(phrase),
+                "{name} missing safety contract: {phrase}"
+            );
+        }
+
+        let reference_path = skill_dir.join(reference);
+        assert!(
+            reference_path.is_file(),
+            "{name} must ship its referenced contract: {reference}"
+        );
+        assert!(
+            skill.contains(&format!("]({reference})")),
+            "{name} must link to its reference"
+        );
+        let reference_content = fs::read_to_string(&reference_path).unwrap();
+
+        let eval_path = skill_dir.join("evals/evals.json");
+        let evals: Value = serde_json::from_str(
+            &fs::read_to_string(&eval_path)
+                .unwrap_or_else(|error| panic!("missing evals for {name}: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("invalid eval JSON for {name}: {error}"));
+        assert_eq!(evals["skill_name"], name);
+        let cases = evals["evals"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} evals must be an array"));
+        assert!(
+            cases.len() >= 3,
+            "{name} must ship at least three eval cases"
+        );
+        assert!(cases.iter().all(|case| {
+            case["prompt"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+                && case["expected_output"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+                && case["files"].as_array().is_some()
+        }));
+
+        let trigger_path = skill_dir.join("evals/trigger-evals.json");
+        let trigger_cases: Value = serde_json::from_str(
+            &fs::read_to_string(&trigger_path)
+                .unwrap_or_else(|error| panic!("missing trigger evals for {name}: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("invalid trigger eval JSON for {name}: {error}"));
+        let trigger_cases = trigger_cases
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} trigger evals must be an array"));
+        let positives = trigger_cases
+            .iter()
+            .filter(|case| case["should_trigger"] == true)
+            .count();
+        let negatives = trigger_cases
+            .iter()
+            .filter(|case| case["should_trigger"] == false)
+            .count();
+        assert!(
+            trigger_cases.len() >= 10 && positives >= 4 && negatives >= 4,
+            "{name} must ship balanced positive and near-miss trigger evals"
+        );
+        assert!(trigger_cases.iter().all(|case| {
+            case["query"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+                && case["should_trigger"].is_boolean()
+        }));
+
+        for private_marker in [
+            "ghp_",
+            "gho_",
+            "ghu_",
+            "ghs_",
+            "ghr_",
+            "github_pat_",
+            "Authorization: Bearer",
+        ] {
+            assert!(
+                !skill.contains(private_marker)
+                    && !reference_content.contains(private_marker)
+                    && !fs::read_to_string(&eval_path)
+                        .unwrap()
+                        .contains(private_marker)
+                    && !fs::read_to_string(&trigger_path)
+                        .unwrap()
+                        .contains(private_marker),
+                "{name} must not contain token-like fixture content"
+            );
+        }
+    }
+
+    let skills_lock = fs::read_to_string(root.join("skills-lock.json")).unwrap_or_default();
+    for public_skill in [
+        "using-qgh-context",
+        "setting-up-qgh",
+        "researching-with-qgh",
+    ] {
+        assert!(
+            !skills_lock.contains(public_skill),
+            "repo-owned public skill must not be recorded as an installed dependency: {public_skill}"
+        );
+    }
+
+    for internal_skill in [
+        ".agents/skills/grill-drive/SKILL.md",
+        ".agents/skills/issue-grill-with-docs/SKILL.md",
+        ".codex/skills/issue-triage/SKILL.md",
+        ".codex/skills/loop-budget/SKILL.md",
+        ".codex/skills/loop-constraints/SKILL.md",
+        ".codex/skills/loop-triage/SKILL.md",
+    ] {
+        let content = fs::read_to_string(root.join(internal_skill)).unwrap();
+        assert!(
+            content.contains("metadata:\n  internal: true"),
+            "maintainer-only skill must stay hidden from default public discovery: {internal_skill}"
+        );
+    }
 }
 
 #[test]

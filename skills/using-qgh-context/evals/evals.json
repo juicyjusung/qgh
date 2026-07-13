@@ -1,0 +1,42 @@
+{
+  "skill_name": "using-qgh-context",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "이 저장소에서 과거에 'query 결과는 답이 아니다'라고 결정한 근거를 qgh로 찾아줘. 원문을 연 뒤 URL, source version, freshness, coverage 한계까지 포함한 짧은 근거 메모로 정리하고 GitHub에는 접속하지 마.",
+      "expected_output": "The agent should use only local-safe qgh status/query/get JSON commands, inspect the resolved scope and snapshot limits, open the selected source through both emitted get_args values, cite the authoritative canonical URL and source version, and avoid treating a snippet as evidence.",
+      "expectations": [
+        "Uses only command -v, qgh status --json, qgh query --json, and default qgh get --json in the proposed retrieval trace",
+        "Checks the resolved profile/repo plus freshness and coverage before making an evidence claim",
+        "Uses both emitted get_args values and explicitly rejects the query snippet as citation evidence",
+        "The evidence-note format includes canonical URL, source version, freshness, coverage, and a separate inference field"
+      ],
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Issue #47 purge 설계에서 timeout이 삭제 trigger가 아닌 이유를 예전 issue와 comment에서 확인해줘. 현재 issue 상태 확인이나 수정은 하지 마.",
+      "expected_output": "The agent should retrieve historical local evidence, prefer exact issue/repo identifiers, qualify any partial or stale snapshot, separate recorded facts from inference, and not use gh, sync, doctor, verify-lifecycle, or a GitHub write operation.",
+      "expectations": [
+        "Starts with explicit issue/repository evidence and opens relied-on candidates through qgh get",
+        "Separates recorded historical facts from the agent's interpretation",
+        "Does not propose gh, sync, doctor, model install, embed, verify-lifecycle, or GitHub writes",
+        "Qualifies the conclusion with local snapshot freshness and coverage"
+      ],
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "qgh가 설치되어 있지 않은 환경에서 예전에 합의한 reranker 정책을 찾아서 인용해줘.",
+      "expected_output": "The agent should detect that qgh is unavailable, stop without installing it or inventing evidence, and provide an explicit setup handoff. It must not automatically run init, sync, doctor, model installation, or any network operation.",
+      "expectations": [
+        "Stops historical retrieval when command -v qgh shows qgh is unavailable",
+        "Does not invent, quote, or cite reranker evidence that was not retrieved",
+        "Does not install qgh or run init, sync, doctor, embed, model install, or network operations",
+        "Provides a clearly labeled explicit setup handoff",
+        "Does not claim that qgh executable absence proves no local snapshot files exist"
+      ],
+      "files": []
+    }
+  ]
+}

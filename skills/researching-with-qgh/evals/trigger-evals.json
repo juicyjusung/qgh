@@ -1,0 +1,14 @@
+[
+  {"query":"hybrid search 설계 결정과 release blocker를 여러 issue에서 조사해 구현 브리프를 만들어줘.","should_trigger":true},
+  {"query":"동시 query/sync 버그의 과거 논의를 추적해서 root-cause 가설과 검증 계획을 세워줘.","should_trigger":true},
+  {"query":"상충하는 issue comment들을 대조해 최종 제품 결정을 정리해줘.","should_trigger":true},
+  {"query":"이 architecture review 전에 과거 ADR 논의와 issue 근거를 종합해줘.","should_trigger":true},
+  {"query":"purge와 publication snapshot 관련 여러 기록을 조사해서 위험 목록을 만들어줘.","should_trigger":true},
+  {"query":"README 역할 설명을 위해 qgh와 gh에 대한 기존 결정들을 evidence brief로 만들어줘.","should_trigger":true},
+  {"query":"Issue #47 본문 하나만 열어서 URL과 함께 보여줘.","should_trigger":false},
+  {"query":"Issue #47이 오늘도 열려 있는지 실시간 확인해줘.","should_trigger":false},
+  {"query":"qgh를 설치하고 profile을 초기화해줘.","should_trigger":false},
+  {"query":"최신 reranker 논문과 leaderboard를 웹에서 조사해줘.","should_trigger":false},
+  {"query":"이 컴파일 에러의 코드만 수정해줘.","should_trigger":false},
+  {"query":"repository에서 SourceVersion struct 정의를 찾아줘.","should_trigger":false}
+]
