@@ -21,6 +21,7 @@ mod paths;
 mod qwen;
 mod resolution;
 mod store;
+mod terminal;
 mod time;
 
 /// Internal release/live-qrels adapters. Not a CLI, MCP, or config surface.

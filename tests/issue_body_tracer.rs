@@ -406,17 +406,56 @@ fn malformed_tantivy_query_is_content_free_across_cli_and_mcp_errors() {
 #[test]
 fn normal_query_fails_closed_when_active_tantivy_artifact_is_missing() {
     let fixture = TestFixture::new("query-missing-active-tantivy");
-    let server = FakeGitHub::start(issue_payload_with_pr());
+    let server = RateLimitFakeGitHub::start();
     fixture.write_config(&server.base_url);
     assert_success(&fixture.qgh(["sync", "--json"]));
     fixture.remove_active_tantivy_generation();
 
     let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
-    assert!(!query.status.success());
+    assert_eq!(query.status.code(), Some(6));
     assert_eq!(
         stdout_json(&query)["error"]["code"],
         "publication.tantivy_artifact_not_ready"
     );
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert!(status_json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| { warning["code"] == "publication.tantivy_artifact_not_ready" }));
+
+    let human_status = fixture.qgh(["status"]);
+    assert_success(&human_status);
+    let human_stdout = stdout_text(&human_status);
+    assert!(human_stdout.contains("qgh status — search blocked"));
+    assert!(human_stdout.contains("search: blocked until the local index is rebuilt"));
+    assert!(human_stdout.contains("next: qgh sync --all --profile work"));
+
+    server.set_mode(RATE_LIMIT_PRIMARY);
+    let backoff = fixture.qgh(["sync", "--json"]);
+    assert_eq!(backoff.status.code(), Some(5));
+    let backoff_json = stdout_json(&backoff);
+    assert_eq!(
+        backoff_json["error"]["details"]["local_query_available"],
+        false
+    );
+    assert_eq!(
+        backoff_json["error"]["details"]["local_retrieval_available"],
+        false
+    );
+    assert!(backoff_json["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .contains("Local query is not currently ready"));
+
+    let blocked_backoff_status = fixture.qgh(["status"]);
+    assert_success(&blocked_backoff_status);
+    let blocked_backoff_stdout = stdout_text(&blocked_backoff_status);
+    assert!(blocked_backoff_stdout.contains("qgh status — search blocked"));
+    assert!(blocked_backoff_stdout.contains("next: retry now: qgh sync --all --profile work"));
 }
 
 #[test]
@@ -428,7 +467,7 @@ fn exact_query_fails_closed_but_get_survives_when_active_tantivy_is_missing() {
     fixture.remove_active_tantivy_generation();
 
     let exact = fixture.qgh(["query", "https://github.com/owner/repo/issues/42", "--json"]);
-    assert!(!exact.status.success());
+    assert_eq!(exact.status.code(), Some(6));
     assert_eq!(
         stdout_json(&exact)["error"]["code"],
         "publication.tantivy_artifact_not_ready"
@@ -624,9 +663,8 @@ fn sync_reports_human_progress_on_stderr_without_polluting_stdout() {
     assert!(stdout.contains("synced repo scope: all profile repos"));
     assert!(stdout.contains("issues: fetched 1, upserted 1, skipped PRs 1"));
     assert!(stdout.contains("comments: fetched 1, upserted 1"));
-    assert!(stdout.contains("backoff: none"));
     assert!(stdout.contains("active index generation: 1"));
-    assert!(stdout.contains("next: qgh query <terms> --profile work"));
+    assert!(stdout.contains("next: qgh sync --backfill --all --profile work"));
     let stderr = stderr_text(&sync);
     assert!(stderr.contains("qgh sync: fetching GitHub issues/comments repos=1"));
     assert!(stderr.contains("qgh sync: fetching repo=owner/repo"));
@@ -643,6 +681,22 @@ fn sync_reports_human_progress_on_stderr_without_polluting_stdout() {
     );
     assert!(stdout_text(&quiet).contains("qgh sync complete"));
     assert!(!stdout_text(&quiet).starts_with('{'));
+
+    let mut forced_terminal = fixture.base_command();
+    let forced_quiet = forced_terminal
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .env("TERM", "xterm-256color")
+        .env("LANG", "en_US.UTF-8")
+        .args(["--profile", "work", "sync", "--quiet"])
+        .output()
+        .unwrap();
+    assert_success(&forced_quiet);
+    let forced_quiet_stdout = stdout_text(&forced_quiet);
+    assert!(forced_quiet_stdout.starts_with("qgh sync complete"));
+    assert!(!forced_quiet_stdout.contains('\u{1b}'));
+    assert!(!forced_quiet_stdout.contains('✓'));
+    assert!(stderr_text(&forced_quiet).is_empty());
 
     let json = fixture.qgh(["sync", "--json"]);
     assert_success(&json);
@@ -661,7 +715,7 @@ fn non_json_cli_commands_print_human_summaries_without_weakening_json_contract()
     assert_success(&query);
     let query_stdout = stdout_text(&query);
     assert!(!query_stdout.starts_with('{'));
-    assert!(query_stdout.contains("qgh query results"));
+    assert!(query_stdout.contains("qgh query — 1 source candidates"));
     assert!(query_stdout.contains("These are source candidates, not answers"));
     assert!(query_stdout.contains("Snippets are previews, not citation evidence"));
     assert!(
@@ -670,7 +724,7 @@ fn non_json_cli_commands_print_human_summaries_without_weakening_json_contract()
 
     let search = fixture.qgh(["search", "BM25 tracer"]);
     assert_success(&search);
-    assert!(stdout_text(&search).contains("qgh query results"));
+    assert!(stdout_text(&search).contains("qgh query — 1 source candidates"));
 
     let get = fixture.qgh(["get", "qgh://github.com/issue/I_kwDOISSUE1"]);
     assert_success(&get);
@@ -700,7 +754,7 @@ fn non_json_cli_commands_print_human_summaries_without_weakening_json_contract()
     assert!(status_stdout.contains("DB path:"));
     assert!(status_stdout.contains("Tantivy index path:"));
     assert!(status_stdout.contains("default sync scope: all repos in the selected profile"));
-    assert!(status_stdout.contains("qgh sync --all"));
+    assert!(status_stdout.contains("next: qgh sync --backfill --all --profile work"));
 
     let doctor = fixture.qgh(["doctor"]);
     assert_success(&doctor);
@@ -715,6 +769,136 @@ fn non_json_cli_commands_print_human_summaries_without_weakening_json_contract()
     assert_success(&json_query);
     assert_eq!(stdout_json(&json_query)["schema_version"], "qgh.v1");
     assert!(stderr_text(&json_query).is_empty());
+}
+
+#[test]
+fn terminal_decoration_is_opt_in_and_no_color_is_authoritative() {
+    let fixture = TestFixture::new("terminal-decoration");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let mut decorated_command = fixture.base_command();
+    let decorated = decorated_command
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .env("TERM", "xterm-256color")
+        .env("LANG", "en_US.UTF-8")
+        .args(["--profile", "work", "status"])
+        .output()
+        .unwrap();
+    assert_success(&decorated);
+    let decorated_stdout = stdout_text(&decorated);
+    assert!(
+        decorated_stdout.contains("\u{1b}["),
+        "decorated stdout:\n{decorated_stdout}"
+    );
+    assert!(decorated_stdout.contains("✓ qgh status"));
+    assert!(decorated_stdout.contains("→ qgh sync --backfill --all --profile work"));
+
+    let mut plain_command = fixture.base_command();
+    let plain = plain_command
+        .env("CLICOLOR_FORCE", "1")
+        .env("NO_COLOR", "1")
+        .env("TERM", "xterm-256color")
+        .env("LANG", "en_US.UTF-8")
+        .args(["--profile", "work", "status"])
+        .output()
+        .unwrap();
+    assert_success(&plain);
+    let plain_stdout = stdout_text(&plain);
+    assert!(!plain_stdout.contains("\u{1b}["));
+    assert!(plain_stdout.contains("✓ qgh status — search ready"));
+    assert!(plain_stdout.contains("→ qgh sync --backfill --all --profile work"));
+
+    let captured = fixture.qgh(["status"]);
+    assert_success(&captured);
+    assert!(!stdout_text(&captured).contains("\u{1b}["));
+
+    let mut ascii_command = fixture.base_command();
+    let ascii = ascii_command
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .env("TERM", "xterm-256color")
+        .env("LC_ALL", "C")
+        .args(["--profile", "work", "status"])
+        .output()
+        .unwrap();
+    assert_success(&ascii);
+    assert!(stdout_text(&ascii).contains("[ok] qgh status"));
+    assert!(stdout_text(&ascii).contains("-> qgh sync --backfill --all --profile work"));
+
+    let mut json_command = fixture.base_command();
+    let json = json_command
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .env("TERM", "xterm-256color")
+        .args(["--profile", "work", "status", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&json);
+    assert_eq!(stdout_json(&json)["schema_version"], "qgh.v1");
+    assert!(!stdout_text(&json).contains("\u{1b}["));
+    assert!(stderr_text(&json).is_empty());
+
+    let mut dumb_command = fixture.base_command();
+    let dumb = dumb_command
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .env("TERM", "dumb")
+        .args(["--profile", "work", "status"])
+        .output()
+        .unwrap();
+    assert_success(&dumb);
+    assert!(!stdout_text(&dumb).contains("\u{1b}["));
+    assert!(!stdout_text(&dumb).contains('✓'));
+    assert!(stdout_text(&dumb).contains("next: qgh sync --backfill --all --profile work"));
+
+    let never_synced_fixture = TestFixture::new("terminal-decoration-not-ready");
+    never_synced_fixture.write_config(&server.base_url);
+    let mut not_ready_command = never_synced_fixture.base_command();
+    let not_ready = not_ready_command
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .env("TERM", "xterm-256color")
+        .env("LANG", "en_US.UTF-8")
+        .args(["--profile", "work", "status"])
+        .output()
+        .unwrap();
+    assert_success(&not_ready);
+    assert!(stdout_text(&not_ready).contains("! qgh status — search not ready"));
+}
+
+#[test]
+fn terminal_decoration_preserves_authoritative_get_body_bytes() {
+    let fixture = TestFixture::new("terminal-get-source-fidelity");
+    let server = FakeGitHub::start(issue_payload_with_terminal_control_words());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let mut command = fixture.base_command();
+    let get = command
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .env("TERM", "xterm-256color")
+        .env("LANG", "en_US.UTF-8")
+        .args([
+            "--profile",
+            "work",
+            "get",
+            "qgh://github.com/issue/I_kwDOISSUE1",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&get);
+    let stdout = stdout_text(&get);
+    let body = stdout.split_once("body:\n").unwrap().1;
+    assert_eq!(
+        body,
+        "first line\r\nnext: reproduce this\r\nrepair: preserve this\r\nlast line\n"
+    );
+    assert!(!body.contains("\u{1b}["));
+    assert!(!body.contains('→'));
 }
 
 #[test]
@@ -1023,6 +1207,20 @@ fn repo_policy_defaults_cli_query_to_current_worktree_repo_scope() {
         .map(|result| result["repo"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert_eq!(override_results, ["other/repo"]);
+
+    server.clear_requests();
+    let explicit_sync = fixture.qgh(["sync", "--repo", "other/repo", "--json"]);
+    assert_success(&explicit_sync);
+    let explicit_sync_json = stdout_json(&explicit_sync);
+    assert_eq!(explicit_sync_json["meta"]["repo"], "other/repo");
+    assert_eq!(explicit_sync_json["meta"]["repo_source"], "cli");
+    let requests = server.requests();
+    assert!(requests
+        .iter()
+        .any(|request| request.starts_with("GET /repos/other/repo/issues?")));
+    assert!(requests
+        .iter()
+        .all(|request| !request.contains("/repos/owner/repo/")));
 
     let hard_issue_filter = fixture.qgh_in(&nested_worktree_dir, ["query", "#7", "--json"]);
     assert_success(&hard_issue_filter);
@@ -2112,6 +2310,21 @@ fn init_without_json_prints_human_summary_for_profile_and_repo_policy_paths() {
 }
 
 #[test]
+fn init_human_warnings_use_stderr_without_polluting_summary_stdout() {
+    let fixture = TestFixture::new("init-human-warning-stream");
+    let worktree = fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let output = fixture.qgh_without_profile_in(&worktree, ["init", "repo"]);
+    assert_success(&output);
+    let stdout = stdout_text(&output);
+    let stderr = stderr_text(&output);
+    assert!(stdout.contains("qgh init repo complete"));
+    assert!(stdout.contains("profile check: not_checked"));
+    assert!(!stdout.contains("config.profile_not_checked"));
+    assert!(stderr.contains("warning [config.profile_not_checked]"));
+}
+
+#[test]
 fn init_repo_inputs_with_secret_suffixes_fail_content_free() {
     let fixture = TestFixture::new("init-secret-repo-inputs");
     let worktree = fixture.init_git_worktree();
@@ -2232,7 +2445,8 @@ fn init_warns_when_repo_already_allowlisted_in_other_profile() {
         ["--profile", "fresh", "init", "--yes", "--force"],
     );
     assert_success(&human_init);
-    assert!(stdout_text(&human_init).contains("config.duplicate_repo_allowlist"));
+    assert!(!stdout_text(&human_init).contains("config.duplicate_repo_allowlist"));
+    assert!(stderr_text(&human_init).contains("warning [config.duplicate_repo_allowlist]"));
 }
 
 #[test]
@@ -3372,10 +3586,19 @@ fn corrupt_embedding_fingerprint_degrades_status_and_query_without_breaking_get(
     assert_eq!(
         json_object_keys(&status_json["warnings"][0]),
         BTreeSet::from([
+            "action".to_string(),
             "code".to_string(),
             "message".to_string(),
             "severity".to_string(),
         ])
+    );
+    assert_eq!(
+        status_json["warnings"][0]["action"],
+        json!({
+            "reason": "embedding_rebuild_required",
+            "command": "qgh embed --force --profile work",
+            "json_command": "qgh embed --force --profile work --json"
+        })
     );
 
     let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
@@ -3389,10 +3612,19 @@ fn corrupt_embedding_fingerprint_degrades_status_and_query_without_breaking_get(
     assert_eq!(
         json_object_keys(&query_json["warnings"][0]),
         BTreeSet::from([
+            "action".to_string(),
             "code".to_string(),
             "message".to_string(),
             "severity".to_string(),
         ])
+    );
+    assert_eq!(
+        query_json["warnings"][0]["action"],
+        json!({
+            "reason": "embedding_rebuild_required",
+            "command": "qgh embed --force --profile work",
+            "json_command": "qgh embed --force --profile work --json"
+        })
     );
 
     let get = fixture.qgh(["get", source_id, "--json"]);
@@ -3434,10 +3666,20 @@ fn unreadable_vector_table_degrades_status_and_query_without_breaking_get() {
         assert_eq!(
             json_object_keys(&status_json["warnings"][0]),
             BTreeSet::from([
+                "action".to_string(),
                 "code".to_string(),
                 "message".to_string(),
                 "severity".to_string(),
             ])
+        );
+        assert_eq!(
+            status_json["warnings"][0]["action"],
+            json!({
+                "reason": "embedding_rebuild_required",
+                "command": "qgh embed --force --profile work",
+                "json_command": "qgh embed --force --profile work --json"
+            }),
+            "scenario={scenario}: {status_json}"
         );
 
         let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
@@ -3450,6 +3692,15 @@ fn unreadable_vector_table_degrades_status_and_query_without_breaking_get() {
         assert_eq!(
             warning_codes(&query_json),
             vec!["embedding.artifact_corrupt"],
+            "scenario={scenario}: {query_json}"
+        );
+        assert_eq!(
+            query_json["warnings"][0]["action"],
+            json!({
+                "reason": "embedding_rebuild_required",
+                "command": "qgh embed --force --profile work",
+                "json_command": "qgh embed --force --profile work --json"
+            }),
             "scenario={scenario}: {query_json}"
         );
 
@@ -3683,6 +3934,39 @@ quantization = "none"
     assert!(!stdout_text(&output).contains(private_marker));
     assert!(!stderr_text(&output).contains(private_marker));
 
+    let human =
+        fixture.qgh_with_document_vectors(["sync"], &json!({ private_marker: [0.1, 0.2, 0.3] }));
+    assert_success(&human);
+    let human_stdout = stdout_text(&human);
+    assert!(human_stdout.contains("qgh sync complete — search ready with limitations"));
+    assert!(human_stdout.contains("search: BM25 ready; semantic unavailable"));
+    assert!(human_stdout.contains("next: qgh sync --backfill --all --profile work"));
+    assert!(!human_stdout.contains("repair: qgh embed --force --profile work"));
+    let human_stderr = stderr_text(&human);
+    assert!(human_stderr.contains("warning [embedding.generation_invalid_spec]"));
+    assert!(human_stderr.contains("BM25 index refresh remains available"));
+    assert!(!human_stdout.contains(private_marker));
+    assert!(!human_stderr.contains(private_marker));
+
+    let mut quiet_warning_command = fixture.base_command();
+    let quiet_warning = quiet_warning_command
+        .env(
+            "QGH_TEST_EMBEDDING_DOCUMENT_VECTORS",
+            json!({ private_marker: [0.1, 0.2, 0.3] }).to_string(),
+        )
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .env("TERM", "xterm-256color")
+        .env("LANG", "en_US.UTF-8")
+        .args(["--profile", "work", "sync", "--quiet"])
+        .output()
+        .unwrap();
+    assert_success(&quiet_warning);
+    let quiet_warning_stderr = stderr_text(&quiet_warning);
+    assert!(quiet_warning_stderr.contains("warning [embedding.generation_invalid_spec]"));
+    assert!(!quiet_warning_stderr.contains('\u{1b}'));
+    assert!(!stdout_text(&quiet_warning).contains('\u{1b}'));
+
     let query = fixture.qgh(["query", "BM25 tracer", "--json"]);
     assert_success(&query);
     let query_json = stdout_json(&query);
@@ -3780,6 +4064,130 @@ fn embedding_config_without_vector_artifacts_keeps_bm25_query_available() {
         request_count_after_sync,
         "local query must not make GitHub or model acquisition requests"
     );
+}
+
+#[cfg(all(feature = "vector-search", feature = "fastembed-provider"))]
+#[test]
+fn missing_qwen_embedding_model_guides_install_across_sync_and_status() {
+    let fixture = TestFixture::new("qwen-model-install-action");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        r#"
+provider = "local"
+model = "qwen3-embedding-0.6b"
+device = "auto"
+"#,
+    );
+
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+    let sync_json = stdout_json(&sync);
+    let warning = sync_json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|warning| warning["code"] == "embedding.model_not_installed")
+        .unwrap_or_else(|| panic!("missing Qwen model warning: {sync_json}"));
+    assert_eq!(
+        warning["action"],
+        json!({
+            "reason": "embedding_model_not_installed",
+            "command": "qgh model install qwen3-embedding-0.6b",
+            "json_command": "qgh model install qwen3-embedding-0.6b --json"
+        })
+    );
+
+    let human_sync = fixture.qgh(["sync"]);
+    assert_success(&human_sync);
+    assert!(stderr_text(&human_sync).contains("qgh model install qwen3-embedding-0.6b"));
+    assert!(!stdout_text(&human_sync).contains("repair: qgh embed --force"));
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(
+        status_json["data"]["embedding"]["repair_action"],
+        warning["action"]
+    );
+    assert_eq!(
+        status_json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|warning| warning["code"] == "embedding.coverage_missing")
+            .unwrap()["action"],
+        warning["action"]
+    );
+
+    let human_status = fixture.qgh(["status"]);
+    assert_success(&human_status);
+    assert!(stderr_text(&human_status).contains("qgh model install qwen3-embedding-0.6b"));
+}
+
+#[cfg(all(feature = "vector-search", feature = "fastembed-provider"))]
+#[test]
+fn corrupt_qwen_embedding_model_guides_reinstall_across_sync_and_status() {
+    let fixture = TestFixture::new("qwen-model-reinstall-action");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config_with_embedding(
+        &server.base_url,
+        r#"
+provider = "local"
+model = "qwen3-embedding-0.6b"
+device = "auto"
+"#,
+    );
+    let private_marker = "PRIVATE_CORRUPT_QWEN_SNAPSHOT_91";
+    let snapshot = fixture
+        .cache_home
+        .join("qgh/prepared-qwen-models/qwen3-embedding-0.6b");
+    fs::create_dir_all(&snapshot).unwrap();
+    fs::write(snapshot.join("manifest.json"), private_marker).unwrap();
+
+    let sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&sync);
+    let sync_json = stdout_json(&sync);
+    let warning = sync_json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|warning| warning["code"] == "embedding.qwen_snapshot_invalid")
+        .unwrap_or_else(|| panic!("missing corrupt Qwen warning: {sync_json}"));
+    let expected_action = json!({
+        "reason": "embedding_model_invalid",
+        "command": "qgh model install qwen3-embedding-0.6b",
+        "json_command": "qgh model install qwen3-embedding-0.6b --json"
+    });
+    assert_eq!(warning["action"], expected_action);
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["embedding"]["state"], "corrupt");
+    assert_eq!(
+        status_json["data"]["embedding"]["repair_action"],
+        expected_action
+    );
+    assert_eq!(status_json["warnings"][0]["action"], expected_action);
+    assert!(!status_json.to_string().contains(private_marker));
+
+    let embed = fixture.qgh(["embed", "--force", "--json"]);
+    assert_eq!(embed.status.code(), Some(2));
+    let embed_json = stdout_json(&embed);
+    assert_eq!(
+        embed_json["error"]["code"],
+        "embedding.qwen_snapshot_invalid"
+    );
+    assert_eq!(
+        embed_json["error"]["details"]["repair_action"],
+        expected_action
+    );
+    assert!(embed_json["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .contains("qgh model install qwen3-embedding-0.6b"));
+    assert!(!embed_json.to_string().contains(private_marker));
 }
 
 #[test]
@@ -3890,18 +4298,29 @@ device = "auto"
     let reranked_json = stdout_json(&reranked);
 
     assert_eq!(reranked_json["data"]["results"], baseline_results);
+    assert_eq!(reranked_json["data"]["rerank"]["requested"], true);
+    assert_eq!(reranked_json["data"]["rerank"]["applied"], false);
     assert_eq!(
-        reranked_json["data"]["rerank"],
-        json!({
-            "requested": true,
-            "applied": false,
-            "reason": "model_not_installed"
-        })
+        reranked_json["data"]["rerank"]["reason"],
+        "model_not_installed"
     );
     assert_eq!(
         warning_codes(&reranked_json),
         vec!["reranker.model_not_installed"]
     );
+    let expected_action = json!({
+        "reason": "reranker_model_not_installed",
+        "command": "qgh model install qwen3-reranker-0.6b",
+        "json_command": "qgh model install qwen3-reranker-0.6b --json"
+    });
+    assert_eq!(
+        reranked_json["data"]["rerank"]["repair_action"],
+        expected_action
+    );
+    assert_eq!(reranked_json["warnings"][0]["action"], expected_action);
+    let human = fixture.qgh(["query", "BM25 tracer", "--rerank"]);
+    assert_success(&human);
+    assert!(stderr_text(&human).contains("qgh model install qwen3-reranker-0.6b"));
     assert_eq!(
         server.request_count(),
         request_count_after_sync,
@@ -3938,6 +4357,13 @@ device = "auto"
     assert_eq!(output["data"]["results"], baseline);
     assert_eq!(output["data"]["rerank"]["reason"], "model_corrupt");
     assert_eq!(warning_codes(&output), vec!["reranker.model_corrupt"]);
+    let expected_action = json!({
+        "reason": "reranker_model_invalid",
+        "command": "qgh model install qwen3-reranker-0.6b",
+        "json_command": "qgh model install qwen3-reranker-0.6b --json"
+    });
+    assert_eq!(output["data"]["rerank"]["repair_action"], expected_action);
+    assert_eq!(output["warnings"][0]["action"], expected_action);
     assert!(!serde_json::to_string(&output)
         .unwrap()
         .contains("private malformed payload"));
@@ -4615,8 +5041,16 @@ fn force_embed_uses_local_snapshot_without_advancing_remote_freshness() {
     );
 
     let idempotent_embed =
-        fixture.qgh_with_document_vectors(["embed", "--force", "--json"], &document_vectors);
+        fixture.qgh_with_document_vectors(["embed", "--force"], &document_vectors);
     assert_success(&idempotent_embed);
+    let embed_stdout = stdout_text(&idempotent_embed);
+    assert!(embed_stdout.contains("text chunks rebuilt: 0"));
+    assert!(embed_stdout.contains("vectors generated: 2"));
+    assert!(!embed_stdout.contains("chunks: refreshed"));
+    let embed_stderr = stderr_text(&idempotent_embed);
+    assert!(embed_stderr.contains("qgh embed: generating vectors total=2"));
+    assert!(embed_stderr.contains("qgh embed: generated vectors=2/2"));
+    assert!(!embed_stderr.contains("BM25 issue body tracer"));
     assert_eq!(
         fixture.sqlite_chunk_ids_for_source(issue_source_id),
         repaired_chunk_ids
@@ -4874,7 +5308,7 @@ device = "auto"
 
 #[cfg(feature = "fastembed-provider")]
 #[test]
-fn qwen_status_skips_artifact_validation_while_doctor_keeps_it_explicit() {
+fn qwen_status_checks_snapshot_layout_while_doctor_keeps_full_validation_explicit() {
     let fixture = TestFixture::new("qwen-status-no-artifact-validation");
     let server = FakeGitHub::start(issue_payload_with_pr());
     fixture.write_config(&server.base_url);
@@ -4902,7 +5336,7 @@ device = "auto"
 
     assert_success(&status);
     let status_json = stdout_json(&status);
-    assert_eq!(status_json["data"]["embedding"]["state"], "missing");
+    assert_eq!(status_json["data"]["embedding"]["state"], "corrupt");
     let status_output = format!("{}{}", stdout_text(&status), stderr_text(&status));
     assert!(!status_output.contains("private malformed model marker"));
     assert_eq!(server.request_count(), requests_before_local_reads);
@@ -4944,7 +5378,8 @@ fn model_install_cli_rejects_unknown_presets_before_profile_resolution() {
 fn bm25_binary_reports_unavailable_model_installer_without_resolving_a_profile() {
     let fixture = TestFixture::new("model-install-bm25-binary");
 
-    let output = fixture.qgh(["model", "install", "qwen3-embedding-0.6b", "--json"]);
+    let output =
+        fixture.qgh_without_profile(["model", "install", "qwen3-embedding-0.6b", "--json"]);
 
     assert_eq!(output.status.code(), Some(2));
     let output_json = stdout_json(&output);
@@ -5014,6 +5449,17 @@ fn coverage_metadata_surfaces_partial_and_warns_on_no_result() {
     );
     assert!(status_json["data"]["coverage"]["recent_bootstrap_floor"].is_string());
 
+    let requests_before_human_status = server.request_count();
+    let human_status = fixture.qgh(["status"]);
+    assert_success(&human_status);
+    assert_eq!(server.request_count(), requests_before_human_status);
+    let human_status = stdout_text(&human_status);
+    assert!(human_status.contains("qgh status — search ready"));
+    assert!(human_status.contains("search: BM25 ready; semantic not configured"));
+    assert!(human_status.contains("coverage: partial; historical coverage incomplete"));
+    assert!(human_status.contains("next: qgh sync --backfill --all --profile work"));
+    assert!(!human_status.contains("next: qgh sync --all"));
+
     // a no-result query on a partial corpus gets a strong coverage warning.
     let empty = fixture.qgh(["query", "zzznomatchqgh", "--json"]);
     assert_success(&empty);
@@ -5027,6 +5473,17 @@ fn coverage_metadata_surfaces_partial_and_warns_on_no_result() {
         .find(|warning| warning["code"] == "coverage.partial_no_result")
         .expect("partial coverage no-result warning");
     assert_eq!(coverage_warning["severity"], "warn_strong");
+
+    let empty_human_output = fixture.qgh(["query", "zzznomatchqgh"]);
+    assert_success(&empty_human_output);
+    let empty_human = stdout_text(&empty_human_output);
+    assert!(empty_human.contains("qgh query — 0 source candidates"));
+    assert!(empty_human.contains("coverage: partial; historical coverage incomplete"));
+    assert!(empty_human.contains("No matches in the current partial corpus."));
+    assert!(empty_human.contains("next: qgh sync --backfill --all --profile work"));
+    assert!(
+        stderr_text(&empty_human_output).contains("strong warning [coverage.partial_no_result]")
+    );
 
     // an exact-locator no-result on the same partial corpus must NOT fire the
     // FTS coverage backfill warning: the locator was filtered/unresolved, not a
@@ -5051,7 +5508,8 @@ fn coverage_metadata_surfaces_partial_and_warns_on_no_result() {
          VALUES (1, 1, 1)
          ON CONFLICT(id) DO UPDATE SET
             open_backfill_complete = 1,
-            historical_backfill_complete = 1",
+            historical_backfill_complete = 1,
+            historical_scope_fingerprint = open_scope_fingerprint",
         [],
     )
     .unwrap();
@@ -5115,6 +5573,19 @@ fn sync_if_stale_skips_when_fresh_and_runs_when_stale() {
     let skipped_json = stdout_json(&skipped);
     assert_eq!(skipped_json["data"]["sync_state"], "skipped_fresh");
     assert_eq!(skipped_json["data"]["sync"]["max_age_seconds"], 1800);
+
+    let requests_before_human_skip = server.request_count();
+    let human_skip = fixture.qgh(["sync", "--if-stale", "--max-age", "30m"]);
+    assert_success(&human_skip);
+    assert_eq!(server.request_count(), requests_before_human_skip);
+    let human_stdout = stdout_text(&human_skip);
+    assert!(human_stdout.contains("qgh sync skipped — local snapshot is fresh"));
+    assert!(human_stdout.contains("repo scope: all profile repos"));
+    assert!(human_stdout.contains("network: skipped; no GitHub request was needed"));
+    assert!(human_stdout.contains("snapshot age: "));
+    assert!(human_stdout.contains("max age: 1800 seconds"));
+    assert!(human_stdout.contains("next: qgh sync --backfill --all --profile work"));
+    assert!(!human_stdout.contains("n/a"));
 
     // Age the snapshot past max-age: --if-stale now runs a real sync.
     fixture.set_last_sync_age_seconds(3_600);
@@ -5412,14 +5883,15 @@ fn backfill_walks_history_and_completes_coverage() {
     assert_eq!(after_live["data"]["coverage"]["mode"], "partial");
 
     // Backfill walks history to the end and completes historical coverage.
-    let backfill = fixture.qgh(["sync", "--backfill", "--max-requests", "50", "--json"]);
+    let backfill = fixture.qgh(["sync", "--backfill", "--max-requests", "50"]);
     assert_success(&backfill);
-    let backfill_json = stdout_json(&backfill);
-    assert_eq!(backfill_json["data"]["backfill"]["reached_end"], true);
-    assert_eq!(
-        backfill_json["data"]["backfill"]["historical_backfill_complete"],
-        true
-    );
+    let backfill_stdout = stdout_text(&backfill);
+    assert!(backfill_stdout.contains("qgh historical backfill pass complete"));
+    assert!(backfill_stdout.contains("fetched: issues 1, comments 1, skipped PRs 1"));
+    assert!(backfill_stdout.contains("coverage: complete"));
+    assert!(backfill_stdout.contains("history cursor:"));
+    assert!(backfill_stdout.contains("next: qgh query <terms> --profile work"));
+    assert!(!backfill_stdout.contains("fetched -"));
 
     // Coverage now derives to complete (open + historical both done).
     let after_backfill = stdout_json(&fixture.qgh(["status", "--json"]));
@@ -5429,6 +5901,173 @@ fn backfill_walks_history_and_completes_coverage() {
     );
     assert_eq!(after_backfill["data"]["coverage"]["mode"], "complete");
     assert!(after_backfill["data"]["coverage"]["history_cursor"].is_string());
+}
+
+#[test]
+fn single_repo_worktree_sync_and_backfill_reach_complete_coverage() {
+    let fixture = TestFixture::new("single-repo-worktree-coverage");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    let worktree = fixture.init_git_worktree_with_repo_policy("owner/repo");
+
+    assert_success(&fixture.qgh_in(&worktree, ["sync", "--json"]));
+    let after_live = stdout_json(&fixture.qgh_in(&worktree, ["status", "--json"]));
+    assert_eq!(
+        after_live["data"]["coverage"]["open_backfill_complete"],
+        true
+    );
+    assert_eq!(
+        after_live["data"]["coverage"]["next_action"]["command"],
+        "qgh sync --backfill --all --profile work"
+    );
+
+    let backfill = fixture.qgh_in(&worktree, ["sync", "--backfill", "--all"]);
+    assert_success(&backfill);
+    let backfill_stdout = stdout_text(&backfill);
+    assert!(backfill_stdout.contains("coverage: complete"));
+    assert!(backfill_stdout.contains("open coverage complete: true"));
+    assert!(backfill_stdout.contains("historical coverage complete: true"));
+    assert!(backfill_stdout.contains("next: qgh query <terms> --profile work"));
+
+    let complete = stdout_json(&fixture.qgh_in(&worktree, ["status", "--json"]));
+    assert_eq!(complete["data"]["coverage"]["mode"], "complete");
+    assert_eq!(complete["data"]["coverage"]["next_action"], Value::Null);
+}
+
+#[test]
+fn repo_scoped_live_sync_guides_full_profile_coverage_before_backfill() {
+    let fixture = TestFixture::new("repo-scoped-open-coverage-action");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    let worktree = fixture.init_git_worktree_with_repo_policy("owner/repo");
+
+    assert_success(&fixture.qgh_in(&worktree, ["sync", "--json"]));
+    let status = fixture.qgh_in(&worktree, ["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(
+        status_json["data"]["coverage"]["open_backfill_complete"],
+        false
+    );
+    assert_eq!(
+        status_json["data"]["coverage"]["next_action"]["command"],
+        "qgh sync --all --profile work"
+    );
+    assert_eq!(
+        status_json["data"]["coverage"]["next_action"]["json_command"],
+        "qgh sync --all --profile work --json"
+    );
+    assert_eq!(
+        status_json["data"]["coverage"]["next_action"]["reason"],
+        "open_coverage_incomplete"
+    );
+
+    let human_status = fixture.qgh_in(&worktree, ["status"]);
+    assert_success(&human_status);
+    assert!(stdout_text(&human_status)
+        .contains("coverage: partial; open and historical coverage incomplete"));
+    assert!(stdout_text(&human_status).contains("next: qgh sync --all --profile work"));
+
+    let no_result = fixture.qgh_in(&worktree, ["query", "zzznomatchqgh", "--json"]);
+    assert_success(&no_result);
+    let no_result_json = stdout_json(&no_result);
+    assert_eq!(
+        no_result_json["data"]["coverage"]["next_action"]["command"],
+        "qgh sync --all --profile work"
+    );
+    assert!(no_result_json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning["code"] == "coverage.partial_no_result"
+            && warning["message"]
+                .as_str()
+                .unwrap()
+                .contains("coverage.next_action")));
+
+    let scoped_backfill = fixture.qgh_in(&worktree, ["sync", "--backfill"]);
+    assert_success(&scoped_backfill);
+    let scoped_stdout = stdout_text(&scoped_backfill);
+    assert!(scoped_stdout.contains("coverage: partial"));
+    assert!(scoped_stdout.contains("open coverage complete: false"));
+    assert!(scoped_stdout.contains("historical coverage complete: false"));
+    assert!(scoped_stdout.contains("next: qgh sync --all --profile work"));
+}
+
+#[test]
+fn profile_membership_change_invalidates_completed_historical_coverage() {
+    let fixture = TestFixture::new("coverage-profile-membership-change");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo"]);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    assert_success(&fixture.qgh(["sync", "--backfill", "--all", "--json"]));
+    let initially_complete = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(initially_complete["data"]["coverage"]["mode"], "complete");
+
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    assert_success(&fixture.qgh(["sync", "--all", "--json"]));
+    let expanded = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(expanded["data"]["coverage"]["open_backfill_complete"], true);
+    assert_eq!(
+        expanded["data"]["coverage"]["historical_backfill_complete"],
+        false
+    );
+    assert_eq!(expanded["data"]["coverage"]["mode"], "partial");
+    assert_eq!(
+        expanded["data"]["coverage"]["next_action"]["command"],
+        "qgh sync --backfill --all --profile work"
+    );
+
+    assert_success(&fixture.qgh(["sync", "--backfill", "--all", "--json"]));
+    let completed_again = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(completed_again["data"]["coverage"]["mode"], "complete");
+    assert_eq!(
+        completed_again["data"]["coverage"]["next_action"],
+        Value::Null
+    );
+}
+
+#[test]
+fn repo_scoped_backfill_does_not_claim_profile_wide_completion() {
+    let fixture = TestFixture::new("repo-scoped-backfill-coverage");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_repos(&server.base_url, &["owner/repo", "other/repo"]);
+    let worktree = fixture.init_git_worktree_with_repo_policy("owner/repo");
+
+    assert_success(&fixture.qgh_in(&worktree, ["sync", "--all", "--json"]));
+
+    let limited_all = fixture.qgh_in(
+        &worktree,
+        ["sync", "--backfill", "--all", "--max-requests", "1"],
+    );
+    assert_success(&limited_all);
+    assert!(stdout_text(&limited_all).contains("next: qgh sync --backfill --all --profile work"));
+
+    let scoped = fixture.qgh_in(&worktree, ["sync", "--backfill"]);
+    assert_success(&scoped);
+    let scoped_stdout = stdout_text(&scoped);
+    assert!(scoped_stdout.contains("repo scope: owner/repo"));
+    assert!(scoped_stdout.contains("repo scope history end reached: true"));
+    assert!(scoped_stdout.contains("coverage: partial"));
+    assert!(scoped_stdout.contains("next: qgh sync --backfill --all --profile work"));
+
+    let partial_status = fixture.qgh_in(&worktree, ["status", "--json"]);
+    assert_success(&partial_status);
+    assert_eq!(
+        stdout_json(&partial_status)["data"]["coverage"]["historical_backfill_complete"],
+        false
+    );
+    let human_status = fixture.qgh_in(&worktree, ["status"]);
+    assert_success(&human_status);
+    assert!(stdout_text(&human_status).contains("next: qgh sync --backfill --all --profile work"));
+
+    let full = fixture.qgh_in(&worktree, ["sync", "--backfill", "--all", "--json"]);
+    assert_success(&full);
+    assert_eq!(
+        stdout_json(&full)["data"]["backfill"]["historical_backfill_complete"],
+        true
+    );
 }
 
 #[test]
@@ -5457,6 +6096,32 @@ fn backfill_flag_conflicts_are_rejected() {
     assert_eq!(
         stdout_json(&orphan_budget)["error"]["code"],
         "validation.requires_backfill"
+    );
+
+    // Freshness options and targeted-sync parent options are never ignored.
+    let orphan_max_age = fixture.qgh(["sync", "--max-age", "30m", "--json"]);
+    assert_eq!(orphan_max_age.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&orphan_max_age)["error"]["code"],
+        "validation.max_age_requires_if_stale"
+    );
+
+    let targeted_with_backfill = fixture.qgh(["sync", "--backfill", "issue", "42", "--json"]);
+    assert_eq!(targeted_with_backfill.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&targeted_with_backfill)["error"]["code"],
+        "validation.cli"
+    );
+    assert!(stdout_json(&targeted_with_backfill)["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .contains("sync issue <number>"));
+
+    let all_with_repo = fixture.qgh(["sync", "--all", "--repo", "owner/repo", "--json"]);
+    assert_eq!(all_with_repo.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&all_with_repo)["error"]["code"],
+        "validation.cli"
     );
 }
 
@@ -5605,7 +6270,7 @@ fn query_freshness_uses_effective_repo_sync_age_not_profile_latest_sync_run() {
 }
 
 #[test]
-fn sync_records_primary_rate_limit_backoff_and_local_reads_continue() {
+fn rate_limited_sync_is_retryable_failure_and_preserves_local_search() {
     let fixture = TestFixture::new("primary-rate-limit");
     let server = RateLimitFakeGitHub::start();
     fixture.write_config(&server.base_url);
@@ -5614,24 +6279,89 @@ fn sync_records_primary_rate_limit_backoff_and_local_reads_continue() {
     server.set_mode(RATE_LIMIT_PRIMARY);
 
     let limited_sync = fixture.qgh(["sync", "--json"]);
-    assert_success(&limited_sync);
+    assert_eq!(limited_sync.status.code(), Some(5));
+    assert!(stderr_text(&limited_sync).is_empty());
     let limited_json = stdout_json(&limited_sync);
-    assert_eq!(limited_json["data"]["sync_state"], "backoff");
+    assert_eq!(limited_json["ok"], false);
+    assert_eq!(limited_json["error"]["code"], "sync.backoff");
+    assert_eq!(limited_json["error"]["retryable"], true);
+    assert_eq!(limited_json["error"]["exit_code"], 5);
+    assert_eq!(limited_json["error"]["details"]["profile_id"], "work");
     assert_eq!(
-        limited_json["data"]["backoff"]["reason"],
+        limited_json["error"]["details"]["reason"],
         "primary_rate_limit"
     );
     assert_eq!(
-        limited_json["data"]["backoff"]["scope"],
+        limited_json["error"]["details"]["scope"],
         "issues:owner/repo"
     );
-    assert_eq!(limited_json["data"]["backoff"]["retry_after_seconds"], 0);
-    assert!(limited_json["data"]["backoff"]["reset_at"]
+    assert_eq!(limited_json["error"]["details"]["retry_after_seconds"], 0);
+    assert_eq!(
+        limited_json["error"]["details"]["retry_command"],
+        "qgh sync --all --profile work --json"
+    );
+    assert_eq!(
+        limited_json["error"]["details"]["retry_action"],
+        json!({
+            "reason": "sync_backoff",
+            "command": "qgh sync --all --profile work",
+            "json_command": "qgh sync --all --profile work --json"
+        })
+    );
+    assert!(limited_json["error"]["details"]["reset_at"]
         .as_str()
         .is_some());
-    assert!(limited_json["data"]["backoff"]["last_successful_sync"]
+    assert!(limited_json["error"]["details"]["retry_at"]
         .as_str()
         .is_some());
+    assert!(limited_json["error"]["details"]["last_successful_sync"]
+        .as_str()
+        .is_some());
+    assert_eq!(
+        limited_json["error"]["details"]["local_retrieval_available"],
+        true
+    );
+
+    let human_backoff = fixture.qgh(["sync"]);
+    assert_eq!(human_backoff.status.code(), Some(5));
+    assert!(stdout_text(&human_backoff).is_empty());
+    let human_backoff_stderr = stderr_text(&human_backoff);
+    assert!(human_backoff_stderr.contains("sync.backoff"));
+    assert!(human_backoff_stderr.contains("retryable"));
+    assert!(human_backoff_stderr.contains("Retry now: qgh sync --all --profile work."));
+    assert!(
+        human_backoff_stderr.contains("Existing local query, get, and status remain available.")
+    );
+
+    let mut colored_backoff_command = fixture.base_command();
+    let colored_backoff = colored_backoff_command
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .env("TERM", "xterm-256color")
+        .env("LANG", "en_US.UTF-8")
+        .args(["--profile", "work", "sync"])
+        .output()
+        .unwrap();
+    assert_eq!(colored_backoff.status.code(), Some(5));
+    let colored_stderr = stderr_text(&colored_backoff);
+    assert!(colored_stderr.contains("\u{1b}[1;33m"));
+    assert!(colored_stderr.contains("! retryable sync.backoff"));
+    assert!(!colored_stderr.contains("\u{1b}[1;31m"));
+
+    let mut quiet_backoff_command = fixture.base_command();
+    let quiet_backoff = quiet_backoff_command
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .env("TERM", "xterm-256color")
+        .env("LANG", "en_US.UTF-8")
+        .args(["--profile", "work", "sync", "--quiet"])
+        .output()
+        .unwrap();
+    assert_eq!(quiet_backoff.status.code(), Some(5));
+    let quiet_backoff_stderr = stderr_text(&quiet_backoff);
+    assert!(quiet_backoff_stderr.contains("retryable sync.backoff"));
+    assert!(!quiet_backoff_stderr.contains('\u{1b}'));
+    assert!(!quiet_backoff_stderr.contains('!'));
 
     let local_query = fixture.qgh(["query", "BM25 issue body tracer", "--json"]);
     assert_success(&local_query);
@@ -5657,9 +6387,27 @@ fn sync_records_primary_rate_limit_backoff_and_local_reads_continue() {
         status_json["data"]["sync"]["backoff"]["scope"],
         "issues:owner/repo"
     );
+    assert_eq!(
+        status_json["data"]["sync"]["backoff"]["retry_command"],
+        "qgh sync --all --profile work --quiet"
+    );
+    assert_eq!(
+        status_json["data"]["sync"]["backoff"]["retry_action"],
+        json!({
+            "reason": "sync_backoff",
+            "command": "qgh sync --all --profile work --quiet",
+            "json_command": "qgh sync --all --profile work --quiet --json"
+        })
+    );
     assert!(status_json["data"]["sync"]["last_sync_at"]
         .as_str()
         .is_some());
+
+    let human_status = fixture.qgh(["status"]);
+    assert_success(&human_status);
+    let human_status_stdout = stdout_text(&human_status);
+    assert!(human_status_stdout.contains("reset_at="));
+    assert!(human_status_stdout.contains("next: retry now: qgh sync --all --profile work --quiet"));
 }
 
 #[test]
@@ -5670,21 +6418,26 @@ fn sync_records_secondary_rate_limit_retry_after_without_generic_failure() {
     fixture.write_config(&server.base_url);
 
     let limited_sync = fixture.qgh(["sync", "--json"]);
-    assert_success(&limited_sync);
+    assert_eq!(limited_sync.status.code(), Some(5));
+    assert!(stderr_text(&limited_sync).is_empty());
     let limited_json = stdout_json(&limited_sync);
-    assert_eq!(limited_json["data"]["sync_state"], "backoff");
+    assert_eq!(limited_json["error"]["code"], "sync.backoff");
+    assert_eq!(limited_json["error"]["retryable"], true);
     assert_eq!(
-        limited_json["data"]["backoff"]["reason"],
+        limited_json["error"]["details"]["reason"],
         "secondary_rate_limit"
     );
     assert_eq!(
-        limited_json["data"]["backoff"]["scope"],
+        limited_json["error"]["details"]["scope"],
         "issues:owner/repo"
     );
-    assert_eq!(limited_json["data"]["backoff"]["retry_after_seconds"], 0);
     assert_eq!(
-        limited_json["data"]["backoff"]["last_successful_sync"],
+        limited_json["error"]["details"]["last_successful_sync"],
         Value::Null
+    );
+    assert_eq!(
+        limited_json["error"]["details"]["local_retrieval_available"],
+        false
     );
 
     let status = fixture.qgh(["status", "--json"]);
@@ -5695,6 +6448,34 @@ fn sync_records_secondary_rate_limit_retry_after_without_generic_failure() {
         "secondary_rate_limit"
     );
     assert_eq!(status_json["data"]["sources"]["issue_count"], 0);
+
+    let human_status = fixture.qgh(["status"]);
+    assert_success(&human_status);
+    assert!(stdout_text(&human_status).contains("next: retry now: qgh sync --all --profile work"));
+}
+
+#[test]
+fn huge_retry_after_remains_a_structured_backoff_without_panicking() {
+    let fixture = TestFixture::new("huge-retry-after");
+    let server = RateLimitFakeGitHub::start();
+    server.set_mode(RATE_LIMIT_HUGE_RETRY_AFTER);
+    fixture.write_config(&server.base_url);
+
+    let limited = fixture.qgh(["sync", "--json"]);
+    assert_eq!(limited.status.code(), Some(5));
+    let limited_json = stdout_json(&limited);
+    assert_eq!(limited_json["error"]["code"], "sync.backoff");
+    assert_eq!(limited_json["error"]["retryable"], true);
+    assert_eq!(
+        limited_json["error"]["details"]["retry_after_seconds"],
+        i64::MAX
+    );
+    assert_eq!(limited_json["error"]["details"]["retry_at"], Value::Null);
+
+    let status = fixture.qgh(["status"]);
+    assert_success(&status);
+    assert!(stdout_text(&status)
+        .contains("next: wait for GitHub backoff to clear, then qgh sync --all --profile work"));
 }
 
 #[test]
@@ -5704,16 +6485,16 @@ fn sync_resumes_from_last_committed_issue_page_after_mid_pagination_backoff() {
     fixture.write_config(&server.base_url);
 
     let limited_sync = fixture.qgh(["sync", "--json"]);
-    assert_success(&limited_sync);
+    assert_eq!(limited_sync.status.code(), Some(5));
     let limited_json = stdout_json(&limited_sync);
-    assert_eq!(limited_json["data"]["sync_state"], "backoff");
-    assert!(warning_codes(&limited_json).contains(&"publication.incomplete_snapshot_deferred"));
+    assert_eq!(limited_json["error"]["code"], "sync.backoff");
+    assert_eq!(limited_json["error"]["retryable"], true);
     assert_eq!(
-        limited_json["data"]["backoff"]["reason"],
+        limited_json["error"]["details"]["reason"],
         "secondary_rate_limit"
     );
     assert_eq!(
-        limited_json["data"]["backoff"]["last_successful_sync"],
+        limited_json["error"]["details"]["last_successful_sync"],
         Value::Null
     );
 
@@ -5820,13 +6601,27 @@ quantization = "none"
     );
 
     let backfill = fixture.qgh(["sync", "--backfill", "--json"]);
-    assert_success(&backfill);
+    assert_eq!(backfill.status.code(), Some(5));
     let backfill_json = stdout_json(&backfill);
-    assert_eq!(backfill_json["data"]["sync_state"], "backoff");
-    assert!(warning_codes(&backfill_json).contains(&"publication.incomplete_snapshot_deferred"));
-    assert!(!warning_codes(&backfill_json)
-        .iter()
-        .any(|code| code.starts_with("embedding.sync_")));
+    assert_eq!(backfill_json["error"]["code"], "sync.backoff");
+    assert_eq!(backfill_json["error"]["retryable"], true);
+    assert_eq!(
+        backfill_json["error"]["details"]["reason"],
+        "secondary_rate_limit"
+    );
+    assert_eq!(
+        backfill_json["error"]["details"]["retry_command"],
+        "qgh sync --all --backfill --profile work --json"
+    );
+    assert_eq!(
+        backfill_json["error"]["details"]["local_retrieval_available"],
+        false
+    );
+    let persisted_backoff = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(
+        persisted_backoff["data"]["sync"]["backoff"]["retry_command"],
+        "qgh sync --all --backfill --profile work --json"
+    );
     assert_eq!(
         fixture.embedding_sync_run_reference_count("embedding-sync"),
         0
@@ -8049,6 +8844,33 @@ fn sync_issue_auth_failure_does_not_tombstone_local_sources() {
 }
 
 #[test]
+fn sync_issue_transient_failure_is_retryable_and_preserves_local_sources() {
+    let fixture = TestFixture::new("targeted-refresh-transient");
+    let server = TargetedRefreshFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    assert_success(&fixture.qgh(["sync", "--json"]));
+    server.set_mode(TARGET_REFRESH_TRANSIENT);
+    let refresh = fixture.qgh(["sync", "issue", "42", "--json"]);
+    assert_eq!(refresh.status.code(), Some(3));
+    let refresh_json = stdout_json(&refresh);
+    assert_eq!(refresh_json["error"]["code"], "github.request_failed");
+    assert_eq!(refresh_json["error"]["retryable"], true);
+    assert!(refresh_json["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .contains("local content was not removed"));
+    fixture.assert_no_tombstone("qgh://github.com/issue/I_kwDOISSUE1");
+
+    let local_query = fixture.qgh(["query", "BM25 issue body tracer", "--json"]);
+    assert_success(&local_query);
+    assert_eq!(
+        stdout_json(&local_query)["data"]["results"][0]["source_id"],
+        "qgh://github.com/issue/I_kwDOISSUE1"
+    );
+}
+
+#[test]
 fn sync_issue_secondary_rate_limit_without_retry_after_does_not_tombstone() {
     let fixture = TestFixture::new("targeted-refresh-ambiguous-rate-limit");
     let server = TargetedRefreshFakeGitHub::start();
@@ -8057,16 +8879,26 @@ fn sync_issue_secondary_rate_limit_without_retry_after_does_not_tombstone() {
     assert_success(&fixture.qgh(["sync", "--json"]));
     server.set_mode(TARGET_REFRESH_SECONDARY_RATE_LIMIT_NO_RETRY_AFTER);
     let refresh = fixture.qgh(["sync", "issue", "42", "--json"]);
-    assert_success(&refresh);
+    assert_eq!(refresh.status.code(), Some(5));
     let refresh_json = stdout_json(&refresh);
-    assert_eq!(refresh_json["data"]["sync_state"], "backoff");
+    assert_eq!(refresh_json["error"]["code"], "sync.backoff");
+    assert_eq!(refresh_json["error"]["retryable"], true);
     assert_eq!(
-        refresh_json["data"]["backoff"]["reason"],
+        refresh_json["error"]["details"]["reason"],
         "secondary_rate_limit"
     );
     assert_eq!(
-        refresh_json["data"]["backoff"]["scope"],
+        refresh_json["error"]["details"]["scope"],
         "issue:owner/repo#42"
+    );
+    assert_eq!(
+        refresh_json["error"]["details"]["retry_command"],
+        "qgh sync issue 42 --repo owner/repo --profile work --json"
+    );
+    let persisted_backoff = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(
+        persisted_backoff["data"]["sync"]["backoff"]["retry_command"],
+        "qgh sync issue 42 --repo owner/repo --profile work --json"
     );
     fixture.assert_no_tombstone("qgh://github.com/issue/I_kwDOISSUE1");
 }
@@ -8195,6 +9027,29 @@ fn issue_payload_with_pr() -> &'static str {
         "milestone": null,
         "assignees": [],
         "pull_request": {"url": "https://api.github.com/repos/owner/repo/pulls/43"}
+      }
+    ]"#
+}
+
+fn issue_payload_with_terminal_control_words() -> &'static str {
+    r#"[
+      {
+        "id": 1001,
+        "node_id": "I_kwDOISSUE1",
+        "number": 42,
+        "title": "Source fidelity",
+        "body": "first line\r\nnext: reproduce this\r\nrepair: preserve this\r\nlast line",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://github.com/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:05Z",
+        "closed_at": null,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}],
+        "milestone": null,
+        "assignees": []
       }
     ]"#
 }
@@ -10778,6 +11633,7 @@ fn handle_lifecycle_connection(
 const RATE_LIMIT_ACTIVE: usize = 1;
 const RATE_LIMIT_PRIMARY: usize = 2;
 const RATE_LIMIT_SECONDARY: usize = 3;
+const RATE_LIMIT_HUGE_RETRY_AFTER: usize = 4;
 
 struct RateLimitFakeGitHub {
     base_url: String,
@@ -10858,6 +11714,19 @@ fn handle_rate_limit_connection(mut stream: TcpStream, mode: &Arc<AtomicUsize>) 
         let response = format!(
             "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nretry-after: 0\r\nx-ratelimit-remaining: 42\r\n\r\n{body}",
             body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        return;
+    }
+    if request_line.starts_with("GET /repos/owner/repo/issues?")
+        && request_line.contains("state=all")
+        && mode == RATE_LIMIT_HUGE_RETRY_AFTER
+    {
+        let body = r#"{"message":"secondary rate limit"}"#;
+        let response = format!(
+            "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nretry-after: {}\r\nx-ratelimit-remaining: 42\r\n\r\n{body}",
+            body.len(),
+            i64::MAX
         );
         stream.write_all(response.as_bytes()).unwrap();
         return;
@@ -11496,6 +12365,7 @@ const TARGET_REFRESH_AUTH_FAILED: usize = 7;
 const TARGET_REFRESH_SECONDARY_RATE_LIMIT_NO_RETRY_AFTER: usize = 8;
 const TARGET_REFRESH_EMPTY_COMMENTS: usize = 9;
 const TARGET_REFRESH_INITIAL_WITH_TRANSFER_TARGET: usize = 10;
+const TARGET_REFRESH_TRANSIENT: usize = 11;
 
 struct TargetedRefreshFakeGitHub {
     base_url: String,
@@ -11604,6 +12474,12 @@ fn handle_targeted_refresh_connection(
             )
         } else if mode == TARGET_REFRESH_AUTH_FAILED {
             ("401 Unauthorized", r#"{"message":"Bad credentials"}"#, None)
+        } else if mode == TARGET_REFRESH_TRANSIENT {
+            (
+                "503 Service Unavailable",
+                r#"{"message":"temporarily unavailable"}"#,
+                None,
+            )
         } else if mode == TARGET_REFRESH_SECONDARY_RATE_LIMIT_NO_RETRY_AFTER {
             (
                 "403 Forbidden",

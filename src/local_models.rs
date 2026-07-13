@@ -205,6 +205,13 @@ pub struct ModelInstallOutcome {
     pub snapshot: PreparedQwenModelSnapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSnapshotState {
+    Missing,
+    Present,
+    Invalid,
+}
+
 #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
 pub trait ModelArtifactFetcher {
     fn fetch(&mut self, spec: &QwenModelSpec, relative_path: &str) -> Result<PathBuf, QghError>;
@@ -218,6 +225,19 @@ pub struct PreparedQwenModelStore {
 impl PreparedQwenModelStore {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
+    }
+
+    /// Performs a metadata-only readiness check suitable for `status`.
+    ///
+    /// This validates the pinned manifest, exact tree, file kinds, and byte
+    /// sizes without hashing the multi-gigabyte payload on every CLI process.
+    /// Runtime loading still calls `inspect`, which verifies every checksum.
+    pub fn snapshot_state(&self, spec: &QwenModelSpec) -> ModelSnapshotState {
+        match self.inspect_layout(spec) {
+            Ok(_) => ModelSnapshotState::Present,
+            Err(error) if error.code == "model.not_installed" => ModelSnapshotState::Missing,
+            Err(_) => ModelSnapshotState::Invalid,
+        }
     }
 
     #[cfg_attr(not(feature = "fastembed-provider"), allow(dead_code))]
@@ -294,6 +314,46 @@ impl PreparedQwenModelStore {
     }
 
     pub fn inspect(&self, spec: &QwenModelSpec) -> Result<PreparedQwenModelSnapshot, QghError> {
+        let snapshot = self.inspect_layout(spec)?;
+        for artifact in &spec.artifacts {
+            let canonical_path = snapshot
+                .paths
+                .get(&artifact.relative_path)
+                .ok_or_else(model_artifact_invalid)?;
+            let identity = snapshot
+                .identities
+                .get(&artifact.relative_path)
+                .ok_or_else(model_artifact_invalid)?;
+            let verification_cached = VERIFIED_ARTIFACTS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .map_err(|_| model_artifact_invalid())?
+                .get(canonical_path)
+                .is_some_and(|(sha256, verified_identity)| {
+                    sha256 == &artifact.sha256 && verified_identity == identity
+                });
+            if !verification_cached {
+                let (sha256, byte_size, hashed_identity) = hash_file_stable(canonical_path)?;
+                if sha256 != artifact.sha256 || byte_size != artifact.byte_size {
+                    return Err(model_artifact_invalid());
+                }
+                if &hashed_identity != identity {
+                    return Err(model_artifact_invalid());
+                }
+                VERIFIED_ARTIFACTS
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .map_err(|_| model_artifact_invalid())?
+                    .insert(
+                        canonical_path.clone(),
+                        (artifact.sha256.clone(), identity.clone()),
+                    );
+            }
+        }
+        Ok(snapshot)
+    }
+
+    fn inspect_layout(&self, spec: &QwenModelSpec) -> Result<PreparedQwenModelSnapshot, QghError> {
         validate_spec(spec)?;
         let root = self.model_root(spec);
         let root_metadata = fs::symlink_metadata(&root).map_err(|_| model_not_installed())?;
@@ -337,31 +397,6 @@ impl PreparedQwenModelStore {
                 return Err(model_artifact_invalid());
             }
             let identity = FileIdentity::from_metadata(&metadata);
-            let verification_cached = VERIFIED_ARTIFACTS
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock()
-                .map_err(|_| model_artifact_invalid())?
-                .get(&canonical_path)
-                .is_some_and(|(sha256, verified_identity)| {
-                    sha256 == &artifact.sha256 && verified_identity == &identity
-                });
-            if !verification_cached {
-                let (sha256, byte_size, hashed_identity) = hash_file_stable(&canonical_path)?;
-                if sha256 != artifact.sha256 || byte_size != artifact.byte_size {
-                    return Err(model_artifact_invalid());
-                }
-                if hashed_identity != identity {
-                    return Err(model_artifact_invalid());
-                }
-                VERIFIED_ARTIFACTS
-                    .get_or_init(|| Mutex::new(HashMap::new()))
-                    .lock()
-                    .map_err(|_| model_artifact_invalid())?
-                    .insert(
-                        canonical_path.clone(),
-                        (artifact.sha256.clone(), identity.clone()),
-                    );
-            }
             paths.insert(artifact.relative_path.clone(), canonical_path);
             identities.insert(artifact.relative_path.clone(), identity);
         }

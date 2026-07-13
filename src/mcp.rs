@@ -175,7 +175,8 @@ fn initialize_result() -> Value {
             "name": "qgh",
             "title": "qgh",
             "version": env!("CARGO_PKG_VERSION")
-        }
+        },
+        "instructions": "Use query -> get -> cite. query searches the local snapshot and returns source candidates, not answers. Before citing, call get with the emitted get_args and use the authoritative body, canonical URL, and source version. query, get, and status are local-only. qgh does not write to GitHub and this server does not expose sync, embed, model, or doctor tools."
     })
 }
 
@@ -566,21 +567,21 @@ fn tool_list() -> Vec<Value> {
     vec![
         tool(
             "query",
-            "Search local GitHub Issue and issue comment sources.",
+            "Search the local snapshot for GitHub Issue and comment source candidates. Results are not answers; call get with each emitted get_args before citing.",
             query_input_schema(),
             query_output_schema(),
         ),
         tool(
             "get",
-            "Fetch one authoritative local source by qgh source_id.",
+            "Fetch one authoritative full source by qgh source_id, including its body, canonical URL, and source version for citation. This local-only tool does not contact GitHub.",
             get_input_schema(),
-            envelope_output_schema(),
+            get_output_schema(),
         ),
         tool(
             "status",
-            "Read local profile, source, database, index, and privacy status.",
+            "Read local-only profile, source, freshness, coverage, index, and privacy status. This tool does not contact GitHub.",
             status_input_schema(),
-            envelope_output_schema(),
+            status_output_schema(),
         ),
     ]
 }
@@ -603,19 +604,52 @@ fn query_input_schema() -> Value {
         "type": "object",
         "required": ["query"],
         "properties": {
-            "query": { "type": "string" },
-            "rerank": { "type": "boolean" },
-            "limit": { "type": "integer", "minimum": 1 },
-            "repo": { "type": "string", "pattern": "^[^/]+/[^/]+$" },
+            "query": {
+                "type": "string",
+                "description": "Search terms, issue URL, comment URL, or exact identifier."
+            },
+            "rerank": {
+                "type": "boolean",
+                "description": "Request the configured local reranker for this query."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum number of source candidates to return."
+            },
+            "repo": {
+                "type": "string",
+                "pattern": "^[^/]+/[^/]+$",
+                "description": "Restrict candidates to one allowed owner/repo."
+            },
             "label": {
                 "type": "array",
-                "items": { "type": "string" }
+                "items": { "type": "string" },
+                "description": "Require all listed GitHub labels."
             },
-            "state": { "type": "string", "enum": ["open", "closed"] },
-            "author": { "type": "string" },
-            "issue": { "type": "integer", "minimum": 1 },
-            "max_age": { "type": "string", "pattern": "^[1-9][0-9]*(s|m|h|d|mo)$" },
-            "require_fresh": { "type": "boolean" }
+            "state": {
+                "type": "string",
+                "enum": ["open", "closed"],
+                "description": "Restrict candidates to open or closed issues."
+            },
+            "author": {
+                "type": "string",
+                "description": "Restrict candidates to a GitHub author login."
+            },
+            "issue": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Resolve one exact issue number in the effective repo scope."
+            },
+            "max_age": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]*(s|m|h|d|mo)$",
+                "description": "Override the allowed local snapshot age for this call."
+            },
+            "require_fresh": {
+                "type": "boolean",
+                "description": "Fail instead of warning when the local snapshot is stale."
+            },
         },
         "additionalProperties": false
     })
@@ -626,8 +660,15 @@ fn status_input_schema() -> Value {
         "$schema": JSON_SCHEMA,
         "type": "object",
         "properties": {
-            "max_age": { "type": "string", "pattern": "^[1-9][0-9]*(s|m|h|d|mo)$" },
-            "require_fresh": { "type": "boolean" }
+            "max_age": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]*(s|m|h|d|mo)$",
+                "description": "Override the allowed local snapshot age for this call."
+            },
+            "require_fresh": {
+                "type": "boolean",
+                "description": "Fail instead of warning when the local snapshot is stale."
+            }
         },
         "additionalProperties": false
     })
@@ -639,25 +680,71 @@ fn get_input_schema() -> Value {
         "type": "object",
         "required": ["source_id"],
         "properties": {
-            "source_id": { "type": "string" },
-            "profile_id": { "type": "string" }
+            "source_id": {
+                "type": "string",
+                "description": "Stable qgh source_id, normally copied from query get_args."
+            },
+            "profile_id": {
+                "type": "string",
+                "description": "Profile emitted in query get_args; preserves the query-to-get round trip."
+            }
         },
         "additionalProperties": false
     })
 }
 
 fn query_output_schema() -> Value {
-    let data_schema: Value =
+    let mut data_schema: Value =
         serde_json::from_str(include_str!("../docs/schemas/query-result.schema.json"))
             .expect("query result schema must be valid JSON");
+    inline_command_action_refs(&mut data_schema);
     envelope_output_schema_with_data(data_schema)
 }
 
-fn envelope_output_schema() -> Value {
-    envelope_output_schema_with_data(json!({ "type": "object" }))
+fn get_output_schema() -> Value {
+    let data_schema: Value =
+        serde_json::from_str(include_str!("../docs/schemas/get-output.schema.json"))
+            .expect("get output schema must be valid JSON");
+    envelope_output_schema_with_data(data_schema)
+}
+
+fn status_output_schema() -> Value {
+    let mut data_schema: Value =
+        serde_json::from_str(include_str!("../docs/schemas/status-output.schema.json"))
+            .expect("status output schema must be valid JSON");
+    inline_command_action_refs(&mut data_schema);
+    envelope_output_schema_with_data(data_schema)
+}
+
+fn command_action_schema() -> Value {
+    serde_json::from_str(include_str!("../docs/schemas/command-action.schema.json"))
+        .expect("command action schema must be valid JSON")
+}
+
+fn inline_command_action_refs(value: &mut Value) {
+    if value.get("$ref").and_then(Value::as_str) == Some("command-action.schema.json") {
+        *value = command_action_schema();
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                inline_command_action_refs(item);
+            }
+        }
+        Value::Object(object) => {
+            for child in object.values_mut() {
+                inline_command_action_refs(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn envelope_output_schema_with_data(data_schema: Value) -> Value {
+    let error_schema: Value =
+        serde_json::from_str(include_str!("../docs/schemas/error.schema.json"))
+            .expect("error schema must be valid JSON");
     json!({
         "$schema": JSON_SCHEMA,
         "type": "object",
@@ -666,7 +753,7 @@ fn envelope_output_schema_with_data(data_schema: Value) -> Value {
             "schema_version": { "const": "qgh.v1" },
             "ok": { "type": "boolean" },
             "data": data_schema,
-            "error": { "type": "object" },
+            "error": error_schema,
             "warnings": {
                 "type": "array",
                 "items": {
@@ -678,7 +765,8 @@ fn envelope_output_schema_with_data(data_schema: Value) -> Value {
                             "type": "string",
                             "enum": ["warn", "warn_strong", "fail"]
                         },
-                        "message": { "type": "string" }
+                        "message": { "type": "string" },
+                        "action": command_action_schema()
                     },
                     "additionalProperties": false
                 }

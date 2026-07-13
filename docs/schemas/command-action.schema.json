@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/command-action.schema.json",
+  "title": "qgh command action",
+  "type": "object",
+  "required": ["reason", "command", "json_command"],
+  "properties": {
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "command": {
+      "type": "string",
+      "pattern": "^qgh "
+    },
+    "json_command": {
+      "type": "string",
+      "pattern": "^qgh .* --json$",
+      "description": "Machine-safe equivalent that preserves JSON output mode."
+    }
+  },
+  "additionalProperties": false
+}

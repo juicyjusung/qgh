@@ -16,16 +16,32 @@ over the same local retrieval contract.
 `sync` without `--json` emits human-readable progress diagnostics to stderr so
 long GitHub fetch/index runs do not look stalled, then prints a final human
 summary to stdout. `sync --json` and `sync --quiet` suppress progress
-diagnostics. Progress lines and human summaries are not a stable
+diagnostics. `--quiet` also disables TTY decoration for its final human
+summary. Progress lines and human summaries are not a stable
 machine-readable API; use `--json` for automation.
+Standalone `embed --force` follows the same foreground contract: human runs
+show content-free model/chunk/vector phase progress on stderr, while `--json`
+and `--quiet` suppress progress. Provider inference remains one throughput-
+optimized call, so qgh does not claim an in-flight percentage or ETA that the
+runtime cannot observe. The final payload distinguishes text chunks rebuilt
+from vectors generated.
 `sync --if-stale --json` returns `data.sync_state: "skipped_fresh"` when the
 local snapshot is still within the effective max-age and no network sync runs.
 A completed source sync publishes its newly built lexical generation even when
 configured local embedding refresh fails; the response keeps the embedding
 warning and reports the actual active lexical generation. A partial sync or
 backfill interrupted by backoff does not fabricate a source-snapshot id or
-publish its partial corpus, and reports
-`publication.incomplete_snapshot_deferred` instead.
+publish its partial corpus. It returns the retryable `sync.backoff` error (exit
+`5`), while `status` retains content-free retry state and the last valid
+publication remains usable only when its artifact is still ready. The error
+details and persisted status backoff state include the legacy-compatible,
+content-free `retry_command` plus `retry_action`. The action preserves whether
+the interrupted operation was live sync, backfill, reconciliation, or targeted
+issue refresh, makes repo scope explicit, and supplies both `command` for a
+person and `json_command` for an agent. Legacy backoff rows without either
+field tell the user to retry the interrupted command rather than inventing a
+different command. Agents should execute `retry_action.json_command`; it keeps
+JSON output mode even when the interrupted command came from a human terminal.
 
 `sync issue <number>` is the explicit targeted refresh path for one issue and
 its complete per-issue comment list. Its `sync` envelope includes `target`,
@@ -33,12 +49,19 @@ its complete per-issue comment list. Its `sync` envelope includes `target`,
 to the normal sync/index summary fields. Transfer, delete, and permission-loss
 lifecycle changes are reported as distinct reason codes.
 
+General sync accepts `--repo <owner/repo>` as an explicit, worktree-independent
+scope. `--repo` and `--all` are mutually exclusive. This lets retry actions and
+agents preserve the exact repository scope without depending on the current
+working directory.
+
 Success:
 
 - `schema_version`: `qgh.v1`
 - `ok`: `true`
 - `data`: command-specific payload
-- `warnings`: array of `{code, severity, message}` objects. Freshness warnings
+- `warnings`: array of `{code, severity, message, action?}` objects. Optional
+  actions are content-free `command-action` objects with separate human and
+  JSON-mode commands. Freshness warnings
   use the severity ladder `fail > warn_strong > warn`; all triggered warnings
   are listed even when the envelope decision uses the maximum severity.
 - `meta`: object
@@ -57,6 +80,8 @@ Released schema snapshots:
 - `docs/schemas/error.schema.json`: stable error taxonomy and exit-code classes.
 - `docs/schemas/init-output.schema.json`: CLI-only `init` data payload.
 - `docs/schemas/sync-output.schema.json`: `sync` data payload.
+- `docs/schemas/embed-output.schema.json`: CLI-only `embed` data payload.
+- `docs/schemas/command-action.schema.json`: content-free human and JSON-mode remediation commands.
 - `docs/schemas/model-output.schema.json`: CLI-only `model install` data payload.
 - `docs/schemas/query-result.schema.json`: `query`/`search` data payload.
 - `docs/schemas/get-output.schema.json`: `get` data payload.
@@ -119,11 +144,28 @@ creates tracked repo policy only. Neither command is exposed to MCP.
 Human output is generated from the same command data as the JSON envelope, but
 it is optimized for a person reading the terminal:
 
+When stdout/stderr is an interactive terminal, qgh adds restrained status
+color and `✓`, `!`, `×`, and `→` markers. `NO_COLOR` disables color,
+`TERM=dumb` disables all decoration, and CI/redirected output stays plain.
+`CLICOLOR_FORCE=1` is an explicit test/CI override except for `TERM=dumb` and
+`NO_COLOR`'s color ban. These decorations never appear in JSON or MCP, and
+never rewrite an authoritative `get` body. `--quiet` is an explicit plain
+human-output override even on a decorated terminal.
+
 - `init`: profile id/action, repo allowlist action, token source reference,
   config path, repo policy action/path, and next commands.
 - `sync`: synced repo scope, fetched/upserted issue and comment counts, targeted
-  comment diff counts when present, backoff state, active index generation, and
-  next query command.
+  comment diff counts when present, active index generation, and a state-based
+  next sync/backfill/query command. GitHub backoff is a retryable `sync.backoff`
+  failure (exit `5`). Its details include `profile_id`, absolute retry/reset
+  timing, and content-free query/status/get availability signals; a historical
+  successful sync row alone does not claim that query is ready. Profile-wide
+  partial coverage from a repo-scoped context first points to `sync --all` for
+  open coverage, then to `sync --backfill --all` for older closed issues. A
+  scoped pass cannot claim profile-wide completion. Completion is also
+  invalidated when the configured profile repository membership changes.
+- `embed`: text chunks rebuilt, vectors generated, and content-free foreground
+  progress. `--force` remains required for a standalone full rebuild.
 - `query`/`search`: source-candidate list, not answers. It states that snippets
   are previews, not citation evidence, reports local snapshot freshness, and
   shows `qgh get <source_id> --profile-id <profile_id>` for each result.
@@ -133,10 +175,15 @@ it is optimized for a person reading the terminal:
   `--verify-lifecycle` to opt in to a GitHub lifecycle check. Batch get
   summaries include requested/returned/failed counts and per-item success or
   error state.
-- `status`: selected profile, local snapshot freshness, effective repo scope
-  and repo source, DB path, Tantivy index path, source counts, default sync
-  scope, content-free pending-purge state, optional local embedding coverage,
-  and `qgh sync --all` guidance.
+- `status`: search readiness first, then selected profile, local snapshot
+  freshness, effective repo scope, source counts, coverage, content-free
+  pending-purge state, optional local embedding coverage, and a state-based
+  next command. Partial historical coverage recommends explicit
+  `qgh sync --backfill`; status never starts network work itself.
+- Embedding/reranker warnings distinguish an absent Qwen snapshot from an
+  invalid one. Both direct the user or agent to the explicit `qgh model
+  install` repair path; status uses metadata-only integrity checks and runtime
+  loading still performs full SHA-256 validation.
 - `doctor`: failed checks first with actionable hints, then all checks, pending
   purge state, the unmanaged-backup deletion boundary, and MCP exposure status.
 

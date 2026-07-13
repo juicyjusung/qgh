@@ -10,8 +10,8 @@ use crate::context::{prepare_embedding_input, EmbeddingSourceContext, PreparedEm
 use crate::embedding::{EmbeddingFingerprint, EmbeddingVector};
 use crate::error::QghError;
 use crate::model::{
-    BackoffView, CommentRecord, CoverageSnapshot, CursorUpdate, CursorView, IndexSource,
-    IssueRecord, ParentIssueView, ReconciliationCandidate, ReconciliationRunView,
+    BackoffView, CommandAction, CommentRecord, CoverageSnapshot, CursorUpdate, CursorView,
+    IndexSource, IssueRecord, ParentIssueView, ReconciliationCandidate, ReconciliationRunView,
     SourceVersionView, StatusSnapshot, StoredChunk, StoredComment, StoredCursor, StoredIssue,
     StoredSource, SyncSummary, TargetedSyncSummary, TombstoneView, VectorSearchFilters,
     VectorSearchHit,
@@ -5659,6 +5659,7 @@ impl Store {
         scope: &str,
         retry_after_seconds: i64,
         reset_at: Option<&str>,
+        retry_command: &str,
     ) -> Result<BackoffView, QghError> {
         let observed_at = now_rfc3339();
         let last_successful_sync: Option<String> = self
@@ -5676,27 +5677,34 @@ impl Store {
             .optional()?;
         self.conn.execute(
             "INSERT INTO sync_backoff_state
-                (id, reason, scope, retry_after_seconds, reset_at, observed_at, last_successful_sync)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+                (id, reason, scope, retry_after_seconds, reset_at, observed_at, last_successful_sync, retry_command)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
                 reason = excluded.reason,
                 scope = excluded.scope,
                 retry_after_seconds = excluded.retry_after_seconds,
                 reset_at = excluded.reset_at,
                 observed_at = excluded.observed_at,
-                last_successful_sync = excluded.last_successful_sync",
+                last_successful_sync = excluded.last_successful_sync,
+                retry_command = excluded.retry_command",
             params![
                 reason,
                 scope,
                 retry_after_seconds,
                 reset_at,
                 observed_at,
-                last_successful_sync
+                last_successful_sync,
+                retry_command
             ],
         )?;
         Ok(BackoffView {
             reason: reason.to_string(),
             scope: scope.to_string(),
+            retry_command: Some(retry_command.to_string()),
+            retry_action: Some(CommandAction::from_retry_command(
+                "sync_backoff",
+                retry_command,
+            )),
             retry_after_seconds,
             reset_at: reset_at.map(ToString::to_string),
             observed_at,
@@ -5986,24 +5994,35 @@ impl Store {
                 },
             )
             .optional()?;
+        let retry_command_expr =
+            if table_has_column(&self.conn, "sync_backoff_state", "retry_command")? {
+                "retry_command"
+            } else {
+                "NULL"
+            };
+        let backoff_sql = format!(
+            "SELECT reason, scope, {retry_command_expr}, retry_after_seconds, reset_at, observed_at, last_successful_sync
+             FROM sync_backoff_state
+             WHERE id = 1"
+        );
         let backoff = self
             .conn
-            .query_row(
-                "SELECT reason, scope, retry_after_seconds, reset_at, observed_at, last_successful_sync
-                 FROM sync_backoff_state
-                 WHERE id = 1",
-                [],
-                |row| {
-                    Ok(BackoffView {
-                        reason: row.get(0)?,
-                        scope: row.get(1)?,
-                        retry_after_seconds: row.get(2)?,
-                        reset_at: row.get(3)?,
-                        observed_at: row.get(4)?,
-                        last_successful_sync: row.get(5)?,
-                    })
-                },
-            )
+            .query_row(&backoff_sql, [], |row| {
+                let retry_command: Option<String> = row.get(2)?;
+                let retry_action = retry_command
+                    .as_deref()
+                    .map(|command| CommandAction::from_retry_command("sync_backoff", command));
+                Ok(BackoffView {
+                    reason: row.get(0)?,
+                    scope: row.get(1)?,
+                    retry_command,
+                    retry_action,
+                    retry_after_seconds: row.get(3)?,
+                    reset_at: row.get(4)?,
+                    observed_at: row.get(5)?,
+                    last_successful_sync: row.get(6)?,
+                })
+            })
             .optional()?;
         Ok(StatusSnapshot {
             issue_count,
@@ -6188,27 +6207,41 @@ impl Store {
     }
 
     pub fn coverage_snapshot(&self) -> Result<CoverageSnapshot, QghError> {
+        let open_scope_fingerprint =
+            if table_has_column(&self.conn, "coverage_state", "open_scope_fingerprint")? {
+                "open_scope_fingerprint"
+            } else {
+                "NULL"
+            };
+        let historical_scope_fingerprint =
+            if table_has_column(&self.conn, "coverage_state", "historical_scope_fingerprint")? {
+                "historical_scope_fingerprint"
+            } else {
+                "NULL"
+            };
+        let sql = format!(
+            "SELECT open_cursor, history_cursor, open_backfill_complete,
+                    historical_backfill_complete, {open_scope_fingerprint},
+                    {historical_scope_fingerprint}, oldest_synced_updated_at,
+                    recent_bootstrap_floor, next_backfill_window_hint
+             FROM coverage_state
+             WHERE id = 1"
+        );
         let snapshot = self
             .conn
-            .query_row(
-                "SELECT open_cursor, history_cursor, open_backfill_complete,
-                        historical_backfill_complete, oldest_synced_updated_at,
-                        recent_bootstrap_floor, next_backfill_window_hint
-                 FROM coverage_state
-                 WHERE id = 1",
-                [],
-                |row| {
-                    Ok(CoverageSnapshot {
-                        open_cursor: row.get(0)?,
-                        history_cursor: row.get(1)?,
-                        open_backfill_complete: row.get::<_, i64>(2)? != 0,
-                        historical_backfill_complete: row.get::<_, i64>(3)? != 0,
-                        oldest_synced_updated_at: row.get(4)?,
-                        recent_bootstrap_floor: row.get(5)?,
-                        next_backfill_window_hint: row.get(6)?,
-                    })
-                },
-            )
+            .query_row(&sql, [], |row| {
+                Ok(CoverageSnapshot {
+                    open_cursor: row.get(0)?,
+                    history_cursor: row.get(1)?,
+                    open_backfill_complete: row.get::<_, i64>(2)? != 0,
+                    historical_backfill_complete: row.get::<_, i64>(3)? != 0,
+                    open_scope_fingerprint: row.get(4)?,
+                    historical_scope_fingerprint: row.get(5)?,
+                    oldest_synced_updated_at: row.get(6)?,
+                    recent_bootstrap_floor: row.get(7)?,
+                    next_backfill_window_hint: row.get(8)?,
+                })
+            })
             .optional()?;
         Ok(snapshot.unwrap_or_default())
     }
@@ -6220,14 +6253,17 @@ impl Store {
         self.conn.execute(
             "INSERT INTO coverage_state
                 (id, open_cursor, history_cursor, open_backfill_complete,
-                 historical_backfill_complete, oldest_synced_updated_at,
+                 historical_backfill_complete, open_scope_fingerprint,
+                 historical_scope_fingerprint, oldest_synced_updated_at,
                  recent_bootstrap_floor, next_backfill_window_hint)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
                 open_cursor = excluded.open_cursor,
                 history_cursor = excluded.history_cursor,
                 open_backfill_complete = excluded.open_backfill_complete,
                 historical_backfill_complete = excluded.historical_backfill_complete,
+                open_scope_fingerprint = excluded.open_scope_fingerprint,
+                historical_scope_fingerprint = excluded.historical_scope_fingerprint,
                 oldest_synced_updated_at = excluded.oldest_synced_updated_at,
                 recent_bootstrap_floor = excluded.recent_bootstrap_floor,
                 next_backfill_window_hint = excluded.next_backfill_window_hint",
@@ -6236,6 +6272,8 @@ impl Store {
                 coverage.history_cursor,
                 coverage.open_backfill_complete as i64,
                 coverage.historical_backfill_complete as i64,
+                coverage.open_scope_fingerprint,
+                coverage.historical_scope_fingerprint,
                 coverage.oldest_synced_updated_at,
                 coverage.recent_bootstrap_floor,
                 coverage.next_backfill_window_hint,
@@ -8567,6 +8605,8 @@ impl Store {
                 history_cursor TEXT,
                 open_backfill_complete INTEGER NOT NULL DEFAULT 0,
                 historical_backfill_complete INTEGER NOT NULL DEFAULT 0,
+                open_scope_fingerprint TEXT,
+                historical_scope_fingerprint TEXT,
                 oldest_synced_updated_at TEXT,
                 recent_bootstrap_floor TEXT,
                 next_backfill_window_hint TEXT
@@ -8579,7 +8619,8 @@ impl Store {
                 retry_after_seconds INTEGER NOT NULL,
                 reset_at TEXT,
                 observed_at TEXT NOT NULL,
-                last_successful_sync TEXT
+                last_successful_sync TEXT,
+                retry_command TEXT
             );
 
             CREATE TABLE IF NOT EXISTS tombstones (
@@ -8716,6 +8757,19 @@ impl Store {
                 applied_at TEXT NOT NULL
             );
             "#,
+        )?;
+        ensure_column(&self.conn, "sync_backoff_state", "retry_command", "TEXT")?;
+        ensure_column(
+            &self.conn,
+            "coverage_state",
+            "open_scope_fingerprint",
+            "TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "coverage_state",
+            "historical_scope_fingerprint",
+            "TEXT",
         )?;
         ensure_column(
             &self.conn,
@@ -9628,9 +9682,10 @@ fn validate_remaining_tantivy_purge_files(
 }
 
 fn tantivy_artifact_not_ready_error() -> QghError {
-    QghError::validation(
+    QghError::new(
         "publication.tantivy_artifact_not_ready",
         "The reserved Tantivy generation is missing or does not match its persisted source count.",
+        6,
     )
 }
 
@@ -11528,6 +11583,57 @@ mod tests {
     }
 
     #[test]
+    fn legacy_backoff_rows_migrate_with_an_unknown_retry_command() {
+        let paths = temp_profile_paths("legacy-backoff-retry-command");
+        drop(Store::open(&paths).unwrap());
+        let legacy = Connection::open(&paths.db_path).unwrap();
+        legacy
+            .execute_batch(
+                "ALTER TABLE sync_backoff_state DROP COLUMN retry_command;
+                ALTER TABLE coverage_state DROP COLUMN open_scope_fingerprint;
+                ALTER TABLE coverage_state DROP COLUMN historical_scope_fingerprint;
+                INSERT INTO sync_backoff_state
+                    (id, reason, scope, retry_after_seconds, reset_at, observed_at, last_successful_sync)
+                VALUES (1, 'primary_rate_limit', 'issues:owner/repo', 60, NULL, '2026-01-01T00:00:00Z', NULL);
+                INSERT INTO coverage_state
+                    (id, open_backfill_complete, historical_backfill_complete)
+                VALUES (1, 1, 1);",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let read_only = Store::open_for_read(&paths).unwrap();
+        let backoff = read_only.status().unwrap().backoff.unwrap();
+        assert_eq!(backoff.retry_command, None);
+        assert_eq!(backoff.retry_action, None);
+        let coverage = read_only.coverage_snapshot().unwrap();
+        assert!(coverage.open_backfill_complete);
+        assert!(coverage.historical_backfill_complete);
+        assert_eq!(coverage.open_scope_fingerprint, None);
+        assert_eq!(coverage.historical_scope_fingerprint, None);
+        drop(read_only);
+
+        let migrated = Store::open(&paths).unwrap();
+        assert!(table_has_column(&migrated.conn, "sync_backoff_state", "retry_command").unwrap());
+        assert!(
+            table_has_column(&migrated.conn, "coverage_state", "open_scope_fingerprint").unwrap()
+        );
+        assert!(table_has_column(
+            &migrated.conn,
+            "coverage_state",
+            "historical_scope_fingerprint"
+        )
+        .unwrap());
+        assert_eq!(
+            migrated.status().unwrap().backoff.unwrap().retry_command,
+            None
+        );
+        drop(migrated);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
     fn fresh_empty_profile_does_not_require_successor_repair_and_migrates_missing_marker() {
         let paths = temp_profile_paths("successor-repair-fresh-empty");
         let mut store = Store::open(&paths).unwrap();
@@ -11783,11 +11889,22 @@ mod tests {
             Some(remote_completed_at.clone())
         );
         let backoff = store
-            .record_backoff_state("rate_limit", repo, 60, None)
+            .record_backoff_state("rate_limit", repo, 60, None, "qgh sync --profile work")
             .unwrap();
         assert_eq!(
             backoff.last_successful_sync,
             Some(remote_completed_at.clone())
+        );
+        assert_eq!(
+            backoff.retry_command.as_deref(),
+            Some("qgh sync --profile work")
+        );
+        assert_eq!(
+            backoff.retry_action,
+            Some(CommandAction::new(
+                "sync_backoff",
+                "qgh sync --profile work"
+            ))
         );
         let repo_sync_at: String = store
             .conn

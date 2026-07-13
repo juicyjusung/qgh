@@ -499,9 +499,10 @@ fn collect_owned_generation_entries(
 }
 
 fn index_build_collision_error() -> QghError {
-    QghError::validation(
+    QghError::new(
         "publication.tantivy_artifact_not_ready",
         "The reserved Tantivy generation is unavailable.",
+        6,
     )
 }
 
@@ -1099,6 +1100,7 @@ mod tests {
         let error = rebuild(&index_root, 1, &[]).unwrap_err();
 
         assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
+        assert_eq!(error.exit_code, 6);
         assert!(sentinel.exists());
         assert!(!index_root.join("generation-1").exists());
         let _ = fs::remove_dir_all(index_root);
@@ -1115,6 +1117,7 @@ mod tests {
         let error = rebuild(&index_root, 2, &[]).unwrap_err();
 
         assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
+        assert_eq!(error.exit_code, 6);
         assert!(sentinel.exists());
         assert!(!index_root.join("shadow-2").exists());
         let _ = fs::remove_dir_all(index_root);

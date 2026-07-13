@@ -33,6 +33,11 @@ impl QghError {
         self
     }
 
+    pub fn with_retryable(mut self, retryable: bool) -> Self {
+        self.retryable = retryable;
+        self
+    }
+
     pub fn no_matching_profile(repo: Option<&str>) -> Self {
         let details = repo
             .map(|repo| json!({ "repo": repo }))

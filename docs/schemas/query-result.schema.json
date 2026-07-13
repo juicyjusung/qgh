@@ -153,6 +153,7 @@
         "history_cursor",
         "open_backfill_complete",
         "historical_backfill_complete",
+        "next_action",
         "oldest_synced_updated_at",
         "recent_bootstrap_floor",
         "next_backfill_window_hint"
@@ -174,6 +175,13 @@
         },
         "historical_backfill_complete": {
           "type": "boolean"
+        },
+        "next_action": {
+          "anyOf": [
+            { "$ref": "command-action.schema.json" },
+            { "type": "null" }
+          ],
+          "description": "Exact content-free command for completing the next missing coverage phase, or null when coverage is complete."
         },
         "oldest_synced_updated_at": {
           "type": ["string", "null"]
@@ -290,6 +298,9 @@
                 "runtime_unavailable",
                 "inference_failed"
               ]
+            },
+            "repair_action": {
+              "$ref": "command-action.schema.json"
             }
           },
           "additionalProperties": false

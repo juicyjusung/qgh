@@ -98,6 +98,8 @@
     "docs/schemas/error.schema.json",
     "docs/schemas/init-output.schema.json",
     "docs/schemas/sync-output.schema.json",
+    "docs/schemas/embed-output.schema.json",
+    "docs/schemas/command-action.schema.json",
     "docs/schemas/model-output.schema.json",
     "docs/schemas/query-result.schema.json",
     "docs/schemas/get-output.schema.json",

@@ -1,4 +1,6 @@
 use crate::error::QghError;
+use crate::terminal::{SummaryTone, TerminalUi};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use std::fmt::{self, Write as _};
 
@@ -48,38 +50,118 @@ pub fn print_human_success(
     data: &Value,
     warnings: &[Value],
     meta: &Value,
+    decorate: bool,
 ) {
     let rendered = match kind {
-        SuccessOutputKind::Init => render_init(data, warnings),
-        SuccessOutputKind::Sync => render_sync(data, meta),
+        SuccessOutputKind::Init => render_init(data),
+        SuccessOutputKind::Sync => render_sync(data, warnings, meta),
         SuccessOutputKind::Embed => render_embed(data),
         SuccessOutputKind::Model => render_model(data),
-        SuccessOutputKind::Query => render_query(data),
+        SuccessOutputKind::Query => render_query(data, warnings),
         SuccessOutputKind::Get => render_get(data),
-        SuccessOutputKind::Status => render_status(data),
+        SuccessOutputKind::Status => render_status(data, warnings),
         SuccessOutputKind::Doctor => render_doctor(data),
     };
-    print!("{rendered}");
+    let tone = success_tone(kind, data, warnings);
+    let terminal = if decorate {
+        TerminalUi::stdout()
+    } else {
+        TerminalUi::plain()
+    };
+    print!(
+        "{}",
+        terminal.render_summary(&rendered, tone, !matches!(kind, SuccessOutputKind::Get),)
+    );
 }
 
-pub fn print_human_warnings(warnings: &[Value]) {
-    for warning in warnings {
-        eprintln!(
-            "{}: {}",
-            display_at(warning, &["code"]),
-            display_at(warning, &["message"])
-        );
+fn success_tone(kind: SuccessOutputKind, data: &Value, warnings: &[Value]) -> SummaryTone {
+    if !warnings.is_empty() {
+        return SummaryTone::Warning;
+    }
+    let needs_attention = match kind {
+        SuccessOutputKind::Status => status_readiness(data, warnings) != "ready",
+        SuccessOutputKind::Doctor => {
+            data.get("checks")
+                .and_then(Value::as_array)
+                .is_some_and(|checks| {
+                    checks
+                        .iter()
+                        .any(|check| !check.get("ok").and_then(Value::as_bool).unwrap_or(false))
+                })
+        }
+        SuccessOutputKind::Sync => {
+            string_at(data, &["coverage", "mode"]) == Some("partial")
+                || (data.get("backfill").is_some()
+                    && !(data
+                        .pointer("/backfill/open_backfill_complete")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        && data
+                            .pointer("/backfill/historical_backfill_complete")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)))
+        }
+        SuccessOutputKind::Get => data
+            .pointer("/summary/failed")
+            .and_then(Value::as_u64)
+            .is_some_and(|failed| failed > 0),
+        SuccessOutputKind::Init
+        | SuccessOutputKind::Embed
+        | SuccessOutputKind::Model
+        | SuccessOutputKind::Query => false,
+    };
+    if needs_attention {
+        SummaryTone::Warning
+    } else {
+        SummaryTone::Success
     }
 }
 
-pub fn print_error(error: &QghError, json_mode: bool) {
+pub fn print_human_warnings(warnings: &[Value], decorate: bool) {
+    let terminal = if decorate {
+        TerminalUi::stderr()
+    } else {
+        TerminalUi::plain()
+    };
+    for warning in warnings {
+        let severity = match string_at(warning, &["severity"]) {
+            Some("fail") => "error",
+            Some("warn_strong") => "strong warning",
+            Some("warn") | None => "warning",
+            Some(other) => other,
+        };
+        eprintln!(
+            "{}",
+            terminal.warning(
+                severity,
+                &display_at(warning, &["code"]),
+                &display_at(warning, &["message"]),
+            )
+        );
+        if let Some(command) = string_at(warning, &["action", "command"]) {
+            eprintln!("{}", terminal.hint(command));
+        }
+    }
+}
+
+pub fn print_error(error: &QghError, json_mode: bool, decorate: bool) {
     if json_mode {
         let envelope = error_envelope(error);
         println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
     } else {
-        eprintln!("{}: {}", error.code, error.message);
+        let terminal = if decorate {
+            TerminalUi::stderr()
+        } else {
+            TerminalUi::plain()
+        };
+        let rendered = if error.retryable {
+            terminal.retryable_error(&error.code, &error.message)
+        } else {
+            terminal.error(&error.code, &error.message)
+        };
+        eprintln!("{rendered}");
         if let Some(hint) = &error.hint {
-            eprintln!("hint: {hint}");
+            eprintln!("{}", terminal.hint(hint));
         }
     }
 }
@@ -98,8 +180,14 @@ fn render_embed(data: &Value) -> String {
     line(
         &mut out,
         format_args!(
-            "chunks: refreshed {}, embedded {}",
+            "text chunks rebuilt: {}",
             display_at(data, &["chunks", "refreshed"]),
+        ),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "vectors generated: {}",
             display_at(data, &["chunks", "embedded"])
         ),
     );
@@ -128,7 +216,7 @@ fn render_model(data: &Value) -> String {
     out
 }
 
-fn render_init(data: &Value, warnings: &[Value]) -> String {
+fn render_init(data: &Value) -> String {
     let mut out = String::new();
     if string_at(data, &["profile_config_path"]).is_some() {
         line(&mut out, format_args!("qgh init complete"));
@@ -194,15 +282,22 @@ fn render_init(data: &Value, warnings: &[Value]) -> String {
             ),
         );
     }
-    append_warnings(&mut out, warnings);
     out
 }
 
-fn render_sync(data: &Value, meta: &Value) -> String {
+fn render_sync(data: &Value, warnings: &[Value], meta: &Value) -> String {
+    if data.get("backfill").is_some() {
+        return render_backfill_sync(data, warnings, meta);
+    }
     let mut out = String::new();
     let state = string_at(data, &["sync_state"]).unwrap_or("ok");
-    let title = if state == "backoff" {
-        "qgh sync paused by backoff"
+    if state == "skipped_fresh" {
+        return render_skipped_fresh_sync(data, meta);
+    }
+    let title = if !warnings.is_empty() {
+        "qgh sync complete — search ready with limitations"
+    } else if string_at(data, &["coverage", "mode"]) == Some("partial") {
+        "qgh sync complete — search ready; coverage partial"
     } else {
         "qgh sync complete"
     };
@@ -219,54 +314,46 @@ fn render_sync(data: &Value, meta: &Value) -> String {
         ),
     );
     line(&mut out, format_args!("state: {state}"));
-    if state == "backoff" {
+    if warnings.iter().any(is_semantic_unavailable_warning) {
         line(
             &mut out,
-            format_args!(
-                "sources: issues {}, comments {}, tombstones {}",
-                display_at(data, &["sources", "issue_count"]),
-                display_at(data, &["sources", "comment_count"]),
-                display_at(data, &["sources", "tombstone_count"])
-            ),
+            format_args!("search: BM25 ready; semantic unavailable"),
         );
     } else {
-        line(
-            &mut out,
-            format_args!(
-                "issues: fetched {}, upserted {}, skipped PRs {}",
-                display_at(data, &["issues", "fetched"]),
-                display_at(data, &["issues", "upserted"]),
-                display_at(data, &["issues", "skipped_pull_requests"])
-            ),
-        );
-        line(
-            &mut out,
-            format_args!(
-                "comments: fetched {}, upserted {}",
-                display_at(data, &["comments", "fetched"]),
-                display_at(data, &["comments", "upserted"])
-            ),
-        );
-        if data
-            .get("comments")
-            .and_then(|comments| comments.get("added"))
-            .is_some()
-        {
-            line(
-                &mut out,
-                format_args!(
-                    "comment changes: added {}, updated {}, deleted {}",
-                    display_at(data, &["comments", "added"]),
-                    display_at(data, &["comments", "updated"]),
-                    display_at(data, &["comments", "deleted"])
-                ),
-            );
-        }
+        line(&mut out, format_args!("search: local index ready"));
     }
     line(
         &mut out,
-        format_args!("backoff: {}", backoff_summary(data.get("backoff"))),
+        format_args!(
+            "issues: fetched {}, upserted {}, skipped PRs {}",
+            display_at(data, &["issues", "fetched"]),
+            display_at(data, &["issues", "upserted"]),
+            display_at(data, &["issues", "skipped_pull_requests"])
+        ),
     );
+    line(
+        &mut out,
+        format_args!(
+            "comments: fetched {}, upserted {}",
+            display_at(data, &["comments", "fetched"]),
+            display_at(data, &["comments", "upserted"])
+        ),
+    );
+    if data
+        .get("comments")
+        .and_then(|comments| comments.get("added"))
+        .is_some()
+    {
+        line(
+            &mut out,
+            format_args!(
+                "comment changes: added {}, updated {}, deleted {}",
+                display_at(data, &["comments", "added"]),
+                display_at(data, &["comments", "updated"]),
+                display_at(data, &["comments", "deleted"])
+            ),
+        );
+    }
     line(
         &mut out,
         format_args!(
@@ -274,29 +361,210 @@ fn render_sync(data: &Value, meta: &Value) -> String {
             display_at(data, &["index", "active_generation"])
         ),
     );
-    line(
-        &mut out,
-        format_args!(
-            "next: qgh query <terms> --profile {}",
-            display_at(data, &["profile_id"])
-        ),
-    );
+    if data.get("coverage").is_some() {
+        line(
+            &mut out,
+            format_args!("coverage: {}", status_coverage_summary(data)),
+        );
+    }
+    let next_action = string_at(data, &["coverage", "next_action", "command"])
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "qgh query <terms> --profile {}",
+                display_at(data, &["profile_id"])
+            )
+        });
+    line(&mut out, format_args!("next: {next_action}"));
     out
 }
 
-fn render_query(data: &Value) -> String {
+fn render_skipped_fresh_sync(data: &Value, meta: &Value) -> String {
+    let mut out = String::new();
+    line(
+        &mut out,
+        format_args!("qgh sync skipped — local snapshot is fresh"),
+    );
+    line(
+        &mut out,
+        format_args!("profile: {}", display_at(data, &["profile_id"])),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "repo scope: {}",
+            repo_scope_summary(meta.get("repo"), meta.get("repo_source"))
+        ),
+    );
+    line(&mut out, format_args!("state: skipped_fresh"));
+    line(
+        &mut out,
+        format_args!("network: skipped; no GitHub request was needed"),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "last successful sync: {}",
+            display_at(data, &["sync", "last_successful_sync"])
+        ),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "snapshot age: {} seconds",
+            display_at(data, &["sync", "snapshot_age_seconds"])
+        ),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "max age: {} seconds",
+            display_at(data, &["sync", "max_age_seconds"])
+        ),
+    );
+    if data.get("coverage").is_some() {
+        line(
+            &mut out,
+            format_args!("coverage: {}", status_coverage_summary(data)),
+        );
+    }
+    let next_action = string_at(data, &["coverage", "next_action", "command"])
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "qgh query <terms> --profile {}",
+                display_at(data, &["profile_id"])
+            )
+        });
+    line(&mut out, format_args!("next: {next_action}"));
+    out
+}
+
+fn is_semantic_unavailable_warning(warning: &Value) -> bool {
+    string_at(warning, &["code"]).is_some_and(|code| {
+        code == "publication.embedding_snapshot_mismatch"
+            || (code.starts_with("embedding.")
+                && !matches!(
+                    code,
+                    "embedding.generation_cleanup_failed" | "embedding.tombstone_cleanup_failed"
+                ))
+    })
+}
+
+fn render_backfill_sync(data: &Value, warnings: &[Value], meta: &Value) -> String {
+    let mut out = String::new();
+    let open_complete = data
+        .pointer("/backfill/open_backfill_complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let historical_complete = data
+        .pointer("/backfill/historical_backfill_complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let complete = open_complete && historical_complete;
+    let title = if warnings.is_empty() {
+        "qgh historical backfill pass complete"
+    } else {
+        "qgh historical backfill pass complete — search ready with limitations"
+    };
+    line(&mut out, format_args!("{title}"));
+    line(
+        &mut out,
+        format_args!("profile: {}", display_at(data, &["profile_id"])),
+    );
+    if warnings.iter().any(is_semantic_unavailable_warning) {
+        line(
+            &mut out,
+            format_args!("search: BM25 ready; semantic unavailable"),
+        );
+    } else {
+        line(&mut out, format_args!("search: local index ready"));
+    }
+    line(
+        &mut out,
+        format_args!(
+            "repo scope: {}",
+            repo_scope_summary(meta.get("repo"), meta.get("repo_source"))
+        ),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "fetched: issues {}, comments {}, skipped PRs {}",
+            display_at(data, &["backfill", "issues"]),
+            display_at(data, &["backfill", "comments"]),
+            display_at(data, &["backfill", "skipped_pull_requests"])
+        ),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "coverage: {}",
+            if complete { "complete" } else { "partial" }
+        ),
+    );
+    line(
+        &mut out,
+        format_args!("open coverage complete: {open_complete}"),
+    );
+    line(
+        &mut out,
+        format_args!("historical coverage complete: {historical_complete}"),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "history cursor: {}",
+            display_at(data, &["backfill", "history_cursor"])
+        ),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "repo scope history end reached: {}",
+            display_at(data, &["backfill", "reached_end"])
+        ),
+    );
+    if complete {
+        line(
+            &mut out,
+            format_args!(
+                "next: qgh query <terms> --profile {}",
+                display_at(data, &["profile_id"])
+            ),
+        );
+    } else if let Some(command) = string_at(data, &["backfill", "next_action", "command"]) {
+        line(&mut out, format_args!("next: {command}"));
+    } else {
+        line(&mut out, format_args!("next: qgh status"));
+    }
+    out
+}
+
+fn render_query(data: &Value, warnings: &[Value]) -> String {
     let mut out = String::new();
     let results = data
         .get("results")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    line(&mut out, format_args!("qgh query results"));
+    line(
+        &mut out,
+        format_args!("qgh query — {} source candidates", results.len()),
+    );
     line(
         &mut out,
         format_args!("profile: {}", display_at(data, &["profile_id"])),
     );
     line(&mut out, format_args!("results: {}", results.len()));
+    line(
+        &mut out,
+        format_args!("search: {}", query_search_summary(results)),
+    );
+    line(
+        &mut out,
+        format_args!("coverage: {}", status_coverage_summary(data)),
+    );
     if let Some(rerank) = data.get("rerank") {
         if rerank
             .get("applied")
@@ -363,6 +631,10 @@ fn render_query(data: &Value) -> String {
         );
         line(
             &mut out,
+            format_args!("   ranking: {}", display_at(result, &["ranking", "kind"])),
+        );
+        line(
+            &mut out,
             format_args!("   snippet: {}", compact(&display_at(result, &["snippet"]))),
         );
         line(
@@ -375,12 +647,59 @@ fn render_query(data: &Value) -> String {
         );
     }
     if results.is_empty() {
-        line(
-            &mut out,
-            format_args!("next: adjust filters or run qgh sync before searching again."),
-        );
+        if warnings
+            .iter()
+            .any(|warning| string_at(warning, &["code"]) == Some("coverage.partial_no_result"))
+        {
+            line(
+                &mut out,
+                format_args!("No matches in the current partial corpus."),
+            );
+            line(
+                &mut out,
+                format_args!(
+                    "next: {}",
+                    string_at(data, &["coverage", "next_action", "command"])
+                        .unwrap_or("qgh status")
+                ),
+            );
+        } else {
+            line(
+                &mut out,
+                format_args!("No matches in the current local corpus."),
+            );
+            line(
+                &mut out,
+                format_args!("next: adjust the query or filters and search again."),
+            );
+        }
     }
     out
+}
+
+fn query_search_summary(results: &[Value]) -> &'static str {
+    if results.iter().any(|result| {
+        matches!(
+            string_at(result, &["ranking", "kind"]),
+            Some("hybrid") | Some("reranked")
+        )
+    }) {
+        "hybrid"
+    } else if results
+        .iter()
+        .any(|result| string_at(result, &["ranking", "kind"]) == Some("vector"))
+    {
+        "vector"
+    } else if results
+        .iter()
+        .any(|result| string_at(result, &["ranking", "kind"]) == Some("exact"))
+    {
+        "exact lookup"
+    } else if results.is_empty() {
+        "local snapshot"
+    } else {
+        "BM25"
+    }
 }
 
 fn render_get(data: &Value) -> String {
@@ -501,10 +820,11 @@ fn render_get_batch(data: &Value) -> String {
     out
 }
 
-fn render_status(data: &Value) -> String {
+fn render_status(data: &Value, warnings: &[Value]) -> String {
     let mut out = String::new();
     let resolution = data.get("resolution").unwrap_or(&Value::Null);
-    line(&mut out, format_args!("qgh status"));
+    let readiness = status_readiness(data, warnings);
+    line(&mut out, format_args!("qgh status — search {readiness}"));
     line(
         &mut out,
         format_args!(
@@ -549,6 +869,17 @@ fn render_status(data: &Value) -> String {
             display_at(data, &["sources", "comment_count"]),
             display_at(data, &["sources", "tombstone_count"])
         ),
+    );
+    line(
+        &mut out,
+        format_args!(
+            "search: {}",
+            status_search_summary(data, warnings, readiness)
+        ),
+    );
+    line(
+        &mut out,
+        format_args!("coverage: {}", status_coverage_summary(data)),
     );
     line(
         &mut out,
@@ -599,9 +930,157 @@ fn render_status(data: &Value) -> String {
     );
     line(
         &mut out,
-        format_args!("next: qgh sync --all syncs every repo in the selected profile."),
+        format_args!(
+            "next: {}",
+            status_next_action(data, display_at(data, &["profile_id"]), readiness)
+        ),
     );
     out
+}
+
+fn status_readiness(data: &Value, warnings: &[Value]) -> &'static str {
+    if data
+        .pointer("/purge/retrieval_blocked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || warnings.iter().any(is_retrieval_blocking_warning)
+    {
+        "blocked"
+    } else if string_at(data, &["freshness", "decision"]) == Some("never_synced") {
+        "not ready"
+    } else {
+        "ready"
+    }
+}
+
+fn is_retrieval_blocking_warning(warning: &Value) -> bool {
+    matches!(
+        string_at(warning, &["code"]),
+        Some(
+            "publication.source_snapshot_incomplete"
+                | "publication.source_snapshot_changed"
+                | "publication.source_inventory_mismatch"
+                | "publication.embedding_snapshot_mismatch"
+                | "publication.tantivy_artifact_not_ready"
+        )
+    )
+}
+
+fn status_search_summary(data: &Value, warnings: &[Value], readiness: &str) -> String {
+    if readiness == "blocked" {
+        if data
+            .pointer("/purge/retrieval_blocked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return "blocked until pending purge repair completes".to_string();
+        }
+        if warnings.iter().any(is_retrieval_blocking_warning) {
+            return "blocked until the local index is rebuilt".to_string();
+        }
+    }
+    if readiness == "not ready" {
+        return "not ready; no successful local snapshot".to_string();
+    }
+    match string_at(data, &["embedding", "state"]) {
+        None => "BM25 ready; semantic not configured".to_string(),
+        Some("complete") => "hybrid ready; BM25 + semantic".to_string(),
+        Some(state) => format!("BM25 ready; semantic {state}"),
+    }
+}
+
+fn status_coverage_summary(data: &Value) -> String {
+    match string_at(data, &["coverage", "mode"]) {
+        Some("complete") => "complete".to_string(),
+        Some("partial") => match (
+            data.pointer("/coverage/open_backfill_complete")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            data.pointer("/coverage/historical_backfill_complete")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ) {
+            (false, false) => "partial; open and historical coverage incomplete".to_string(),
+            (false, true) => "partial; open coverage incomplete".to_string(),
+            (true, false) => "partial; historical coverage incomplete".to_string(),
+            (true, true) => "partial; coverage state inconsistent".to_string(),
+        },
+        Some(mode) => mode.to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+fn status_next_action(data: &Value, profile_id: String, readiness: &str) -> String {
+    if let Some(backoff) = data
+        .pointer("/sync/backoff")
+        .filter(|value| value.is_object())
+    {
+        let retry_command = string_at(backoff, &["retry_action", "command"])
+            .or_else(|| string_at(backoff, &["retry_command"]));
+        if let Some(retry_at) = backoff_retry_at(backoff) {
+            if retry_at <= Utc::now() {
+                return retry_command.map_or_else(
+                    || "retry the interrupted sync command now".to_string(),
+                    |command| format!("retry now: {command}"),
+                );
+            }
+            return retry_command.map_or_else(
+                || {
+                    format!(
+                        "wait until {}, then retry the interrupted sync command",
+                        retry_at.to_rfc3339()
+                    )
+                },
+                |command| format!("wait until {}, then {command}", retry_at.to_rfc3339()),
+            );
+        }
+        return retry_command.map_or_else(
+            || {
+                "wait for GitHub backoff to clear, then retry the interrupted sync command"
+                    .to_string()
+            },
+            |command| format!("wait for GitHub backoff to clear, then {command}"),
+        );
+    }
+    if readiness == "blocked" {
+        return status_sync_command(data, &profile_id);
+    }
+    if readiness == "not ready" {
+        return status_sync_command(data, &profile_id);
+    }
+    if let Some(action) = string_at(data, &["coverage", "next_action", "command"]) {
+        return action.to_string();
+    }
+    format!("qgh query <terms> --profile {profile_id}")
+}
+
+fn status_sync_command(data: &Value, profile_id: &str) -> String {
+    if let Some(repo) = string_at(data, &["resolution", "effective_repo_scope"]) {
+        format!("qgh sync --repo {repo} --profile {profile_id}")
+    } else {
+        format!("qgh sync --all --profile {profile_id}")
+    }
+}
+
+fn backoff_retry_at(backoff: &Value) -> Option<DateTime<Utc>> {
+    if let Some(reset_at) = string_at(backoff, &["reset_at"]) {
+        if let Some(reset_at) = DateTime::parse_from_rfc3339(reset_at)
+            .ok()
+            .map(|value| value.with_timezone(&Utc))
+        {
+            return Some(reset_at);
+        }
+    }
+    let observed_at = string_at(backoff, &["observed_at"])
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())?
+        .with_timezone(&Utc);
+    let retry_after_seconds = backoff
+        .get("retry_after_seconds")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0);
+    Duration::try_seconds(retry_after_seconds)
+        .and_then(|duration| observed_at.checked_add_signed(duration))
 }
 
 fn render_doctor(data: &Value) -> String {
@@ -681,23 +1160,6 @@ fn append_next_steps(out: &mut String, data: &Value) {
     }
 }
 
-fn append_warnings(out: &mut String, warnings: &[Value]) {
-    if warnings.is_empty() {
-        return;
-    }
-    line(out, format_args!("warnings:"));
-    for warning in warnings {
-        line(
-            out,
-            format_args!(
-                "  {}: {}",
-                display_at(warning, &["code"]),
-                display_at(warning, &["message"])
-            ),
-        );
-    }
-}
-
 fn display_title(result: &Value) -> String {
     string_at(result, &["title"])
         .or_else(|| string_at(result, &["parent_issue", "title"]))
@@ -723,10 +1185,11 @@ fn repo_scope_summary(repo: Option<&Value>, source: Option<&Value>) -> String {
 fn backoff_summary(backoff: Option<&Value>) -> String {
     match backoff {
         Some(Value::Object(_)) => format!(
-            "reason={}, scope={}, retry_after_seconds={}",
+            "reason={}, scope={}, retry_after_seconds={}, reset_at={}",
             display_at(backoff.unwrap(), &["reason"]),
             display_at(backoff.unwrap(), &["scope"]),
-            display_at(backoff.unwrap(), &["retry_after_seconds"])
+            display_at(backoff.unwrap(), &["retry_after_seconds"]),
+            display_at(backoff.unwrap(), &["reset_at"])
         ),
         _ => "none".to_string(),
     }
@@ -831,4 +1294,45 @@ fn compact(value: &str) -> String {
 
 fn line(out: &mut String, args: fmt::Arguments<'_>) {
     let _ = writeln!(out, "{args}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cleanup_warnings_do_not_claim_semantic_search_is_unavailable() {
+        for code in [
+            "embedding.generation_cleanup_failed",
+            "embedding.tombstone_cleanup_failed",
+        ] {
+            assert!(!is_semantic_unavailable_warning(&json!({ "code": code })));
+        }
+    }
+
+    #[test]
+    fn runtime_and_snapshot_warnings_report_semantic_search_unavailable() {
+        for code in [
+            "embedding.sync_tokenizer_failed",
+            "publication.embedding_snapshot_mismatch",
+        ] {
+            assert!(is_semantic_unavailable_warning(&json!({ "code": code })));
+        }
+    }
+
+    #[test]
+    fn legacy_backoff_status_does_not_invent_a_different_retry_command() {
+        let data = json!({
+            "sync": {
+                "backoff": {
+                    "retry_after_seconds": 0,
+                    "observed_at": "2026-01-01T00:00:00Z"
+                }
+            }
+        });
+        let action = status_next_action(&data, "work".to_string(), "ready");
+        assert_eq!(action, "retry the interrupted sync command now");
+        assert!(!action.contains("qgh sync --profile"));
+    }
 }

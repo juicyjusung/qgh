@@ -2605,7 +2605,7 @@ fn backoff_from_response(
             .and_then(|epoch| DateTime::from_timestamp(epoch, 0))
             .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true));
         let retry_after_seconds = reset_epoch
-            .map(|epoch| (epoch - Utc::now().timestamp()).max(0))
+            .map(|epoch| epoch.saturating_sub(Utc::now().timestamp()).max(0))
             .unwrap_or(60);
         return Some(BackoffPlan {
             reason: "primary_rate_limit".to_string(),
@@ -2623,6 +2623,7 @@ fn backoff_from_response(
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<i64>().ok())
+        .map(|value| value.max(0))
         .unwrap_or(60);
     Some(BackoffPlan {
         reason: "secondary_rate_limit".to_string(),
@@ -2833,9 +2834,10 @@ fn authentication_failure() -> QghError {
 }
 
 #[allow(dead_code)]
-fn github_unavailable() -> QghError {
+pub(crate) fn github_unavailable() -> QghError {
     QghError::github("GitHub request did not produce a confirmed lifecycle result.")
         .with_hint("Retry later; local content was not removed.")
+        .with_retryable(true)
 }
 
 #[allow(dead_code)]
@@ -3656,6 +3658,41 @@ mod permission_classification_tests {
             r#"{"message":"secondary rate limit; resource not accessible"}"#,
         );
         assert!(matches!(result, ResponseDisposition::Backoff(_)));
+    }
+
+    #[test]
+    fn backoff_headers_normalize_extreme_and_negative_values() {
+        let mut primary_headers = HeaderMap::new();
+        primary_headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        primary_headers.insert(
+            "x-ratelimit-reset",
+            HeaderValue::from_static("-9223372036854775808"),
+        );
+        let primary = backoff_from_response(StatusCode::FORBIDDEN, &primary_headers, "scope")
+            .expect("primary rate-limit evidence");
+        assert_eq!(primary.retry_after_seconds, 0);
+        assert_eq!(primary.reset_at, None);
+
+        let mut negative_headers = HeaderMap::new();
+        negative_headers.insert(RETRY_AFTER, HeaderValue::from_static("-5"));
+        let negative =
+            backoff_from_response(StatusCode::TOO_MANY_REQUESTS, &negative_headers, "scope")
+                .expect("secondary rate-limit evidence");
+        assert_eq!(negative.retry_after_seconds, 0);
+
+        let mut huge_headers = HeaderMap::new();
+        huge_headers.insert(RETRY_AFTER, HeaderValue::from_static("9223372036854775807"));
+        let huge = backoff_from_response(StatusCode::TOO_MANY_REQUESTS, &huge_headers, "scope")
+            .expect("secondary rate-limit evidence");
+        assert_eq!(huge.retry_after_seconds, i64::MAX);
+    }
+
+    #[test]
+    fn transient_unavailable_error_is_retryable() {
+        let error = github_unavailable();
+        assert_eq!(error.code, "github.request_failed");
+        assert_eq!(error.exit_code, 3);
+        assert!(error.retryable);
     }
 
     #[test]

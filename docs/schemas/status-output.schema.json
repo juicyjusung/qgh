@@ -260,6 +260,8 @@
       "required": [
         "reason",
         "scope",
+        "retry_command",
+        "retry_action",
         "retry_after_seconds",
         "reset_at",
         "observed_at",
@@ -271,6 +273,21 @@
         },
         "scope": {
           "type": "string"
+        },
+        "retry_command": {
+          "type": ["string", "null"],
+          "description": "Sanitized command for retrying the interrupted sync operation; null only for legacy stored backoff rows."
+        },
+        "retry_action": {
+          "oneOf": [
+            {
+              "$ref": "command-action.schema.json"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Human and machine-safe retry commands; null only for legacy stored backoff rows."
         },
         "retry_after_seconds": {
           "type": "integer",
@@ -420,6 +437,7 @@
         "history_cursor",
         "open_backfill_complete",
         "historical_backfill_complete",
+        "next_action",
         "oldest_synced_updated_at",
         "recent_bootstrap_floor",
         "next_backfill_window_hint"
@@ -442,6 +460,13 @@
         "historical_backfill_complete": {
           "type": "boolean"
         },
+        "next_action": {
+          "anyOf": [
+            { "$ref": "command-action.schema.json" },
+            { "type": "null" }
+          ],
+          "description": "Exact content-free command for completing the next missing coverage phase, or null when coverage is complete."
+        },
         "oldest_synced_updated_at": {
           "type": ["string", "null"]
         },
@@ -457,7 +482,7 @@
     },
     "embedding": {
       "type": "object",
-      "required": ["state", "coverage", "configured_model", "fingerprint"],
+      "required": ["state", "coverage", "configured_model", "fingerprint", "repair_action"],
       "properties": {
         "state": {
           "type": "string",
@@ -478,6 +503,13 @@
               "type": "null"
             }
           ]
+        },
+        "repair_action": {
+          "anyOf": [
+            { "$ref": "command-action.schema.json" },
+            { "type": "null" }
+          ],
+          "description": "Content-free local remediation command, or null when no embedding repair is currently actionable."
         }
       },
       "additionalProperties": false

@@ -327,6 +327,17 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
         assert_eq!(tool["inputSchema"]["type"], "object");
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        let warning_action =
+            &tool["outputSchema"]["properties"]["warnings"]["items"]["properties"]["action"];
+        assert_eq!(warning_action["additionalProperties"], false);
+        assert_eq!(
+            warning_action["required"],
+            json!(["reason", "command", "json_command"])
+        );
+        assert!(
+            !schema_contains_ref(&tool["outputSchema"], "command-action.schema.json"),
+            "MCP outputSchema must inline command actions for offline clients"
+        );
         match tool["name"].as_str().unwrap() {
             "query" => {
                 assert_eq!(
@@ -736,6 +747,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "docs/schemas/error.schema.json",
             "docs/schemas/init-output.schema.json",
             "docs/schemas/sync-output.schema.json",
+            "docs/schemas/embed-output.schema.json",
+            "docs/schemas/command-action.schema.json",
             "docs/schemas/model-output.schema.json",
             "docs/schemas/query-result.schema.json",
             "docs/schemas/get-output.schema.json",
@@ -762,6 +775,14 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         &fs::read_to_string(root.join("docs/schemas/sync-output.schema.json")).unwrap(),
     )
     .unwrap();
+    let embed_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/embed-output.schema.json")).unwrap(),
+    )
+    .unwrap();
+    let command_action_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/command-action.schema.json")).unwrap(),
+    )
+    .unwrap();
     let model_schema: Value = serde_json::from_str(
         &fs::read_to_string(root.join("docs/schemas/model-output.schema.json")).unwrap(),
     )
@@ -783,6 +804,24 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     )
     .unwrap();
     assert_eq!(model_schema["additionalProperties"], false);
+    assert_eq!(embed_schema["additionalProperties"], false);
+    assert_eq!(command_action_schema["additionalProperties"], false);
+    assert_eq!(
+        command_action_schema["required"],
+        json!(["reason", "command", "json_command"])
+    );
+    assert_eq!(
+        embed_schema["required"],
+        json!(["profile_id", "embedding_state", "chunks"])
+    );
+    assert_eq!(
+        embed_schema["properties"]["embedding_state"]["const"],
+        "refreshed"
+    );
+    assert_eq!(
+        embed_schema["properties"]["chunks"]["required"],
+        json!(["refreshed", "embedded"])
+    );
     assert_eq!(
         model_schema["required"],
         json!([
@@ -842,12 +881,14 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "validation.window_requires_recent",
         "validation.backfill_conflicts",
         "validation.requires_backfill",
+        "validation.max_age_requires_if_stale",
         "validation.repo_required",
         "validation.lifecycle_failed",
         "github.invalid_issue_json",
         "github.invalid_comment_json",
         "github.confirmed_lifecycle_requires_typed_handling",
         "sync.commit_page_failed",
+        "sync.backoff",
         "sync.transfer_cycle",
         "sync.transfer_chain_too_long",
         "embedding.source_snapshot_incomplete",
@@ -868,16 +909,16 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     }
     assert_eq!(
         sync_schema["properties"]["sync_state"]["enum"],
-        json!(["ok", "backoff", "skipped_fresh"])
+        json!(["ok", "skipped_fresh"])
     );
     assert_eq!(sync_schema["additionalProperties"], false);
     assert_eq!(
         schema_property_names(&sync_schema),
         BTreeSet::from([
             "backfill".to_string(),
-            "backoff".to_string(),
             "comment_listing".to_string(),
             "comments".to_string(),
+            "coverage".to_string(),
             "cursors".to_string(),
             "index".to_string(),
             "issues".to_string(),
@@ -885,7 +926,6 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "profile_id".to_string(),
             "reconciliation".to_string(),
             "scheduler".to_string(),
-            "sources".to_string(),
             "sync".to_string(),
             "sync_run_id".to_string(),
             "sync_state".to_string(),
@@ -1043,7 +1083,9 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "skipped_pull_requests",
             "reached_end",
             "history_cursor",
-            "historical_backfill_complete"
+            "open_backfill_complete",
+            "historical_backfill_complete",
+            "next_action"
         ])
     );
     assert_eq!(sync_backfill["additionalProperties"], false);
@@ -1063,33 +1105,16 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "boolean"
     );
     assert_eq!(
-        sync_schema["properties"]["backoff"]["$ref"],
-        "#/$defs/backoff"
-    );
-    let sync_backoff = &sync_schema["$defs"]["backoff"];
-    assert_eq!(
-        sync_backoff["required"],
-        json!([
-            "reason",
-            "scope",
-            "retry_after_seconds",
-            "reset_at",
-            "observed_at",
-            "last_successful_sync"
-        ])
-    );
-    assert_eq!(sync_backoff["additionalProperties"], false);
-    assert_eq!(
-        sync_backoff["properties"]["retry_after_seconds"]["minimum"],
-        0
+        sync_backfill["properties"]["open_backfill_complete"]["type"],
+        "boolean"
     );
     assert_eq!(
-        sync_backoff["properties"]["reset_at"]["type"],
-        json!(["string", "null"])
+        sync_backfill["properties"]["next_action"]["anyOf"][0]["$ref"],
+        "command-action.schema.json"
     );
     assert_eq!(
-        sync_backoff["properties"]["last_successful_sync"]["type"],
-        json!(["string", "null"])
+        sync_backfill["properties"]["next_action"]["anyOf"][1]["type"],
+        "null"
     );
     assert_eq!(
         sync_schema["properties"]["cursors"]["$ref"],
@@ -1118,27 +1143,6 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         sync_cursors["properties"]["watermarks"]["additionalProperties"]["type"],
         json!(["string", "null"])
     );
-    assert_eq!(
-        sync_schema["properties"]["sources"]["$ref"],
-        "#/$defs/sources"
-    );
-    let sync_sources = &sync_schema["$defs"]["sources"];
-    assert_eq!(
-        sync_sources["required"],
-        json!(["issue_count", "comment_count", "tombstone_count"])
-    );
-    assert_eq!(sync_sources["additionalProperties"], false);
-    assert_eq!(
-        schema_property_names(sync_sources),
-        BTreeSet::from([
-            "comment_count".to_string(),
-            "issue_count".to_string(),
-            "tombstone_count".to_string(),
-        ])
-    );
-    assert_eq!(sync_sources["properties"]["issue_count"]["minimum"], 0);
-    assert_eq!(sync_sources["properties"]["comment_count"]["minimum"], 0);
-    assert_eq!(sync_sources["properties"]["tombstone_count"]["minimum"], 0);
     assert_eq!(
         sync_schema["properties"]["scheduler"]["$ref"],
         "#/$defs/scheduler"
@@ -1311,6 +1315,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "history_cursor",
             "open_backfill_complete",
             "historical_backfill_complete",
+            "next_action",
             "oldest_synced_updated_at",
             "recent_bootstrap_floor",
             "next_backfill_window_hint"
@@ -1323,6 +1328,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "historical_backfill_complete".to_string(),
             "history_cursor".to_string(),
             "mode".to_string(),
+            "next_action".to_string(),
             "next_backfill_window_hint".to_string(),
             "oldest_synced_updated_at".to_string(),
             "open_backfill_complete".to_string(),
@@ -1350,6 +1356,14 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             json!(["string", "null"])
         );
     }
+    assert_eq!(
+        status_coverage["properties"]["next_action"]["anyOf"][0]["$ref"],
+        "command-action.schema.json"
+    );
+    assert_eq!(
+        status_coverage["properties"]["next_action"]["anyOf"][1]["type"],
+        "null"
+    );
     for field in ["open_backfill_complete", "historical_backfill_complete"] {
         assert_eq!(status_coverage["properties"][field]["type"], "boolean");
     }
@@ -1362,7 +1376,13 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     let status_embedding = &status_schema["$defs"]["embedding"];
     assert_eq!(
         status_embedding["required"],
-        json!(["state", "coverage", "configured_model", "fingerprint"])
+        json!([
+            "state",
+            "coverage",
+            "configured_model",
+            "fingerprint",
+            "repair_action"
+        ])
     );
     assert_eq!(status_embedding["additionalProperties"], false);
     assert_eq!(
@@ -1371,6 +1391,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "configured_model".to_string(),
             "coverage".to_string(),
             "fingerprint".to_string(),
+            "repair_action".to_string(),
             "state".to_string(),
         ])
     );
@@ -1398,6 +1419,14 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         status_embedding["properties"]["fingerprint"]["anyOf"][1]["type"],
+        "null"
+    );
+    assert_eq!(
+        status_embedding["properties"]["repair_action"]["anyOf"][0]["$ref"],
+        "command-action.schema.json"
+    );
+    assert_eq!(
+        status_embedding["properties"]["repair_action"]["anyOf"][1]["type"],
         "null"
     );
     let embedding_coverage = &status_schema["$defs"]["embedding_coverage"];
@@ -1541,6 +1570,14 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         status_schema["$defs"]["coverage"]
     );
     assert_eq!(
+        sync_schema["properties"]["coverage"]["$ref"],
+        "#/$defs/coverage"
+    );
+    assert_eq!(
+        sync_schema["$defs"]["coverage"],
+        status_schema["$defs"]["coverage"]
+    );
+    assert_eq!(
         query_schema["required"],
         json!([
             "profile_id",
@@ -1578,6 +1615,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert_eq!(
         query_rerank["oneOf"][0]["properties"]["runtime_profile"]["enum"],
         json!(["metal_f32", "cpu_f32"])
+    );
+    assert_eq!(
+        query_rerank["oneOf"][1]["properties"]["repair_action"]["$ref"],
+        "command-action.schema.json"
     );
     let query_result = &query_schema["$defs"]["query_result"];
     assert_eq!(
@@ -2035,6 +2076,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         json!([
             "reason",
             "scope",
+            "retry_command",
+            "retry_action",
             "retry_after_seconds",
             "reset_at",
             "observed_at",
@@ -2042,6 +2085,18 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         ])
     );
     assert_eq!(sync_backoff["additionalProperties"], false);
+    assert_eq!(
+        sync_backoff["properties"]["retry_command"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        sync_backoff["properties"]["retry_action"]["oneOf"][0]["$ref"],
+        "command-action.schema.json"
+    );
+    assert_eq!(
+        sync_backoff["properties"]["retry_action"]["oneOf"][1]["type"],
+        "null"
+    );
     assert_eq!(
         sync_backoff["properties"]["retry_after_seconds"]["minimum"],
         0
@@ -2600,6 +2655,206 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
 }
 
 #[test]
+fn cli_help_teaches_workflow_and_side_effect_boundaries() {
+    let top_level = stdout_text(&qgh(&["--help"]));
+    for workflow_step in [
+        "qgh init",
+        "qgh sync",
+        "qgh query",
+        "qgh get",
+        "cite",
+        "qgh status",
+        "--json",
+    ] {
+        assert!(
+            top_level.contains(workflow_step),
+            "top-level help must teach workflow step {workflow_step}:\n{top_level}"
+        );
+    }
+    for description in [
+        "Sync GitHub Issues/comments and refresh local search",
+        "Rebuild all local vector embeddings",
+        "Search the local snapshot for source candidates",
+        "Open authoritative local sources before citing them",
+        "Inspect local search readiness without network access",
+        "Probe GitHub connectivity and local model health",
+        "Serve the read-only query/get/status MCP tools over stdio",
+    ] {
+        assert!(
+            top_level.contains(description),
+            "top-level help must teach: {description}\n{top_level}"
+        );
+    }
+
+    let sync = stdout_text(&qgh(&["sync", "--help"]));
+    assert!(sync.contains("incremental embeddings"));
+    assert!(sync.contains("Sync one explicit owner/repo"));
+    assert!(sync.contains("This command contacts GitHub"));
+    assert!(sync.contains("may purge qgh-managed local data"));
+    assert!(sync.contains("transient failures do not"));
+    assert!(sync.contains("one budgeted historical pass"));
+    assert!(sync.contains("repeat until coverage is complete"));
+    assert!(sync.contains("default 7d"));
+    assert!(sync.contains("confirmed unavailable sources may be purged locally"));
+    assert!(sync.contains("Hide progress on stderr"));
+    assert!(sync.contains("keep the final human summary plain"));
+
+    let embed = stdout_text(&qgh(&["embed", "--help"]));
+    assert!(embed.contains("advanced full rebuild"));
+    assert!(embed.contains("Normal sync updates embeddings incrementally"));
+    assert!(embed.contains("keep the final human summary plain"));
+
+    let model = stdout_text(&qgh(&["model", "--help"]));
+    assert!(model.contains("global local model store"));
+    assert!(model.contains("--profile is not valid"));
+    let install = stdout_text(&qgh(&["model", "install", "--help"]));
+    assert!(install.contains("Download and verify"));
+    assert!(install.contains("repository content is never sent"));
+
+    let init = stdout_text(&qgh(&["init", "--help"]));
+    for explanation in [
+        "owner/repo",
+        "Accept inferred defaults",
+        "GitHub host",
+        "GitHub REST API base URL",
+        "GitHub web base URL",
+        "token source reference",
+        "environment variable name",
+        "Overwrite an existing .qgh.toml repository policy",
+    ] {
+        assert!(
+            init.contains(explanation),
+            "missing init help: {explanation}"
+        );
+    }
+    let init_repo = stdout_text(&qgh(&["init", "repo", "--help"]));
+    assert!(init_repo.contains("repository policy only"));
+    assert!(init_repo.contains("Overwrite an existing .qgh.toml"));
+
+    let sync_issue = stdout_text(&qgh(&["sync", "issue", "--help"]));
+    assert!(sync_issue.contains("Refresh one issue and its comments"));
+    assert!(sync_issue.contains("confirmed lifecycle changes"));
+
+    let get = stdout_text(&qgh(&["get", "--help"]));
+    assert!(get.contains("contacts GitHub"));
+    assert!(get.contains("purges confirmed unavailable local content"));
+
+    let query = stdout_text(&qgh(&["query", "--help"]));
+    assert!(!query.contains("--wiki"));
+
+    let status = stdout_text(&qgh(&["status", "--help"]));
+    assert!(status.contains("without network access"));
+    let doctor = stdout_text(&qgh(&["doctor", "--help"]));
+    assert!(doctor.contains("contacts GitHub"));
+    assert!(doctor.contains("loads the configured local model runtime"));
+
+    let profile_with_model = qgh(&[
+        "--profile",
+        "work",
+        "model",
+        "install",
+        "qwen3-embedding-0.6b",
+        "--json",
+    ]);
+    assert_eq!(profile_with_model.status.code(), Some(2));
+    let error: Value = serde_json::from_slice(&profile_with_model.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "validation.cli");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("global model store"));
+}
+
+#[test]
+fn mcp_surface_teaches_query_get_cite_without_write_tools() {
+    let output = mcp([
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "qgh-agent-ux-test", "version": "0"}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }),
+    ]);
+    assert_success(&output);
+    let messages = stdout_json_lines(&output);
+    let instructions = messages[0]["result"]["instructions"].as_str().unwrap();
+    for required in [
+        "query -> get -> cite",
+        "source candidates, not answers",
+        "local snapshot",
+        "query, get, and status are local-only",
+        "does not write to GitHub",
+        "does not expose sync, embed, model, or doctor tools",
+    ] {
+        assert!(
+            instructions.contains(required),
+            "MCP instructions must explain {required}: {instructions}"
+        );
+    }
+
+    let tools = messages[1]["result"]["tools"].as_array().unwrap();
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["query", "get", "status"]
+    );
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap();
+        let description = tool["description"].as_str().unwrap();
+        match name {
+            "query" => {
+                assert!(description.contains("source candidates"));
+                assert!(description.contains("get_args"));
+            }
+            "get" => {
+                assert!(description.contains("authoritative full source"));
+                assert!(description.contains("canonical URL"));
+                assert!(description.contains("does not contact GitHub"));
+            }
+            "status" => {
+                assert!(description.contains("local-only"));
+                assert!(description.contains("does not contact GitHub"));
+            }
+            _ => unreachable!(),
+        }
+        for (property, schema) in tool["inputSchema"]["properties"].as_object().unwrap() {
+            assert!(
+                schema["description"]
+                    .as_str()
+                    .is_some_and(|description| !description.is_empty()),
+                "MCP {name}.{property} must be self-describing"
+            );
+        }
+        assert_eq!(
+            tool["outputSchema"]["properties"]["error"]["$id"],
+            "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/error.schema.json"
+        );
+        let expected_data_schema = match name {
+            "query" => "query-result.schema.json",
+            "get" => "get-output.schema.json",
+            "status" => "status-output.schema.json",
+            _ => unreachable!(),
+        };
+        assert!(tool["outputSchema"]["properties"]["data"]["$id"]
+            .as_str()
+            .unwrap()
+            .ends_with(expected_data_schema));
+    }
+}
+
+#[test]
 fn bm25_only_build_excludes_vector_runtime_dependencies() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
@@ -2787,6 +3042,21 @@ fn format_schema_location(schema_path: &str, json_path: &[String]) -> String {
         format!("{schema_path}:<root>")
     } else {
         format!("{schema_path}:{}", json_path.join("."))
+    }
+}
+
+fn schema_contains_ref(schema: &Value, reference: &str) -> bool {
+    match schema {
+        Value::Object(object) => {
+            object.get("$ref").and_then(Value::as_str) == Some(reference)
+                || object
+                    .values()
+                    .any(|child| schema_contains_ref(child, reference))
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(|child| schema_contains_ref(child, reference)),
+        _ => false,
     }
 }
 

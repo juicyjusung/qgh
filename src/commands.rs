@@ -35,14 +35,17 @@ use crate::freshness::{self, FreshnessContext, FreshnessOverrides};
 use crate::fusion::{self, LEXICAL_GUARD_V1};
 use crate::github;
 use crate::index;
+#[cfg(feature = "fastembed-provider")]
+use crate::local_models::ModelSnapshotState;
 use crate::local_models::{
     default_prepared_qwen_model_store, install_qwen_model, qwen_model_manifest_hash,
     qwen_model_spec, ModelInstallAction, QWEN_EMBEDDING_MODEL_ID, QWEN_EMBEDDING_PRESET_ID,
     QWEN_EMBEDDING_QUERY_PREFIX, QWEN_RERANKER_PRESET_ID,
 };
 use crate::model::{
-    ReconciliationCandidate, StoredChunk, StoredComment, StoredIssue, StoredSource, SyncSummary,
-    TargetedSyncSummary, VectorSearchFilters,
+    BackoffView, CommandAction, CoverageSnapshot, ReconciliationCandidate, StoredChunk,
+    StoredComment, StoredIssue, StoredSource, SyncSummary, TargetedSyncSummary,
+    VectorSearchFilters,
 };
 use crate::paths::ProfilePaths;
 #[cfg(feature = "fastembed-provider")]
@@ -56,6 +59,7 @@ use crate::store::{
     PendingPurgeView, PurgeTarget, PurgeTrigger, RetrievalBuildSnapshot, RetrievalPublicationView,
     Store,
 };
+use crate::terminal::TerminalUi;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -144,14 +148,12 @@ pub async fn sync(
     backfill: bool,
     max_requests: Option<usize>,
     max_duration: Option<&str>,
+    all_repos: bool,
     repo_scope: Option<&ResolvedRepoScope>,
+    json_mode: bool,
+    quiet: bool,
     show_progress: bool,
 ) -> Result<LocalReadOutcome, QghError> {
-    let progress = StderrSyncProgress::new(show_progress);
-    progress.line(format_args!(
-        "qgh sync: loading profile profile={profile_id}"
-    ));
-    let profile = load_profile(profile_id)?;
     if window.is_some() && reconcile != Some(ReconcileMode::Recent) {
         return Err(QghError::validation(
             "validation.window_requires_recent",
@@ -170,6 +172,31 @@ pub async fn sync(
             "--max-requests and --max-duration require --backfill.",
         ));
     }
+    if !if_stale && max_age.is_some() {
+        return Err(QghError::validation(
+            "validation.max_age_requires_if_stale",
+            "--max-age requires --if-stale.",
+        ));
+    }
+    let retry_command = sync_retry_command(
+        profile_id,
+        reconcile,
+        window,
+        if_stale,
+        max_age,
+        backfill,
+        max_requests,
+        max_duration,
+        all_repos,
+        repo_scope.map(|scope| scope.repo.as_str()),
+        json_mode,
+        quiet,
+    );
+    let progress = StderrSyncProgress::new(show_progress);
+    progress.line(format_args!(
+        "qgh sync: loading profile profile={profile_id}"
+    ));
+    let profile = load_profile(profile_id)?;
     let parsed_window_seconds = window
         .map(|value| freshness::parse_duration_seconds("window", value))
         .transpose()?;
@@ -187,6 +214,7 @@ pub async fn sync(
         None
     };
     let fetch_profile = profile_scoped_to_repo(&profile, repo_scope)?;
+    let full_profile_scope = fetch_profile.repos.len() == profile.repos.len();
     let mut store = Store::open(&profile.paths)?;
     run_sync_purge_preflight(&profile, &mut store)?;
     let token = resolve_token(&profile)?;
@@ -200,6 +228,11 @@ pub async fn sync(
             if snapshot_age_seconds <= max_age_seconds {
                 match store.resolve_active_tantivy_artifact() {
                     Ok(_) => {
+                        let coverage = coverage::evaluate(
+                            &profile_coverage_snapshot(&store, &profile)?,
+                            false,
+                            &profile.id,
+                        );
                         progress.line(format_args!(
                             "qgh sync: skipped, snapshot fresh age={snapshot_age_seconds}s max_age={max_age_seconds}s"
                         ));
@@ -211,21 +244,13 @@ pub async fn sync(
                                     "last_successful_sync": last_sync,
                                     "snapshot_age_seconds": snapshot_age_seconds,
                                     "max_age_seconds": max_age_seconds
-                                }
+                                },
+                                "coverage": coverage.block
                             }),
                             Vec::new(),
                         ));
                     }
-                    Err(error)
-                        if matches!(
-                            error.code.as_str(),
-                            "publication.source_snapshot_incomplete"
-                                | "publication.source_snapshot_changed"
-                                | "publication.embedding_snapshot_mismatch"
-                                | "publication.tantivy_artifact_not_ready"
-                                | "publication.source_inventory_mismatch"
-                        ) =>
-                    {
+                    Err(error) if is_repairable_retrieval_publication_error(&error.code) => {
                         progress.line(format_args!(
                             "qgh sync: fresh remote snapshot requires retrieval publication repair"
                         ));
@@ -247,6 +272,8 @@ pub async fn sync(
             &mut store,
             max_requests,
             max_duration,
+            full_profile_scope,
+            &retry_command,
             &progress,
         )
         .await;
@@ -327,42 +354,7 @@ pub async fn sync(
                     "qgh sync: backoff reason={} scope={} retry_after_seconds={}",
                     backoff.reason, backoff.scope, backoff.retry_after_seconds
                 ));
-                let backoff = store.record_backoff_state(
-                    &backoff.reason,
-                    &backoff.scope,
-                    backoff.retry_after_seconds,
-                    backoff.reset_at.as_deref(),
-                )?;
-                let status = store.status()?;
-                let warnings = if summary.is_some() {
-                    vec![incomplete_snapshot_publication_warning()]
-                } else {
-                    Vec::new()
-                };
-                return Ok(local_read_outcome(
-                    json!({
-                        "profile_id": profile.id,
-                        "sync_state": "backoff",
-                        "backoff": backoff,
-                        "sync": {
-                            "last_successful_sync": status.last_sync_at,
-                            "scheduler": {
-                                "max_in_flight_requests": profile.max_in_flight_requests,
-                                "hard_cap": 16
-                            }
-                        },
-                        "sources": {
-                            "issue_count": status.issue_count,
-                            "comment_count": status.comment_count,
-                            "tombstone_count": status.tombstone_count
-                        },
-                        "index": {
-                            "active_generation": status.active_generation,
-                            "dirty_task_count": status.dirty_task_count
-                        }
-                    }),
-                    warnings,
-                ));
+                return sync_backoff_failure(&mut store, &profile.id, backoff, &retry_command);
             }
         }
     }
@@ -447,37 +439,7 @@ pub async fn sync(
                 "qgh sync: comment backoff reason={} scope={} retry_after_seconds={}",
                 backoff.reason, backoff.scope, backoff.retry_after_seconds
             ));
-            let backoff = store.record_backoff_state(
-                &backoff.reason,
-                &backoff.scope,
-                backoff.retry_after_seconds,
-                backoff.reset_at.as_deref(),
-            )?;
-            let status = store.status()?;
-            return Ok(local_read_outcome(
-                json!({
-                    "profile_id": profile.id,
-                    "sync_state": "backoff",
-                    "backoff": backoff,
-                    "sync": {
-                        "last_successful_sync": status.last_sync_at,
-                        "scheduler": {
-                            "max_in_flight_requests": profile.max_in_flight_requests,
-                            "hard_cap": 16
-                        }
-                    },
-                    "sources": {
-                        "issue_count": status.issue_count,
-                        "comment_count": status.comment_count,
-                        "tombstone_count": status.tombstone_count
-                    },
-                    "index": {
-                        "active_generation": status.active_generation,
-                        "dirty_task_count": status.dirty_task_count
-                    }
-                }),
-                vec![incomplete_snapshot_publication_warning()],
-            ));
+            return sync_backoff_failure(&mut store, &profile.id, backoff, &retry_command);
         }
     }
 
@@ -492,9 +454,10 @@ pub async fn sync(
         summary.cursor_updates.len()
     ));
 
-    // Seed corpus coverage metadata from a full-profile sync only. A repo-scoped
-    // sync must not claim corpus-wide completion for repos it never touched.
-    if repo_scope.is_none() {
+    // Seed corpus coverage metadata from a full-profile sync only. A scoped
+    // single-repo sync is still full-profile when that is the profile's only
+    // repository; a partial multi-repo sync must not claim corpus completion.
+    if full_profile_scope {
         let mut coverage = store.coverage_snapshot()?;
         if coverage.recent_bootstrap_floor.is_none() {
             // Fixed once at first seed; never re-derived from `now`. checked_sub
@@ -516,6 +479,7 @@ pub async fn sync(
         // A full-profile Fetched sync paginated every repo to the end (a mid-pass
         // backoff returns early), so open issues are covered up to now.
         coverage.open_backfill_complete = true;
+        coverage.open_scope_fingerprint = Some(profile_coverage_scope_fingerprint(&profile));
         if let Some(watermark) = summary
             .cursor_updates
             .iter()
@@ -584,11 +548,11 @@ pub async fn sync(
                 match interruption_disposition(interruption) {
                     InterruptionDisposition::Error(error) => return Err(error),
                     InterruptionDisposition::Backoff(backoff) => {
-                        return sync_backoff_outcome(
-                            &profile,
+                        return sync_backoff_failure(
                             &mut store,
+                            &profile.id,
                             backoff,
-                            vec![incomplete_snapshot_publication_warning()],
+                            &retry_command,
                         )
                     }
                 }
@@ -630,6 +594,11 @@ pub async fn sync(
         "qgh sync: complete sync_run_id={}",
         summary.sync_run_id
     ));
+    let coverage = coverage::evaluate(
+        &profile_coverage_snapshot(&store, &profile)?,
+        false,
+        &profile.id,
+    );
     Ok(local_read_outcome(
         json!({
             "profile_id": profile.id,
@@ -658,51 +627,152 @@ pub async fn sync(
                 "active_generation": index.generation,
                 "dirty_task_count": index.dirty_task_count
             },
-            "reconciliation": reconciliation
+            "reconciliation": reconciliation,
+            "coverage": coverage.block
         }),
         index.warnings,
     ))
 }
 
-fn sync_backoff_outcome(
-    profile: &Profile,
+#[allow(clippy::too_many_arguments)]
+fn sync_retry_command(
+    profile_id: &str,
+    reconcile: Option<ReconcileMode>,
+    window: Option<&str>,
+    if_stale: bool,
+    max_age: Option<&str>,
+    backfill: bool,
+    max_requests: Option<usize>,
+    max_duration: Option<&str>,
+    all_repos: bool,
+    repo: Option<&str>,
+    json_mode: bool,
+    quiet: bool,
+) -> String {
+    let mut command = String::from("qgh sync");
+    if all_repos || repo.is_none() {
+        command.push_str(" --all");
+    } else if let Some(repo) = repo {
+        command.push_str(&format!(" --repo {repo}"));
+    }
+    if backfill {
+        command.push_str(" --backfill");
+        if let Some(max_requests) = max_requests {
+            command.push_str(&format!(" --max-requests {max_requests}"));
+        }
+        if let Some(max_duration) = max_duration {
+            command.push_str(&format!(" --max-duration {max_duration}"));
+        }
+    } else {
+        if let Some(reconcile) = reconcile {
+            let reconcile = match reconcile {
+                ReconcileMode::Full => "full",
+                ReconcileMode::Recent => "recent",
+            };
+            command.push_str(&format!(" --reconcile {reconcile}"));
+        }
+        if let Some(window) = window {
+            command.push_str(&format!(" --window {window}"));
+        }
+        if if_stale {
+            command.push_str(" --if-stale");
+        }
+        if let Some(max_age) = max_age {
+            command.push_str(&format!(" --max-age {max_age}"));
+        }
+    }
+    command.push_str(&format!(" --profile {profile_id}"));
+    if quiet {
+        command.push_str(" --quiet");
+    }
+    if json_mode {
+        command.push_str(" --json");
+    }
+    command
+}
+
+fn sync_backoff_failure(
     store: &mut Store,
+    profile_id: &str,
     backoff: github::BackoffPlan,
-    warnings: Vec<Value>,
+    retry_command: &str,
 ) -> Result<LocalReadOutcome, QghError> {
     let backoff = store.record_backoff_state(
         &backoff.reason,
         &backoff.scope,
         backoff.retry_after_seconds,
         backoff.reset_at.as_deref(),
+        retry_command,
     )?;
-    let status = store.status()?;
-    Ok(local_read_outcome(
-        json!({
-            "profile_id": profile.id,
-            "sync_state": "backoff",
-            "backoff": backoff,
-            "sync": {
-                "last_successful_sync": status.last_sync_at,
-                "scheduler": {
-                    "max_in_flight_requests": profile.max_in_flight_requests,
-                    "hard_cap": 16
-                }
-            },
-            "sources": {
-                "issue_count": status.issue_count,
-                "comment_count": status.comment_count,
-                "tombstone_count": status.tombstone_count
-            },
-            "index": {
-                "active_generation": status.active_generation,
-                "dirty_task_count": status.dirty_task_count
-            }
-        }),
-        warnings,
+    let local_query_available = matches!(store.successor_repair_required(), Ok(false))
+        && matches!(store.resolve_active_tantivy_artifact(), Ok(Some(_)));
+    Err(sync_backoff_error(
+        profile_id,
+        &backoff,
+        local_query_available,
+        retry_command,
     ))
 }
 
+fn sync_backoff_error(
+    profile_id: &str,
+    backoff: &BackoffView,
+    local_query_available: bool,
+    retry_command: &str,
+) -> QghError {
+    let retry_action = CommandAction::from_retry_command("sync_backoff", retry_command);
+    let retry_at = backoff
+        .reset_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+        .or_else(|| {
+            DateTime::parse_from_rfc3339(&backoff.observed_at)
+                .ok()
+                .map(|value| value.with_timezone(&Utc))
+                .and_then(|observed_at| {
+                    Duration::try_seconds(backoff.retry_after_seconds.max(0))
+                        .and_then(|duration| observed_at.checked_add_signed(duration))
+                })
+        });
+    let retry_instruction = if retry_at.is_some_and(|retry_at| retry_at <= Utc::now()) {
+        format!("Retry now: {retry_command}.")
+    } else if let Some(retry_at) = retry_at {
+        format!("Retry {retry_command} after {}.", retry_at.to_rfc3339())
+    } else {
+        format!("Retry {retry_command} after GitHub permits requests again.")
+    };
+    let local_read_instruction = if local_query_available {
+        "Existing local query, get, and status remain available."
+    } else {
+        "Local query is not currently ready; status remains available, and get may remain available for unfenced sources."
+    };
+    QghError::new(
+        "sync.backoff",
+        "GitHub sync paused because the remote host requested backoff.",
+        5,
+    )
+    .with_details(json!({
+        "profile_id": profile_id,
+        "reason": backoff.reason,
+        "scope": backoff.scope,
+        "retry_after_seconds": backoff.retry_after_seconds,
+        "reset_at": backoff.reset_at,
+        "observed_at": backoff.observed_at,
+        "last_successful_sync": backoff.last_successful_sync,
+        "local_retrieval_available": local_query_available,
+        "local_query_available": local_query_available,
+        "local_status_available": true,
+        "local_get_availability": "source_dependent",
+        "retry_command": retry_command,
+        "retry_action": retry_action,
+        "retry_at": retry_at.map(|value| value.to_rfc3339())
+    }))
+    .with_hint(format!("{retry_instruction} {local_read_instruction}"))
+    .with_retryable(true)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn backfill_sync(
     profile: &Profile,
     fetch_profile: &Profile,
@@ -710,6 +780,8 @@ async fn backfill_sync(
     store: &mut Store,
     max_requests: Option<usize>,
     max_duration: Option<&str>,
+    full_profile_scope: bool,
+    retry_command: &str,
     progress: &StderrSyncProgress,
 ) -> Result<LocalReadOutcome, QghError> {
     progress.line(format_args!("qgh sync: historical backfill"));
@@ -802,8 +874,9 @@ async fn backfill_sync(
             None => corpus_oldest,
         });
     }
-    if outcome.all_reached_end {
+    if full_profile_scope && outcome.all_reached_end {
         coverage.historical_backfill_complete = true;
+        coverage.historical_scope_fingerprint = Some(profile_coverage_scope_fingerprint(profile));
     }
     store.update_coverage(&coverage)?;
 
@@ -813,35 +886,7 @@ async fn backfill_sync(
             "qgh sync: backfill backoff reason={} scope={} retry_after_seconds={}",
             backoff.reason, backoff.scope, backoff.retry_after_seconds
         ));
-        let backoff = store.record_backoff_state(
-            &backoff.reason,
-            &backoff.scope,
-            backoff.retry_after_seconds,
-            backoff.reset_at.as_deref(),
-        )?;
-        let warnings = vec![incomplete_snapshot_publication_warning()];
-        let status = store.status()?;
-        return Ok(local_read_outcome(
-            json!({
-                "profile_id": profile.id,
-                "sync_state": "backoff",
-                "backoff": backoff,
-                "backfill": {
-                    "issues": outcome.issues,
-                    "comments": outcome.comments,
-                    "skipped_pull_requests": outcome.skipped_pull_requests,
-                    "reached_end": false,
-                    "history_cursor": coverage.history_cursor,
-                    "historical_backfill_complete": coverage.historical_backfill_complete
-                },
-                "sources": {
-                    "issue_count": status.issue_count,
-                    "comment_count": status.comment_count,
-                    "tombstone_count": status.tombstone_count
-                }
-            }),
-            warnings,
-        ));
+        return sync_backoff_failure(store, &profile.id, backoff, retry_command);
     }
 
     store.clear_backoff_state()?;
@@ -850,6 +895,8 @@ async fn backfill_sync(
     }
     let repair = repair_lexical_successor_if_required(profile, store)?;
     let index = rebuild_after_successor_repair(profile, store, progress, repair)?;
+    let coverage = profile_coverage_snapshot(store, profile)?;
+    let next_action = coverage::next_action(&coverage, &profile.id);
     Ok(local_read_outcome(
         json!({
             "profile_id": profile.id,
@@ -860,7 +907,9 @@ async fn backfill_sync(
                 "skipped_pull_requests": outcome.skipped_pull_requests,
                 "reached_end": outcome.all_reached_end,
                 "history_cursor": coverage.history_cursor,
-                "historical_backfill_complete": coverage.historical_backfill_complete
+                "open_backfill_complete": coverage.open_backfill_complete,
+                "historical_backfill_complete": coverage.historical_backfill_complete,
+                "next_action": next_action
             },
             "index": {
                 "active_generation": index.generation,
@@ -887,10 +936,36 @@ fn merge_sync_summary(total: &mut Option<SyncSummary>, page: SyncSummary) {
     }
 }
 
+fn profile_coverage_scope_fingerprint(profile: &Profile) -> String {
+    let repositories = profile
+        .repos
+        .iter()
+        .map(RepoRef::full_name)
+        .collect::<Vec<_>>();
+    coverage::repository_scope_fingerprint(repositories.iter().map(String::as_str))
+}
+
+fn profile_coverage_snapshot(
+    store: &Store,
+    profile: &Profile,
+) -> Result<CoverageSnapshot, QghError> {
+    let mut snapshot = store.coverage_snapshot()?;
+    let expected = profile_coverage_scope_fingerprint(profile);
+    if snapshot.open_scope_fingerprint.as_deref() != Some(expected.as_str()) {
+        snapshot.open_backfill_complete = false;
+    }
+    if snapshot.historical_scope_fingerprint.as_deref() != Some(expected.as_str()) {
+        snapshot.historical_backfill_complete = false;
+    }
+    Ok(snapshot)
+}
+
 pub async fn sync_issue(
     profile_id: &str,
     issue_number: i64,
     repo_scope: Option<&ResolvedRepoScope>,
+    json_mode: bool,
+    quiet: bool,
     show_progress: bool,
 ) -> Result<LocalReadOutcome, QghError> {
     if issue_number < 1 {
@@ -907,6 +982,16 @@ pub async fn sync_issue(
     ));
     let profile = load_profile(profile_id)?;
     let repo = target_issue_repo(&profile, repo_scope)?;
+    let mut retry_command = format!(
+        "qgh sync issue {issue_number} --repo {} --profile {profile_id}",
+        repo.full_name()
+    );
+    if quiet {
+        retry_command.push_str(" --quiet");
+    }
+    if json_mode {
+        retry_command.push_str(" --json");
+    }
     let mut store = Store::open(&profile.paths)?;
     run_sync_purge_preflight(&profile, &mut store)?;
     let token = resolve_token(&profile)?;
@@ -962,42 +1047,7 @@ pub async fn sync_issue(
                 "qgh sync issue: backoff reason={} scope={} retry_after_seconds={}",
                 backoff.reason, backoff.scope, backoff.retry_after_seconds
             ));
-            let backoff = store.record_backoff_state(
-                &backoff.reason,
-                &backoff.scope,
-                backoff.retry_after_seconds,
-                backoff.reset_at.as_deref(),
-            )?;
-            let status = store.status()?;
-            Ok(local_read_outcome(
-                json!({
-                    "profile_id": profile.id,
-                    "sync_state": "backoff",
-                    "target": {
-                        "kind": "issue",
-                        "repo": repo.full_name(),
-                        "issue_number": issue_number
-                    },
-                    "backoff": backoff,
-                    "sync": {
-                        "last_successful_sync": status.last_sync_at,
-                        "scheduler": {
-                            "max_in_flight_requests": profile.max_in_flight_requests,
-                            "hard_cap": 16
-                        }
-                    },
-                    "sources": {
-                        "issue_count": status.issue_count,
-                        "comment_count": status.comment_count,
-                        "tombstone_count": status.tombstone_count
-                    },
-                    "index": {
-                        "active_generation": status.active_generation,
-                        "dirty_task_count": status.dirty_task_count
-                    }
-                }),
-                Vec::new(),
-            ))
+            sync_backoff_failure(&mut store, &profile.id, backoff, &retry_command)
         }
         github::ClassifiedTargetIssueTerminal::AuthenticationFailed => {
             finish_confirmed_target_purges(&mut store)?;
@@ -1010,9 +1060,7 @@ pub async fn sync_issue(
         | github::ClassifiedTargetIssueTerminal::AmbiguousForbidden => {
             finish_confirmed_target_purges(&mut store)?;
             repair_lexical_successor_if_required(&profile, &mut store)?;
-            Err(QghError::github(
-                "GitHub request ended without a confirmed destructive lifecycle state.",
-            ))
+            Err(github::github_unavailable())
         }
         github::ClassifiedTargetIssueTerminal::Failed(error) => {
             finish_confirmed_target_purges(&mut store)?;
@@ -1139,17 +1187,29 @@ pub async fn sync_issue(
 
 struct StderrSyncProgress {
     enabled: bool,
+    operation: &'static str,
 }
 
 impl StderrSyncProgress {
     fn new(enabled: bool) -> Self {
-        Self { enabled }
+        Self {
+            enabled,
+            operation: "sync",
+        }
+    }
+
+    fn for_operation(enabled: bool, operation: &'static str) -> Self {
+        Self { enabled, operation }
     }
 
     fn line(&self, args: fmt::Arguments<'_>) {
         if self.enabled {
-            eprintln!("{args}");
+            eprintln!("{}", TerminalUi::stderr().progress(&args.to_string()));
         }
+    }
+
+    fn phase(&self, args: fmt::Arguments<'_>) {
+        self.line(format_args!("qgh {}: {args}", self.operation));
     }
 }
 
@@ -1655,9 +1715,7 @@ fn interruption_disposition(
         ),
         github::LifecycleInterruption::Transient(_)
         | github::LifecycleInterruption::AmbiguousForbidden => {
-            InterruptionDisposition::Error(QghError::github(
-                "GitHub request ended without a confirmed destructive lifecycle state.",
-            ))
+            InterruptionDisposition::Error(github::github_unavailable())
         }
         github::LifecycleInterruption::Backoff(plan) => InterruptionDisposition::Backoff(plan),
     }
@@ -1920,11 +1978,8 @@ fn prepare_embedding_chunks_for_sync_if_enabled(
     }
     let tokenizer = match embedding_tokenizer(embedding) {
         Ok(tokenizer) => tokenizer,
-        Err(_) => {
-            warnings.push(embedding_sync_warning(
-                "embedding.sync_tokenizer_failed",
-                "Prepared embedding model acquisition or tokenizer initialization failed during sync. BM25 index refresh remains available.",
-            ));
+        Err(error) => {
+            warnings.push(embedding_tokenizer_failure_warning(embedding, &error));
             return (warnings, false);
         }
     };
@@ -1976,8 +2031,8 @@ fn refresh_embedding_chunks(
             .replace_chunks_for_source_version(&source.source_id, source_version_id, &chunks)?
             .len();
     }
-    progress.line(format_args!(
-        "qgh sync: refreshed embedding chunks chunks={} skipped_sources={}",
+    progress.phase(format_args!(
+        "refreshed embedding chunks chunks={} skipped_sources={}",
         stats.refreshed_chunks, stats.skipped_sources
     ));
     Ok(stats)
@@ -2284,9 +2339,46 @@ fn embedding_sync_warning(code: &str, message: &'static str) -> Value {
 }
 
 fn embedding_refresh_failure_warning(error: &QghError) -> Value {
-    embedding_sync_warning(
+    let mut warning = embedding_sync_warning(
         &error.code,
         "Embedding refresh failed during sync. BM25 index refresh remains available.",
+    );
+    if matches!(
+        error.code.as_str(),
+        "embedding.model_not_installed" | "embedding.qwen_snapshot_invalid"
+    ) {
+        let reason = if error.code == "embedding.model_not_installed" {
+            "embedding_model_not_installed"
+        } else {
+            "embedding_model_invalid"
+        };
+        warning["action"] = json!(CommandAction::new(
+            reason,
+            "qgh model install qwen3-embedding-0.6b",
+        ));
+    }
+    warning
+}
+
+fn embedding_tokenizer_failure_warning(embedding: &EmbeddingConfig, error: &QghError) -> Value {
+    if is_qwen_embedding_config(embedding) {
+        let code = match error.code.as_str() {
+            "model.not_installed" => Some("embedding.model_not_installed"),
+            "model.snapshot_invalid" | "model.artifact_invalid" => {
+                Some("embedding.qwen_snapshot_invalid")
+            }
+            _ => None,
+        };
+        if let Some(code) = code {
+            return embedding_refresh_failure_warning(&QghError::validation(
+                code,
+                "The configured Qwen embedding snapshot is not ready.",
+            ));
+        }
+    }
+    embedding_sync_warning(
+        "embedding.sync_tokenizer_failed",
+        "Prepared embedding model acquisition or tokenizer initialization failed during sync. BM25 index refresh remains available.",
     )
 }
 
@@ -2508,10 +2600,11 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
         .with_hint("Run `qgh embed --force` to recompute every stored chunk embedding."));
     }
 
+    let progress = StderrSyncProgress::for_operation(!args.json && !args.quiet, "embed");
+    progress.phase(format_args!("loading configured local model"));
     let mut store = Store::open(&profile.paths)?;
     store.enable_vector()?;
     let runtime = embedding_runtime_for_acquisition(embedding)?;
-    let progress = StderrSyncProgress::new(false);
     let chunk_stats = refresh_embedding_chunks(
         &mut store,
         runtime.tokenizer.as_ref(),
@@ -2534,7 +2627,7 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
     if snapshot.identity().sync_run_id() != source_snapshot_sync_run_id {
         return Err(incomplete_source_snapshot_error_for_command());
     }
-    let data = refresh_chunk_embeddings(
+    let data = refresh_chunk_embeddings_with_progress(
         &mut store,
         &profile.paths,
         runtime.provider.as_ref(),
@@ -2542,6 +2635,7 @@ pub fn embed(profile_id: &str, args: &EmbedArgs) -> Result<LocalReadOutcome, Qgh
         runtime.fingerprint_seed.clone(),
         &runtime.chunker_fingerprint,
         &snapshot,
+        &progress,
     )?;
     let mut warnings = Vec::new();
     let publication_activated = store
@@ -2883,20 +2977,28 @@ fn installed_qwen_embedding_snapshot(
         qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).expect("Qwen embedding preset is registered");
     default_prepared_qwen_model_store()
         .and_then(|store| store.inspect(&spec))
-        .map_err(|error| {
-            if error.code == "model.not_installed" {
-                QghError::validation(
-                    "embedding.model_not_installed",
-                    "The configured local Qwen embedding model is not installed.",
-                )
-                .with_hint("Run `qgh model install qwen3-embedding-0.6b`.")
-            } else {
-                QghError::validation(
-                    "embedding.qwen_snapshot_invalid",
-                    "The prepared Qwen embedding snapshot failed integrity validation.",
-                )
-            }
-        })
+        .map_err(qwen_embedding_snapshot_error)
+}
+
+#[cfg(feature = "fastembed-provider")]
+fn qwen_embedding_snapshot_error(error: QghError) -> QghError {
+    let (code, message, reason) = if error.code == "model.not_installed" {
+        (
+            "embedding.model_not_installed",
+            "The configured local Qwen embedding model is not installed.",
+            "embedding_model_not_installed",
+        )
+    } else {
+        (
+            "embedding.qwen_snapshot_invalid",
+            "The prepared Qwen embedding snapshot failed integrity validation.",
+            "embedding_model_invalid",
+        )
+    };
+    let repair_action = CommandAction::new(reason, "qgh model install qwen3-embedding-0.6b");
+    QghError::validation(code, message)
+        .with_details(json!({ "repair_action": repair_action }))
+        .with_hint("Run `qgh model install qwen3-embedding-0.6b` to repair the pinned snapshot.")
 }
 
 #[cfg(feature = "fastembed-provider")]
@@ -3096,6 +3198,7 @@ fn prepared_manifest_model_id(manifest: &ModelManifestV1) -> String {
     }
 }
 
+#[cfg(test)]
 fn refresh_chunk_embeddings(
     store: &mut Store,
     paths: &ProfilePaths,
@@ -3104,6 +3207,29 @@ fn refresh_chunk_embeddings(
     fingerprint_seed: EmbeddingFingerprintSeed,
     expected_chunker_fingerprint: &str,
     snapshot: &RetrievalBuildSnapshot,
+) -> Result<Value, QghError> {
+    refresh_chunk_embeddings_with_progress(
+        store,
+        paths,
+        provider,
+        model_manifest_hash,
+        fingerprint_seed,
+        expected_chunker_fingerprint,
+        snapshot,
+        &StderrSyncProgress::new(false),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_chunk_embeddings_with_progress(
+    store: &mut Store,
+    paths: &ProfilePaths,
+    provider: &dyn EmbeddingProvider,
+    model_manifest_hash: String,
+    fingerprint_seed: EmbeddingFingerprintSeed,
+    expected_chunker_fingerprint: &str,
+    snapshot: &RetrievalBuildSnapshot,
+    progress: &StderrSyncProgress,
 ) -> Result<Value, QghError> {
     let chunks = snapshot.embedding_chunks();
     if chunks.is_empty() {
@@ -3123,10 +3249,15 @@ fn refresh_chunk_embeddings(
         ));
     }
 
+    progress.phase(format_args!("generating vectors total={}", chunks.len()));
+    let started = Instant::now();
     let texts = chunks
         .iter()
         .map(|chunk| chunk.prepared_input.as_str())
         .collect::<Vec<_>>();
+    // Keep the full corpus in one provider call so Qwen can globally bucket
+    // token lengths and choose its adaptive Metal batches. The provider owns
+    // inference batching; qgh only batches durable SQLite staging below.
     let vectors = provider.embed_documents(&texts).map_err(embedding_error)?;
     if vectors.len() != chunks.len() {
         return Err(QghError::validation(
@@ -3139,9 +3270,18 @@ fn refresh_chunk_embeddings(
         })));
     }
     let dimension = embedding_dimension(&vectors)?;
+    let embeddings = chunks.iter().zip(vectors).collect::<Vec<_>>();
+    let elapsed_seconds = started.elapsed().as_secs_f64().max(f64::EPSILON);
+    let chunks_per_second = embeddings.len() as f64 / elapsed_seconds;
+    progress.phase(format_args!(
+        "generated vectors={}/{} elapsed_seconds={:.1} chunks_per_second={:.2}",
+        embeddings.len(),
+        chunks.len(),
+        elapsed_seconds,
+        chunks_per_second
+    ));
     let fingerprint = fingerprint_seed.with_dimension(dimension);
     let runtime_fingerprint_hash = fingerprint.hash();
-    let embeddings = chunks.iter().zip(vectors).collect::<Vec<_>>();
     let source_sync_run_id = snapshot.identity().sync_run_id().to_string();
     let context_template_version = crate::context::METADATA_CONTEXT_TEMPLATE_VERSION.to_string();
     let spec = crate::store::EmbeddingGenerationSpec {
@@ -3824,7 +3964,11 @@ pub fn query(
             // result here means the locator was filtered out or did not resolve, not
             // that historical backfill is incomplete. Expose the coverage block but
             // do not fire the partial-coverage backfill warning.
-            let coverage = coverage::evaluate(&store.coverage_snapshot()?, false);
+            let coverage = coverage::evaluate(
+                &profile_coverage_snapshot(&store, &profile)?,
+                false,
+                &profile.id,
+            );
             let mut warnings = freshness.warnings;
             warnings.extend(coverage.warnings);
             warnings.append(&mut vector_open_warnings);
@@ -3946,7 +4090,11 @@ pub fn query(
         if freshness.fails {
             return Err(freshness_error(freshness.block, freshness.warnings));
         }
-        let coverage = coverage::evaluate(&store.coverage_snapshot()?, results.items.is_empty());
+        let coverage = coverage::evaluate(
+            &profile_coverage_snapshot(&store, &profile)?,
+            results.items.is_empty(),
+            &profile.id,
+        );
         let mut warnings = freshness.warnings;
         warnings.extend(coverage.warnings);
         warnings.append(&mut hybrid_warnings);
@@ -4415,13 +4563,10 @@ fn hybrid_vector_hits(
         EmbeddingRuntimeValidation::QueryOnly,
     ) {
         Ok(runtime) => runtime,
-        Err(_) => {
+        Err(error) => {
             return Ok((
                 None,
-                vec![embedding_warning(
-                    "embedding.runtime_unavailable",
-                    "Local embedding runtime was unavailable. BM25 results are still returned.",
-                )],
+                vec![embedding_runtime_failure_warning(embedding, &error)],
             ));
         }
     };
@@ -4502,7 +4647,6 @@ enum PreparedRuntimeAvailability {
     Available,
     Missing,
     Corrupt,
-    NotChecked,
 }
 
 struct ConfiguredEmbeddingSnapshot {
@@ -4537,9 +4681,9 @@ impl EmbeddingCoverageState {
         match self.prepared_runtime {
             PreparedRuntimeAvailability::Corrupt => "corrupt",
             PreparedRuntimeAvailability::Missing if !self.artifact_corrupt => "missing",
-            PreparedRuntimeAvailability::Available
-            | PreparedRuntimeAvailability::Missing
-            | PreparedRuntimeAvailability::NotChecked => self.state(),
+            PreparedRuntimeAvailability::Available | PreparedRuntimeAvailability::Missing => {
+                self.state()
+            }
         }
     }
 
@@ -4750,6 +4894,45 @@ fn embedding_warning(code: &'static str, message: &'static str) -> Value {
     })
 }
 
+fn embedding_runtime_failure_warning(embedding: &EmbeddingConfig, error: &QghError) -> Value {
+    if is_qwen_embedding_config(embedding) {
+        let (code, message, action) = match error.code.as_str() {
+            "embedding.model_not_installed" => (
+                "embedding.model_not_installed",
+                "The local Qwen embedding model is not installed. BM25 results are still returned.",
+                CommandAction::new(
+                    "embedding_model_not_installed",
+                    "qgh model install qwen3-embedding-0.6b",
+                ),
+            ),
+            "embedding.qwen_snapshot_invalid" => (
+                "embedding.qwen_snapshot_invalid",
+                "The local Qwen embedding snapshot failed integrity validation. BM25 results are still returned.",
+                CommandAction::new(
+                    "embedding_model_invalid",
+                    "qgh model install qwen3-embedding-0.6b",
+                ),
+            ),
+            _ => {
+                return embedding_warning(
+                    "embedding.runtime_unavailable",
+                    "Local embedding runtime was unavailable. BM25 results are still returned.",
+                );
+            }
+        };
+        return json!({
+            "code": code,
+            "severity": "warn",
+            "message": message,
+            "action": action
+        });
+    }
+    embedding_warning(
+        "embedding.runtime_unavailable",
+        "Local embedding runtime was unavailable. BM25 results are still returned.",
+    )
+}
+
 fn reranker_warning(code: &'static str, message: &'static str) -> Value {
     json!({
         "code": code,
@@ -4877,15 +5060,27 @@ fn rerank_failure(reason: &'static str, code: &'static str, message: &'static st
 
 fn rerank_error_report(error: &QghError) -> RerankReport {
     match error.code.as_str() {
-        "model.not_installed" => rerank_failure(
-            "model_not_installed",
-            "reranker.model_not_installed",
-            "Reranking was requested but the configured local model is not installed. Original retrieval order is returned.",
+        "model.not_installed" => with_rerank_repair_action(
+            rerank_failure(
+                "model_not_installed",
+                "reranker.model_not_installed",
+                "Reranking was requested but the configured local model is not installed. Original retrieval order is returned.",
+            ),
+            CommandAction::new(
+                "reranker_model_not_installed",
+                "qgh model install qwen3-reranker-0.6b",
+            ),
         ),
-        "model.snapshot_invalid" | "model.artifact_invalid" => rerank_failure(
-            "model_corrupt",
-            "reranker.model_corrupt",
-            "The configured local reranker failed integrity validation. Original retrieval order is returned.",
+        "model.snapshot_invalid" | "model.artifact_invalid" => with_rerank_repair_action(
+            rerank_failure(
+                "model_corrupt",
+                "reranker.model_corrupt",
+                "The configured local reranker failed integrity validation. Original retrieval order is returned.",
+            ),
+            CommandAction::new(
+                "reranker_model_invalid",
+                "qgh model install qwen3-reranker-0.6b",
+            ),
         ),
         "reranker.device_unavailable" => rerank_failure(
             "device_unavailable",
@@ -4903,6 +5098,14 @@ fn rerank_error_report(error: &QghError) -> RerankReport {
             "Reranking was requested but the configured local runtime is unavailable. Original retrieval order is returned.",
         ),
     }
+}
+
+fn with_rerank_repair_action(mut report: RerankReport, action: CommandAction) -> RerankReport {
+    report.status["repair_action"] = json!(action.clone());
+    if let Some(warning) = report.warning.as_mut() {
+        warning["action"] = json!(action);
+    }
+    report
 }
 
 fn apply_rerank_scores(candidates: &mut Vec<ResolvedQueryCandidate>, scores: Vec<f32>) {
@@ -5190,11 +5393,18 @@ fn embedding_warnings(profile: &Profile, store: &Store) -> Result<Vec<Value>, Qg
     let Some(coverage) = embedding_coverage_state(profile, store)? else {
         return Ok(Vec::new());
     };
-    Ok(embedding_warnings_for_coverage(&coverage))
-}
-
-fn embedding_warnings_for_coverage(coverage: &EmbeddingCoverageState) -> Vec<Value> {
-    embedding_warnings_for_state(coverage.state())
+    // Query-time data readiness must not be overwritten by whether the local
+    // runtime snapshot can currently be opened. `hybrid_vector_hits` reports
+    // runtime failures separately after stored coverage has been validated.
+    let state = coverage.state();
+    let mut warnings = embedding_warnings_for_state(state);
+    if let (Some(warning), Some(action)) = (
+        warnings.first_mut(),
+        embedding_repair_action(profile, &coverage, state),
+    ) {
+        warning["action"] = json!(action);
+    }
+    Ok(warnings)
 }
 
 fn embedding_warnings_for_state(state: &str) -> Vec<Value> {
@@ -5233,7 +5443,11 @@ fn embedding_status_report(
     let configured = configured_embedding_contract_snapshot(embedding);
     let coverage = embedding_coverage_state_for_config(embedding, store, &configured)?;
     let status_state = coverage.status_state();
-    let warnings = embedding_warnings_for_state(status_state);
+    let repair_action = embedding_repair_action(profile, &coverage, status_state);
+    let mut warnings = embedding_warnings_for_state(status_state);
+    if let (Some(warning), Some(action)) = (warnings.first_mut(), repair_action.as_ref()) {
+        warning["action"] = json!(action);
+    }
 
     Ok((
         Some(json!({
@@ -5245,6 +5459,7 @@ fn embedding_status_report(
                 "mismatched_chunks": coverage.mismatched_chunks
             },
             "configured_model": configured_embedding_model_json(embedding, &configured),
+            "repair_action": repair_action,
             "fingerprint": coverage
                 .active_fingerprint
                 .as_ref()
@@ -5255,6 +5470,52 @@ fn embedding_status_report(
         })),
         warnings,
     ))
+}
+
+fn embedding_repair_action(
+    profile: &Profile,
+    coverage: &EmbeddingCoverageState,
+    state: &str,
+) -> Option<CommandAction> {
+    if state == "complete" {
+        return None;
+    }
+    let embedding = profile.embedding.as_ref()?;
+    if is_qwen_embedding_config(embedding) {
+        #[cfg(feature = "fastembed-provider")]
+        {
+            let spec = qwen_model_spec(QWEN_EMBEDDING_PRESET_ID)
+                .expect("Qwen embedding preset is registered");
+            let snapshot_state = default_prepared_qwen_model_store()
+                .ok()
+                .map(|store| store.snapshot_state(&spec))?;
+            match snapshot_state {
+                ModelSnapshotState::Missing => {
+                    return Some(CommandAction::new(
+                        "embedding_model_not_installed",
+                        "qgh model install qwen3-embedding-0.6b",
+                    ));
+                }
+                ModelSnapshotState::Invalid => {
+                    return Some(CommandAction::new(
+                        "embedding_model_invalid",
+                        "qgh model install qwen3-embedding-0.6b",
+                    ));
+                }
+                ModelSnapshotState::Present => {}
+            }
+        }
+        #[cfg(not(feature = "fastembed-provider"))]
+        {
+            return None;
+        }
+    }
+    (coverage.total_chunks > 0).then(|| {
+        CommandAction::new(
+            "embedding_rebuild_required",
+            format!("qgh embed --force --profile {}", profile.id),
+        )
+    })
 }
 
 fn configured_embedding_model_json(
@@ -5377,6 +5638,23 @@ fn configured_qwen_embedding_contract_snapshot(
         qwen_model_spec(QWEN_EMBEDDING_PRESET_ID).expect("Qwen embedding preset is registered");
     let manifest_hash = qwen_model_manifest_hash(&spec);
     let runtime_profile = configured_qwen_runtime_profile_id(embedding.device);
+    let prepared_runtime = {
+        #[cfg(feature = "fastembed-provider")]
+        {
+            match default_prepared_qwen_model_store() {
+                Ok(store) => match store.snapshot_state(&spec) {
+                    ModelSnapshotState::Missing => PreparedRuntimeAvailability::Missing,
+                    ModelSnapshotState::Present => PreparedRuntimeAvailability::Available,
+                    ModelSnapshotState::Invalid => PreparedRuntimeAvailability::Corrupt,
+                },
+                Err(_) => PreparedRuntimeAvailability::Corrupt,
+            }
+        }
+        #[cfg(not(feature = "fastembed-provider"))]
+        {
+            PreparedRuntimeAvailability::Missing
+        }
+    };
     ConfiguredEmbeddingSnapshot {
         model_id: Some(QWEN_EMBEDDING_MODEL_ID.to_string()),
         model_revision: Some(configured_qwen_runtime_identity(
@@ -5385,7 +5663,7 @@ fn configured_qwen_embedding_contract_snapshot(
         )),
         pooling: Some(PoolingKind::LastToken),
         query_prefix: Some(QWEN_EMBEDDING_QUERY_PREFIX.to_string()),
-        prepared_runtime: PreparedRuntimeAvailability::NotChecked,
+        prepared_runtime,
     }
 }
 
@@ -5895,7 +6173,26 @@ pub fn status(
     let store = Store::open_for_read(&profile.paths)?;
     let status = store.status()?;
     let purge = purge_report(&store)?;
-    let coverage = coverage::evaluate(&store.coverage_snapshot()?, false);
+    let coverage = coverage::evaluate(
+        &profile_coverage_snapshot(&store, &profile)?,
+        false,
+        &profile.id,
+    );
+    let retrieval_warning = match store.resolve_active_tantivy_artifact() {
+        Ok(Some(_)) => None,
+        Ok(None) if status.last_sync_at.is_some() => Some(json!({
+            "code": "publication.tantivy_artifact_not_ready",
+            "severity": "warn_strong",
+            "message": "The local lexical retrieval artifact is not ready. Run qgh sync to rebuild it."
+        })),
+        Ok(None) => None,
+        Err(error) if is_repairable_retrieval_publication_error(&error.code) => Some(json!({
+            "code": error.code,
+            "severity": "warn_strong",
+            "message": "The local retrieval publication is not ready. Run qgh sync to rebuild it."
+        })),
+        Err(error) => return Err(error),
+    };
     let active_index_path = active_index_path(&store, &profile.paths.index_active)?;
     let last_successful_sync_at = match repo_scope {
         Some(scope) => {
@@ -5915,6 +6212,9 @@ pub fn status(
         return Err(freshness_error(freshness.block, freshness.warnings));
     }
     let mut warnings = freshness.warnings;
+    if let Some(warning) = retrieval_warning {
+        warnings.push(warning);
+    }
     let (embedding, embedding_warnings) = embedding_status_report(&profile, &store)?;
     warnings.extend(embedding_warnings);
     let source_count = (status.issue_count + status.comment_count) as usize;
@@ -6012,6 +6312,17 @@ pub fn status(
         outcome.data["embedding"] = embedding;
     }
     Ok(outcome)
+}
+
+fn is_repairable_retrieval_publication_error(code: &str) -> bool {
+    matches!(
+        code,
+        "publication.source_snapshot_incomplete"
+            | "publication.source_snapshot_changed"
+            | "publication.embedding_snapshot_mismatch"
+            | "publication.tantivy_artifact_not_ready"
+            | "publication.source_inventory_mismatch"
+    )
 }
 
 pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
@@ -6544,6 +6855,62 @@ fn lexical_evidence(
 mod tests {
     use super::*;
     use crate::model::{IssueRecord, SourceVersionView};
+
+    #[test]
+    fn sync_retry_action_preserves_the_interrupted_operation() {
+        assert_eq!(
+            sync_retry_command(
+                "work",
+                None,
+                None,
+                false,
+                None,
+                true,
+                Some(25),
+                Some("90s"),
+                true,
+                None,
+                true,
+                false,
+            ),
+            "qgh sync --all --backfill --max-requests 25 --max-duration 90s --profile work --json"
+        );
+        assert_eq!(
+            sync_retry_command(
+                "work",
+                Some(ReconcileMode::Recent),
+                Some("7d"),
+                true,
+                Some("30m"),
+                false,
+                None,
+                None,
+                false,
+                Some("owner/repo"),
+                true,
+                true,
+            ),
+            "qgh sync --repo owner/repo --reconcile recent --window 7d --if-stale --max-age 30m --profile work --quiet --json"
+        );
+    }
+
+    #[test]
+    fn transient_lifecycle_interruption_is_retryable() {
+        let disposition = interruption_disposition(github::LifecycleInterruption::Transient(
+            github::GitHubTransientKind::Server,
+        ));
+        let InterruptionDisposition::Error(error) = disposition else {
+            panic!("transient lifecycle interruption must remain an error");
+        };
+
+        assert_eq!(error.code, "github.request_failed");
+        assert_eq!(error.exit_code, 3);
+        assert!(error.retryable);
+        assert_eq!(
+            error.hint.as_deref(),
+            Some("Retry later; local content was not removed.")
+        );
+    }
 
     #[cfg(feature = "fastembed-provider")]
     #[test]
@@ -7341,6 +7708,78 @@ mod tests {
             .unwrap()
             .contains("BM25 index refresh remains available"));
         assert_eq!(warning.as_object().unwrap().len(), 3);
+        assert!(!warning.to_string().contains(private_marker));
+    }
+
+    #[test]
+    fn missing_qwen_embedding_warning_has_content_free_install_action() {
+        let private_marker = "PRIVATE_MODEL_FAILURE_MARKER_91";
+        let error = QghError::validation("embedding.model_not_installed", private_marker)
+            .with_hint(private_marker);
+
+        let warning = embedding_refresh_failure_warning(&error);
+
+        assert_eq!(
+            warning["action"],
+            json!({
+                "reason": "embedding_model_not_installed",
+                "command": "qgh model install qwen3-embedding-0.6b",
+                "json_command": "qgh model install qwen3-embedding-0.6b --json"
+            })
+        );
+        assert!(!warning.to_string().contains(private_marker));
+    }
+
+    #[test]
+    fn prepared_runtime_failure_overrides_complete_stored_embedding_status() {
+        let mut coverage = EmbeddingCoverageState {
+            active_fingerprint: None,
+            generation_active: true,
+            active_matches_config: true,
+            artifact_corrupt: false,
+            total_chunks: 1,
+            completed_chunks: 1,
+            missing_chunks: 0,
+            mismatched_chunks: 0,
+            prepared_runtime: PreparedRuntimeAvailability::Missing,
+        };
+
+        assert_eq!(coverage.state(), "complete");
+        assert_eq!(coverage.status_state(), "missing");
+        coverage.prepared_runtime = PreparedRuntimeAvailability::Corrupt;
+        assert_eq!(coverage.status_state(), "corrupt");
+    }
+
+    #[cfg(feature = "fastembed-provider")]
+    #[test]
+    fn qwen_query_runtime_snapshot_failure_has_content_free_install_action() {
+        let embedding = EmbeddingConfig {
+            provider: EmbeddingProviderKind::Local,
+            manifest_path: None,
+            model: Some(QWEN_EMBEDDING_PRESET_ID.to_string()),
+            model_path: None,
+            file: None,
+            pooling: None,
+            query_prefix: None,
+            quantization: None,
+            token_source: None,
+            device: crate::config::LocalModelDevice::Auto,
+        };
+        let private_marker = "PRIVATE_QWEN_RUNTIME_FAILURE_91";
+        let warning = embedding_runtime_failure_warning(
+            &embedding,
+            &QghError::validation("embedding.qwen_snapshot_invalid", private_marker),
+        );
+
+        assert_eq!(warning["code"], "embedding.qwen_snapshot_invalid");
+        assert_eq!(
+            warning["action"],
+            json!({
+                "reason": "embedding_model_invalid",
+                "command": "qgh model install qwen3-embedding-0.6b",
+                "json_command": "qgh model install qwen3-embedding-0.6b --json"
+            })
+        );
         assert!(!warning.to_string().contains(private_marker));
     }
 

@@ -10,7 +10,7 @@
     },
     "sync_state": {
       "type": "string",
-      "enum": ["ok", "backoff", "skipped_fresh"]
+      "enum": ["ok", "skipped_fresh"]
     },
     "sync_run_id": {
       "type": "string"
@@ -36,14 +36,11 @@
     "reconciliation": {
       "$ref": "#/$defs/reconciliation"
     },
-    "backoff": {
-      "$ref": "#/$defs/backoff"
-    },
     "backfill": {
       "$ref": "#/$defs/backfill"
     },
-    "sources": {
-      "$ref": "#/$defs/sources"
+    "coverage": {
+      "$ref": "#/$defs/coverage"
     },
     "scheduler": {
       "$ref": "#/$defs/scheduler"
@@ -196,7 +193,9 @@
         "skipped_pull_requests",
         "reached_end",
         "history_cursor",
-        "historical_backfill_complete"
+        "open_backfill_complete",
+        "historical_backfill_complete",
+        "next_action"
       ],
       "properties": {
         "issues": {
@@ -217,40 +216,68 @@
         "history_cursor": {
           "type": ["string", "null"]
         },
+        "open_backfill_complete": {
+          "type": "boolean"
+        },
         "historical_backfill_complete": {
           "type": "boolean"
+        },
+        "next_action": {
+          "anyOf": [
+            { "$ref": "command-action.schema.json" },
+            { "type": "null" }
+          ],
+          "description": "Exact content-free command for completing the next missing coverage phase, or null when coverage is complete."
         }
       },
       "additionalProperties": false
     },
-    "backoff": {
+    "coverage": {
       "type": "object",
       "required": [
-        "reason",
-        "scope",
-        "retry_after_seconds",
-        "reset_at",
-        "observed_at",
-        "last_successful_sync"
+        "mode",
+        "open_cursor",
+        "history_cursor",
+        "open_backfill_complete",
+        "historical_backfill_complete",
+        "next_action",
+        "oldest_synced_updated_at",
+        "recent_bootstrap_floor",
+        "next_backfill_window_hint"
       ],
       "properties": {
-        "reason": {
-          "type": "string"
+        "mode": {
+          "type": "string",
+          "enum": ["partial", "complete"],
+          "description": "Derived from the completion flags; complete iff both backfills are complete. Never set directly."
         },
-        "scope": {
-          "type": "string"
-        },
-        "retry_after_seconds": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "reset_at": {
+        "open_cursor": {
           "type": ["string", "null"]
         },
-        "observed_at": {
-          "type": "string"
+        "history_cursor": {
+          "type": ["string", "null"]
         },
-        "last_successful_sync": {
+        "open_backfill_complete": {
+          "type": "boolean"
+        },
+        "historical_backfill_complete": {
+          "type": "boolean"
+        },
+        "next_action": {
+          "anyOf": [
+            { "$ref": "command-action.schema.json" },
+            { "type": "null" }
+          ],
+          "description": "Exact content-free command for completing the next missing coverage phase, or null when coverage is complete."
+        },
+        "oldest_synced_updated_at": {
+          "type": ["string", "null"]
+        },
+        "recent_bootstrap_floor": {
+          "type": ["string", "null"],
+          "description": "Fixed bootstrap_start - lookback boundary. Recent lookback is acceleration, not a corpus boundary."
+        },
+        "next_backfill_window_hint": {
           "type": ["string", "null"]
         }
       },
@@ -273,25 +300,6 @@
           "additionalProperties": {
             "type": ["string", "null"]
           }
-        }
-      },
-      "additionalProperties": false
-    },
-    "sources": {
-      "type": "object",
-      "required": ["issue_count", "comment_count", "tombstone_count"],
-      "properties": {
-        "issue_count": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "comment_count": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "tombstone_count": {
-          "type": "integer",
-          "minimum": 0
         }
       },
       "additionalProperties": false

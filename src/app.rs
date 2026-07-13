@@ -27,7 +27,9 @@ pub async fn run_from_env() -> i32 {
         }
         Err(error) => {
             let qgh_error = QghError::validation("validation.cli", error.to_string());
-            print_error(&qgh_error, std::env::args().any(|arg| arg == "--json"));
+            let json_mode = std::env::args().any(|arg| arg == "--json");
+            let decorate = !std::env::args().any(|arg| arg == "--quiet");
+            print_error(&qgh_error, json_mode, decorate);
             return qgh_error.exit_code;
         }
     };
@@ -35,6 +37,7 @@ pub async fn run_from_env() -> i32 {
         return run_mcp(cli).await;
     }
     let wants_json = cli.wants_json();
+    let decorate_human = !cli.wants_quiet();
     match run(cli).await {
         Ok(outcome) => {
             if outcome.json_mode {
@@ -45,16 +48,15 @@ pub async fn run_from_env() -> i32 {
                     &outcome.data,
                     &outcome.warnings,
                     &outcome.meta,
+                    outcome.decorate_human,
                 );
-                if !matches!(outcome.output_kind, SuccessOutputKind::Init) {
-                    print_human_warnings(&outcome.warnings);
-                }
+                print_human_warnings(&outcome.warnings, outcome.decorate_human);
             }
             0
         }
         Err(error) => {
             let exit_code = error.exit_code;
-            print_error(&error, wants_json);
+            print_error(&error, wants_json, decorate_human);
             exit_code
         }
     }
@@ -65,7 +67,7 @@ async fn run_mcp(cli: Cli) -> i32 {
         Ok(()) => 0,
         Err(error) => {
             let exit_code = error.exit_code;
-            print_error(&error, false);
+            print_error(&error, false, true);
             exit_code
         }
     }
@@ -77,10 +79,12 @@ struct CommandOutcome {
     data: Value,
     warnings: Vec<Value>,
     meta: Value,
+    decorate_human: bool,
 }
 
 async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
     let json_mode = cli.wants_json();
+    let decorate_human = !cli.wants_quiet();
     if let crate::cli::Command::Init(args) = &cli.command {
         let outcome = commands::init(cli.profile.as_deref(), args)?;
         return Ok(CommandOutcome {
@@ -89,9 +93,17 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
             data: outcome.data,
             warnings: outcome.warnings,
             meta: outcome.meta,
+            decorate_human,
         });
     }
     if let crate::cli::Command::Model(args) = &cli.command {
+        if cli.profile.is_some() {
+            return Err(QghError::validation(
+                "validation.cli",
+                "qgh model install uses the global model store; --profile is not valid.",
+            )
+            .with_hint("Remove --profile and run qgh model install again."));
+        }
         let outcome = commands::install_model(args)?;
         return Ok(CommandOutcome {
             output_kind: SuccessOutputKind::Model,
@@ -99,8 +111,11 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
             data: outcome.data,
             warnings: outcome.warnings,
             meta: json!({}),
+            decorate_human,
         });
     }
+
+    validate_sync_cli_options(&cli)?;
 
     let context = resolve_command_context(&cli)?;
     let profile_id = context.profile_id.clone();
@@ -117,6 +132,8 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
                         &profile_id,
                         issue_args.number,
                         context.repo_scope.as_ref(),
+                        args.wants_json(),
+                        args.quiet(),
                         show_progress,
                     )
                     .await?
@@ -131,7 +148,10 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
                         args.backfill,
                         args.max_requests,
                         args.max_duration.as_deref(),
+                        args.all,
                         context.repo_scope.as_ref(),
+                        args.json,
+                        args.quiet,
                         show_progress,
                     )
                     .await?
@@ -189,7 +209,41 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
         data,
         warnings,
         meta: context.meta_json(),
+        decorate_human,
     })
+}
+
+fn validate_sync_cli_options(cli: &Cli) -> Result<(), QghError> {
+    let crate::cli::Command::Sync(args) = &cli.command else {
+        return Ok(());
+    };
+    if args.all && args.repo.is_some() {
+        return Err(QghError::validation(
+            "validation.cli",
+            "sync --all cannot be combined with --repo.",
+        )
+        .with_hint("Choose either one explicit --repo <owner/repo> or --all profile repos."));
+    }
+    if args.target.is_none() {
+        return Ok(());
+    }
+    if args.reconcile.is_some()
+        || args.window.is_some()
+        || args.repo.is_some()
+        || args.all
+        || args.backfill
+        || args.max_requests.is_some()
+        || args.max_duration.is_some()
+        || args.if_stale
+        || args.max_age.is_some()
+    {
+        return Err(QghError::validation(
+            "validation.cli",
+            "sync issue cannot be combined with parent sync scope, lifecycle, freshness, or backfill options.",
+        )
+        .with_hint("Use only sync issue <number> [--repo <owner/repo>] [--quiet] [--json]."));
+    }
+    Ok(())
 }
 
 fn success_output_kind(command: &crate::cli::Command) -> SuccessOutputKind {
@@ -283,6 +337,8 @@ fn effective_repo_scope_for_command(
             }
             if args.all {
                 Ok(None)
+            } else if let Some(repo) = &args.repo {
+                repo_scope_from_cli_arg(repo).map(Some)
             } else {
                 repo_scope_from_worktree()
             }

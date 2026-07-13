@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/embed-output.schema.json",
+  "title": "qgh embed output data",
+  "type": "object",
+  "required": ["profile_id", "embedding_state", "chunks"],
+  "properties": {
+    "profile_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "embedding_state": {
+      "const": "refreshed"
+    },
+    "chunks": {
+      "type": "object",
+      "required": ["refreshed", "embedded"],
+      "properties": {
+        "refreshed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "embedded": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

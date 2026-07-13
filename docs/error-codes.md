@@ -25,6 +25,18 @@ Common codes include `config.no_matching_profile`, `config.ambiguous_profile`,
 `source.outside_effective_scope`, `purge.failed`, `purge.retry_failed`,
 `purge.read_fenced`, and `purge.write_fenced`.
 
+`sync.backoff` is the retryable, exit-`5` result for a confirmed GitHub primary
+or secondary rate-limit interruption. qgh persists only content-free backoff
+metadata for `status`. Its details name the profile and report whether the
+active lexical publication is actually query-ready; a historical successful
+sync row alone does not claim retrieval availability. `status` remains the
+local diagnostic path, while `get` availability can remain source-dependent.
+Retry the explicit `sync` at or after the absolute retry/reset time. qgh does
+not turn this condition into a successful sync or silently retry network work
+from a read command. `retry_action.command` is the human retry and
+`retry_action.json_command` is the machine-safe equivalent; legacy
+`retry_command` remains for compatibility.
+
 Local model acquisition and prepared-snapshot publication fail closed with
 stable, content-free errors:
 
@@ -75,6 +87,10 @@ content-free `embedding.qwen_*` code for snapshot, device, tokenizer, runtime,
 or inference failure. These failures never authorize a Qwen model download
 during `sync`, `embed`, `query`, `get`, `status`, `doctor`, or MCP query
 handling.
+Absent or invalid Qwen embedding and reranker snapshots expose content-free
+install actions. The install command reuses a valid pinned snapshot or
+quarantines and replaces an invalid one; repository content is never sent to
+the model provider.
 `embedding.pooling_unsupported` rejects a pooling contract the selected runtime
 cannot execute.
 
@@ -123,6 +139,8 @@ validated:
 These failures do not activate or query an unvalidated generation. Run a
 successful `sync` to publish a coherent successor; when purge successor repair
 is pending, the next otherwise-valid `sync` performs that repair first.
+`publication.tantivy_artifact_not_ready` is an index/storage-state failure and
+therefore exits with class `6`, not CLI-validation class `2`.
 
 `query`/`search` and `status` may return `freshness.stale` when the local
 snapshot violates a fail-mode freshness policy or `--require-fresh` is passed.
@@ -162,7 +180,10 @@ failures are represented as item-level errors without failing the whole batch.
 `--window` is used without `--reconcile recent`, `validation.backfill_conflicts`
 when `--backfill` is combined with live-sync modifiers,
 `validation.requires_backfill` when backfill budget flags are used without
-`--backfill`, and `validation.repo_required` when `sync issue` cannot resolve a
-single target repo.
+`--backfill`, `validation.max_age_requires_if_stale` when `--max-age` is used
+without `--if-stale`, and `validation.repo_required` when `sync issue` cannot
+resolve a single target repo. `sync issue` also rejects parent sync scope,
+lifecycle, freshness, and backfill options with `validation.cli` instead of
+silently ignoring them.
 
 Human output and JSON output share exit-code classes. Human diagnostics go to stderr; JSON envelopes go to stdout.

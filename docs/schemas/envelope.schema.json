@@ -32,6 +32,9 @@
           },
           "message": {
             "type": "string"
+          },
+          "action": {
+            "$ref": "command-action.schema.json"
           }
         },
         "additionalProperties": false

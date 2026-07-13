@@ -168,10 +168,36 @@ pub struct ReconciliationRunView {
 pub struct BackoffView {
     pub reason: String,
     pub scope: String,
+    pub retry_command: Option<String>,
+    pub retry_action: Option<CommandAction>,
     pub retry_after_seconds: i64,
     pub reset_at: Option<String>,
     pub observed_at: String,
     pub last_successful_sync: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommandAction {
+    pub reason: String,
+    pub command: String,
+    pub json_command: String,
+}
+
+impl CommandAction {
+    pub fn new(reason: impl Into<String>, command: impl Into<String>) -> Self {
+        let command = command.into();
+        let json_command = format!("{command} --json");
+        Self {
+            reason: reason.into(),
+            command,
+            json_command,
+        }
+    }
+
+    pub fn from_retry_command(reason: impl Into<String>, command: &str) -> Self {
+        let command = command.strip_suffix(" --json").unwrap_or(command);
+        Self::new(reason, command)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +248,8 @@ pub struct CoverageSnapshot {
     pub history_cursor: Option<String>,
     pub open_backfill_complete: bool,
     pub historical_backfill_complete: bool,
+    pub open_scope_fingerprint: Option<String>,
+    pub historical_scope_fingerprint: Option<String>,
     pub oldest_synced_updated_at: Option<String>,
     pub recent_bootstrap_floor: Option<String>,
     pub next_backfill_window_hint: Option<String>,
