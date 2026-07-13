@@ -7632,11 +7632,9 @@ pub(super) fn rss_monitor_failure_for_test() -> Result<Value, DynError> {
 }
 
 pub(super) fn timed_failure_evidence_for_test() -> Result<Value, DynError> {
-    let mut command = Command::new("/usr/bin/time");
+    let mut command = Command::new("/bin/sh");
     command
-        .arg("-l")
         .args([
-            "/bin/sh",
             "-c",
             "printf '{\"data\":{\"chunks\":{\"embedded\":12500}}}'; exit 7",
         ])
