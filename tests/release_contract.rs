@@ -2624,22 +2624,6 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert!(checklist.contains("qwen3-embedding-0.6b"));
     assert!(checklist.contains("lexical_guard_v1"));
 
-    let readme = fs::read_to_string(root.join("README.md")).unwrap();
-    for required in [
-        "brew install juicyjusung/tap/qgh",
-        "qgh init -y",
-        "qgh sync",
-        "qgh query",
-        "qgh get",
-        "qgh --version",
-        "qgh doctor",
-    ] {
-        assert!(
-            readme.contains(required),
-            "missing README phrase: {required}"
-        );
-    }
-
     let cli_json_contract = fs::read_to_string(root.join("docs/cli-json-contract.md")).unwrap();
     for required in [
         "Released command payload schemas are closed by default",
@@ -2652,6 +2636,92 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "missing CLI JSON contract phrase: {required}"
         );
     }
+}
+
+#[test]
+fn readme_onboarding_matches_released_cli_and_mcp_contracts() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+
+    for required in [
+        "local-first, read-only CLI and MCP",
+        "GitHub Issues and issue comments",
+        "macOS Apple Silicon",
+        "Linux x86_64",
+        "brew install juicyjusung/tap/qgh",
+        "gh auth status",
+        "qgh init -y",
+        "qgh sync",
+        "qgh sync --all",
+        "qgh sync --backfill",
+        "coverage: partial",
+        "open coverage",
+        "historical coverage",
+        "coverage.next_action",
+        "qgh query",
+        "qgh get '<source_id>' --profile-id '<profile_id>'",
+        "query -> get -> cite",
+        "source candidates, not answers",
+        "canonical_url",
+        "snippet alone",
+        "explicit repository scope",
+        "organization-wide scope",
+        "no GitHub write-back",
+        "qgh.v1",
+        "qgh status",
+        "qgh doctor",
+        "qgh mcp",
+        "`query`, `get`, and `status`",
+        "brew upgrade juicyjusung/tap/qgh",
+        "qgh --version",
+    ] {
+        assert!(
+            readme.contains(required),
+            "README must teach released onboarding contract: {required}"
+        );
+    }
+
+    for relative_path in [
+        "docs/cli-json-contract.md",
+        "docs/privacy.md",
+        "docs/release-checklist.md",
+        "docs/local-qwen-models.md",
+        "docs/error-codes.md",
+    ] {
+        assert!(
+            readme.contains(&format!("]({relative_path})")),
+            "README must link to {relative_path}"
+        );
+        assert!(
+            root.join(relative_path).is_file(),
+            "README-linked file must exist: {relative_path}"
+        );
+    }
+
+    let mut remainder = readme.as_str();
+    while let Some(link_start) = remainder.find("](") {
+        let after_start = &remainder[link_start + 2..];
+        let link_end = after_start
+            .find(')')
+            .expect("README Markdown link must have a closing parenthesis");
+        let target = &after_start[..link_end];
+        let local_target = target.split('#').next().unwrap();
+        if !local_target.is_empty()
+            && !local_target.starts_with('#')
+            && !local_target.contains("://")
+        {
+            assert!(
+                root.join(local_target).exists(),
+                "README relative link target must exist: {target}"
+            );
+        }
+        remainder = &after_start[link_end + 1..];
+    }
+
+    assert!(
+        !readme.contains("npx skills add"),
+        "README must not advertise the unreleased agent-skill install path"
+    );
 }
 
 #[test]
