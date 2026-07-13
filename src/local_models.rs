@@ -205,6 +205,7 @@ pub struct ModelInstallOutcome {
     pub snapshot: PreparedQwenModelSnapshot,
 }
 
+#[cfg(feature = "fastembed-provider")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSnapshotState {
     Missing,
@@ -232,6 +233,7 @@ impl PreparedQwenModelStore {
     /// This validates the pinned manifest, exact tree, file kinds, and byte
     /// sizes without hashing the multi-gigabyte payload on every CLI process.
     /// Runtime loading still calls `inspect`, which verifies every checksum.
+    #[cfg(feature = "fastembed-provider")]
     pub fn snapshot_state(&self, spec: &QwenModelSpec) -> ModelSnapshotState {
         match self.inspect_layout(spec) {
             Ok(_) => ModelSnapshotState::Present,

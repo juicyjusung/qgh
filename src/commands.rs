@@ -3198,7 +3198,7 @@ fn prepared_manifest_model_id(manifest: &ModelManifestV1) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "vector-search"))]
 fn refresh_chunk_embeddings(
     store: &mut Store,
     paths: &ProfilePaths,
