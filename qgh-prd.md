@@ -20,6 +20,7 @@
 개정: 2026-06-30 KST (CLI-first contract — MCP is a read-only thin adapter over CLI JSON/local retrieval)
 개정: 2026-06-30 KST (init preset preview, customize fallback, and `-y` alias)
 개정: 2026-07-02 KST (#2를 full mirror에서 tracker gateway summary로 전환)
+개정: 2026-07-14 KST (#97~#101 — single-flight sync, rate-budget observation, explicit-profile coordinator, user schedulers)
 제품명: qgh
 문서 목적: GitHub Issues와 issue comments용 CLI-first local retrieval 도구와 read-only MCP adapter의 MVP 요구사항을 정의한다.
 
@@ -221,6 +222,7 @@ MVP에서 제외한다.
 | FR-14 | qgh는 no result, validation error, auth error, rate-limit/backoff state, stale index warning을 JSON schema상 구분해야 한다. | agent와 shell automation이 실패를 성공 결과로 오인하지 않아야 한다. | AC-11, AC-14 |
 | FR-15 | qgh는 GitHub config에 token 평문을 저장하지 않고 MVP supported source reference(`github_cli`, `env`)로만 다뤄야 한다. `credential_store`와 GitHub App token은 post-MVP capability다. Runtime source fallback은 금지한다. | local config leak가 private repo access leak로 이어지지 않고 wrong-account fallback이 생기지 않아야 한다. | AC-26 |
 | FR-16 | qgh는 CLI-only `doctor` command를 제공해 repo policy, profile resolution, allowlist match count, config/profile, local permissions, SQLite/Tantivy consistency, GitHub auth/reachability, and rate-limit headers를 명시적 probe로 점검해야 한다. MCP에는 `doctor`를 노출하지 않는다. | `status`를 local snapshot으로 유지하면서 설치/인증/권한 문제를 진단할 수 있어야 한다. | AC-28 |
+| FR-17 | qgh는 profile별 single-flight sync lease, response에서 관측한 content-free rate-budget snapshot, 명시적 profile 목록만 받는 bounded foreground coordinator, macOS LaunchAgent/Linux systemd user timer lifecycle을 제공해야 한다. Coordinator는 fresh/never-synced/cooldown/busy profile을 local-only로 계획하고, host당 순차 실행·모든 GitHub send 직전 shared gate·20% observed reserve·unknown budget probe 1회·pass당 최대 8회·persisted round-robin을 적용하며 hidden bootstrap/backfill/reconciliation/model work를 실행하지 않는다. `schedule`은 CLI-only다. | 많은 profile을 자동 갱신해도 writer 충돌, API burst, 암묵적 scope 확장, 숨은 maintenance가 생기지 않아야 한다. | AC-29~AC-31 |
 
 ### 8.1 REST Sync Scheduler Contract
 
@@ -232,8 +234,11 @@ MVP sync implementation baseline은 다음을 따른다.
 - All pagination follows `Link` header `rel="next"` until exhausted. qgh does not infer completeness from page counts alone.
 - Sync persists ETag/conditional request metadata per endpoint/cursor where available and treats `304 Not Modified` as a successful no-change result.
 - Watermarks use GitHub `updated_at` plus an overlap window. MVP default overlap is 60 seconds with idempotent upsert by source identity and version hash.
-- Default max in-flight GitHub REST requests is 4 per host, with a hard config cap of 16. qgh must never approach GitHub's documented 100 concurrent request secondary limit.
-- Sync uses response rate-limit headers as the primary rate-limit signal. `GET /rate_limit` is reserved for explicit `doctor` or debug output because it can still count against secondary limits.
+- 현재 sync engine의 effective max in-flight GitHub REST requests와 runtime hard cap은 모두 1이다. 기존 `max_in_flight_requests` config는 strict 1..16 validation을 유지하지만 현재 실행값을 높이지 않으며, output은 effective 값과 configured 값을 분리해 표시한다.
+- Sync는 모든 GitHub response(성공, `304`, primary/secondary backoff)에서 content-free rate-limit headers를 best-effort observation으로 저장한다. `status`는 이 local snapshot의 fresh/partial/stale 상태만 읽고 네트워크를 호출하지 않는다. `GET /rate_limit`은 explicit `doctor`에만 사용한다.
+- 같은 profile의 `sync`와 `sync issue`는 stable advisory lock으로 single-flight이며, 충돌은 retryable `sync.busy`로 실패한다. lock 파일은 삭제하지 않고 process 종료/crash 시 OS가 lease를 회수한다.
+- `qgh schedule run <PROFILE_ID>...`은 explicit profiles만 대상으로 full local plan 후 host별 순차 실행한다. never-synced profile은 bootstrap command를 안내한다. Shared host gate는 pagination, comment, parent lookup, permission confirmation을 포함한 모든 scheduled GitHub send 직전에 검사된다. Unknown/partial/stale core budget은 probe request 정확히 한 번만 허용하며 complete fresh core headers가 오면 해당 profile의 request sequence만 known budget으로 계속할 수 있고, pass 시작 시 unknown이던 host에서는 두 번째 profile을 시작하지 않는다. 그렇지 않으면 후속 요청을 모두 defer한다. Known budget은 `remaining - ceil(limit * 20%)`개 이하의 추가 요청만 시작하고 최신 observation이 reserve에 도달하면 qgh가 추가 요청을 시작하지 않는다. Remote work 직전 host별 content-free write-ahead guard를 atomic하게 저장한다. 시작한 request는 completed profile sync와 usable fresh core headroom이 모두 확인된 경우에만 guard를 제거하며, selected profile의 active backoff도 guard를 유지하거나 host-global state로 승격한다. Guard deadline은 적용 가능한 host reset/backoff 중 가장 늦은 시각(최대 24시간)을 사용하고 둘 다 없으면 5분 observation TTL로 fallback한다. 다음 pass는 explicit subset으로 다른 same-host profile만 지정해도 `host_cooldown`으로 defer하며, 관측된 remaining 값을 추정치로 덮어쓰지 않는다. 이는 다른 client의 동시 quota 소비까지 막는 absolute guarantee가 아니다. 중단 전 commit된 page/cursor는 유지하고 full sync success는 기록하지 않으며 같은 host의 나머지 profile도 remote work 없이 defer한다. Profile당 한 번, 전체 pass당 최대 8번만 remote sync를 시작하고 cursor를 atomic하게 저장해 다음 pass를 round-robin으로 시작한다.
+- `qgh schedule start/status/stop`은 macOS LaunchAgent 또는 Linux systemd user timer 한 개만 관리한다. OS user마다 고정된 HOME/uid 기반 owner record와 lease를 사용하므로 XDG override가 달라도 같은 manager identity를 직렬화하고, 기록된 이전 artifact path에서 status/stop/update를 수행한다. owner가 없는 active manager target 또는 유일하게 증명되지 않는 legacy v1 state는 `schedule.ownership_ambiguous`로 fail closed한다. `start`는 외부에서 비활성화된 manager job을 다시 활성화하며, Linux stop/update는 timer를 먼저 차단한 뒤 실행 중 service를 중지한다. 예약 작업은 `schedule run`만 호출하며 cron fallback, token material 저장, MCP exposure가 없다.
 - On primary rate limit, qgh waits until `x-ratelimit-reset`. On secondary limit, qgh honors `retry-after` when present; otherwise it waits at least one minute and applies bounded exponential backoff.
 - Sync output records backoff state, cursor state, fetched/updated/tombstoned counts, skipped PR count, and dirty index task count.
 - Full reconciliation is never hidden background work. It is invoked as `qgh sync --reconcile full` and uses bounded rate-limit budget with status-visible last run age and estimated cost class.
@@ -249,6 +254,7 @@ MVP sync implementation baseline은 다음을 따른다.
 | NFR-05 | Output schema는 versioned이고 release artifact와 문서가 같은 tool contract를 설명해야 한다. | agent가 stale schema나 unreleased option을 호출하는 문제를 막는다. | AC-11, AC-19 |
 | NFR-06 | qgh는 GHES endpoint를 profile 단위로 표현할 수 있어야 한다. (best-effort, release gate 아님) | regulated/private 환경에서는 github.com이 아닌 GHES가 target일 수 있다. | AC-01, AC-20 |
 | NFR-07 | Config는 `${XDG_CONFIG_HOME:-~/.config}/qgh`, profile data는 `${XDG_DATA_HOME:-~/.local/share}/qgh/profiles/<profile-id>`, cache는 `${XDG_CACHE_HOME:-~/.cache}/qgh` 아래에 둔다. Local DB, Tantivy index, log, cache 파일은 single-user 권한(예: 0600/0700)으로 생성해야 한다. | issue/comment에 흔히 포함되는 secret/internal host가 인덱싱되므로 derived data의 로컬 노출을 줄인다. | AC-23 |
+| NFR-08 | sync/schedule lease, rate-budget rows, coordinator cursor, scheduler registration/artifacts/logs는 single-user 권한과 atomic publication을 사용하고 token/body/query를 포함하지 않아야 한다. | 자동 실행 상태 자체가 private content 또는 credential 유출면이 되지 않아야 한다. | AC-29~AC-31 |
 
 ## 10. Data/Source Model Requirements
 
@@ -283,6 +289,7 @@ MVP implementation baseline은 다음을 따른다.
 | IR-05 | MCP server stdout은 protocol messages로만 사용하고 diagnostics는 stderr/log channel로 보내야 한다. | JSON-RPC framing 오염은 agent integration을 즉시 깨뜨린다. | AC-21 |
 | IR-06 | `query` response는 result ranking을 설명하되 score를 confidence처럼 표시하지 않아야 하고, snippet이 citation 근거가 아니라 `get` 필요 미리보기임을 schema/문서로 명시해야 한다. | ranking score와 answer correctness를 혼동하거나 snippet만으로 답하면 agent가 false positive를 확신할 수 있다. snippet-only 억제는 protocol이 아니라 contract/eval로 enforce되는 advisory임을 분명히 한다. | AC-07, AC-22 |
 | IR-07 | `doctor`는 CLI-only command이며 MCP tool list에 포함하지 않는다. `doctor`는 명시적 실행에서만 network/auth probes를 수행하고 같은 JSON envelope를 사용해야 한다. | agent에게 probe surface를 노출하지 않으면서 local install/auth 문제를 진단한다. | AC-12, AC-21, AC-28 |
+| IR-08 | `schedule run/start/status/stop`은 CLI-only command이며 strict versioned JSON/human output을 제공한다. `run`과 `start`는 positional explicit profile 목록을 요구하고 global `--profile`, implicit all-profile discovery, duplicate profile을 거부한다. | 자동화가 wrong profile을 선택하거나 MCP read-only surface를 넓히지 않게 한다. | AC-30, AC-31 |
 
 ### 11.1 JSON and Error Contract
 
@@ -290,7 +297,7 @@ Machine-readable output uses one versioned envelope when `--json` is passed:
 
 ```json
 {
-  "schema_version": "qgh.v1",
+  "schema_version": "qgh.v2",
   "ok": true,
   "data": {},
   "warnings": [],
@@ -305,7 +312,7 @@ Failures use the same envelope with `ok: false` and no partial success data:
 
 ```json
 {
-  "schema_version": "qgh.v1",
+  "schema_version": "qgh.v2",
   "ok": false,
   "error": {
     "code": "config.no_matching_profile",
@@ -326,14 +333,14 @@ Contract rules:
 
 - `query` no-result is success: `ok: true`, `data.results: []`, exit code `0`.
 - Validation, config, auth, source-not-found, tombstoned source, storage/index corruption, and rate-limit/backoff are errors with stable namespaced `error.code`.
-- Initial code families are `config.*`, `validation.*`, `auth.*`, `github.*`, `sync.*`, `index.*`, `source.*`, `storage.*`, `internal.*`.
+- Initial code families are `config.*`, `validation.*`, `auth.*`, `github.*`, `sync.*`, `schedule.*`, `index.*`, `source.*`, `storage.*`, `internal.*`.
 - CLI `--json` prints the envelope to stdout for both success and failure; human diagnostics and logs go to stderr and must not include private content.
 - CLI human mode prints human-readable output, but exit code and internal error code mapping must match JSON mode.
 - Exit code classes: `0` success, `2` validation/config usage, `3` auth/permission, `4` source not found/tombstoned, `5` GitHub rate-limit/backoff, `6` storage/index state, `70` internal error.
 - MCP adapter returns the same envelope in structured content. Tool-level errors set `isError: true`; JSON-RPC protocol errors are reserved for malformed protocol messages or server faults.
 
 Without `--json`, successful `init`, `sync`, `query`/`search`, `get`,
-`status`, and `doctor` commands print human-readable summaries on stdout.
+`status`, `doctor`, and `schedule` commands print human-readable summaries on stdout.
 Those summaries explain the selected profile, effective repo scope, local paths,
 source counts, next commands, and the `query -> get -> cite` workflow in user
 terms. Human `query` output must state that results are source candidates, not
@@ -404,6 +411,7 @@ Repo policy rules:
 | PSR-03 | Local DB, snippets, embeddings, logs는 sensitive derivative data로 취급해야 한다. | vector/snippet도 원문 재구성이 어렵더라도 private content를 반영한다. | AC-15, AC-23 |
 | PSR-04 | Token은 qgh config에 평문 저장하지 않고 MVP에서는 `github_cli` 또는 `env` explicit source reference로 다뤄야 한다. `credential_store`와 GitHub App token은 post-MVP/server capability다. | local config leak와 wrong-account fallback이 private repo access leak로 이어지지 않아야 한다. | AC-24, AC-26 |
 | PSR-05 | MCP v1은 read-only이고 GitHub write permission 없이 사용할 수 있어야 한다. | 최소 권한으로 agent integration을 가능하게 한다. | AC-12, AC-24 |
+| PSR-06 | OS scheduler artifact와 registration state는 literal token을 저장하지 않고 scheduled authentication은 non-interactive `github_cli` source만 허용해야 한다. `env` token source profile은 foreground `schedule run`에는 사용할 수 있지만 `schedule start`에서는 거부한다. | user manager 환경에 secret을 복제하거나 interactive shell environment에 의존하지 않게 한다. | AC-31 |
 
 ## 13. Search Quality Requirements
 
@@ -458,6 +466,9 @@ Repo policy rules:
 | AC-26 | qgh config 파일/저장소 어디에도 literal token 문자열이 기록되지 않고 source reference만 저장됨이 검증된다. | FR-15, PSR-04 |
 | AC-27 | reconciliation job(FR-05)이 bounded rate-limit 예산 안에서 deleted comment와 transferred/unavailable issue를 tombstone하고, manual/configured cadence, last run age, estimated cost class가 `status`/문서에 표시된다. | FR-05, NFR-03 |
 | AC-28 | CLI `doctor --profile <id>`는 config/profile, file permissions, SQLite/Tantivy consistency, GitHub auth/reachability, and rate-limit headers를 versioned envelope로 보고하고, MCP tool 목록에는 `doctor`가 없다. | FR-16, IR-07 |
+| AC-29 | concurrent `sync`/`sync issue` process 중 하나만 profile writer lease를 얻고 나머지는 content-free retryable `sync.busy`를 반환한다. 정상 종료와 forced termination 뒤 재실행이 성공하며 모든 sync success/status가 effective sequential concurrency와 local rate-budget observation을 같은 strict schema로 표시한다. | FR-17, NFR-02, NFR-03, NFR-08 |
+| AC-30 | `schedule run`은 explicit profile만 계획하고 fresh/never-synced/cooldown/busy profile에서 불필요한 GitHub 요청을 하지 않는다. 같은 host는 동시 요청 1이고 모든 send 직전 shared gate를 적용한다. Unknown core budget은 probe request 1회 뒤 complete fresh headers가 없으면 후속 요청과 same-host profile을 defer하며, known budget은 observed 20% reserve 아래의 추가 요청을 시작하지 않는다. Remote work 전 content-free host guard를 atomic하게 게시하고 uncertain request나 active selected-profile backoff 뒤에는 reset/backoff 또는 bounded fallback까지 유지해 process crash와 다음 explicit subset도 same-host request를 시작하지 않는다. 중단 전 commit은 유지하고 full sync success는 기록하지 않는다. Pass는 최대 8회이며 process 재시작 뒤에도 round-robin cursor와 partial-failure isolation이 유지된다. | FR-17, IR-08, NFR-03, NFR-08 |
+| AC-31 | `schedule start/status/stop`은 macOS LaunchAgent와 Linux systemd user timer에서 idempotent하게 한 개의 user job을 관리하고 missed-run coalescing, no-overlap, direct argv, stable executable path, private artifacts, rollback, unsupported-platform structured error를 검증한다. `status`/`stop`은 GitHub 네트워크를 호출하지 않고 token material이나 cron fallback을 만들지 않는다. | FR-17, IR-08, NFR-08, PSR-06 |
 
 ## 15. Validation and Research Plan
 

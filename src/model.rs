@@ -177,6 +177,17 @@ pub struct BackoffView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RateBudgetObservation {
+    pub host: String,
+    pub resource: Option<String>,
+    pub limit: Option<i64>,
+    pub remaining: Option<i64>,
+    pub reset_at: Option<String>,
+    pub observed_at: String,
+    pub best_effort: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommandAction {
     pub reason: String,
     pub command: String,

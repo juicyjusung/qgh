@@ -9,6 +9,7 @@ use crate::resolution::{
     repo_scope_from_cli_arg, repo_scope_from_worktree, resolve_context, resolve_explicit_context,
     ResolvedCommandContext, ResolvedRepoScope,
 };
+use crate::schedule;
 use clap::error::ErrorKind;
 use clap::Parser;
 use serde_json::{json, Value};
@@ -114,6 +115,24 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
             decorate_human,
         });
     }
+    if let crate::cli::Command::Schedule(args) = &cli.command {
+        if cli.profile.is_some() {
+            return Err(QghError::validation(
+                "validation.schedule_profile_boundary",
+                "qgh schedule accepts only its explicit profile list; global --profile is not valid.",
+            )
+            .with_hint("Remove global --profile and pass profile ids after schedule run or start."));
+        }
+        let outcome = schedule::execute(args).await?;
+        return Ok(CommandOutcome {
+            output_kind: SuccessOutputKind::Schedule,
+            json_mode,
+            data: outcome.data,
+            warnings: outcome.warnings,
+            meta: json!({}),
+            decorate_human,
+        });
+    }
 
     validate_sync_cli_options(&cli)?;
 
@@ -193,6 +212,9 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
             (data, Vec::new())
         }
         crate::cli::Command::Init(_) => unreachable!("init is handled before normal resolution"),
+        crate::cli::Command::Schedule(_) => {
+            unreachable!("schedule is handled before normal resolution")
+        }
         crate::cli::Command::Mcp => unreachable!("MCP is handled before normal CLI output"),
     };
 
@@ -254,6 +276,7 @@ fn success_output_kind(command: &crate::cli::Command) -> SuccessOutputKind {
         crate::cli::Command::Query(_) | crate::cli::Command::Search(_) => SuccessOutputKind::Query,
         crate::cli::Command::Get { .. } => SuccessOutputKind::Get,
         crate::cli::Command::Status(_) => SuccessOutputKind::Status,
+        crate::cli::Command::Schedule(_) => SuccessOutputKind::Schedule,
         crate::cli::Command::Doctor { .. } => SuccessOutputKind::Doctor,
         crate::cli::Command::Init(_) => SuccessOutputKind::Init,
         crate::cli::Command::Mcp => unreachable!("MCP is handled before normal CLI output"),
@@ -344,6 +367,9 @@ fn effective_repo_scope_for_command(
             }
         }
         crate::cli::Command::Init(_) => unreachable!("init is handled before normal resolution"),
+        crate::cli::Command::Schedule(_) => {
+            unreachable!("schedule is handled before normal resolution")
+        }
         crate::cli::Command::Mcp => unreachable!("MCP is handled before normal CLI output"),
     }
 }

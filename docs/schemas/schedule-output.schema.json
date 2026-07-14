@@ -1,0 +1,324 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/schedule-output.schema.json",
+  "title": "qgh schedule data",
+  "oneOf": [
+    { "$ref": "#/$defs/run" },
+    { "$ref": "#/$defs/start" },
+    { "$ref": "#/$defs/status" },
+    { "$ref": "#/$defs/stop" }
+  ],
+  "$defs": {
+    "run": {
+      "type": "object",
+      "required": ["operation", "pass_state", "policy", "summary", "hosts", "profiles"],
+      "properties": {
+        "operation": { "const": "run" },
+        "pass_state": {
+          "enum": ["completed", "completed_with_failures"]
+        },
+        "policy": { "$ref": "#/$defs/policy" },
+        "summary": { "$ref": "#/$defs/summary" },
+        "hosts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/host_result" }
+        },
+        "profiles": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/profile_result" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "policy": {
+      "type": "object",
+      "required": [
+        "explicit_profiles",
+        "host_max_in_flight",
+        "unknown_budget_max_attempts",
+        "reserve_percent",
+        "max_attempts_per_profile",
+        "max_remote_attempts_per_pass",
+        "rate_observation_fresh_seconds"
+      ],
+      "properties": {
+        "explicit_profiles": { "const": true },
+        "host_max_in_flight": { "const": 1 },
+        "unknown_budget_max_attempts": { "const": 1 },
+        "reserve_percent": { "const": 20 },
+        "max_attempts_per_profile": { "const": 1 },
+        "max_remote_attempts_per_pass": { "const": 8 },
+        "rate_observation_fresh_seconds": { "const": 300 }
+      },
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "required": ["requested", "planned", "started", "skipped", "deferred", "completed", "failed"],
+      "properties": {
+        "requested": { "type": "integer", "minimum": 1 },
+        "planned": { "type": "integer", "minimum": 1 },
+        "started": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "deferred": { "type": "integer", "minimum": 0 },
+        "completed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "host_result": {
+      "type": "object",
+      "required": [
+        "host",
+        "profile_ids",
+        "cursor_before",
+        "cursor_after",
+        "budget_state",
+        "budget_snapshot"
+      ],
+      "properties": {
+        "host": { "type": "string" },
+        "profile_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string" }
+        },
+        "cursor_before": { "type": ["string", "null"] },
+        "cursor_after": { "type": ["string", "null"] },
+        "budget_state": { "enum": ["unknown", "fresh"] },
+        "budget_snapshot": { "$ref": "#/$defs/nullable_rate_budget" }
+      },
+      "additionalProperties": false
+    },
+    "profile_result": {
+      "type": "object",
+      "required": [
+        "profile_id",
+        "host",
+        "planned",
+        "started",
+        "outcome",
+        "reason",
+        "error_code",
+        "next_action",
+        "budget_snapshot"
+      ],
+      "properties": {
+        "profile_id": { "type": "string" },
+        "host": { "type": "string" },
+        "planned": { "const": true },
+        "started": { "type": "boolean" },
+        "outcome": {
+          "enum": ["skipped", "deferred", "completed", "failed"]
+        },
+        "reason": {
+          "enum": [
+            "bootstrap_required",
+            "fresh",
+            "host_cooldown",
+            "host_busy",
+            "pass_limit",
+            "unknown_budget_limit",
+            "rate_budget_reserve",
+            "sync_busy",
+            "synced",
+            "sync_failed"
+          ]
+        },
+        "error_code": { "type": ["string", "null"] },
+        "next_action": {
+          "anyOf": [
+            { "$ref": "command-action.schema.json" },
+            { "type": "null" }
+          ]
+        },
+        "budget_snapshot": { "$ref": "#/$defs/nullable_rate_budget" }
+      },
+      "additionalProperties": false
+    },
+    "start": {
+      "allOf": [
+        { "$ref": "#/$defs/lifecycle" },
+        {
+          "type": "object",
+          "properties": {
+            "operation": { "const": "start" },
+            "action": { "enum": ["installed", "updated", "reloaded", "unchanged"] },
+            "schedule_state": { "const": "active" },
+            "installed": { "const": true },
+            "profile_ids": { "$ref": "#/$defs/start_lifecycle_profiles" },
+            "interval": { "const": "1h" },
+            "jitter": { "$ref": "#/$defs/jitter" },
+            "manager_checked": { "const": true }
+          }
+        }
+      ]
+    },
+    "status": {
+      "type": "object",
+      "required": [
+        "operation",
+        "action",
+        "schedule_state",
+        "installed",
+        "platform",
+        "manager_scope",
+        "profile_ids",
+        "interval",
+        "jitter",
+        "manager_checked",
+        "network_access",
+        "foreground_command",
+        "artifact_state"
+      ],
+      "properties": {
+        "operation": { "const": "status" },
+        "action": { "const": "inspected" },
+        "schedule_state": { "enum": ["not_installed", "active", "drifted"] },
+        "installed": { "type": "boolean" },
+        "platform": { "$ref": "#/$defs/platform" },
+        "manager_scope": { "const": "user" },
+        "profile_ids": { "$ref": "#/$defs/lifecycle_profiles" },
+        "interval": { "type": ["string", "null"] },
+        "jitter": { "$ref": "#/$defs/nullable_jitter" },
+        "manager_checked": { "const": false },
+        "network_access": { "const": false },
+        "foreground_command": { "const": "schedule run" },
+        "artifact_state": {
+          "enum": ["missing", "orphaned", "platform_mismatch", "ready", "changed"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "stop": {
+      "allOf": [
+        { "$ref": "#/$defs/lifecycle" },
+        {
+          "type": "object",
+          "properties": {
+            "operation": { "const": "stop" },
+            "action": { "enum": ["removed", "unchanged"] },
+            "schedule_state": { "const": "not_installed" },
+            "installed": { "const": false }
+          }
+        }
+      ]
+    },
+    "lifecycle": {
+      "type": "object",
+      "required": [
+        "operation",
+        "action",
+        "schedule_state",
+        "installed",
+        "platform",
+        "manager_scope",
+        "profile_ids",
+        "interval",
+        "jitter",
+        "manager_checked",
+        "network_access",
+        "foreground_command"
+      ],
+      "properties": {
+        "operation": { "enum": ["start", "stop"] },
+        "action": { "type": "string" },
+        "schedule_state": { "enum": ["active", "not_installed"] },
+        "installed": { "type": "boolean" },
+        "platform": { "$ref": "#/$defs/platform" },
+        "manager_scope": { "const": "user" },
+        "profile_ids": { "$ref": "#/$defs/lifecycle_profiles" },
+        "interval": { "type": ["string", "null"] },
+        "jitter": { "$ref": "#/$defs/nullable_jitter" },
+        "manager_checked": { "const": true },
+        "network_access": { "const": false },
+        "foreground_command": { "const": "schedule run" }
+      },
+      "additionalProperties": false
+    },
+    "platform": {
+      "enum": ["macos_launchd", "linux_systemd_user"]
+    },
+    "lifecycle_profiles": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "start_lifecycle_profiles": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "nullable_jitter": {
+      "anyOf": [
+        { "$ref": "#/$defs/jitter" },
+        { "type": "null" }
+      ]
+    },
+    "jitter": {
+      "type": "object",
+      "required": ["strategy", "offset_seconds", "max_seconds"],
+      "properties": {
+        "strategy": {
+          "enum": ["deterministic_minute_offset", "systemd_fixed_random_delay"]
+        },
+        "offset_seconds": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 840,
+          "multipleOf": 60
+        },
+        "max_seconds": { "const": 900 }
+      },
+      "additionalProperties": false
+    },
+    "nullable_rate_budget": {
+      "anyOf": [
+        { "$ref": "#/$defs/rate_budget" },
+        { "type": "null" }
+      ]
+    },
+    "rate_budget": {
+      "type": "object",
+      "required": ["best_effort", "stale_after_seconds", "observations"],
+      "properties": {
+        "best_effort": { "const": true },
+        "stale_after_seconds": { "const": 300 },
+        "observations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/rate_budget_observation" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "rate_budget_observation": {
+      "type": "object",
+      "required": [
+        "host",
+        "resource",
+        "limit",
+        "remaining",
+        "reset_at",
+        "observed_at",
+        "best_effort",
+        "state",
+        "stale"
+      ],
+      "properties": {
+        "host": { "type": "string" },
+        "resource": { "type": ["string", "null"] },
+        "limit": { "type": ["integer", "null"], "minimum": 0 },
+        "remaining": { "type": ["integer", "null"], "minimum": 0 },
+        "reset_at": { "type": ["string", "null"] },
+        "observed_at": { "type": "string" },
+        "best_effort": { "const": true },
+        "state": { "enum": ["fresh", "partial", "stale"] },
+        "stale": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

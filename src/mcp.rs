@@ -3,7 +3,9 @@ use crate::commands;
 use crate::config::parse_repo;
 use crate::error::QghError;
 use crate::freshness;
-use crate::output::{error_envelope, success_envelope_with_meta_and_warnings};
+use crate::output::{
+    error_envelope, success_envelope_with_meta_and_warnings, ENVELOPE_SCHEMA_VERSION,
+};
 use crate::resolution::{
     repo_scope_from_command_arg, repo_scope_from_worktree, resolve_context,
     resolve_explicit_context, ResolvedCommandContext, ResolvedRepoScope,
@@ -750,7 +752,7 @@ fn envelope_output_schema_with_data(data_schema: Value) -> Value {
         "type": "object",
         "required": ["schema_version", "ok", "warnings", "meta"],
         "properties": {
-            "schema_version": { "const": "qgh.v1" },
+            "schema_version": { "const": ENVELOPE_SCHEMA_VERSION },
             "ok": { "type": "boolean" },
             "data": data_schema,
             "error": error_schema,

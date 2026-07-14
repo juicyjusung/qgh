@@ -109,6 +109,45 @@ repo-scoped sync cannot claim completion for a multi-repo profile.
 `qgh embed --force` is an advanced repair or full recompute command, not part
 of the normal sync workflow.
 
+Each profile permits one writer sync at a time. A concurrent `sync` or
+`sync issue` exits with retryable `sync.busy`; process exit or crash releases
+the OS lease. Sync and local-only `status` report the effective sequential
+request contract and the latest best-effort rate-budget headers without
+calling GitHub's `/rate_limit` endpoint.
+
+## Scheduled Multi-Profile Freshness
+
+Run one bounded pass over only the profiles you name:
+
+```sh
+qgh schedule run work personal
+```
+
+The pass plans from local state first, serializes requests by GitHub host,
+checks a shared gate before every GitHub send, preserves a 20% observed quota reserve,
+limits unknown budget to one probe request, and starts at most eight
+profile syncs. Complete core headers can unlock bounded follow-up requests;
+when a pass starts unknown, only that profile may continue and no second
+same-host profile starts in the pass. Missing headers defer follow-ups and
+leave a private host guard for a later pass. This constrains qgh requests, not other clients
+sharing the quota. It does not discover profiles or hide
+bootstrap, backfill, reconciliation, or model work. A never-synced profile is
+skipped with an explicit `qgh sync --all --profile PROFILE` next action.
+
+Install one hourly user job after every scheduled profile uses the
+non-interactive `github_cli` token source:
+
+```sh
+qgh schedule start work personal
+qgh schedule status
+qgh schedule stop
+```
+
+macOS uses a LaunchAgent; Linux uses a systemd user timer. Lifecycle commands
+do not contact GitHub or store tokens, and qgh never installs a cron fallback.
+See [Scheduled sync](docs/scheduling.md) for artifacts, catch-up behavior,
+credentials, logs, and recovery.
+
 ## Query, Get, Cite
 
 1. Find source candidates:
@@ -133,7 +172,7 @@ of the normal sync workflow.
 ## JSON for Agents and Scripts
 
 Human output is designed for reading and may evolve. Add `--json` for the
-versioned, machine-stable `qgh.v1` envelope:
+versioned, machine-stable `qgh.v2` envelope:
 
 ```sh
 qgh query "search terms" --json
@@ -154,7 +193,7 @@ instead of silently falling back. See the
 
 The optional `qgh` skill teaches an agent when and how to use qgh; it does not
 install the qgh binary, authenticate GitHub, create a profile, download a
-model, or run `init`, `sync`, or `doctor`. Install the CLI and prepare its local
+model, or run `init`, `sync`, `schedule`, or `doctor`. Install the CLI and prepare its local
 snapshot separately using the sections above.
 
 With Node.js 18 or newer, install the single qgh workflow into the current
@@ -193,7 +232,7 @@ separate.
 The skill distinguishes qgh's local read-only retrieval/citation layer from
 `gh`, which is the path for live GitHub truth and authorized Issue writes.
 Invoking the skill or asking for retrieval does not authorize installation,
-`qgh init`, `qgh sync`, `qgh doctor`, model downloads, or lifecycle
+`qgh init`, `qgh sync`, `qgh schedule`, `qgh doctor`, model downloads, or lifecycle
 verification. When the user explicitly requests one of those operations, the
 setup route states its boundary and performs only that scoped task. See
 [Agent skills](docs/agent-skills.md) for selection, installation scope, safety,
@@ -223,7 +262,7 @@ Or configure an MCP client with the profile that owns the local snapshot:
 ```
 
 MCP v1 exposes only the read-only `query`, `get`, and `status` tools. It does
-not expose `init`, `sync`, model management, `doctor`, lifecycle verification,
+not expose `init`, `sync`, `schedule`, model management, `doctor`, lifecycle verification,
 or GitHub write tools. An operator prepares and refreshes the local snapshot
 with the CLI. MCP `get` opens one source per call; CLI `get` also supports
 bounded batches.

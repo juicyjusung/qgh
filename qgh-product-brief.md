@@ -20,6 +20,7 @@
 개정: 2026-06-30 — CLI-first contract and MCP thin-adapter positioning
 개정: 2026-06-30 — init preset preview, customize fallback, and `-y` alias
 개정: 2026-07-02 — issue #1을 full mirror에서 tracker gateway summary로 전환
+개정: 2026-07-14 — safe scheduled sync (#97~#101) 반영
 
 ## 1. 제품 정의
 
@@ -248,7 +249,7 @@ GitHub content는 수정, 삭제, 이동된다. 특히 comment delete와 issue t
 
 GitHub primary 한도(App installation 5,000/hr 등)보다 secondary limit(동시 요청 100, REST 900 points/min)이 먼저 binding된다. 이를 무시하면 backfill이 중단되거나 차단된다.
 
-대응: fetch scheduler를 secondary limit 중심으로 설계하고 `retry-after`/`x-ratelimit-reset`을 준수한다. conditional request(ETag/304, primary 한도 비소모)로 폴링 비용을 낮추고, incremental sync는 `since` + `state=all` + `pull_request` key 필터를 쓴다. 기본 동시 요청은 host당 4, hard cap은 16으로 둔다. token type은 headroom을 위해 GitHub App installation token을 서버형/post-MVP에서 우선 검토한다.
+대응: sync engine은 host/profile 내부 GitHub 요청을 effective concurrency 1로 실행하고 profile별 single-flight lease를 둔다. 모든 response의 rate-limit headers를 content-free best-effort snapshot으로 저장하며 `status`는 이를 local-only로 표시한다. `qgh schedule run <PROFILE_ID>...`은 explicit profile만 host별 순차 조정하고, unknown budget은 1회, usable budget은 20% reserve, 전체 pass는 최대 8회로 제한한다. conditional request(ETag/304)와 `since` + `state=all` + `pull_request` key 필터를 유지하고 `retry-after`/`x-ratelimit-reset`을 준수한다. macOS LaunchAgent/Linux systemd user timer는 이 bounded foreground pass만 호출하며 hidden bootstrap/backfill/reconciliation은 실행하지 않는다.
 
 ### Privacy
 

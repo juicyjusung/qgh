@@ -232,6 +232,12 @@ pub enum TokenSource {
     Unsupported,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenResolutionMode {
+    Standard,
+    ManagedSchedule,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
@@ -1245,6 +1251,13 @@ fn looks_like_windows_absolute_path(value: &str) -> bool {
 }
 
 pub fn resolve_token(profile: &Profile) -> Result<String, QghError> {
+    resolve_token_with_mode(profile, TokenResolutionMode::Standard)
+}
+
+pub(crate) fn resolve_token_with_mode(
+    profile: &Profile,
+    mode: TokenResolutionMode,
+) -> Result<String, QghError> {
     match &profile.token_source {
         TokenSource::Env { env } => std::env::var(env).map_err(|_| {
             QghError::auth(format!(
@@ -1252,8 +1265,7 @@ pub fn resolve_token(profile: &Profile) -> Result<String, QghError> {
             ))
         }),
         TokenSource::GithubCli => {
-            let output = Command::new("gh")
-                .args(github_cli_token_args(&profile.host))
+            let output = github_cli_token_command(&profile.host, mode)
                 .output()
                 .map_err(|error| {
                     QghError::auth(format!("Failed to run `gh auth token`: {error}"))
@@ -1272,6 +1284,22 @@ pub fn resolve_token(profile: &Profile) -> Result<String, QghError> {
             "Token source must be `github_cli` or `env`.",
         )),
     }
+}
+
+fn github_cli_token_command(host: &str, mode: TokenResolutionMode) -> Command {
+    let mut command = Command::new("gh");
+    command.args(github_cli_token_args(host));
+    if mode == TokenResolutionMode::ManagedSchedule {
+        for variable in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+        ] {
+            command.env_remove(variable);
+        }
+    }
+    command
 }
 
 fn github_cli_token_args(host: &str) -> [&str; 4] {
@@ -1821,6 +1849,25 @@ mod tests {
         assert_eq!(
             github_cli_token_args("oss.navercorp.com"),
             ["auth", "token", "--hostname", "oss.navercorp.com"]
+        );
+    }
+
+    #[test]
+    fn managed_github_cli_token_command_removes_all_ambient_token_overrides() {
+        let command = github_cli_token_command("github.com", TokenResolutionMode::ManagedSchedule);
+        let removed = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            removed,
+            std::collections::BTreeSet::from([
+                "GH_ENTERPRISE_TOKEN".to_string(),
+                "GH_TOKEN".to_string(),
+                "GITHUB_ENTERPRISE_TOKEN".to_string(),
+                "GITHUB_TOKEN".to_string(),
+            ])
         );
     }
 

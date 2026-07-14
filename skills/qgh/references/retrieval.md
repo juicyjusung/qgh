@@ -1,6 +1,6 @@
 # qgh Retrieval Contract
 
-Use this reference for direct lookup and as the evidence-opening contract for multi-source research. The released CLI and its `qgh.v1` JSON envelopes are authoritative; human terminal wording may evolve.
+Use this reference for direct lookup and as the evidence-opening contract for multi-source research. The released CLI and its `qgh.v2` JSON envelopes are authoritative; human terminal wording may evolve.
 
 ## Readiness
 

@@ -37,6 +37,14 @@ pub fn qgh_cache_dir() -> Result<PathBuf, QghError> {
     Ok(xdg_or_home("XDG_CACHE_HOME", ".cache")?.join("qgh"))
 }
 
+pub fn qgh_data_dir() -> Result<PathBuf, QghError> {
+    Ok(xdg_or_home("XDG_DATA_HOME", ".local/share")?.join("qgh"))
+}
+
+pub fn schedule_hosts_dir() -> Result<PathBuf, QghError> {
+    Ok(qgh_data_dir()?.join("schedule").join("hosts"))
+}
+
 pub fn config_file_path() -> Result<PathBuf, QghError> {
     Ok(xdg_or_home("XDG_CONFIG_HOME", ".config")?
         .join("qgh")

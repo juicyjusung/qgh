@@ -4,6 +4,8 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use std::fmt::{self, Write as _};
 
+pub(crate) const ENVELOPE_SCHEMA_VERSION: &str = "qgh.v2";
+
 #[derive(Debug, Clone, Copy)]
 pub enum SuccessOutputKind {
     Init,
@@ -14,6 +16,7 @@ pub enum SuccessOutputKind {
     Get,
     Status,
     Doctor,
+    Schedule,
 }
 
 pub fn success_envelope_with_meta_and_warnings(
@@ -22,7 +25,7 @@ pub fn success_envelope_with_meta_and_warnings(
     warnings: Vec<Value>,
 ) -> Value {
     json!({
-        "schema_version": "qgh.v1",
+        "schema_version": ENVELOPE_SCHEMA_VERSION,
         "ok": true,
         "data": data,
         "warnings": warnings,
@@ -32,7 +35,7 @@ pub fn success_envelope_with_meta_and_warnings(
 
 pub fn error_envelope(error: &QghError) -> Value {
     json!({
-        "schema_version": "qgh.v1",
+        "schema_version": ENVELOPE_SCHEMA_VERSION,
         "ok": false,
         "error": error,
         "warnings": [],
@@ -61,6 +64,7 @@ pub fn print_human_success(
         SuccessOutputKind::Get => render_get(data),
         SuccessOutputKind::Status => render_status(data, warnings),
         SuccessOutputKind::Doctor => render_doctor(data),
+        SuccessOutputKind::Schedule => render_schedule(data),
     };
     let tone = success_tone(kind, data, warnings);
     let terminal = if decorate {
@@ -105,6 +109,12 @@ fn success_tone(kind: SuccessOutputKind, data: &Value, warnings: &[Value]) -> Su
             .pointer("/summary/failed")
             .and_then(Value::as_u64)
             .is_some_and(|failed| failed > 0),
+        SuccessOutputKind::Schedule => {
+            data.pointer("/summary/failed")
+                .and_then(Value::as_u64)
+                .is_some_and(|failed| failed > 0)
+                || string_at(data, &["schedule_state"]) == Some("drifted")
+        }
         SuccessOutputKind::Init
         | SuccessOutputKind::Embed
         | SuccessOutputKind::Model
@@ -115,6 +125,95 @@ fn success_tone(kind: SuccessOutputKind, data: &Value, warnings: &[Value]) -> Su
     } else {
         SummaryTone::Success
     }
+}
+
+fn render_schedule(data: &Value) -> String {
+    let mut out = String::new();
+    let operation = string_at(data, &["operation"]).unwrap_or("unknown");
+    line(&mut out, format_args!("qgh schedule {operation}"));
+    if operation == "run" {
+        line(
+            &mut out,
+            format_args!("pass: {}", display_at(data, &["pass_state"])),
+        );
+        line(
+            &mut out,
+            format_args!(
+                "profiles: requested {}, started {}, completed {}, skipped {}, deferred {}, failed {}",
+                display_at(data, &["summary", "requested"]),
+                display_at(data, &["summary", "started"]),
+                display_at(data, &["summary", "completed"]),
+                display_at(data, &["summary", "skipped"]),
+                display_at(data, &["summary", "deferred"]),
+                display_at(data, &["summary", "failed"])
+            ),
+        );
+        if let Some(profiles) = data.get("profiles").and_then(Value::as_array) {
+            for profile in profiles {
+                line(
+                    &mut out,
+                    format_args!(
+                        "{}: {} ({}), planned {}, started {}, budget {}",
+                        display_at(profile, &["profile_id"]),
+                        display_at(profile, &["outcome"]),
+                        display_at(profile, &["reason"]),
+                        display_at(profile, &["planned"]),
+                        display_at(profile, &["started"]),
+                        rate_budget_summary(profile.get("budget_snapshot"))
+                    ),
+                );
+                if let Some(command) = string_at(profile, &["next_action", "command"]) {
+                    line(&mut out, format_args!("  next: {command}"));
+                }
+            }
+        }
+    } else {
+        line(
+            &mut out,
+            format_args!("state: {}", display_at(data, &["schedule_state"])),
+        );
+        line(
+            &mut out,
+            format_args!("action: {}", display_at(data, &["action"])),
+        );
+        line(
+            &mut out,
+            format_args!("platform: {}", display_at(data, &["platform"])),
+        );
+        line(
+            &mut out,
+            format_args!("profiles: {}", join_array(data.get("profile_ids"))),
+        );
+        line(
+            &mut out,
+            format_args!("interval: {}", display_at(data, &["interval"])),
+        );
+        if data.get("jitter").is_some_and(Value::is_object) {
+            line(
+                &mut out,
+                format_args!(
+                    "jitter: {} max {}s offset {}s",
+                    display_at(data, &["jitter", "strategy"]),
+                    display_at(data, &["jitter", "max_seconds"]),
+                    display_at(data, &["jitter", "offset_seconds"])
+                ),
+            );
+        }
+        if data.get("artifact_state").is_some() {
+            line(
+                &mut out,
+                format_args!("artifacts: {}", display_at(data, &["artifact_state"])),
+            );
+        }
+        line(
+            &mut out,
+            format_args!(
+                "manager checked: {}",
+                display_at(data, &["manager_checked"])
+            ),
+        );
+    }
+    out
 }
 
 pub fn print_human_warnings(warnings: &[Value], decorate: bool) {
@@ -160,6 +259,12 @@ pub fn print_error(error: &QghError, json_mode: bool, decorate: bool) {
             terminal.error(&error.code, &error.message)
         };
         eprintln!("{rendered}");
+        if error.code == "sync.backoff" {
+            eprintln!(
+                "rate budget: {}",
+                rate_budget_summary(error.details.get("rate_budget"))
+            );
+        }
         if let Some(hint) = &error.hint {
             eprintln!("{}", terminal.hint(hint));
         }
@@ -314,6 +419,14 @@ fn render_sync(data: &Value, warnings: &[Value], meta: &Value) -> String {
         ),
     );
     line(&mut out, format_args!("state: {state}"));
+    line(
+        &mut out,
+        format_args!(
+            "rate budget: {}",
+            rate_budget_summary(data.get("rate_budget"))
+        ),
+    );
+    append_sync_scheduler(&mut out, data.get("scheduler"));
     if warnings.iter().any(is_semantic_unavailable_warning) {
         line(
             &mut out,
@@ -404,6 +517,14 @@ fn render_skipped_fresh_sync(data: &Value, meta: &Value) -> String {
     line(
         &mut out,
         format_args!(
+            "rate budget: {}",
+            rate_budget_summary(data.get("rate_budget"))
+        ),
+    );
+    append_sync_scheduler(&mut out, data.get("scheduler"));
+    line(
+        &mut out,
+        format_args!(
             "last successful sync: {}",
             display_at(data, &["sync", "last_successful_sync"])
         ),
@@ -487,6 +608,14 @@ fn render_backfill_sync(data: &Value, warnings: &[Value], meta: &Value) -> Strin
             repo_scope_summary(meta.get("repo"), meta.get("repo_source"))
         ),
     );
+    line(
+        &mut out,
+        format_args!(
+            "rate budget: {}",
+            rate_budget_summary(data.get("rate_budget"))
+        ),
+    );
+    append_sync_scheduler(&mut out, data.get("scheduler"));
     line(
         &mut out,
         format_args!(
@@ -914,6 +1043,14 @@ fn render_status(data: &Value, warnings: &[Value]) -> String {
     line(
         &mut out,
         format_args!(
+            "rate budget: {}",
+            rate_budget_summary(data.pointer("/sync/rate_budget"))
+        ),
+    );
+    append_sync_scheduler(&mut out, data.pointer("/sync/scheduler"));
+    line(
+        &mut out,
+        format_args!(
             "purge: pending {}, successor repair required {}, retrieval blocked {}, stages {}",
             display_at(data, &["purge", "pending_count"]),
             display_at(data, &["purge", "successor_repair_required"]),
@@ -951,6 +1088,52 @@ fn status_readiness(data: &Value, warnings: &[Value]) -> &'static str {
     } else {
         "ready"
     }
+}
+
+fn rate_budget_summary(rate_budget: Option<&Value>) -> String {
+    let observations = rate_budget
+        .and_then(|value| value.get("observations"))
+        .and_then(Value::as_array);
+    let Some(observations) = observations.filter(|values| !values.is_empty()) else {
+        return "unknown (best-effort; no observation)".to_string();
+    };
+    observations
+        .iter()
+        .map(|observation| {
+            format!(
+                "{} remaining {}/{} reset_at={} state={} best-effort",
+                rate_budget_value(observation, "resource"),
+                rate_budget_value(observation, "remaining"),
+                rate_budget_value(observation, "limit"),
+                rate_budget_value(observation, "reset_at"),
+                display_at(observation, &["state"])
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn rate_budget_value(observation: &Value, field: &str) -> String {
+    observation
+        .get(field)
+        .filter(|value| !value.is_null())
+        .map(display_value)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn append_sync_scheduler(out: &mut String, scheduler: Option<&Value>) {
+    let scheduler = scheduler.unwrap_or(&Value::Null);
+    line(
+        out,
+        format_args!(
+            "sync requests: {}; effective max in-flight {} (hard cap {}); configured {} (compatibility only, configuration hard cap {})",
+            display_at(scheduler, &["mode"]),
+            display_at(scheduler, &["max_in_flight_requests"]),
+            display_at(scheduler, &["hard_cap"]),
+            display_at(scheduler, &["configured_max_in_flight_requests"]),
+            display_at(scheduler, &["configuration_hard_cap"])
+        ),
+    );
 }
 
 fn is_retrieval_blocking_warning(warning: &Value) -> bool {

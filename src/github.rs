@@ -1,8 +1,10 @@
 use crate::config::{Profile, RepoRef};
 use crate::error::QghError;
 use crate::model::{
-    CommentRecord, CursorUpdate, IssueRecord, ReconciliationCandidate, StoredCursor,
+    CommentRecord, CursorUpdate, IssueRecord, RateBudgetObservation, ReconciliationCandidate,
+    StoredCursor,
 };
+use crate::rate_budget;
 use crate::time::now_rfc3339;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -11,6 +13,7 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration as StdDuration;
 
@@ -178,6 +181,7 @@ pub enum ProgressEvent {
         scope: String,
         retry_after_seconds: i64,
     },
+    RateBudgetObserved(RateBudgetObservation),
     ReconciliationProgress {
         checked: usize,
         total: usize,
@@ -258,6 +262,7 @@ pub enum RepositoryAccessOutcome {
     ConfirmedPermissionLoss(ConfirmedRepositoryPermissionLoss),
     AuthenticationFailed,
     Backoff(BackoffPlan),
+    RequestBudget(RequestBudgetDeferral),
     Transient(GitHubTransientKind),
     AmbiguousForbidden,
 }
@@ -271,6 +276,7 @@ pub enum ClassifiedLifecycleCheck {
     },
     AuthenticationFailed,
     Backoff(BackoffPlan),
+    RequestBudget(RequestBudgetDeferral),
     Transient(GitHubTransientKind),
     AmbiguousForbidden,
 }
@@ -279,11 +285,143 @@ pub enum ClassifiedLifecycleCheck {
 pub enum GitHubInterruption {
     AuthenticationFailed,
     Backoff(BackoffPlan),
+    RequestBudget(RequestBudgetDeferral),
     Transient(GitHubTransientKind),
     AmbiguousForbidden,
 }
 
 pub type LifecycleInterruption = GitHubInterruption;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestBudgetDeferral {
+    RateBudgetReserve,
+    UnknownBudgetLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestBudgetState {
+    Unknown { probe_available: bool },
+    Known { additional_requests: i64 },
+    Blocked(RequestBudgetDeferral),
+}
+
+/// Scheduled-sync-only admission control shared by every GitHub request path.
+///
+/// The gate deliberately uses interior mutability because the GitHub fetch
+/// pipeline is sequential and passes a shared reference through nested request
+/// paths (pagination, comments, and lifecycle confirmations).
+pub struct RequestBudgetGate {
+    state: RefCell<RequestBudgetState>,
+    started_requests: Cell<usize>,
+    awaiting_response_observation: Cell<bool>,
+}
+
+impl RequestBudgetGate {
+    pub fn from_observations(
+        observations: &[RateBudgetObservation],
+        every_profile_has_fresh_core: bool,
+    ) -> Self {
+        let additional_requests = every_profile_has_fresh_core
+            .then(|| {
+                observations
+                    .iter()
+                    .filter(|observation| rate_budget::is_fresh_core(observation))
+                    .filter_map(rate_budget::scheduled_additional_requests)
+                    .min()
+            })
+            .flatten();
+        Self {
+            state: RefCell::new(match additional_requests {
+                Some(additional_requests) => RequestBudgetState::Known {
+                    additional_requests,
+                },
+                None => RequestBudgetState::Unknown {
+                    probe_available: true,
+                },
+            }),
+            started_requests: Cell::new(0),
+            awaiting_response_observation: Cell::new(false),
+        }
+    }
+
+    pub(crate) fn started_any(&self) -> bool {
+        self.started_requests.get() > 0
+    }
+
+    pub(crate) fn has_unobserved_started_request(&self) -> bool {
+        self.awaiting_response_observation.get()
+    }
+
+    fn record_started_request(&self) {
+        self.started_requests
+            .set(self.started_requests.get().saturating_add(1));
+        self.awaiting_response_observation.set(true);
+    }
+
+    fn before_request(&self) -> Result<(), RequestBudgetDeferral> {
+        let mut state = self.state.borrow_mut();
+        match *state {
+            RequestBudgetState::Unknown {
+                probe_available: true,
+            } => {
+                *state = RequestBudgetState::Unknown {
+                    probe_available: false,
+                };
+                self.record_started_request();
+                Ok(())
+            }
+            RequestBudgetState::Unknown {
+                probe_available: false,
+            } => {
+                *state = RequestBudgetState::Blocked(RequestBudgetDeferral::UnknownBudgetLimit);
+                Err(RequestBudgetDeferral::UnknownBudgetLimit)
+            }
+            RequestBudgetState::Known {
+                additional_requests,
+            } if additional_requests > 0 => {
+                *state = RequestBudgetState::Known {
+                    additional_requests: additional_requests - 1,
+                };
+                self.record_started_request();
+                Ok(())
+            }
+            RequestBudgetState::Known { .. } => {
+                *state = RequestBudgetState::Blocked(RequestBudgetDeferral::RateBudgetReserve);
+                Err(RequestBudgetDeferral::RateBudgetReserve)
+            }
+            RequestBudgetState::Blocked(reason) => Err(reason),
+        }
+    }
+
+    fn observe(&self, observation: &RateBudgetObservation) {
+        let observed = rate_budget::scheduled_additional_requests(observation);
+        self.awaiting_response_observation.set(observed.is_none());
+        let mut state = self.state.borrow_mut();
+        match (*state, observed) {
+            (RequestBudgetState::Blocked(reason), _) => {
+                *state = RequestBudgetState::Blocked(reason);
+            }
+            (_, None) => {
+                *state = RequestBudgetState::Blocked(RequestBudgetDeferral::UnknownBudgetLimit);
+            }
+            (
+                RequestBudgetState::Known {
+                    additional_requests,
+                },
+                Some(observed),
+            ) => {
+                *state = RequestBudgetState::Known {
+                    additional_requests: additional_requests.min(observed),
+                };
+            }
+            (_, Some(observed)) => {
+                *state = RequestBudgetState::Known {
+                    additional_requests: observed,
+                };
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PermissionEvidence {
@@ -306,6 +444,7 @@ enum ResponseDisposition {
     SourceGone { http_status: u16 },
     AuthenticationFailed,
     Backoff(BackoffPlan),
+    RequestBudget(RequestBudgetDeferral),
     Transient(GitHubTransientKind),
     AmbiguousForbidden,
 }
@@ -348,6 +487,7 @@ fn legacy_fetch_outcome(outcome: ClassifiedFetchOutcome) -> Result<FetchOutcome,
         Some(LifecycleInterruption::AuthenticationFailed) => {
             return Err(authentication_failure());
         }
+        Some(LifecycleInterruption::RequestBudget(_)) => return Err(github_unavailable()),
         Some(LifecycleInterruption::Transient(_) | LifecycleInterruption::AmbiguousForbidden) => {
             return Err(github_unavailable())
         }
@@ -370,6 +510,7 @@ pub async fn fetch_issues_classified(
         cursors,
         fetch_comments,
         progress,
+        None,
         commit_page,
         None,
     )
@@ -383,6 +524,7 @@ pub async fn fetch_issues_classified_with_lifecycle_commit(
     cursors: &[StoredCursor],
     fetch_comments: bool,
     progress: Option<&dyn ProgressReporter>,
+    request_budget: Option<&RequestBudgetGate>,
     commit_page: &mut dyn FnMut(FetchPage) -> Result<(), QghError>,
     commit_lifecycle: &mut dyn FnMut(&ConfirmedFetchLifecycle) -> Result<(), QghError>,
 ) -> Result<ClassifiedFetchOutcome, QghError> {
@@ -394,6 +536,7 @@ pub async fn fetch_issues_classified_with_lifecycle_commit(
         cursors,
         fetch_comments,
         progress,
+        request_budget,
         commit_page,
         Some(commit_lifecycle),
     )
@@ -408,6 +551,7 @@ async fn fetch_issues_classified_with_client(
     cursors: &[StoredCursor],
     fetch_comments: bool,
     progress: Option<&dyn ProgressReporter>,
+    request_budget: Option<&RequestBudgetGate>,
     commit_page: &mut dyn FnMut(FetchPage) -> Result<(), QghError>,
     mut commit_lifecycle: Option<LifecycleCommit<'_>>,
 ) -> Result<ClassifiedFetchOutcome, QghError> {
@@ -474,6 +618,9 @@ async fn fetch_issues_classified_with_client(
             if let Some(etag) = stored_cursor.and_then(|cursor| cursor.etag.as_ref()) {
                 request = request.header(IF_NONE_MATCH, etag);
             }
+            if let Err(reason) = request_budget_before(request_budget) {
+                finish_fetch!(Some(LifecycleInterruption::RequestBudget(reason)));
+            }
             let response = match request.send().await {
                 Ok(response) => response,
                 Err(error) => {
@@ -484,6 +631,7 @@ async fn fetch_issues_classified_with_client(
             };
             let status = response.status();
             let headers = response.headers().clone();
+            emit_rate_budget_observation(progress, profile, &headers, request_budget);
             if let Some(backoff) = backoff_from_response(status, &headers, &endpoint) {
                 emit_backoff(progress, &backoff);
                 wait_for_backoff(&backoff);
@@ -542,7 +690,12 @@ async fn fetch_issues_classified_with_client(
                 );
                 if matches!(disposition, ResponseDisposition::PermissionCandidate { .. }) {
                     match confirm_repository_after_prior_denial(
-                        client, profile, token, repo, progress,
+                        client,
+                        profile,
+                        token,
+                        repo,
+                        progress,
+                        request_budget,
                     )
                     .await
                     {
@@ -578,6 +731,9 @@ async fn fetch_issues_classified_with_client(
                         RepositoryAccessOutcome::AmbiguousForbidden => {
                             finish_fetch!(Some(LifecycleInterruption::AmbiguousForbidden));
                         }
+                        RepositoryAccessOutcome::RequestBudget(reason) => {
+                            finish_fetch!(Some(LifecycleInterruption::RequestBudget(reason)));
+                        }
                     }
                 }
                 let interruption = match disposition {
@@ -591,6 +747,9 @@ async fn fetch_issues_classified_with_client(
                     ResponseDisposition::Transient(kind) => LifecycleInterruption::Transient(kind),
                     ResponseDisposition::AmbiguousForbidden => {
                         LifecycleInterruption::AmbiguousForbidden
+                    }
+                    ResponseDisposition::RequestBudget(reason) => {
+                        LifecycleInterruption::RequestBudget(reason)
                     }
                     ResponseDisposition::SourceGone { .. } | ResponseDisposition::Redirect => {
                         LifecycleInterruption::Transient(GitHubTransientKind::UnexpectedResponse)
@@ -638,6 +797,7 @@ async fn fetch_issues_classified_with_client(
                         repo,
                         &issue,
                         progress,
+                        request_budget,
                     )
                     .await
                     {
@@ -693,6 +853,9 @@ async fn fetch_issues_classified_with_client(
                         }
                         CommentFetchOutcome::AmbiguousForbidden => {
                             finish_fetch!(Some(LifecycleInterruption::AmbiguousForbidden));
+                        }
+                        CommentFetchOutcome::RequestBudget(reason) => {
+                            finish_fetch!(Some(LifecycleInterruption::RequestBudget(reason)));
                         }
                         CommentFetchOutcome::Failed(error) => fail_fetch!(error),
                     }
@@ -804,6 +967,7 @@ fn legacy_backfill_outcome(outcome: BackfillOutcome) -> Result<BackfillOutcome, 
     match outcome.interruption.as_ref() {
         None => Ok(outcome),
         Some(LifecycleInterruption::AuthenticationFailed) => Err(authentication_failure()),
+        Some(LifecycleInterruption::RequestBudget(_)) => Err(github_unavailable()),
         Some(
             LifecycleInterruption::Backoff(_)
             | LifecycleInterruption::Transient(_)
@@ -924,6 +1088,7 @@ async fn fetch_backfill_issues_classified_inner(
             };
             let status = response.status();
             let headers = response.headers().clone();
+            emit_rate_budget_observation(progress, profile, &headers, None);
             if let Some(plan) = backoff_from_response(status, &headers, &history_endpoint) {
                 emit_backoff(progress, &plan);
                 wait_for_backoff(&plan);
@@ -949,7 +1114,7 @@ async fn fetch_backfill_issues_classified_inner(
                 );
                 if matches!(disposition, ResponseDisposition::PermissionCandidate { .. }) {
                     match confirm_repository_after_prior_denial(
-                        &client, profile, token, repo, progress,
+                        &client, profile, token, repo, progress, None,
                     )
                     .await
                     {
@@ -967,6 +1132,11 @@ async fn fetch_backfill_issues_classified_inner(
                                 }
                                 continue 'repos;
                             }
+                            break 'repos;
+                        }
+                        RepositoryAccessOutcome::RequestBudget(reason) => {
+                            interruption = Some(LifecycleInterruption::RequestBudget(reason));
+                            all_reached_end = false;
                             break 'repos;
                         }
                         RepositoryAccessOutcome::Backoff(plan) => {
@@ -1008,6 +1178,11 @@ async fn fetch_backfill_issues_classified_inner(
                     ResponseDisposition::Backoff(plan) => {
                         wait_for_backoff(&plan);
                         backoff = Some(plan);
+                        all_reached_end = false;
+                        break 'repos;
+                    }
+                    ResponseDisposition::RequestBudget(reason) => {
+                        interruption = Some(LifecycleInterruption::RequestBudget(reason));
                         all_reached_end = false;
                         break 'repos;
                     }
@@ -1063,6 +1238,7 @@ async fn fetch_backfill_issues_classified_inner(
                     repo,
                     &issue,
                     progress,
+                    None,
                 )
                 .await
                 {
@@ -1074,6 +1250,11 @@ async fn fetch_backfill_issues_classified_inner(
                         wait_for_backoff(&plan);
                         backoff = Some(plan);
                         break;
+                    }
+                    CommentFetchOutcome::RequestBudget(reason) => {
+                        interruption = Some(LifecycleInterruption::RequestBudget(reason));
+                        all_reached_end = false;
+                        break 'repos;
                     }
                     CommentFetchOutcome::ConfirmedRepositoryPermissionLoss(confirmed) => {
                         confirmed_permission_lost_repos
@@ -1344,6 +1525,7 @@ async fn fetch_target_issue_classified_with_client_and_transition_commit(
         };
         let status = response.status();
         let headers = response.headers().clone();
+        emit_rate_budget_observation(progress, profile, &headers, None);
         let scope = format!(
             "issue:{}#{}",
             current_repo.full_name(),
@@ -1381,6 +1563,7 @@ async fn fetch_target_issue_classified_with_client_and_transition_commit(
                     &current_repo,
                     &issue,
                     progress,
+                    None,
                 )
                 .await
                 {
@@ -1388,6 +1571,11 @@ async fn fetch_target_issue_classified_with_client_and_transition_commit(
                     CommentFetchOutcome::Backoff(backoff) => {
                         wait_for_backoff(&backoff);
                         finish_target!(ClassifiedTargetIssueTerminal::Backoff(backoff));
+                    }
+                    CommentFetchOutcome::RequestBudget(_) => {
+                        finish_target!(ClassifiedTargetIssueTerminal::Transient(
+                            GitHubTransientKind::UnexpectedResponse,
+                        ));
                     }
                     CommentFetchOutcome::ConfirmedRepositoryPermissionLoss(confirmed) => {
                         finish_target!(target_terminal_from_lifecycle_check(
@@ -1520,6 +1708,7 @@ async fn fetch_target_issue_classified_with_client_and_transition_commit(
                     &current_repo,
                     first,
                     progress,
+                    None,
                 )
                 .await;
                 finish_target!(target_terminal_from_lifecycle_check(
@@ -1549,6 +1738,7 @@ async fn fetch_target_issue_classified_with_client_and_transition_commit(
                             &current_repo,
                             PermissionEvidence::Forbidden { http_status },
                             progress,
+                            None,
                         )
                         .await;
                         target_terminal_from_lifecycle_check(
@@ -1593,7 +1783,7 @@ pub async fn reconcile_sources(
     candidates: &[ReconciliationCandidate],
     progress: Option<&dyn ProgressReporter>,
 ) -> Result<ReconciliationResult, QghError> {
-    reconcile_sources_inner(profile, token, candidates, progress, None).await
+    reconcile_sources_inner(profile, token, candidates, progress, None, None).await
 }
 
 pub async fn reconcile_sources_with_lifecycle_commit(
@@ -1601,9 +1791,18 @@ pub async fn reconcile_sources_with_lifecycle_commit(
     token: &str,
     candidates: &[ReconciliationCandidate],
     progress: Option<&dyn ProgressReporter>,
+    request_budget: Option<&RequestBudgetGate>,
     commit_lifecycle: &mut dyn FnMut(&ConfirmedFetchLifecycle) -> Result<(), QghError>,
 ) -> Result<ReconciliationResult, QghError> {
-    reconcile_sources_inner(profile, token, candidates, progress, Some(commit_lifecycle)).await
+    reconcile_sources_inner(
+        profile,
+        token,
+        candidates,
+        progress,
+        request_budget,
+        Some(commit_lifecycle),
+    )
+    .await
 }
 
 async fn reconcile_sources_inner(
@@ -1611,6 +1810,7 @@ async fn reconcile_sources_inner(
     token: &str,
     candidates: &[ReconciliationCandidate],
     progress: Option<&dyn ProgressReporter>,
+    request_budget: Option<&RequestBudgetGate>,
     mut commit_lifecycle: Option<LifecycleCommit<'_>>,
 ) -> Result<ReconciliationResult, QghError> {
     let client = lifecycle_client()?;
@@ -1635,7 +1835,12 @@ async fn reconcile_sources_inner(
             continue;
         }
         let outcome = match check_candidate_lifecycle_classified(
-            &client, profile, token, candidate, progress,
+            &client,
+            profile,
+            token,
+            candidate,
+            progress,
+            request_budget,
         )
         .await
         {
@@ -1703,6 +1908,9 @@ async fn reconcile_sources_inner(
             ClassifiedLifecycleCheck::Backoff(plan) => {
                 interruption = Some(LifecycleInterruption::Backoff(plan));
             }
+            ClassifiedLifecycleCheck::RequestBudget(reason) => {
+                interruption = Some(LifecycleInterruption::RequestBudget(reason));
+            }
             ClassifiedLifecycleCheck::Transient(kind) => {
                 interruption = Some(LifecycleInterruption::Transient(kind));
             }
@@ -1738,7 +1946,8 @@ pub async fn check_source_lifecycle(
 ) -> Result<LifecycleCheck, QghError> {
     let client = lifecycle_client()?;
     legacy_lifecycle_check(
-        check_candidate_lifecycle_classified(&client, profile, token, candidate, None).await?,
+        check_candidate_lifecycle_classified(&client, profile, token, candidate, None, None)
+            .await?,
     )
 }
 
@@ -1751,6 +1960,7 @@ fn legacy_lifecycle_check(check: ClassifiedLifecycleCheck) -> Result<LifecycleCh
         }
         ClassifiedLifecycleCheck::AuthenticationFailed => Err(authentication_failure()),
         ClassifiedLifecycleCheck::Backoff(_) => Err(github_unavailable()),
+        ClassifiedLifecycleCheck::RequestBudget(_) => Err(github_unavailable()),
         ClassifiedLifecycleCheck::Transient(_) => Err(github_unavailable()),
         ClassifiedLifecycleCheck::AmbiguousForbidden => Err(github_unavailable()),
     }
@@ -1763,7 +1973,7 @@ pub async fn check_source_lifecycle_classified(
     progress: Option<&dyn ProgressReporter>,
 ) -> Result<ClassifiedLifecycleCheck, QghError> {
     let client = lifecycle_client()?;
-    check_candidate_lifecycle_classified(&client, profile, token, candidate, progress).await
+    check_candidate_lifecycle_classified(&client, profile, token, candidate, progress, None).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1776,6 +1986,7 @@ async fn fetch_issue_comments(
     repo: &RepoRef,
     issue: &IssueRecord,
     progress: Option<&dyn ProgressReporter>,
+    request_budget: Option<&RequestBudgetGate>,
 ) -> CommentFetchOutcome {
     let mut comments = Vec::new();
     let endpoint = comment_endpoint(repo, issue.number);
@@ -1792,6 +2003,9 @@ async fn fetch_issue_comments(
         if let Some(etag) = stored_cursor.and_then(|cursor| cursor.etag.as_ref()) {
             request = request.header(IF_NONE_MATCH, etag);
         }
+        if let Err(reason) = request_budget_before(request_budget) {
+            return CommentFetchOutcome::RequestBudget(reason);
+        }
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
@@ -1800,6 +2014,7 @@ async fn fetch_issue_comments(
         };
         let status = response.status();
         let headers = response.headers().clone();
+        emit_rate_budget_observation(progress, profile, &headers, request_budget);
         if let Some(backoff) = backoff_from_response(status, &headers, &endpoint) {
             emit_backoff(progress, &backoff);
             return CommentFetchOutcome::Backoff(backoff);
@@ -1821,7 +2036,13 @@ async fn fetch_issue_comments(
                 classify_response(status, &headers, &body, &endpoint, ResponseTarget::Source);
             if let Some(first) = permission_evidence(&disposition) {
                 return match confirm_source_denial_with_repository(
-                    client, profile, token, repo, first, progress,
+                    client,
+                    profile,
+                    token,
+                    repo,
+                    first,
+                    progress,
+                    request_budget,
                 )
                 .await
                 {
@@ -1842,6 +2063,9 @@ async fn fetch_issue_comments(
                         CommentFetchOutcome::AuthenticationFailed
                     }
                     ClassifiedLifecycleCheck::Backoff(plan) => CommentFetchOutcome::Backoff(plan),
+                    ClassifiedLifecycleCheck::RequestBudget(reason) => {
+                        CommentFetchOutcome::RequestBudget(reason)
+                    }
                     ClassifiedLifecycleCheck::Transient(kind) => {
                         CommentFetchOutcome::Transient(kind)
                     }
@@ -1858,6 +2082,9 @@ async fn fetch_issue_comments(
                     CommentFetchOutcome::AuthenticationFailed
                 }
                 ResponseDisposition::Backoff(plan) => CommentFetchOutcome::Backoff(plan),
+                ResponseDisposition::RequestBudget(reason) => {
+                    CommentFetchOutcome::RequestBudget(reason)
+                }
                 ResponseDisposition::Transient(kind) => CommentFetchOutcome::Transient(kind),
                 ResponseDisposition::AmbiguousForbidden => CommentFetchOutcome::AmbiguousForbidden,
                 ResponseDisposition::Redirect => {
@@ -1956,6 +2183,7 @@ fn legacy_repo_comments_outcome(
     match outcome.interruption.as_ref() {
         None => Ok(outcome),
         Some(LifecycleInterruption::AuthenticationFailed) => Err(authentication_failure()),
+        Some(LifecycleInterruption::RequestBudget(_)) => Err(github_unavailable()),
         Some(
             LifecycleInterruption::Backoff(_)
             | LifecycleInterruption::Transient(_)
@@ -1980,6 +2208,7 @@ pub async fn fetch_repo_comments_classified(
         resolve_parent,
         progress,
         None,
+        None,
     )
     .await
 }
@@ -1992,6 +2221,7 @@ pub async fn fetch_repo_comments_classified_with_lifecycle_commit(
     parent_resolution_budget: usize,
     resolve_parent: &dyn Fn(&str, i64) -> Option<CommentParent>,
     progress: Option<&dyn ProgressReporter>,
+    request_budget: Option<&RequestBudgetGate>,
     commit_lifecycle: &mut dyn FnMut(&ConfirmedFetchLifecycle) -> Result<(), QghError>,
 ) -> Result<RepoCommentsResult, QghError> {
     fetch_repo_comments_classified_inner(
@@ -2001,6 +2231,7 @@ pub async fn fetch_repo_comments_classified_with_lifecycle_commit(
         parent_resolution_budget,
         resolve_parent,
         progress,
+        request_budget,
         Some(commit_lifecycle),
     )
     .await
@@ -2014,6 +2245,7 @@ async fn fetch_repo_comments_classified_inner(
     parent_resolution_budget: usize,
     resolve_parent: &dyn Fn(&str, i64) -> Option<CommentParent>,
     progress: Option<&dyn ProgressReporter>,
+    request_budget: Option<&RequestBudgetGate>,
     mut commit_lifecycle: Option<LifecycleCommit<'_>>,
 ) -> Result<RepoCommentsResult, QghError> {
     let client = lifecycle_client()?;
@@ -2043,6 +2275,10 @@ async fn fetch_repo_comments_classified_inner(
             if let Some(etag) = conditional_etag.take() {
                 request = request.header(IF_NONE_MATCH, etag);
             }
+            if let Err(reason) = request_budget_before(request_budget) {
+                interruption = Some(LifecycleInterruption::RequestBudget(reason));
+                break 'repos;
+            }
             let response = match request.send().await {
                 Ok(response) => response,
                 Err(error) => {
@@ -2054,6 +2290,7 @@ async fn fetch_repo_comments_classified_inner(
             };
             let status = response.status();
             let headers = response.headers().clone();
+            emit_rate_budget_observation(progress, profile, &headers, request_budget);
             if let Some(plan) = backoff_from_response(status, &headers, &endpoint) {
                 emit_backoff(progress, &plan);
                 wait_for_backoff(&plan);
@@ -2078,7 +2315,12 @@ async fn fetch_repo_comments_classified_inner(
                 );
                 if matches!(disposition, ResponseDisposition::PermissionCandidate { .. }) {
                     match confirm_repository_after_prior_denial(
-                        &client, profile, token, repo, progress,
+                        &client,
+                        profile,
+                        token,
+                        repo,
+                        progress,
+                        request_budget,
                     )
                     .await
                     {
@@ -2114,6 +2356,10 @@ async fn fetch_repo_comments_classified_inner(
                             interruption = Some(LifecycleInterruption::AmbiguousForbidden);
                             break 'repos;
                         }
+                        RepositoryAccessOutcome::RequestBudget(reason) => {
+                            interruption = Some(LifecycleInterruption::RequestBudget(reason));
+                            break 'repos;
+                        }
                     }
                 }
                 match disposition {
@@ -2121,6 +2367,9 @@ async fn fetch_repo_comments_classified_inner(
                         interruption = Some(LifecycleInterruption::AuthenticationFailed);
                     }
                     ResponseDisposition::Backoff(plan) => backoff = Some(plan),
+                    ResponseDisposition::RequestBudget(reason) => {
+                        interruption = Some(LifecycleInterruption::RequestBudget(reason));
+                    }
                     ResponseDisposition::Transient(kind) => {
                         interruption = Some(LifecycleInterruption::Transient(kind));
                     }
@@ -2165,7 +2414,16 @@ async fn fetch_repo_comments_classified_inner(
                         handled = true;
                     } else if remote_lookups < parent_resolution_budget {
                         remote_lookups += 1;
-                        match classify_parent(&client, profile, token, repo, number, progress).await
+                        match classify_parent(
+                            &client,
+                            profile,
+                            token,
+                            repo,
+                            number,
+                            progress,
+                            request_budget,
+                        )
+                        .await
                         {
                             ParentClass::PullRequest => {
                                 known_pull_requests.insert(number);
@@ -2186,6 +2444,10 @@ async fn fetch_repo_comments_classified_inner(
                             }
                             ParentClass::Failed(error) => {
                                 terminal_error = Some(error);
+                                break 'repos;
+                            }
+                            ParentClass::RequestBudget(reason) => {
+                                interruption = Some(LifecycleInterruption::RequestBudget(reason));
                                 break 'repos;
                             }
                         }
@@ -2236,6 +2498,7 @@ enum ParentClass {
     PullRequest,
     IssueOrUnknown,
     Backoff(BackoffPlan),
+    RequestBudget(RequestBudgetDeferral),
     Transient(GitHubTransientKind),
     Failed(QghError),
 }
@@ -2247,18 +2510,23 @@ async fn classify_parent(
     repo: &RepoRef,
     issue_number: i64,
     progress: Option<&dyn ProgressReporter>,
+    request_budget: Option<&RequestBudgetGate>,
 ) -> ParentClass {
     let url = issue_object_url(profile, repo, issue_number);
     let request = match github_get(client, &url, token, &profile.api_base_url) {
         Ok(request) => request,
         Err(error) => return ParentClass::Failed(error),
     };
+    if let Err(reason) = request_budget_before(request_budget) {
+        return ParentClass::RequestBudget(reason);
+    }
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) => return ParentClass::Transient(classify_transport_failure(&error)),
     };
     let status = response.status();
     let headers = response.headers().clone();
+    emit_rate_budget_observation(progress, profile, &headers, request_budget);
     if let Some(backoff) = backoff_from_response(status, &headers, &repo_comment_endpoint(repo)) {
         emit_backoff(progress, &backoff);
         return ParentClass::Backoff(backoff);
@@ -2337,6 +2605,25 @@ fn emit_backoff(progress: Option<&dyn ProgressReporter>, backoff: &BackoffPlan) 
     );
 }
 
+fn emit_rate_budget_observation(
+    progress: Option<&dyn ProgressReporter>,
+    profile: &Profile,
+    headers: &HeaderMap,
+    request_budget: Option<&RequestBudgetGate>,
+) {
+    let observation = rate_budget::observe(&profile.host, headers);
+    if let Some(request_budget) = request_budget {
+        request_budget.observe(&observation);
+    }
+    emit(progress, ProgressEvent::RateBudgetObserved(observation));
+}
+
+fn request_budget_before(
+    request_budget: Option<&RequestBudgetGate>,
+) -> Result<(), RequestBudgetDeferral> {
+    request_budget.map_or(Ok(()), RequestBudgetGate::before_request)
+}
+
 fn should_report_repo_progress(issue_count: usize) -> bool {
     issue_count == 1 || issue_count.is_multiple_of(25)
 }
@@ -2348,6 +2635,7 @@ fn should_report_reconciliation_progress(checked: usize, total: usize) -> bool {
 enum CommentFetchOutcome {
     Fetched(Vec<CommentRecord>),
     Backoff(BackoffPlan),
+    RequestBudget(RequestBudgetDeferral),
     ConfirmedRepositoryPermissionLoss(ConfirmedRepositoryPermissionLoss),
     SourceDeleted { http_status: u16 },
     AuthenticationFailed,
@@ -2447,6 +2735,9 @@ fn resolve_source_confirmation(
         },
         ResponseDisposition::AuthenticationFailed => ClassifiedLifecycleCheck::AuthenticationFailed,
         ResponseDisposition::Backoff(plan) => ClassifiedLifecycleCheck::Backoff(plan),
+        ResponseDisposition::RequestBudget(reason) => {
+            ClassifiedLifecycleCheck::RequestBudget(reason)
+        }
         ResponseDisposition::Transient(kind) => ClassifiedLifecycleCheck::Transient(kind),
         ResponseDisposition::AmbiguousForbidden => ClassifiedLifecycleCheck::AmbiguousForbidden,
         ResponseDisposition::SourceGone { .. } | ResponseDisposition::Redirect => {
@@ -2466,6 +2757,9 @@ fn repository_outcome(repo: &RepoRef, disposition: ResponseDisposition) -> Repos
         }
         ResponseDisposition::AuthenticationFailed => RepositoryAccessOutcome::AuthenticationFailed,
         ResponseDisposition::Backoff(plan) => RepositoryAccessOutcome::Backoff(plan),
+        ResponseDisposition::RequestBudget(reason) => {
+            RepositoryAccessOutcome::RequestBudget(reason)
+        }
         ResponseDisposition::Transient(kind) => RepositoryAccessOutcome::Transient(kind),
         ResponseDisposition::AmbiguousForbidden => RepositoryAccessOutcome::AmbiguousForbidden,
         ResponseDisposition::SourceGone { .. } | ResponseDisposition::Redirect => {
@@ -2479,8 +2773,19 @@ async fn repository_access_attempt(
     profile: &Profile,
     token: &str,
     repo: &RepoRef,
+    progress: Option<&dyn ProgressReporter>,
+    request_budget: Option<&RequestBudgetGate>,
 ) -> ResponseDisposition {
-    repository_access_attempt_at(client, &profile.api_base_url, token, repo).await
+    repository_access_attempt_at(
+        client,
+        &profile.api_base_url,
+        token,
+        repo,
+        Some(&profile.host),
+        progress,
+        request_budget,
+    )
+    .await
 }
 
 async fn repository_access_attempt_at(
@@ -2488,6 +2793,9 @@ async fn repository_access_attempt_at(
     api_base_url: &str,
     token: &str,
     repo: &RepoRef,
+    observation_host: Option<&str>,
+    progress: Option<&dyn ProgressReporter>,
+    request_budget: Option<&RequestBudgetGate>,
 ) -> ResponseDisposition {
     let url = repository_object_url_at(api_base_url, repo);
     let scope = format!("repository:{}", repo.full_name());
@@ -2495,6 +2803,9 @@ async fn repository_access_attempt_at(
         Ok(request) => request,
         Err(_) => return ResponseDisposition::Transient(GitHubTransientKind::UnexpectedResponse),
     };
+    if let Err(reason) = request_budget_before(request_budget) {
+        return ResponseDisposition::RequestBudget(reason);
+    }
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
@@ -2503,6 +2814,13 @@ async fn repository_access_attempt_at(
     };
     let status = response.status();
     let headers = response.headers().clone();
+    if let Some(host) = observation_host {
+        let observation = rate_budget::observe(host, &headers);
+        if let Some(request_budget) = request_budget {
+            request_budget.observe(&observation);
+        }
+        emit(progress, ProgressEvent::RateBudgetObserved(observation));
+    }
     let body = if status == StatusCode::FORBIDDEN {
         response.text().await.unwrap_or_default()
     } else {
@@ -2518,8 +2836,10 @@ async fn confirm_source_denial_with_repository(
     repo: &RepoRef,
     first: PermissionEvidence,
     progress: Option<&dyn ProgressReporter>,
+    request_budget: Option<&RequestBudgetGate>,
 ) -> ClassifiedLifecycleCheck {
-    let second = repository_access_attempt(client, profile, token, repo).await;
+    let second =
+        repository_access_attempt(client, profile, token, repo, progress, request_budget).await;
     if let ResponseDisposition::Backoff(plan) = &second {
         emit_backoff(progress, plan);
     }
@@ -2532,8 +2852,10 @@ async fn confirm_repository_after_prior_denial(
     token: &str,
     repo: &RepoRef,
     progress: Option<&dyn ProgressReporter>,
+    request_budget: Option<&RequestBudgetGate>,
 ) -> RepositoryAccessOutcome {
-    let second = repository_access_attempt(client, profile, token, repo).await;
+    let second =
+        repository_access_attempt(client, profile, token, repo, progress, request_budget).await;
     if let ResponseDisposition::Backoff(plan) = &second {
         emit_backoff(progress, plan);
     }
@@ -2566,14 +2888,16 @@ async fn check_repository_access_with_client(
     repo: &RepoRef,
     progress: Option<&dyn ProgressReporter>,
 ) -> RepositoryAccessOutcome {
-    let first = repository_access_attempt_at(client, api_base_url, token, repo).await;
+    let first =
+        repository_access_attempt_at(client, api_base_url, token, repo, None, progress, None).await;
     if !matches!(first, ResponseDisposition::PermissionCandidate { .. }) {
         if let ResponseDisposition::Backoff(plan) = &first {
             emit_backoff(progress, plan);
         }
         return repository_outcome(repo, first);
     }
-    let second = repository_access_attempt_at(client, api_base_url, token, repo).await;
+    let second =
+        repository_access_attempt_at(client, api_base_url, token, repo, None, progress, None).await;
     if let ResponseDisposition::Backoff(plan) = &second {
         emit_backoff(progress, plan);
     }
@@ -2713,6 +3037,9 @@ fn target_terminal_from_lifecycle_check(
             ClassifiedTargetIssueTerminal::AuthenticationFailed
         }
         ClassifiedLifecycleCheck::Backoff(plan) => ClassifiedTargetIssueTerminal::Backoff(plan),
+        ClassifiedLifecycleCheck::RequestBudget(_) => {
+            ClassifiedTargetIssueTerminal::Transient(GitHubTransientKind::UnexpectedResponse)
+        }
         ClassifiedLifecycleCheck::Transient(kind) => ClassifiedTargetIssueTerminal::Transient(kind),
         ClassifiedLifecycleCheck::AmbiguousForbidden => {
             ClassifiedTargetIssueTerminal::AmbiguousForbidden
@@ -2745,12 +3072,14 @@ async fn check_candidate_lifecycle_classified(
     token: &str,
     candidate: &ReconciliationCandidate,
     progress: Option<&dyn ProgressReporter>,
+    request_budget: Option<&RequestBudgetGate>,
 ) -> Result<ClassifiedLifecycleCheck, QghError> {
     let url = source_check_url(profile, candidate)?;
-    let response = match github_get(client, &url, token, &profile.api_base_url)?
-        .send()
-        .await
-    {
+    let request = github_get(client, &url, token, &profile.api_base_url)?;
+    if let Err(reason) = request_budget_before(request_budget) {
+        return Ok(ClassifiedLifecycleCheck::RequestBudget(reason));
+    }
+    let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
             return Ok(ClassifiedLifecycleCheck::Transient(
@@ -2760,6 +3089,7 @@ async fn check_candidate_lifecycle_classified(
     };
     let status = response.status();
     let headers = response.headers().clone();
+    emit_rate_budget_observation(progress, profile, &headers, request_budget);
     let scope = format!("lifecycle:{}", candidate.repo);
     let body = if status == StatusCode::FORBIDDEN {
         response.text().await.unwrap_or_default()
@@ -2795,7 +3125,13 @@ async fn check_candidate_lifecycle_classified(
     if let Some(first) = permission_evidence(&disposition) {
         let repo = candidate_repo(candidate)?;
         return Ok(confirm_source_denial_with_repository(
-            client, profile, token, &repo, first, progress,
+            client,
+            profile,
+            token,
+            &repo,
+            first,
+            progress,
+            request_budget,
         )
         .await);
     }
@@ -2805,6 +3141,9 @@ async fn check_candidate_lifecycle_classified(
         ResponseDisposition::Backoff(plan) => {
             emit_backoff(progress, &plan);
             ClassifiedLifecycleCheck::Backoff(plan)
+        }
+        ResponseDisposition::RequestBudget(reason) => {
+            ClassifiedLifecycleCheck::RequestBudget(reason)
         }
         ResponseDisposition::Transient(kind) => ClassifiedLifecycleCheck::Transient(kind),
         ResponseDisposition::AmbiguousForbidden => ClassifiedLifecycleCheck::AmbiguousForbidden,
@@ -3347,6 +3686,106 @@ mod permission_classification_tests {
     const NOT_FOUND_RESPONSE: &str =
         "HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
     const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+
+    fn fresh_core_budget(limit: i64, remaining: i64) -> RateBudgetObservation {
+        RateBudgetObservation {
+            host: "github.com".to_string(),
+            resource: Some("core".to_string()),
+            limit: Some(limit),
+            remaining: Some(remaining),
+            reset_at: Some(
+                (Utc::now() + Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            ),
+            observed_at: now_rfc3339(),
+            best_effort: true,
+        }
+    }
+
+    #[test]
+    fn unknown_request_budget_probe_transitions_to_known_when_core_headers_are_complete() {
+        let gate = RequestBudgetGate::from_observations(&[], false);
+
+        assert_eq!(gate.before_request(), Ok(()));
+        gate.observe(&fresh_core_budget(10, 8));
+
+        assert_eq!(gate.before_request(), Ok(()));
+        assert_eq!(gate.before_request(), Ok(()));
+    }
+
+    #[test]
+    fn known_request_budget_never_starts_a_request_below_the_twenty_percent_reserve() {
+        let gate = RequestBudgetGate::from_observations(&[fresh_core_budget(10, 3)], true);
+
+        assert_eq!(gate.before_request(), Ok(()));
+        gate.observe(&fresh_core_budget(10, 2));
+
+        assert_eq!(
+            gate.before_request(),
+            Err(RequestBudgetDeferral::RateBudgetReserve)
+        );
+    }
+
+    #[test]
+    fn malformed_remaining_above_limit_is_known_blocked_without_a_probe() {
+        let gate = RequestBudgetGate::from_observations(&[fresh_core_budget(10, 11)], true);
+
+        assert_eq!(
+            gate.before_request(),
+            Err(RequestBudgetDeferral::RateBudgetReserve)
+        );
+        assert!(!gate.started_any());
+    }
+
+    #[test]
+    fn zero_limit_is_known_exhausted_without_a_probe() {
+        let gate = RequestBudgetGate::from_observations(&[fresh_core_budget(0, 0)], true);
+
+        assert_eq!(
+            gate.before_request(),
+            Err(RequestBudgetDeferral::RateBudgetReserve)
+        );
+        assert!(!gate.started_any());
+    }
+
+    #[test]
+    fn mixed_host_evidence_stays_unknown_even_when_one_profile_has_ample_core_budget() {
+        let gate = RequestBudgetGate::from_observations(&[fresh_core_budget(5_000, 4_000)], false);
+
+        assert_eq!(gate.before_request(), Ok(()));
+        assert_eq!(
+            gate.before_request(),
+            Err(RequestBudgetDeferral::UnknownBudgetLimit)
+        );
+    }
+
+    #[test]
+    fn unknown_resource_headers_do_not_establish_a_scheduled_core_budget() {
+        let mut observation = fresh_core_budget(5_000, 4_000);
+        observation.resource = None;
+        let gate = RequestBudgetGate::from_observations(&[observation], false);
+
+        assert_eq!(gate.before_request(), Ok(()));
+        assert_eq!(
+            gate.before_request(),
+            Err(RequestBudgetDeferral::UnknownBudgetLimit)
+        );
+    }
+
+    #[test]
+    fn missing_final_core_headers_leave_the_started_request_unconfirmed() {
+        let gate = RequestBudgetGate::from_observations(&[fresh_core_budget(10, 8)], true);
+        let mut partial = fresh_core_budget(10, 7);
+        partial.resource = None;
+
+        assert_eq!(gate.before_request(), Ok(()));
+        gate.observe(&partial);
+
+        assert!(gate.has_unobserved_started_request());
+        assert_eq!(
+            gate.before_request(),
+            Err(RequestBudgetDeferral::UnknownBudgetLimit)
+        );
+    }
 
     #[test]
     fn github_token_is_bound_to_the_validated_https_api_origin() {
@@ -4263,6 +4702,7 @@ mod permission_classification_tests {
             &[],
             false,
             None,
+            None,
             &mut commit_page,
             &mut commit_lifecycle,
         )
@@ -4808,8 +5248,16 @@ mod permission_classification_tests {
     async fn prior_source_denial_consumes_only_one_repository_confirmation_attempt() {
         let (base_url, request_count, handle) = spawn_responses(vec![NOT_FOUND_RESPONSE]);
         let client = lifecycle_client_with_timeout(StdDuration::from_secs(1)).unwrap();
-        let second =
-            repository_access_attempt_at(&client, &base_url, "test-token", &test_repo()).await;
+        let second = repository_access_attempt_at(
+            &client,
+            &base_url,
+            "test-token",
+            &test_repo(),
+            None,
+            None,
+            None,
+        )
+        .await;
         let outcome =
             resolve_source_confirmation(PermissionEvidence::NotFound { http_status: 404 }, second);
         handle.join().unwrap();
@@ -4839,6 +5287,9 @@ mod permission_classification_tests {
             &format!("http://{address}"),
             "sensitive-marker-must-not-escape",
             &test_repo(),
+            None,
+            None,
+            None,
         )
         .await;
         handle.join().unwrap();

@@ -2,12 +2,19 @@
 
 ## Envelope
 
-Machine-readable CLI output uses one versioned `qgh.v1` envelope on stdout
+Machine-readable CLI output uses one versioned `qgh.v2` envelope on stdout
 when `--json` is passed. Without `--json`, successful CLI commands print
 human-readable summaries on stdout. Diagnostics and human-readable failures go
 to stderr.
 
-The product contract is CLI-first. CLI args, the `qgh.v1` JSON envelope,
+`qgh.v2` replaces `qgh.v1` because the closed `sync` and `status` payloads gained
+scheduler/rate-budget fields and `schedule` added bounded policy and lifecycle
+outputs. qgh emits only `qgh.v2`; strict `qgh.v1` consumers must upgrade
+their envelope and command-payload schemas instead of silently accepting the
+new shape. Internal config, database, and schedule-registration schema versions
+are independent and are not changed by this envelope migration.
+
+The product contract is CLI-first. CLI args, the `qgh.v2` JSON envelope,
 released schema snapshots, and local SQLite/Tantivy retrieval behavior are the
 source of truth for new features. Agents can use `qgh query --json`, `qgh get
 --json`, and `qgh status --json` without MCP. MCP is a read-only thin adapter
@@ -43,6 +50,55 @@ field tell the user to retry the interrupted command rather than inventing a
 different command. Agents should execute `retry_action.json_command`; it keeps
 JSON output mode even when the interrupted command came from a human terminal.
 
+Every successful `sync` payload and `status.data.sync` includes a strict
+`rate_budget` block derived only from response headers already received during
+sync. Each observation is `fresh`, `partial`, or `stale`; missing fields are
+`null`, never guessed from an older complete observation. `best_effort: true`
+means this is admission evidence, not a reservation or a live GitHub quota
+claim. `status` does not contact GitHub. Sync payloads also separate the
+effective sequential scheduler (`max_in_flight_requests: 1`, `hard_cap: 1`)
+from the validated legacy configured value and its config cap (`16`).
+
+Profile writer sync is single-flight. A concurrent `sync` or `sync issue`
+returns retryable `sync.busy` (exit `5`) with only the profile id in details.
+The stable advisory lock is released by normal process exit or crash.
+
+`schedule` is CLI-only. `schedule run <PROFILE_ID>...` accepts only a unique,
+explicit profile list and emits one bounded pass with per-host and per-profile
+outcomes. It never discovers profiles, bootstraps a never-synced profile, or
+runs backfill, reconciliation, or model work. Host execution is sequential and
+one shared scheduled gate is checked immediately before every GitHub HTTP send.
+Unknown/partial/stale core budget permits exactly one probe request; complete
+fresh core headers transition the same run to a known budget, while missing or
+partial headers defer all follow-ups. If the pass began unknown, learned
+headers may continue only that profile's request sequence; no second same-host
+profile starts in that pass. A known gate permits at most
+`remaining - ceil(limit * 20%)` additional sends and qgh starts no additional
+request after its latest observation reaches the reserve. This constrains qgh,
+not other clients sharing the quota, so it is not an absolute quota guarantee.
+Already committed page/cursor work remains durable, the interrupted sync is not
+marked successful, and same-host profiles are deferred. Each profile receives
+at most one sync attempt and a pass starts at most eight remote syncs. A minimal
+persisted cursor rotates the next pass. Immediately before remote work, qgh
+atomically writes a content-free per-host guard. A started request clears it
+only after a completed profile sync with usable fresh core headroom; active
+selected-profile backoff also retains or promotes the guard. Its deadline uses
+the latest applicable host reset or backoff, capped at 24 hours, and falls back
+to the five-minute observation TTL when neither is usable. Later schedule
+passes, including an explicit subset with another same-host profile, report
+`host_cooldown` and start no request during the guard. The stored rate-header
+observation is not replaced with a guessed decrement.
+
+`schedule start <PROFILE_ID>...`, `schedule status`, and `schedule stop` manage
+one user-scoped macOS LaunchAgent or Linux systemd timer. Lifecycle operations
+do not contact GitHub, do not store tokens, and do not install cron/system
+fallbacks. Scheduled profiles must use `github_cli`; foreground `schedule run`
+may still use an explicit `env` token source. `status` inspects only local
+registration and artifact state. Mutating lifecycle operations share a stable
+lease and return retryable `schedule.busy` on overlap. `start` reports
+`reloaded` when unchanged local artifacts had to be re-enabled in the user
+manager; Linux `stop` disables the timer before stopping a running service.
+
 `sync issue <number>` is the explicit targeted refresh path for one issue and
 its complete per-issue comment list. Its `sync` envelope includes `target`,
 `lifecycle`, and comment diff counts (`added`, `updated`, `deleted`) in addition
@@ -56,7 +112,7 @@ working directory.
 
 Success:
 
-- `schema_version`: `qgh.v1`
+- `schema_version`: `qgh.v2`
 - `ok`: `true`
 - `data`: command-specific payload
 - `warnings`: array of `{code, severity, message, action?}` objects. Optional
@@ -68,7 +124,7 @@ Success:
 
 Failure:
 
-- `schema_version`: `qgh.v1`
+- `schema_version`: `qgh.v2`
 - `ok`: `false`
 - `error`: structured error object
 - `warnings`: array
@@ -80,6 +136,7 @@ Released schema snapshots:
 - `docs/schemas/error.schema.json`: stable error taxonomy and exit-code classes.
 - `docs/schemas/init-output.schema.json`: CLI-only `init` data payload.
 - `docs/schemas/sync-output.schema.json`: `sync` data payload.
+- `docs/schemas/schedule-output.schema.json`: CLI-only `schedule` run/lifecycle data payloads.
 - `docs/schemas/embed-output.schema.json`: CLI-only `embed` data payload.
 - `docs/schemas/command-action.schema.json`: content-free human and JSON-mode remediation commands.
 - `docs/schemas/model-output.schema.json`: CLI-only `model install` data payload.
@@ -138,6 +195,7 @@ outside qgh-managed generation paths are not deleted by qgh. Neither `status`
 nor `doctor` retries or starts a purge. MCP exposes `status`, but not `doctor`.
 CLI-only top-level `init` bootstraps profile config plus repo scope. `init repo`
 creates tracked repo policy only. Neither command is exposed to MCP.
+`schedule` is also CLI-only and is not exposed to MCP.
 
 ## Human Output
 
@@ -164,6 +222,9 @@ human-output override even on a decorated terminal.
   open coverage, then to `sync --backfill --all` for older closed issues. A
   scoped pass cannot claim profile-wide completion. Completion is also
   invalidated when the configured profile repository membership changes.
+- `schedule`: foreground pass state plus each explicit profile outcome, or the
+  local user-scheduler lifecycle state/action/platform. Automation must use
+  the schedule schema instead of parsing this summary.
 - `embed`: text chunks rebuilt, vectors generated, and content-free foreground
   progress. `--force` remains required for a standalone full rebuild.
 - `query`/`search`: source-candidate list, not answers. It states that snippets

@@ -1,6 +1,6 @@
 # Error Codes
 
-qgh machine-readable output uses the `qgh.v1` envelope for success and failure. No-result query responses are successful: `ok: true` with `data.results: []`.
+qgh machine-readable output uses the `qgh.v2` envelope for success and failure. No-result query responses are successful: `ok: true` with `data.results: []`.
 
 Stable error families:
 
@@ -9,7 +9,8 @@ Stable error families:
 - `freshness.*`: local snapshot freshness failures.
 - `auth.*`: token source failures.
 - `github.*`: GitHub request failures outside structured backoff state.
-- `sync.*`: sync page-commit and confirmed issue-transfer-chain failures.
+- `sync.*`: sync lease/backoff, page-commit, and confirmed issue-transfer-chain failures.
+- `schedule.*`: foreground coordinator and user scheduler lifecycle failures.
 - `embedding.*`: local embedding preparation and source-snapshot failures.
 - `source.*`: missing or tombstoned source lookups.
 - `purge.*`: fail-closed purge, retry, publication, and read/write-fence failures.
@@ -36,6 +37,34 @@ not turn this condition into a successful sync or silently retry network work
 from a read command. `retry_action.command` is the human retry and
 `retry_action.json_command` is the machine-safe equivalent; legacy
 `retry_command` remains for compatibility.
+
+`sync.busy` is the retryable, exit-`5` result when another process owns the
+same profile writer lease. Details contain only `profile_id`; wait for the
+active process or its OS-released crash lease, then retry. qgh never deletes a
+stable lock file to recover this condition.
+
+`schedule` validation and lifecycle may additionally return:
+
+- `validation.duplicate_profile`: an explicit schedule list repeated a profile.
+- `validation.schedule_profile_boundary`: global `--profile` was combined with schedule's explicit profile list.
+- `validation.schedule_interval`: v1 received an interval other than `1h`.
+- `validation.schedule_profiles`: no explicit start profiles were supplied through a programmatic call.
+- `schedule.credentials_unsupported`: `schedule start` selected an `env` token source instead of `github_cli`.
+- `schedule.busy`: another `schedule start` or `schedule stop` owns the stable lifecycle lease; retry after it finishes.
+- `schedule.credentials_unavailable`: `HOME`, `gh`, or scheduled GitHub CLI credentials are unavailable.
+- `schedule.binary_unavailable`: the invoked qgh executable cannot be pinned as an existing executable absolute file.
+- `schedule.environment_invalid`: a required manager environment value/path cannot be encoded safely.
+- `schedule.platform_unsupported`: the OS has no macOS LaunchAgent or Linux systemd user adapter; no cron fallback is installed.
+- `schedule.manager_unsupported`: the supported OS lacks an active user manager session; manual `schedule run` remains available.
+- `schedule.manager_failed`: launchctl/systemctl failed while applying a user schedule; qgh restores the previous artifact/state best-effort.
+- `schedule.platform_mismatch`: registration state belongs to another platform adapter.
+- `schedule.storage_failed`: private scheduler artifact/state publication or removal failed.
+- `schedule.state_invalid`: strict local registration state is malformed or unsupported.
+- `schedule.ownership_ambiguous`: the fixed user-manager identity is active, orphaned, or has legacy state whose exact artifact owner cannot be proven; qgh makes no lifecycle mutation.
+
+These errors omit tokens, source content, repository names, local DB paths, and
+raw manager stderr. `schedule.partial_failure` is a warning in a successful
+foreground pass, not an error envelope code.
 
 Local model acquisition and prepared-snapshot publication fail closed with
 stable, content-free errors:

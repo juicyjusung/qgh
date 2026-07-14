@@ -1,3 +1,4 @@
+use boon::{Compiler, Schemas};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -56,6 +57,223 @@ fn error_code_docs_describe_publication_snapshot_failures() {
         !docs.contains("embedding.source_snapshot_missing"),
         "error code docs must not advertise the removed embedding.source_snapshot_missing code"
     );
+}
+
+#[test]
+fn sync_backoff_error_details_publish_a_closed_rate_budget_contract() {
+    let schema: Value = serde_json::from_str(
+        &fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/schemas/error.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        schema["allOf"][0]["if"]["properties"]["code"]["const"],
+        "sync.backoff"
+    );
+    assert_eq!(
+        schema["allOf"][0]["then"]["properties"]["details"]["$ref"],
+        "#/$defs/sync_backoff_details"
+    );
+    let details = &schema["$defs"]["sync_backoff_details"];
+    assert_eq!(details["additionalProperties"], false);
+    let required = details["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        required,
+        BTreeSet::from([
+            "profile_id",
+            "reason",
+            "scope",
+            "retry_after_seconds",
+            "reset_at",
+            "observed_at",
+            "last_successful_sync",
+            "local_retrieval_available",
+            "local_query_available",
+            "local_status_available",
+            "local_get_availability",
+            "retry_command",
+            "retry_action",
+            "retry_at",
+            "rate_budget",
+        ])
+    );
+    assert_eq!(
+        details["properties"]["rate_budget"]["$ref"],
+        "#/$defs/rate_budget"
+    );
+    assert_eq!(
+        schema["$defs"]["rate_budget"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        schema["$defs"]["rate_budget_observation"]["additionalProperties"],
+        false
+    );
+}
+
+#[test]
+fn schedule_manager_gate_exercises_real_user_manager_lifecycle_commands() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        fs::read_to_string(root.join(".github/workflows/schedule-manager-gate.yml")).unwrap();
+    for required in [
+        "workflow_dispatch:",
+        "self-hosted",
+        "qgh-schedule-gate-macos",
+        "qgh-schedule-gate-linux",
+        "scripts/verify-schedule-manager.sh",
+        "catch_up_observation:",
+        "Physical catch-up observation:",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "missing real-manager workflow phrase: {required}"
+        );
+    }
+
+    let gate = fs::read_to_string(root.join("scripts/verify-schedule-manager.sh")).unwrap();
+    for required in [
+        "schedule start",
+        "schedule status",
+        "schedule stop",
+        "launchctl print",
+        "launchctl bootout",
+        "launchctl kickstart",
+        "systemctl --user is-enabled",
+        "systemctl --user disable --now",
+        "systemctl --user stop qgh-schedule.service",
+        "systemctl --user start qgh-schedule.service",
+        "systemctl --user show qgh-schedule.service --property=Result --value",
+        "journalctl --user -u qgh-schedule.service _COMM=qgh",
+        "Persistent=true",
+        ".data.pass_state == \"completed\"",
+        ".data.action == \"updated\"",
+        ".data.action == \"reloaded\"",
+        ".data.action == \"unchanged\"",
+        ".data.schedule_state == \"not_installed\"",
+        ".data.artifact_state == \"missing\"",
+    ] {
+        assert!(
+            gate.contains(required),
+            "missing real-manager gate phrase: {required}"
+        );
+    }
+    let preflight = &gate[..gate.find("case \"$(uname -s)\"").unwrap()];
+    assert!(preflight.contains(".data.schedule_state == \"not_installed\""));
+    assert!(preflight.contains(".data.artifact_state == \"missing\""));
+    assert!(
+        !preflight.contains(".data.installed"),
+        "manager preflight must reject drift instead of trusting installed=false"
+    );
+}
+
+#[test]
+fn schedule_lifecycle_schema_validates_real_payload_shapes_with_draft_2020_12() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema_path = root.join("docs/schemas/schedule-output.schema.json");
+    let mut compiler = Compiler::new();
+    let mut schemas = Schemas::new();
+    let command_action: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/command-action.schema.json")).unwrap(),
+    )
+    .unwrap();
+    compiler
+        .add_resource(
+            "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/command-action.schema.json",
+            command_action,
+        )
+        .unwrap();
+    let schema_index = compiler
+        .compile(schema_path.to_str().unwrap(), &mut schemas)
+        .expect("schedule output schema must compile as Draft 2020-12");
+
+    let start = json!({
+        "operation": "start",
+        "action": "installed",
+        "schedule_state": "active",
+        "installed": true,
+        "platform": "linux_systemd_user",
+        "manager_scope": "user",
+        "profile_ids": ["work", "personal"],
+        "interval": "1h",
+        "jitter": {
+            "strategy": "systemd_fixed_random_delay",
+            "offset_seconds": null,
+            "max_seconds": 900
+        },
+        "manager_checked": true,
+        "network_access": false,
+        "foreground_command": "schedule run"
+    });
+    schemas
+        .validate(&start, schema_index)
+        .expect("actual schedule start payload shape must validate");
+
+    let runtime_root = std::env::temp_dir().join(format!(
+        "qgh-schedule-schema-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&runtime_root).unwrap();
+    let run_lifecycle = |operation: &str| {
+        let output = Command::new(binary())
+            .args(["schedule", operation, "--json"])
+            .env("HOME", runtime_root.join("home"))
+            .env("XDG_CONFIG_HOME", runtime_root.join("config"))
+            .env("XDG_DATA_HOME", runtime_root.join("data"))
+            .env("XDG_CACHE_HOME", runtime_root.join("cache"))
+            .output()
+            .unwrap();
+        assert_success(&output);
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["schema_version"], "qgh.v2");
+        envelope["data"].clone()
+    };
+
+    let status = run_lifecycle("status");
+    assert_eq!(status["schedule_state"], "not_installed");
+    assert_eq!(status["artifact_state"], "missing");
+    schemas
+        .validate(&status, schema_index)
+        .expect("actual absent schedule status payload shape must validate");
+
+    let stop = run_lifecycle("stop");
+    assert_eq!(stop["action"], "unchanged");
+    schemas
+        .validate(&stop, schema_index)
+        .expect("actual absent schedule stop payload shape must validate");
+
+    for (name, invalid) in [
+        ("empty profiles", json!({"profile_ids": []})),
+        (
+            "duplicate profiles",
+            json!({"profile_ids": ["work", "work"]}),
+        ),
+        ("nullable interval", json!({"interval": null})),
+        ("nullable jitter", json!({"jitter": null})),
+        ("unchecked manager", json!({"manager_checked": false})),
+    ] {
+        let mut invalid_start = start.clone();
+        invalid_start
+            .as_object_mut()
+            .unwrap()
+            .extend(invalid.as_object().unwrap().clone());
+        assert!(
+            schemas.validate(&invalid_start, schema_index).is_err(),
+            "schedule start schema must reject {name}"
+        );
+    }
+    fs::remove_dir_all(runtime_root).unwrap();
 }
 
 #[cfg(not(feature = "vector-search"))]
@@ -222,7 +440,7 @@ env = "QGH_RELEASE_CONTRACT_TOKEN"
     assert_eq!(output.status.code(), Some(6));
     assert!(stderr_text(&output).is_empty());
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(envelope["schema_version"], "qgh.v1");
+    assert_eq!(envelope["schema_version"], "qgh.v2");
     assert_eq!(envelope["ok"], false);
     assert!(envelope.get("data").is_none());
     assert_eq!(
@@ -253,9 +471,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert_success(&help);
     let help_text = stdout_text(&help);
     assert!(help_text.contains("human output by default"));
-    assert!(help_text.contains("use --json for qgh.v1 envelopes"));
+    assert!(help_text.contains("use --json for qgh.v2 envelopes"));
     for command in [
-        "init", "sync", "embed", "model", "query", "search", "get", "status", "doctor", "mcp",
+        "init", "sync", "embed", "model", "query", "search", "get", "status", "doctor", "schedule",
+        "mcp",
     ] {
         assert!(
             help_text.contains(command),
@@ -280,6 +499,11 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         &["get", "--help"][..],
         &["status", "--help"][..],
         &["doctor", "--help"][..],
+        &["schedule", "--help"][..],
+        &["schedule", "run", "--help"][..],
+        &["schedule", "start", "--help"][..],
+        &["schedule", "status", "--help"][..],
+        &["schedule", "stop", "--help"][..],
     ] {
         let output = qgh(args);
         assert_success(&output);
@@ -416,6 +640,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         assert_eq!(tool["outputSchema"]["type"], "object");
         assert_eq!(tool["outputSchema"]["additionalProperties"], false);
         assert_eq!(
+            tool["outputSchema"]["properties"]["schema_version"]["const"],
+            "qgh.v2"
+        );
+        assert_eq!(
             tool["outputSchema"]["oneOf"][0]["required"],
             json!(["data"])
         );
@@ -446,6 +674,12 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         serde_json::from_str(&fs::read_to_string(root.join("docs/release-artifact.json")).unwrap())
             .unwrap();
     assert_eq!(artifact["schema_version"], "qgh.release.v1");
+    assert_eq!(artifact["contract"]["envelope_schema_version"], "qgh.v2");
+    assert_eq!(artifact["contract"]["envelope_migration"]["from"], "qgh.v1");
+    assert_eq!(
+        artifact["contract"]["envelope_migration"]["compatibility"],
+        "breaking"
+    );
     assert_eq!(
         artifact["contract"]["mcp_tools"],
         json!(["query", "get", "status"])
@@ -453,16 +687,17 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert_eq!(
         artifact["contract"]["cli_commands"],
         json!([
-            "init", "sync", "embed", "model", "query", "search", "get", "status", "doctor", "mcp"
+            "init", "sync", "embed", "model", "query", "search", "get", "status", "doctor",
+            "schedule", "mcp"
         ])
     );
     assert_eq!(
         artifact["contract"]["canonical_cli_commands"],
-        json!(["init", "sync", "embed", "model", "query", "get", "status", "doctor"])
+        json!(["init", "sync", "embed", "model", "query", "get", "status", "doctor", "schedule"])
     );
     assert_eq!(
         artifact["contract"]["cli_only_commands"],
-        json!(["init", "sync", "embed", "model", "doctor"])
+        json!(["init", "sync", "embed", "model", "doctor", "schedule"])
     );
     assert_eq!(
         artifact["contract"]["product_core"],
@@ -503,7 +738,15 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         artifact["contract"]["human_output"],
-        "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v1 envelopes"
+        "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v2 envelopes"
+    );
+    assert_eq!(
+        artifact["contract"]["schedule"]["gate_profile_set_update"],
+        true
+    );
+    assert_eq!(
+        artifact["contract"]["schedule"]["physical_catch_up_observation"],
+        "required manual workflow evidence; not simulated"
     );
     assert_eq!(
         artifact["contract"]["primary_install_channel"]["command"],
@@ -715,6 +958,9 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "privacy no-egress",
             "DB/index permissions",
             "doctor output",
+            "single-flight sync and rate-budget observation",
+            "bounded explicit-profile schedule coordinator",
+            "LaunchAgent and systemd user timer lifecycle",
             "search eval result",
             "one-command Homebrew install",
             "cargo-dist plan/build",
@@ -740,6 +986,11 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         .unwrap()
         .iter()
         .any(|command| command == "model"));
+    assert!(artifact["contract"]["not_exposed_to_mcp"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|command| command == "schedule"));
     assert_eq!(
         artifact["schema_snapshots"],
         json!([
@@ -747,6 +998,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "docs/schemas/error.schema.json",
             "docs/schemas/init-output.schema.json",
             "docs/schemas/sync-output.schema.json",
+            "docs/schemas/schedule-output.schema.json",
             "docs/schemas/embed-output.schema.json",
             "docs/schemas/command-action.schema.json",
             "docs/schemas/model-output.schema.json",
@@ -763,6 +1015,14 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             serde_json::from_str(&fs::read_to_string(root.join(path)).unwrap()).unwrap();
         assert_released_schema_objects_are_closed_or_documented(path, &schema);
     }
+    let envelope_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/envelope.schema.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        envelope_schema["properties"]["schema_version"]["const"],
+        artifact["contract"]["envelope_schema_version"]
+    );
     let init_schema: Value = serde_json::from_str(
         &fs::read_to_string(root.join("docs/schemas/init-output.schema.json")).unwrap(),
     )
@@ -773,6 +1033,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     .unwrap();
     let sync_schema: Value = serde_json::from_str(
         &fs::read_to_string(root.join("docs/schemas/sync-output.schema.json")).unwrap(),
+    )
+    .unwrap();
+    let schedule_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/schedule-output.schema.json")).unwrap(),
     )
     .unwrap();
     let embed_schema: Value = serde_json::from_str(
@@ -803,6 +1067,58 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         &fs::read_to_string(root.join("docs/schemas/doctor-output.schema.json")).unwrap(),
     )
     .unwrap();
+    assert_eq!(
+        schedule_schema["oneOf"],
+        json!([
+            {"$ref": "#/$defs/run"},
+            {"$ref": "#/$defs/start"},
+            {"$ref": "#/$defs/status"},
+            {"$ref": "#/$defs/stop"}
+        ])
+    );
+    let schedule_run = &schedule_schema["$defs"]["run"];
+    assert_eq!(schedule_run["additionalProperties"], false);
+    assert_eq!(
+        schedule_run["required"],
+        json!([
+            "operation",
+            "pass_state",
+            "policy",
+            "summary",
+            "hosts",
+            "profiles"
+        ])
+    );
+    let schedule_policy = &schedule_schema["$defs"]["policy"];
+    assert_eq!(schedule_policy["additionalProperties"], false);
+    assert_eq!(
+        schedule_policy["properties"]["host_max_in_flight"]["const"],
+        1
+    );
+    assert_eq!(
+        schedule_policy["properties"]["unknown_budget_max_attempts"]["const"],
+        1
+    );
+    assert_eq!(
+        schedule_policy["properties"]["reserve_percent"]["const"],
+        20
+    );
+    assert_eq!(
+        schedule_policy["properties"]["max_remote_attempts_per_pass"]["const"],
+        8
+    );
+    assert_eq!(
+        schedule_schema["$defs"]["lifecycle"]["properties"]["network_access"]["const"],
+        false
+    );
+    assert_eq!(
+        schedule_schema["$defs"]["status"]["properties"]["manager_checked"]["const"],
+        false
+    );
+    assert_eq!(
+        sync_schema["required"],
+        json!(["profile_id", "sync_state", "rate_budget", "scheduler"])
+    );
     assert_eq!(model_schema["additionalProperties"], false);
     assert_eq!(embed_schema["additionalProperties"], false);
     assert_eq!(command_action_schema["additionalProperties"], false);
@@ -889,8 +1205,14 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "github.confirmed_lifecycle_requires_typed_handling",
         "sync.commit_page_failed",
         "sync.backoff",
+        "sync.busy",
         "sync.transfer_cycle",
         "sync.transfer_chain_too_long",
+        "validation.duplicate_profile",
+        "validation.schedule_profile_boundary",
+        "schedule.credentials_unsupported",
+        "schedule.manager_failed",
+        "schedule.manager_unsupported",
         "embedding.source_snapshot_incomplete",
         "purge.failed",
         "purge.retry_failed",
@@ -924,6 +1246,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "issues".to_string(),
             "lifecycle".to_string(),
             "profile_id".to_string(),
+            "rate_budget".to_string(),
             "reconciliation".to_string(),
             "scheduler".to_string(),
             "sync".to_string(),
@@ -1150,18 +1473,37 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     let sync_scheduler = &sync_schema["$defs"]["scheduler"];
     assert_eq!(
         sync_scheduler["required"],
-        json!(["max_in_flight_requests", "hard_cap"])
+        json!([
+            "mode",
+            "max_in_flight_requests",
+            "hard_cap",
+            "configured_max_in_flight_requests",
+            "configuration_hard_cap"
+        ])
     );
     assert_eq!(sync_scheduler["additionalProperties"], false);
+    assert_eq!(sync_scheduler["properties"]["mode"]["const"], "sequential");
     assert_eq!(
-        sync_scheduler["properties"]["max_in_flight_requests"]["minimum"],
+        sync_scheduler["properties"]["max_in_flight_requests"]["const"],
         1
     );
+    assert_eq!(sync_scheduler["properties"]["hard_cap"]["const"], 1);
     assert_eq!(
-        sync_scheduler["properties"]["max_in_flight_requests"]["maximum"],
+        sync_scheduler["properties"]["configuration_hard_cap"]["const"],
         16
     );
-    assert_eq!(sync_scheduler["properties"]["hard_cap"]["const"], 16);
+    assert_eq!(
+        sync_schema["properties"]["rate_budget"]["$ref"],
+        "#/$defs/rate_budget"
+    );
+    assert_eq!(
+        sync_schema["$defs"]["rate_budget"]["required"],
+        json!(["best_effort", "stale_after_seconds", "observations"])
+    );
+    assert_eq!(
+        sync_schema["$defs"]["rate_budget"]["properties"]["stale_after_seconds"]["const"],
+        300
+    );
     assert_eq!(
         sync_schema["properties"]["target"]["$ref"],
         "#/$defs/target"
@@ -2030,7 +2372,13 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     let status_sync = &status_schema["$defs"]["sync"];
     assert_eq!(
         status_sync["required"],
-        json!(["last_sync_at", "cursors", "backoff", "scheduler"])
+        json!([
+            "last_sync_at",
+            "cursors",
+            "backoff",
+            "scheduler",
+            "rate_budget"
+        ])
     );
     assert_eq!(status_sync["additionalProperties"], false);
     assert_eq!(
@@ -2039,6 +2387,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "backoff".to_string(),
             "cursors".to_string(),
             "last_sync_at".to_string(),
+            "rate_budget".to_string(),
             "scheduler".to_string(),
         ])
     );
@@ -2112,18 +2461,29 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     let sync_scheduler = &status_schema["$defs"]["sync_scheduler"];
     assert_eq!(
         sync_scheduler["required"],
-        json!(["max_in_flight_requests", "hard_cap"])
+        json!([
+            "mode",
+            "max_in_flight_requests",
+            "hard_cap",
+            "configured_max_in_flight_requests",
+            "configuration_hard_cap"
+        ])
     );
     assert_eq!(sync_scheduler["additionalProperties"], false);
+    assert_eq!(sync_scheduler["properties"]["mode"]["const"], "sequential");
     assert_eq!(
-        sync_scheduler["properties"]["max_in_flight_requests"]["minimum"],
+        sync_scheduler["properties"]["max_in_flight_requests"]["const"],
         1
     );
+    assert_eq!(sync_scheduler["properties"]["hard_cap"]["const"], 1);
     assert_eq!(
-        sync_scheduler["properties"]["max_in_flight_requests"]["maximum"],
+        sync_scheduler["properties"]["configuration_hard_cap"]["const"],
         16
     );
-    assert_eq!(sync_scheduler["properties"]["hard_cap"]["const"], 16);
+    assert_eq!(
+        status_sync["properties"]["rate_budget"]["$ref"],
+        "#/$defs/rate_budget"
+    );
     let status_reconciliation = &status_schema["$defs"]["reconciliation"];
     assert_eq!(
         status_reconciliation["required"],
@@ -2561,7 +2921,9 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     let included = artifact["acceptance_snapshot"]["included_in_mvp_gate"]
         .as_array()
         .unwrap();
-    assert!(included.iter().any(|id| id == "AC-28"));
+    for id in ["AC-28", "AC-29", "AC-30", "AC-31"] {
+        assert!(included.iter().any(|included| included == id));
+    }
     assert!(!included.iter().any(|id| id == "AC-13"));
     assert!(!included.iter().any(|id| id == "AC-20"));
     assert_eq!(
@@ -2587,6 +2949,9 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "privacy no-egress",
         "DB/index permissions",
         "doctor output",
+        "single-flight sync and rate-budget observation",
+        "bounded explicit-profile schedule coordinator",
+        "LaunchAgent and systemd user timer lifecycle",
         "search eval result",
         "brew install juicyjusung/tap/qgh",
         "juicyjusung/homebrew-tap",
@@ -2652,6 +3017,12 @@ fn readme_onboarding_matches_released_cli_and_mcp_contracts() {
         "gh auth status",
         "qgh init -y",
         "qgh sync",
+        "qgh schedule run",
+        "qgh schedule start",
+        "qgh schedule status",
+        "qgh schedule stop",
+        "20% observed quota reserve",
+        "never installs a cron fallback",
         "qgh sync --all",
         "qgh sync --backfill",
         "coverage: partial",
@@ -2667,7 +3038,7 @@ fn readme_onboarding_matches_released_cli_and_mcp_contracts() {
         "explicit repository scope",
         "organization-wide scope",
         "no GitHub write-back",
-        "qgh.v1",
+        "qgh.v2",
         "qgh status",
         "qgh doctor",
         "qgh mcp",
@@ -2694,6 +3065,7 @@ fn readme_onboarding_matches_released_cli_and_mcp_contracts() {
         "docs/local-qwen-models.md",
         "docs/error-codes.md",
         "docs/agent-skills.md",
+        "docs/scheduling.md",
     ] {
         assert!(
             readme.contains(&format!("]({relative_path})")),
@@ -3061,6 +3433,7 @@ fn cli_help_teaches_workflow_and_side_effect_boundaries() {
     for workflow_step in [
         "qgh init",
         "qgh sync",
+        "qgh schedule run",
         "qgh query",
         "qgh get",
         "cite",
@@ -3079,6 +3452,7 @@ fn cli_help_teaches_workflow_and_side_effect_boundaries() {
         "Open authoritative local sources before citing them",
         "Inspect local search readiness without network access",
         "Probe GitHub connectivity and local model health",
+        "Run bounded explicit-profile sync passes or manage user scheduling",
         "Serve the read-only query/get/status MCP tools over stdio",
     ] {
         assert!(
@@ -3148,6 +3522,20 @@ fn cli_help_teaches_workflow_and_side_effect_boundaries() {
     let doctor = stdout_text(&qgh(&["doctor", "--help"]));
     assert!(doctor.contains("contacts GitHub"));
     assert!(doctor.contains("loads the configured local model runtime"));
+    let schedule_run = stdout_text(&qgh(&["schedule", "run", "--help"]));
+    assert!(schedule_run.contains("explicit profile list"));
+    assert!(schedule_run.contains("may contact configured GitHub hosts"));
+    assert!(schedule_run.contains("never performs hidden bootstrap"));
+    let schedule_start = stdout_text(&qgh(&["schedule", "start", "--help"]));
+    assert!(schedule_start.contains("macOS LaunchAgent or Linux systemd timer"));
+    assert!(schedule_start.contains("does not contact GitHub"));
+    assert!(schedule_start.contains("never installs a cron fallback"));
+    let schedule_status = stdout_text(&qgh(&["schedule", "status", "--help"]));
+    assert!(schedule_status.contains("does not contact GitHub"));
+    assert!(schedule_status.contains("does not contact"));
+    let schedule_stop = stdout_text(&qgh(&["schedule", "stop", "--help"]));
+    assert!(schedule_stop.contains("does not contact GitHub"));
+    assert!(schedule_stop.contains("does not install a fallback scheduler"));
 
     let profile_with_model = qgh(&[
         "--profile",
@@ -3404,6 +3792,7 @@ fn collect_schema_object_closure_violations(
             if matches!(object.get("type"), Some(Value::String(kind)) if kind == "object")
                 && !object.contains_key("additionalProperties")
                 && !is_documented_schema_extension_point(schema_path, json_path)
+                && !is_closed_composition_refinement(schema_path, json_path)
             {
                 violations.push(format!(
                     "{schema_location} is an object schema without additionalProperties"
@@ -3424,6 +3813,18 @@ fn collect_schema_object_closure_violations(
         }
         _ => {}
     }
+}
+
+fn is_closed_composition_refinement(schema_path: &str, json_path: &[String]) -> bool {
+    schema_path == "docs/schemas/schedule-output.schema.json"
+        && matches!(
+            json_path,
+            [defs, operation, all_of, branch]
+                if defs == "$defs"
+                    && matches!(operation.as_str(), "start" | "stop")
+                    && all_of == "allOf"
+                    && branch == "1"
+        )
 }
 
 fn is_documented_schema_extension_point(schema_path: &str, json_path: &[String]) -> bool {
@@ -3547,6 +3948,7 @@ fn stable_external_error_codes_from_source(root: &std::path::Path) -> BTreeSet<S
         "freshness.query_snapshot_stale",
         "publication.activation_failed",
         "publication.incomplete_snapshot_deferred",
+        "schedule.partial_failure",
     ];
     const DEBUG_OR_TEST_ONLY_CODES: &[&str] = &["embedding.generation_cleanup_injected_failure"];
     const NON_ERROR_LITERALS: &[&str] = &[
@@ -3556,6 +3958,7 @@ fn stable_external_error_codes_from_source(root: &std::path::Path) -> BTreeSet<S
         "model.onnx",
         "model.onnx_data",
         "model.safetensors",
+        "sync.lock",
     ];
     let warning_codes = WARNING_CODES.iter().copied().collect::<BTreeSet<_>>();
     let debug_or_test_only_codes = DEBUG_OR_TEST_ONLY_CODES
@@ -3624,6 +4027,7 @@ fn stable_error_prefixes() -> &'static [&'static str] {
         "model.",
         "publication.",
         "purge.",
+        "schedule.",
         "source.",
         "storage.",
         "sync.",

@@ -8,8 +8,9 @@ use crate::cli::{
 use crate::config::{
     bootstrap_profile_repo, current_git_worktree_root, discover_repo_policy,
     git_remote_defaults_for_root, load_profile, load_repo_policy_at, parse_repo, resolve_token,
-    suggest_init_profile_id, CommentsMode, EmbeddingConfig, EmbeddingProviderKind, GitRemote,
-    Profile, ProfileBootstrapInput, RepoPolicy, RepoRef, TokenSource,
+    resolve_token_with_mode, suggest_init_profile_id, CommentsMode, EmbeddingConfig,
+    EmbeddingProviderKind, GitRemote, Profile, ProfileBootstrapInput, RepoPolicy, RepoRef,
+    TokenResolutionMode, TokenSource,
 };
 use crate::context::{prepare_embedding_input, EmbeddingSourceContext};
 use crate::coverage;
@@ -35,6 +36,7 @@ use crate::freshness::{self, FreshnessContext, FreshnessOverrides};
 use crate::fusion::{self, LEXICAL_GUARD_V1};
 use crate::github;
 use crate::index;
+use crate::lease::FileLease;
 #[cfg(feature = "fastembed-provider")]
 use crate::local_models::ModelSnapshotState;
 use crate::local_models::{
@@ -43,8 +45,8 @@ use crate::local_models::{
     QWEN_EMBEDDING_QUERY_PREFIX, QWEN_RERANKER_PRESET_ID,
 };
 use crate::model::{
-    BackoffView, CommandAction, CoverageSnapshot, ReconciliationCandidate, StoredChunk,
-    StoredComment, StoredIssue, StoredSource, SyncSummary, TargetedSyncSummary,
+    BackoffView, CommandAction, CoverageSnapshot, RateBudgetObservation, ReconciliationCandidate,
+    StoredChunk, StoredComment, StoredIssue, StoredSource, SyncSummary, TargetedSyncSummary,
     VectorSearchFilters,
 };
 use crate::paths::ProfilePaths;
@@ -54,6 +56,7 @@ use crate::qwen::{
     qwen_embedding_runtime_profile_id, validate_qwen_embedding_device, QwenReranker,
     QWEN_RERANK_DEPTH, QWEN_RERANK_MAX_LENGTH,
 };
+use crate::rate_budget;
 use crate::resolution::ResolvedRepoScope;
 use crate::store::{
     PendingPurgeView, PurgeTarget, PurgeTrigger, RetrievalBuildSnapshot, RetrievalPublicationView,
@@ -62,6 +65,7 @@ use crate::store::{
 use crate::terminal::TerminalUi;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
@@ -81,7 +85,7 @@ const LOCAL_RERANK_MAX_TOKENS: usize = 384;
 
 /// Default `--if-stale` threshold when neither the flag nor `[sync].max_age`
 /// provides one: 30 minutes.
-const DEFAULT_SYNC_MAX_AGE_SECONDS: i64 = 30 * 60;
+pub(crate) const DEFAULT_SYNC_MAX_AGE_SECONDS: i64 = 30 * 60;
 
 /// Default `--reconcile recent` window when neither `--window` nor
 /// `[profile].reconcile_after` provides one: 7 days.
@@ -138,9 +142,78 @@ fn local_read_outcome(data: Value, warnings: Vec<Value>) -> LocalReadOutcome {
     LocalReadOutcome { data, warnings }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn sync(
-    profile_id: &str,
+fn sync_scheduler_contract(profile: &Profile) -> Value {
+    json!({
+        "mode": "sequential",
+        "max_in_flight_requests": 1,
+        "hard_cap": 1,
+        "configured_max_in_flight_requests": profile.max_in_flight_requests,
+        "configuration_hard_cap": 16
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScheduleSyncDeferral {
+    HostCooldown,
+    RateBudgetReserve,
+    UnknownBudgetLimit,
+}
+
+impl ScheduleSyncDeferral {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::HostCooldown => "host_cooldown",
+            Self::RateBudgetReserve => "rate_budget_reserve",
+            Self::UnknownBudgetLimit => "unknown_budget_limit",
+        }
+    }
+}
+
+pub(crate) enum ScheduledSyncResult {
+    Completed(LocalReadOutcome),
+    Deferred {
+        reason: ScheduleSyncDeferral,
+        rate_budget: Vec<RateBudgetObservation>,
+    },
+}
+
+pub(crate) struct ScheduledSyncExecution {
+    pub(crate) result: Result<ScheduledSyncResult, QghError>,
+    pub(crate) remote_started: bool,
+    pub(crate) budget_uncertain: bool,
+}
+
+enum SyncBodyOutcome {
+    Completed(LocalReadOutcome),
+    ScheduledDeferred {
+        reason: ScheduleSyncDeferral,
+        rate_budget: Vec<RateBudgetObservation>,
+    },
+}
+
+enum SyncInvocation<'a> {
+    Standard,
+    Scheduled {
+        host_profiles: &'a [Profile],
+        host_attempts: usize,
+        host_budget_unknown: bool,
+        manager_invoked: bool,
+    },
+}
+
+impl SyncInvocation<'_> {
+    fn token_resolution_mode(&self) -> TokenResolutionMode {
+        match self {
+            Self::Scheduled {
+                manager_invoked: true,
+                ..
+            } => TokenResolutionMode::ManagedSchedule,
+            Self::Standard | Self::Scheduled { .. } => TokenResolutionMode::Standard,
+        }
+    }
+}
+
+fn validate_sync_request(
     reconcile: Option<ReconcileMode>,
     window: Option<&str>,
     if_stale: bool,
@@ -148,12 +221,7 @@ pub async fn sync(
     backfill: bool,
     max_requests: Option<usize>,
     max_duration: Option<&str>,
-    all_repos: bool,
-    repo_scope: Option<&ResolvedRepoScope>,
-    json_mode: bool,
-    quiet: bool,
-    show_progress: bool,
-) -> Result<LocalReadOutcome, QghError> {
+) -> Result<(), QghError> {
     if window.is_some() && reconcile != Some(ReconcileMode::Recent) {
         return Err(QghError::validation(
             "validation.window_requires_recent",
@@ -178,8 +246,134 @@ pub async fn sync(
             "--max-age requires --if-stale.",
         ));
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn sync(
+    profile_id: &str,
+    reconcile: Option<ReconcileMode>,
+    window: Option<&str>,
+    if_stale: bool,
+    max_age: Option<&str>,
+    backfill: bool,
+    max_requests: Option<usize>,
+    max_duration: Option<&str>,
+    all_repos: bool,
+    repo_scope: Option<&ResolvedRepoScope>,
+    json_mode: bool,
+    quiet: bool,
+    show_progress: bool,
+) -> Result<LocalReadOutcome, QghError> {
+    validate_sync_request(
+        reconcile,
+        window,
+        if_stale,
+        max_age,
+        backfill,
+        max_requests,
+        max_duration,
+    )?;
+    let profile = load_profile(profile_id)?;
+    let mut remote_started = false;
+    let mut budget_uncertain = false;
+    match sync_profile(
+        profile,
+        reconcile,
+        window,
+        if_stale,
+        max_age,
+        backfill,
+        max_requests,
+        max_duration,
+        all_repos,
+        repo_scope,
+        json_mode,
+        quiet,
+        show_progress,
+        SyncInvocation::Standard,
+        &mut remote_started,
+        &mut budget_uncertain,
+    )
+    .await?
+    {
+        SyncBodyOutcome::Completed(outcome) => Ok(outcome),
+        SyncBodyOutcome::ScheduledDeferred { .. } => unreachable!("standard sync cannot defer"),
+    }
+}
+
+pub(crate) async fn sync_scheduled(
+    profile: Profile,
+    host_profiles: &[Profile],
+    host_attempts: usize,
+    host_budget_unknown: bool,
+    manager_invoked: bool,
+) -> ScheduledSyncExecution {
+    let mut remote_started = false;
+    let mut budget_uncertain = false;
+    let result = sync_profile(
+        profile,
+        None,
+        None,
+        true,
+        None,
+        false,
+        None,
+        None,
+        true,
+        None,
+        true,
+        false,
+        false,
+        SyncInvocation::Scheduled {
+            host_profiles,
+            host_attempts,
+            host_budget_unknown,
+            manager_invoked,
+        },
+        &mut remote_started,
+        &mut budget_uncertain,
+    )
+    .await
+    .map(|outcome| match outcome {
+        SyncBodyOutcome::Completed(outcome) => ScheduledSyncResult::Completed(outcome),
+        SyncBodyOutcome::ScheduledDeferred {
+            reason,
+            rate_budget,
+        } => ScheduledSyncResult::Deferred {
+            reason,
+            rate_budget,
+        },
+    });
+    ScheduledSyncExecution {
+        result,
+        remote_started,
+        budget_uncertain,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_profile(
+    profile: Profile,
+    reconcile: Option<ReconcileMode>,
+    window: Option<&str>,
+    if_stale: bool,
+    max_age: Option<&str>,
+    backfill: bool,
+    max_requests: Option<usize>,
+    max_duration: Option<&str>,
+    all_repos: bool,
+    repo_scope: Option<&ResolvedRepoScope>,
+    json_mode: bool,
+    quiet: bool,
+    show_progress: bool,
+    invocation: SyncInvocation<'_>,
+    remote_started: &mut bool,
+    budget_uncertain: &mut bool,
+) -> Result<SyncBodyOutcome, QghError> {
+    let profile_id = profile.id.clone();
     let retry_command = sync_retry_command(
-        profile_id,
+        &profile_id,
         reconcile,
         window,
         if_stale,
@@ -196,7 +390,6 @@ pub async fn sync(
     progress.line(format_args!(
         "qgh sync: loading profile profile={profile_id}"
     ));
-    let profile = load_profile(profile_id)?;
     let parsed_window_seconds = window
         .map(|value| freshness::parse_duration_seconds("window", value))
         .transpose()?;
@@ -215,49 +408,55 @@ pub async fn sync(
     };
     let fetch_profile = profile_scoped_to_repo(&profile, repo_scope)?;
     let full_profile_scope = fetch_profile.repos.len() == profile.repos.len();
+    let _sync_lease = FileLease::acquire_profile_sync(&profile.id, &profile.paths)?;
     let mut store = Store::open(&profile.paths)?;
     run_sync_purge_preflight(&profile, &mut store)?;
-    let token = resolve_token(&profile)?;
+    let scheduled_invocation = matches!(&invocation, SyncInvocation::Scheduled { .. });
+    if scheduled_invocation {
+        if let Some(outcome) =
+            skipped_fresh_sync_outcome(&store, &profile, if_stale_max_age_seconds, &progress)?
+        {
+            return Ok(SyncBodyOutcome::Completed(outcome));
+        }
+    }
+    if let SyncInvocation::Scheduled {
+        host_profiles,
+        host_attempts,
+        host_budget_unknown,
+        ..
+    } = &invocation
+    {
+        if let Some((reason, rate_budget)) = revalidate_scheduled_host(
+            &profile,
+            &store,
+            host_profiles,
+            *host_attempts,
+            *host_budget_unknown,
+        )? {
+            return Ok(SyncBodyOutcome::ScheduledDeferred {
+                reason,
+                rate_budget,
+            });
+        }
+    }
+    let request_budget = if let SyncInvocation::Scheduled { host_profiles, .. } = &invocation {
+        let evidence = load_scheduled_rate_budget_observations(&profile, &store, host_profiles)?;
+        Some(github::RequestBudgetGate::from_observations(
+            &evidence.observations,
+            evidence.every_profile_has_fresh_core,
+        ))
+    } else {
+        None
+    };
+    let token = resolve_token_with_mode(&profile, invocation.token_resolution_mode())?;
 
     // `--if-stale`: skip the network sync entirely when the local snapshot is
     // still within max-age. Never-synced always proceeds.
-    if let Some(max_age_seconds) = if_stale_max_age_seconds {
-        let last_sync = store.status()?.last_sync_at;
-        if let Some(last_sync_at) = last_sync.as_deref() {
-            let snapshot_age_seconds = freshness::snapshot_age_seconds(last_sync_at)?;
-            if snapshot_age_seconds <= max_age_seconds {
-                match store.resolve_active_tantivy_artifact() {
-                    Ok(_) => {
-                        let coverage = coverage::evaluate(
-                            &profile_coverage_snapshot(&store, &profile)?,
-                            false,
-                            &profile.id,
-                        );
-                        progress.line(format_args!(
-                            "qgh sync: skipped, snapshot fresh age={snapshot_age_seconds}s max_age={max_age_seconds}s"
-                        ));
-                        return Ok(local_read_outcome(
-                            json!({
-                                "profile_id": profile.id,
-                                "sync_state": "skipped_fresh",
-                                "sync": {
-                                    "last_successful_sync": last_sync,
-                                    "snapshot_age_seconds": snapshot_age_seconds,
-                                    "max_age_seconds": max_age_seconds
-                                },
-                                "coverage": coverage.block
-                            }),
-                            Vec::new(),
-                        ));
-                    }
-                    Err(error) if is_repairable_retrieval_publication_error(&error.code) => {
-                        progress.line(format_args!(
-                            "qgh sync: fresh remote snapshot requires retrieval publication repair"
-                        ));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+    if !scheduled_invocation {
+        if let Some(outcome) =
+            skipped_fresh_sync_outcome(&store, &profile, if_stale_max_age_seconds, &progress)?
+        {
+            return Ok(SyncBodyOutcome::Completed(outcome));
         }
     }
 
@@ -265,6 +464,7 @@ pub async fn sync(
     let per_issue_comments = profile.comments_mode == CommentsMode::PerIssue;
 
     if backfill {
+        *remote_started = true;
         return backfill_sync(
             &profile,
             &fetch_profile,
@@ -276,7 +476,8 @@ pub async fn sync(
             &retry_command,
             &progress,
         )
-        .await;
+        .await
+        .map(SyncBodyOutcome::Completed);
     }
 
     progress.line(format_args!(
@@ -285,6 +486,9 @@ pub async fn sync(
     ));
     let sync_run_id = Store::new_sync_run_id();
     let mut summary = None;
+    if !scheduled_invocation {
+        *remote_started = true;
+    }
     let fetched = {
         let store_cell = std::cell::RefCell::new(&mut store);
         let lifecycle_pending = std::cell::Cell::new(false);
@@ -322,11 +526,18 @@ pub async fn sync(
             &cursors,
             per_issue_comments,
             Some(&progress),
+            request_budget.as_ref(),
             &mut commit_page,
             &mut commit_lifecycle,
         )
-        .await?
+        .await
     };
+    if let Some(request_budget) = request_budget.as_ref() {
+        *remote_started = request_budget.started_any();
+        *budget_uncertain = request_budget.has_unobserved_started_request();
+    }
+    persist_rate_budget_observations(&mut store, &progress)?;
+    let fetched = fetched?;
     let github::ClassifiedFetchOutcome {
         result: fetched,
         interruption,
@@ -354,7 +565,20 @@ pub async fn sync(
                     "qgh sync: backoff reason={} scope={} retry_after_seconds={}",
                     backoff.reason, backoff.scope, backoff.retry_after_seconds
                 ));
-                return sync_backoff_failure(&mut store, &profile.id, backoff, &retry_command);
+                return sync_backoff_failure(
+                    &mut store,
+                    &profile.id,
+                    &profile.host,
+                    backoff,
+                    &retry_command,
+                )
+                .map(SyncBodyOutcome::Completed);
+            }
+            InterruptionDisposition::RequestBudget(reason) => {
+                return Ok(SyncBodyOutcome::ScheduledDeferred {
+                    reason,
+                    rate_budget: store.rate_budget_observations(&profile.host)?,
+                });
             }
         }
     }
@@ -396,10 +620,17 @@ pub async fn sync(
                 budget,
                 &resolve,
                 Some(&progress),
+                request_budget.as_ref(),
                 &mut commit_lifecycle,
             )
-            .await?
+            .await
         };
+        if let Some(request_budget) = request_budget.as_ref() {
+            *remote_started = request_budget.started_any();
+            *budget_uncertain = request_budget.has_unobserved_started_request();
+        }
+        persist_rate_budget_observations(&mut store, &progress)?;
+        let outcome = outcome?;
         let purge_evidence =
             confirmed_fetch_purge_requests(&outcome.confirmed_permission_lost_repos, &[]);
         let queued_purge_requests = queue_purge_requests(&mut store, &purge_evidence.requests)?;
@@ -430,6 +661,12 @@ pub async fn sync(
             repair_lexical_successor_if_required(&profile, &mut store)?;
             match interruption_disposition(interruption) {
                 InterruptionDisposition::Backoff(plan) => backoff = Some(plan),
+                InterruptionDisposition::RequestBudget(reason) => {
+                    return Ok(SyncBodyOutcome::ScheduledDeferred {
+                        reason,
+                        rate_budget: store.rate_budget_observations(&profile.host)?,
+                    });
+                }
                 InterruptionDisposition::Error(error) => return Err(error),
             }
         }
@@ -439,7 +676,14 @@ pub async fn sync(
                 "qgh sync: comment backoff reason={} scope={} retry_after_seconds={}",
                 backoff.reason, backoff.scope, backoff.retry_after_seconds
             ));
-            return sync_backoff_failure(&mut store, &profile.id, backoff, &retry_command);
+            return sync_backoff_failure(
+                &mut store,
+                &profile.id,
+                &profile.host,
+                backoff,
+                &retry_command,
+            )
+            .map(SyncBodyOutcome::Completed);
         }
     }
 
@@ -526,10 +770,17 @@ pub async fn sync(
                     &token,
                     &candidates,
                     Some(&progress),
+                    request_budget.as_ref(),
                     &mut commit_lifecycle,
                 )
-                .await?
+                .await
             };
+            if let Some(request_budget) = request_budget.as_ref() {
+                *remote_started = request_budget.started_any();
+                *budget_uncertain = request_budget.has_unobserved_started_request();
+            }
+            persist_rate_budget_observations(&mut store, &progress)?;
+            let result = result?;
             let purge_evidence = reconciliation_purge_requests(
                 &result.unavailable_sources,
                 &result.confirmed_permission_lost_repos,
@@ -551,9 +802,17 @@ pub async fn sync(
                         return sync_backoff_failure(
                             &mut store,
                             &profile.id,
+                            &profile.host,
                             backoff,
                             &retry_command,
                         )
+                        .map(SyncBodyOutcome::Completed)
+                    }
+                    InterruptionDisposition::RequestBudget(reason) => {
+                        return Ok(SyncBodyOutcome::ScheduledDeferred {
+                            reason,
+                            rate_budget: store.rate_budget_observations(&profile.host)?,
+                        });
                     }
                 }
             }
@@ -599,15 +858,14 @@ pub async fn sync(
         false,
         &profile.id,
     );
-    Ok(local_read_outcome(
+    let rate_budget = stored_rate_budget_block(&store, &profile.host)?;
+    Ok(SyncBodyOutcome::Completed(local_read_outcome(
         json!({
             "profile_id": profile.id,
             "sync_state": "ok",
             "sync_run_id": summary.sync_run_id,
-            "scheduler": {
-                "max_in_flight_requests": profile.max_in_flight_requests,
-                "hard_cap": 16
-            },
+            "rate_budget": rate_budget,
+            "scheduler": sync_scheduler_contract(&profile),
             "issues": {
                 "fetched": summary.fetched_issues,
                 "upserted": summary.upserted_issues,
@@ -631,7 +889,196 @@ pub async fn sync(
             "coverage": coverage.block
         }),
         index.warnings,
-    ))
+    )))
+}
+
+fn skipped_fresh_sync_outcome(
+    store: &Store,
+    profile: &Profile,
+    max_age_seconds: Option<i64>,
+    progress: &StderrSyncProgress,
+) -> Result<Option<LocalReadOutcome>, QghError> {
+    let Some(max_age_seconds) = max_age_seconds else {
+        return Ok(None);
+    };
+    let last_sync = store.status()?.last_sync_at;
+    let Some(last_sync_at) = last_sync.as_deref() else {
+        return Ok(None);
+    };
+    let snapshot_age_seconds = freshness::snapshot_age_seconds(last_sync_at)?;
+    if snapshot_age_seconds > max_age_seconds {
+        return Ok(None);
+    }
+    match store.resolve_active_tantivy_artifact() {
+        Ok(_) => {
+            let coverage = coverage::evaluate(
+                &profile_coverage_snapshot(store, profile)?,
+                false,
+                &profile.id,
+            );
+            progress.line(format_args!(
+                "qgh sync: skipped, snapshot fresh age={snapshot_age_seconds}s max_age={max_age_seconds}s"
+            ));
+            let rate_budget = stored_rate_budget_block(store, &profile.host)?;
+            Ok(Some(local_read_outcome(
+                json!({
+                    "profile_id": profile.id,
+                    "sync_state": "skipped_fresh",
+                    "sync": {
+                        "last_successful_sync": last_sync,
+                        "snapshot_age_seconds": snapshot_age_seconds,
+                        "max_age_seconds": max_age_seconds
+                    },
+                    "rate_budget": rate_budget,
+                    "scheduler": sync_scheduler_contract(profile),
+                    "coverage": coverage.block
+                }),
+                Vec::new(),
+            )))
+        }
+        Err(error) if is_repairable_retrieval_publication_error(&error.code) => {
+            progress.line(format_args!(
+                "qgh sync: fresh remote snapshot requires retrieval publication repair"
+            ));
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn revalidate_scheduled_host(
+    current_profile: &Profile,
+    current_store: &Store,
+    host_profiles: &[Profile],
+    host_attempts: usize,
+    host_budget_unknown: bool,
+) -> Result<Option<(ScheduleSyncDeferral, Vec<RateBudgetObservation>)>, QghError> {
+    let mut observations = Vec::new();
+    let mut core_budget = None;
+    let mut complete = true;
+    let mut active_backoff = false;
+    for profile in host_profiles {
+        if profile.id == current_profile.id {
+            let status = current_store.status()?;
+            active_backoff |= status.backoff.as_ref().is_some_and(sync_backoff_is_active);
+            let profile_observations = current_store.rate_budget_observations(&profile.host)?;
+            let profile_core = fresh_core_budget(&profile_observations);
+            complete &= profile_core.is_some();
+            if let Some(profile_core) = profile_core {
+                core_budget = Some(match core_budget {
+                    None => profile_core,
+                    Some(current) => conservative_rate_observation(current, profile_core),
+                });
+            }
+            observations.extend(profile_observations);
+        } else if profile.paths.db_path.exists() {
+            let store = Store::open_for_read(&profile.paths)?;
+            let status = store.status()?;
+            active_backoff |= status.backoff.as_ref().is_some_and(sync_backoff_is_active);
+            let profile_observations = store.rate_budget_observations(&profile.host)?;
+            let profile_core = fresh_core_budget(&profile_observations);
+            complete &= profile_core.is_some();
+            if let Some(profile_core) = profile_core {
+                core_budget = Some(match core_budget {
+                    None => profile_core,
+                    Some(current) => conservative_rate_observation(current, profile_core),
+                });
+            }
+            observations.extend(profile_observations);
+        } else {
+            complete = false;
+        }
+    }
+
+    if active_backoff {
+        return Ok(Some((ScheduleSyncDeferral::HostCooldown, observations)));
+    }
+    if host_attempts >= 1 && (host_budget_unknown || !complete) {
+        return Ok(Some((
+            ScheduleSyncDeferral::UnknownBudgetLimit,
+            observations,
+        )));
+    }
+    if complete {
+        let reserve_exhausted = core_budget.is_none_or(|observation| {
+            rate_budget::scheduled_additional_requests(&observation).is_none_or(|value| value == 0)
+        });
+        if reserve_exhausted {
+            return Ok(Some((
+                ScheduleSyncDeferral::RateBudgetReserve,
+                observations,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+struct ScheduledRateBudgetEvidence {
+    observations: Vec<RateBudgetObservation>,
+    every_profile_has_fresh_core: bool,
+}
+
+fn load_scheduled_rate_budget_observations(
+    current_profile: &Profile,
+    current_store: &Store,
+    host_profiles: &[Profile],
+) -> Result<ScheduledRateBudgetEvidence, QghError> {
+    let mut observations = Vec::new();
+    let mut every_profile_has_fresh_core = true;
+    for profile in host_profiles {
+        let profile_observations = if profile.id == current_profile.id {
+            current_store.rate_budget_observations(&profile.host)?
+        } else if profile.paths.db_path.exists() {
+            Store::open_for_read(&profile.paths)?.rate_budget_observations(&profile.host)?
+        } else {
+            Vec::new()
+        };
+        every_profile_has_fresh_core &= fresh_core_budget(&profile_observations).is_some();
+        observations.extend(profile_observations);
+    }
+    Ok(ScheduledRateBudgetEvidence {
+        observations,
+        every_profile_has_fresh_core,
+    })
+}
+
+fn fresh_core_budget(observations: &[RateBudgetObservation]) -> Option<RateBudgetObservation> {
+    observations
+        .iter()
+        .filter(|observation| rate_budget::is_fresh_core(observation))
+        .cloned()
+        .reduce(conservative_rate_observation)
+}
+
+fn sync_backoff_is_active(backoff: &BackoffView) -> bool {
+    let retry_at = backoff
+        .reset_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+        .or_else(|| {
+            DateTime::parse_from_rfc3339(&backoff.observed_at)
+                .ok()
+                .map(|value| value.with_timezone(&Utc))
+                .and_then(|observed_at| {
+                    Duration::try_seconds(backoff.retry_after_seconds.max(0))
+                        .and_then(|duration| observed_at.checked_add_signed(duration))
+                })
+        });
+    retry_at.is_none_or(|value| value > Utc::now())
+}
+
+fn conservative_rate_observation(
+    left: RateBudgetObservation,
+    right: RateBudgetObservation,
+) -> RateBudgetObservation {
+    let left_allowance = rate_budget::scheduled_additional_requests(&left).unwrap_or(0);
+    let right_allowance = rate_budget::scheduled_additional_requests(&right).unwrap_or(0);
+    if left_allowance <= right_allowance {
+        left
+    } else {
+        right
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -694,6 +1141,7 @@ fn sync_retry_command(
 fn sync_backoff_failure(
     store: &mut Store,
     profile_id: &str,
+    profile_host: &str,
     backoff: github::BackoffPlan,
     retry_command: &str,
 ) -> Result<LocalReadOutcome, QghError> {
@@ -706,11 +1154,13 @@ fn sync_backoff_failure(
     )?;
     let local_query_available = matches!(store.successor_repair_required(), Ok(false))
         && matches!(store.resolve_active_tantivy_artifact(), Ok(Some(_)));
+    let rate_budget = stored_rate_budget_block(store, profile_host)?;
     Err(sync_backoff_error(
         profile_id,
         &backoff,
         local_query_available,
         retry_command,
+        rate_budget,
     ))
 }
 
@@ -719,6 +1169,7 @@ fn sync_backoff_error(
     backoff: &BackoffView,
     local_query_available: bool,
     retry_command: &str,
+    rate_budget: Value,
 ) -> QghError {
     let retry_action = CommandAction::from_retry_command("sync_backoff", retry_command);
     let retry_at = backoff
@@ -766,7 +1217,8 @@ fn sync_backoff_error(
         "local_get_availability": "source_dependent",
         "retry_command": retry_command,
         "retry_action": retry_action,
-        "retry_at": retry_at.map(|value| value.to_rfc3339())
+        "retry_at": retry_at.map(|value| value.to_rfc3339()),
+        "rate_budget": rate_budget
     }))
     .with_hint(format!("{retry_instruction} {local_read_instruction}"))
     .with_retryable(true)
@@ -832,8 +1284,10 @@ async fn backfill_sync(
             &mut commit_page,
             &mut commit_lifecycle,
         )
-        .await?
+        .await
     };
+    persist_rate_budget_observations(store, progress)?;
+    let outcome = outcome?;
     let purge_evidence = confirmed_fetch_purge_requests(
         &outcome.confirmed_permission_lost_repos,
         &outcome.confirmed_source_deletions,
@@ -853,6 +1307,9 @@ async fn backfill_sync(
             repair_lexical_successor_if_required(profile, store)?;
             match interruption_disposition(interruption) {
                 InterruptionDisposition::Backoff(plan) => Some(plan),
+                InterruptionDisposition::RequestBudget(_) => {
+                    return Err(github::github_unavailable());
+                }
                 InterruptionDisposition::Error(error) => return Err(error),
             }
         }
@@ -886,7 +1343,7 @@ async fn backfill_sync(
             "qgh sync: backfill backoff reason={} scope={} retry_after_seconds={}",
             backoff.reason, backoff.scope, backoff.retry_after_seconds
         ));
-        return sync_backoff_failure(store, &profile.id, backoff, retry_command);
+        return sync_backoff_failure(store, &profile.id, &profile.host, backoff, retry_command);
     }
 
     store.clear_backoff_state()?;
@@ -897,10 +1354,13 @@ async fn backfill_sync(
     let index = rebuild_after_successor_repair(profile, store, progress, repair)?;
     let coverage = profile_coverage_snapshot(store, profile)?;
     let next_action = coverage::next_action(&coverage, &profile.id);
+    let rate_budget = stored_rate_budget_block(store, &profile.host)?;
     Ok(local_read_outcome(
         json!({
             "profile_id": profile.id,
             "sync_state": "ok",
+            "rate_budget": rate_budget,
+            "scheduler": sync_scheduler_contract(profile),
             "backfill": {
                 "issues": outcome.issues,
                 "comments": outcome.comments,
@@ -992,6 +1452,7 @@ pub async fn sync_issue(
     if json_mode {
         retry_command.push_str(" --json");
     }
+    let _sync_lease = FileLease::acquire_profile_sync(&profile.id, &profile.paths)?;
     let mut store = Store::open(&profile.paths)?;
     run_sync_purge_preflight(&profile, &mut store)?;
     let token = resolve_token(&profile)?;
@@ -1016,8 +1477,10 @@ pub async fn sync_issue(
             Some(&progress),
             &mut commit_transition,
         )
-        .await?
+        .await
     };
+    persist_rate_budget_observations(&mut store, &progress)?;
+    let outcome = outcome?;
     let transition_evidence = target_transition_purge_requests(&outcome.confirmed_transitions);
     let mut purge_requests = transition_evidence.requests;
     if let github::ClassifiedTargetIssueTerminal::Confirmed {
@@ -1047,7 +1510,13 @@ pub async fn sync_issue(
                 "qgh sync issue: backoff reason={} scope={} retry_after_seconds={}",
                 backoff.reason, backoff.scope, backoff.retry_after_seconds
             ));
-            sync_backoff_failure(&mut store, &profile.id, backoff, &retry_command)
+            sync_backoff_failure(
+                &mut store,
+                &profile.id,
+                &profile.host,
+                backoff,
+                &retry_command,
+            )
         }
         github::ClassifiedTargetIssueTerminal::AuthenticationFailed => {
             finish_confirmed_target_purges(&mut store)?;
@@ -1108,6 +1577,7 @@ pub async fn sync_issue(
                 "qgh sync issue: complete sync_run_id={}",
                 summary.sync_run_id
             ));
+            let rate_budget = stored_rate_budget_block(&store, &profile.host)?;
             Ok(local_read_outcome(
                 target_issue_sync_json(
                     &profile,
@@ -1115,8 +1585,8 @@ pub async fn sync_issue(
                     issue_number,
                     &summary,
                     &fetched.lifecycle,
-                    index.generation,
-                    index.dirty_task_count,
+                    &index,
+                    rate_budget,
                 ),
                 index.warnings,
             ))
@@ -1169,6 +1639,7 @@ pub async fn sync_issue(
                 "qgh sync issue: complete sync_run_id={}",
                 summary.sync_run_id
             ));
+            let rate_budget = stored_rate_budget_block(&store, &profile.host)?;
             Ok(local_read_outcome(
                 target_issue_sync_json(
                     &profile,
@@ -1176,8 +1647,8 @@ pub async fn sync_issue(
                     issue_number,
                     &summary,
                     &lifecycle,
-                    index.generation,
-                    index.dirty_task_count,
+                    &index,
+                    rate_budget,
                 ),
                 index.warnings,
             ))
@@ -1188,6 +1659,7 @@ pub async fn sync_issue(
 struct StderrSyncProgress {
     enabled: bool,
     operation: &'static str,
+    rate_budget: RefCell<HashMap<String, RateBudgetObservation>>,
 }
 
 impl StderrSyncProgress {
@@ -1195,11 +1667,16 @@ impl StderrSyncProgress {
         Self {
             enabled,
             operation: "sync",
+            rate_budget: RefCell::new(HashMap::new()),
         }
     }
 
     fn for_operation(enabled: bool, operation: &'static str) -> Self {
-        Self { enabled, operation }
+        Self {
+            enabled,
+            operation,
+            rate_budget: RefCell::new(HashMap::new()),
+        }
     }
 
     fn line(&self, args: fmt::Arguments<'_>) {
@@ -1210,6 +1687,19 @@ impl StderrSyncProgress {
 
     fn phase(&self, args: fmt::Arguments<'_>) {
         self.line(format_args!("qgh {}: {args}", self.operation));
+    }
+
+    fn rate_budget_observations(&self) -> Vec<RateBudgetObservation> {
+        let mut observations = self
+            .rate_budget
+            .borrow()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        observations.sort_by(|left, right| {
+            (&left.host, &left.resource).cmp(&(&right.host, &right.resource))
+        });
+        observations
     }
 }
 
@@ -1255,6 +1745,21 @@ impl github::ProgressReporter for StderrSyncProgress {
                     "qgh sync: GitHub backoff reason={reason} scope={scope} retry_after_seconds={retry_after_seconds}"
                 ));
             }
+            github::ProgressEvent::RateBudgetObserved(observation) => {
+                let mut rate_budget = self.rate_budget.borrow_mut();
+                if observation.resource.is_none() {
+                    rate_budget.retain(|_, prior| prior.host != observation.host);
+                } else {
+                    let unknown_key = format!("{}\0", observation.host);
+                    rate_budget.remove(&unknown_key);
+                }
+                let key = format!(
+                    "{}\0{}",
+                    observation.host,
+                    observation.resource.as_deref().unwrap_or("")
+                );
+                rate_budget.insert(key, observation);
+            }
             github::ProgressEvent::ReconciliationProgress { checked, total } => {
                 self.line(format_args!(
                     "qgh sync: reconciled checked_sources={checked}/{total}"
@@ -1262,6 +1767,17 @@ impl github::ProgressReporter for StderrSyncProgress {
             }
         }
     }
+}
+
+fn persist_rate_budget_observations(
+    store: &mut Store,
+    progress: &StderrSyncProgress,
+) -> Result<(), QghError> {
+    store.record_rate_budget_observations(&progress.rate_budget_observations())
+}
+
+fn stored_rate_budget_block(store: &Store, host: &str) -> Result<Value, QghError> {
+    Ok(rate_budget::block(&store.rate_budget_observations(host)?))
 }
 
 fn rebuild_bm25_index(
@@ -1703,6 +2219,7 @@ fn confirmed_fetch_purge_requests(
 
 enum InterruptionDisposition {
     Backoff(github::BackoffPlan),
+    RequestBudget(ScheduleSyncDeferral),
     Error(QghError),
 }
 
@@ -1718,6 +2235,16 @@ fn interruption_disposition(
             InterruptionDisposition::Error(github::github_unavailable())
         }
         github::LifecycleInterruption::Backoff(plan) => InterruptionDisposition::Backoff(plan),
+        github::LifecycleInterruption::RequestBudget(reason) => {
+            InterruptionDisposition::RequestBudget(match reason {
+                github::RequestBudgetDeferral::RateBudgetReserve => {
+                    ScheduleSyncDeferral::RateBudgetReserve
+                }
+                github::RequestBudgetDeferral::UnknownBudgetLimit => {
+                    ScheduleSyncDeferral::UnknownBudgetLimit
+                }
+            })
+        }
     }
 }
 
@@ -2535,13 +3062,15 @@ fn target_issue_sync_json(
     issue_number: i64,
     summary: &TargetedSyncSummary,
     lifecycle: &github::TargetIssueLifecycle,
-    generation: i64,
-    dirty_task_count: i64,
+    index: &IndexRebuildOutcome,
+    rate_budget: Value,
 ) -> Value {
     json!({
         "profile_id": &profile.id,
         "sync_state": "ok",
         "sync_run_id": &summary.sync_run_id,
+        "rate_budget": rate_budget,
+        "scheduler": sync_scheduler_contract(profile),
         "target": {
             "kind": "issue",
             "repo": repo.full_name(),
@@ -2573,8 +3102,8 @@ fn target_issue_sync_json(
             "watermarks": {}
         },
         "index": {
-            "active_generation": generation,
-            "dirty_task_count": dirty_task_count
+            "active_generation": index.generation,
+            "dirty_task_count": index.dirty_task_count
         },
         "reconciliation": {
             "mode": "targeted_issue"
@@ -6173,6 +6702,7 @@ async fn lifecycle_check_for_get(
                     }),
                     Ok(
                         github::ClassifiedLifecycleCheck::Backoff(_)
+                        | github::ClassifiedLifecycleCheck::RequestBudget(_)
                         | github::ClassifiedLifecycleCheck::Transient(_)
                         | github::ClassifiedLifecycleCheck::AmbiguousForbidden,
                     ) => json!({
@@ -6296,6 +6826,7 @@ pub fn status(
             )
         })
         .collect::<serde_json::Map<_, _>>();
+    let rate_budget = stored_rate_budget_block(&store, &profile.host)?;
     let mut outcome = LocalReadOutcome {
         data: json!({
         "profile_id": profile.id,
@@ -6330,10 +6861,8 @@ pub fn status(
             "last_sync_at": status.last_sync_at,
             "cursors": cursors,
             "backoff": status.backoff,
-            "scheduler": {
-                "max_in_flight_requests": profile.max_in_flight_requests,
-                "hard_cap": 16
-            }
+            "rate_budget": rate_budget,
+            "scheduler": sync_scheduler_contract(&profile)
         },
         "reconciliation": {
             "last_full_at": last_reconciliation.map(|run| run.completed_at.clone()),

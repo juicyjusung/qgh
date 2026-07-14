@@ -11,10 +11,10 @@ use crate::embedding::{EmbeddingFingerprint, EmbeddingVector};
 use crate::error::QghError;
 use crate::model::{
     BackoffView, CommandAction, CommentRecord, CoverageSnapshot, CursorUpdate, CursorView,
-    IndexSource, IssueRecord, ParentIssueView, ReconciliationCandidate, ReconciliationRunView,
-    SourceVersionView, StatusSnapshot, StoredChunk, StoredComment, StoredCursor, StoredIssue,
-    StoredSource, SyncSummary, TargetedSyncSummary, TombstoneView, VectorSearchFilters,
-    VectorSearchHit,
+    IndexSource, IssueRecord, ParentIssueView, RateBudgetObservation, ReconciliationCandidate,
+    ReconciliationRunView, SourceVersionView, StatusSnapshot, StoredChunk, StoredComment,
+    StoredCursor, StoredIssue, StoredSource, SyncSummary, TargetedSyncSummary, TombstoneView,
+    VectorSearchFilters, VectorSearchHit,
 };
 use crate::paths::ProfilePaths;
 use crate::paths::{ensure_private_dir, set_private_file};
@@ -5717,6 +5717,82 @@ impl Store {
         Ok(())
     }
 
+    pub fn record_rate_budget_observations(
+        &mut self,
+        observations: &[RateBudgetObservation],
+    ) -> Result<(), QghError> {
+        if observations.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let hosts = observations
+            .iter()
+            .map(|observation| observation.host.as_str())
+            .collect::<BTreeSet<_>>();
+        for host in hosts {
+            tx.execute(
+                "DELETE FROM rate_budget_observations WHERE lower(host) = lower(?1)",
+                params![host],
+            )?;
+        }
+        for observation in observations {
+            let resource_key = observation.resource.as_deref().unwrap_or("");
+            tx.execute(
+                "INSERT INTO rate_budget_observations
+                    (host, resource_key, resource, limit_value, remaining, reset_at, observed_at, best_effort)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(host, resource_key) DO UPDATE SET
+                    resource = excluded.resource,
+                    limit_value = excluded.limit_value,
+                    remaining = excluded.remaining,
+                    reset_at = excluded.reset_at,
+                    observed_at = excluded.observed_at,
+                    best_effort = excluded.best_effort",
+                params![
+                    observation.host,
+                    resource_key,
+                    observation.resource,
+                    observation.limit,
+                    observation.remaining,
+                    observation.reset_at,
+                    observation.observed_at,
+                    observation.best_effort
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn rate_budget_observations(
+        &self,
+        host: &str,
+    ) -> Result<Vec<RateBudgetObservation>, QghError> {
+        if !table_exists(&self.conn, "rate_budget_observations")? {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT host, resource, limit_value, remaining, reset_at, observed_at, best_effort
+             FROM rate_budget_observations
+             WHERE lower(host) = lower(?1)
+             ORDER BY resource_key",
+        )?;
+        let rows = statement.query_map(params![host], |row| {
+            Ok(RateBudgetObservation {
+                host: row.get(0)?,
+                resource: row.get(1)?,
+                limit: row.get(2)?,
+                remaining: row.get(3)?,
+                reset_at: row.get(4)?,
+                observed_at: row.get(5)?,
+                best_effort: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
+    }
+
     #[allow(dead_code)]
     fn record_empty_sync_run(&self) -> Result<String, QghError> {
         let sync_run_id = format!("sync-{}", now_run_id_suffix());
@@ -8621,6 +8697,18 @@ impl Store {
                 observed_at TEXT NOT NULL,
                 last_successful_sync TEXT,
                 retry_command TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS rate_budget_observations (
+                host TEXT NOT NULL,
+                resource_key TEXT NOT NULL,
+                resource TEXT,
+                limit_value INTEGER,
+                remaining INTEGER,
+                reset_at TEXT,
+                observed_at TEXT NOT NULL,
+                best_effort INTEGER NOT NULL CHECK (best_effort = 1),
+                PRIMARY KEY (host, resource_key)
             );
 
             CREATE TABLE IF NOT EXISTS tombstones (
