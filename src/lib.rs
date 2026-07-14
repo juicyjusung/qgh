@@ -12,6 +12,7 @@ mod freshness;
 mod fusion;
 mod github;
 mod index;
+mod lease;
 mod local_models;
 mod mcp;
 mod model;
@@ -19,7 +20,10 @@ mod output;
 mod paths;
 #[cfg(feature = "fastembed-provider")]
 mod qwen;
+mod rate_budget;
 mod resolution;
+mod schedule;
+mod schedule_lifecycle;
 mod store;
 mod terminal;
 mod time;

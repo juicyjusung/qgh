@@ -58,6 +58,106 @@ fn error_code_docs_describe_publication_snapshot_failures() {
     );
 }
 
+#[test]
+fn sync_backoff_error_details_publish_a_closed_rate_budget_contract() {
+    let schema: Value = serde_json::from_str(
+        &fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/schemas/error.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        schema["allOf"][0]["if"]["properties"]["code"]["const"],
+        "sync.backoff"
+    );
+    assert_eq!(
+        schema["allOf"][0]["then"]["properties"]["details"]["$ref"],
+        "#/$defs/sync_backoff_details"
+    );
+    let details = &schema["$defs"]["sync_backoff_details"];
+    assert_eq!(details["additionalProperties"], false);
+    let required = details["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        required,
+        BTreeSet::from([
+            "profile_id",
+            "reason",
+            "scope",
+            "retry_after_seconds",
+            "reset_at",
+            "observed_at",
+            "last_successful_sync",
+            "local_retrieval_available",
+            "local_query_available",
+            "local_status_available",
+            "local_get_availability",
+            "retry_command",
+            "retry_action",
+            "retry_at",
+            "rate_budget",
+        ])
+    );
+    assert_eq!(
+        details["properties"]["rate_budget"]["$ref"],
+        "#/$defs/rate_budget"
+    );
+    assert_eq!(
+        schema["$defs"]["rate_budget"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        schema["$defs"]["rate_budget_observation"]["additionalProperties"],
+        false
+    );
+}
+
+#[test]
+fn schedule_manager_gate_exercises_real_user_manager_lifecycle_commands() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        fs::read_to_string(root.join(".github/workflows/schedule-manager-gate.yml")).unwrap();
+    for required in [
+        "workflow_dispatch:",
+        "self-hosted",
+        "qgh-schedule-gate-macos",
+        "qgh-schedule-gate-linux",
+        "scripts/verify-schedule-manager.sh",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "missing real-manager workflow phrase: {required}"
+        );
+    }
+
+    let gate = fs::read_to_string(root.join("scripts/verify-schedule-manager.sh")).unwrap();
+    for required in [
+        "schedule start",
+        "schedule status",
+        "schedule stop",
+        "launchctl print",
+        "launchctl bootout",
+        "launchctl kickstart",
+        "systemctl --user is-enabled",
+        "systemctl --user disable --now",
+        "systemctl --user stop qgh-schedule.service",
+        "systemctl --user start --no-block qgh-schedule.service",
+        "Persistent=true",
+        ".data.action == \"reloaded\"",
+        ".data.action == \"unchanged\"",
+    ] {
+        assert!(
+            gate.contains(required),
+            "missing real-manager gate phrase: {required}"
+        );
+    }
+}
+
 #[cfg(not(feature = "vector-search"))]
 #[test]
 fn bm25_binary_emits_published_vector_capability_error_envelope() {
@@ -255,7 +355,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert!(help_text.contains("human output by default"));
     assert!(help_text.contains("use --json for qgh.v1 envelopes"));
     for command in [
-        "init", "sync", "embed", "model", "query", "search", "get", "status", "doctor", "mcp",
+        "init", "sync", "embed", "model", "query", "search", "get", "status", "doctor", "schedule",
+        "mcp",
     ] {
         assert!(
             help_text.contains(command),
@@ -280,6 +381,11 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         &["get", "--help"][..],
         &["status", "--help"][..],
         &["doctor", "--help"][..],
+        &["schedule", "--help"][..],
+        &["schedule", "run", "--help"][..],
+        &["schedule", "start", "--help"][..],
+        &["schedule", "status", "--help"][..],
+        &["schedule", "stop", "--help"][..],
     ] {
         let output = qgh(args);
         assert_success(&output);
@@ -453,16 +559,17 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert_eq!(
         artifact["contract"]["cli_commands"],
         json!([
-            "init", "sync", "embed", "model", "query", "search", "get", "status", "doctor", "mcp"
+            "init", "sync", "embed", "model", "query", "search", "get", "status", "doctor",
+            "schedule", "mcp"
         ])
     );
     assert_eq!(
         artifact["contract"]["canonical_cli_commands"],
-        json!(["init", "sync", "embed", "model", "query", "get", "status", "doctor"])
+        json!(["init", "sync", "embed", "model", "query", "get", "status", "doctor", "schedule"])
     );
     assert_eq!(
         artifact["contract"]["cli_only_commands"],
-        json!(["init", "sync", "embed", "model", "doctor"])
+        json!(["init", "sync", "embed", "model", "doctor", "schedule"])
     );
     assert_eq!(
         artifact["contract"]["product_core"],
@@ -715,6 +822,9 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "privacy no-egress",
             "DB/index permissions",
             "doctor output",
+            "single-flight sync and rate-budget observation",
+            "bounded explicit-profile schedule coordinator",
+            "LaunchAgent and systemd user timer lifecycle",
             "search eval result",
             "one-command Homebrew install",
             "cargo-dist plan/build",
@@ -740,6 +850,11 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         .unwrap()
         .iter()
         .any(|command| command == "model"));
+    assert!(artifact["contract"]["not_exposed_to_mcp"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|command| command == "schedule"));
     assert_eq!(
         artifact["schema_snapshots"],
         json!([
@@ -747,6 +862,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "docs/schemas/error.schema.json",
             "docs/schemas/init-output.schema.json",
             "docs/schemas/sync-output.schema.json",
+            "docs/schemas/schedule-output.schema.json",
             "docs/schemas/embed-output.schema.json",
             "docs/schemas/command-action.schema.json",
             "docs/schemas/model-output.schema.json",
@@ -773,6 +889,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     .unwrap();
     let sync_schema: Value = serde_json::from_str(
         &fs::read_to_string(root.join("docs/schemas/sync-output.schema.json")).unwrap(),
+    )
+    .unwrap();
+    let schedule_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/schedule-output.schema.json")).unwrap(),
     )
     .unwrap();
     let embed_schema: Value = serde_json::from_str(
@@ -803,6 +923,58 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         &fs::read_to_string(root.join("docs/schemas/doctor-output.schema.json")).unwrap(),
     )
     .unwrap();
+    assert_eq!(
+        schedule_schema["oneOf"],
+        json!([
+            {"$ref": "#/$defs/run"},
+            {"$ref": "#/$defs/start"},
+            {"$ref": "#/$defs/status"},
+            {"$ref": "#/$defs/stop"}
+        ])
+    );
+    let schedule_run = &schedule_schema["$defs"]["run"];
+    assert_eq!(schedule_run["additionalProperties"], false);
+    assert_eq!(
+        schedule_run["required"],
+        json!([
+            "operation",
+            "pass_state",
+            "policy",
+            "summary",
+            "hosts",
+            "profiles"
+        ])
+    );
+    let schedule_policy = &schedule_schema["$defs"]["policy"];
+    assert_eq!(schedule_policy["additionalProperties"], false);
+    assert_eq!(
+        schedule_policy["properties"]["host_max_in_flight"]["const"],
+        1
+    );
+    assert_eq!(
+        schedule_policy["properties"]["unknown_budget_max_attempts"]["const"],
+        1
+    );
+    assert_eq!(
+        schedule_policy["properties"]["reserve_percent"]["const"],
+        20
+    );
+    assert_eq!(
+        schedule_policy["properties"]["max_remote_attempts_per_pass"]["const"],
+        8
+    );
+    assert_eq!(
+        schedule_schema["$defs"]["lifecycle"]["properties"]["network_access"]["const"],
+        false
+    );
+    assert_eq!(
+        schedule_schema["$defs"]["status"]["properties"]["manager_checked"]["const"],
+        false
+    );
+    assert_eq!(
+        sync_schema["required"],
+        json!(["profile_id", "sync_state", "rate_budget", "scheduler"])
+    );
     assert_eq!(model_schema["additionalProperties"], false);
     assert_eq!(embed_schema["additionalProperties"], false);
     assert_eq!(command_action_schema["additionalProperties"], false);
@@ -889,8 +1061,14 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "github.confirmed_lifecycle_requires_typed_handling",
         "sync.commit_page_failed",
         "sync.backoff",
+        "sync.busy",
         "sync.transfer_cycle",
         "sync.transfer_chain_too_long",
+        "validation.duplicate_profile",
+        "validation.schedule_profile_boundary",
+        "schedule.credentials_unsupported",
+        "schedule.manager_failed",
+        "schedule.manager_unsupported",
         "embedding.source_snapshot_incomplete",
         "purge.failed",
         "purge.retry_failed",
@@ -924,6 +1102,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "issues".to_string(),
             "lifecycle".to_string(),
             "profile_id".to_string(),
+            "rate_budget".to_string(),
             "reconciliation".to_string(),
             "scheduler".to_string(),
             "sync".to_string(),
@@ -1150,18 +1329,37 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     let sync_scheduler = &sync_schema["$defs"]["scheduler"];
     assert_eq!(
         sync_scheduler["required"],
-        json!(["max_in_flight_requests", "hard_cap"])
+        json!([
+            "mode",
+            "max_in_flight_requests",
+            "hard_cap",
+            "configured_max_in_flight_requests",
+            "configuration_hard_cap"
+        ])
     );
     assert_eq!(sync_scheduler["additionalProperties"], false);
+    assert_eq!(sync_scheduler["properties"]["mode"]["const"], "sequential");
     assert_eq!(
-        sync_scheduler["properties"]["max_in_flight_requests"]["minimum"],
+        sync_scheduler["properties"]["max_in_flight_requests"]["const"],
         1
     );
+    assert_eq!(sync_scheduler["properties"]["hard_cap"]["const"], 1);
     assert_eq!(
-        sync_scheduler["properties"]["max_in_flight_requests"]["maximum"],
+        sync_scheduler["properties"]["configuration_hard_cap"]["const"],
         16
     );
-    assert_eq!(sync_scheduler["properties"]["hard_cap"]["const"], 16);
+    assert_eq!(
+        sync_schema["properties"]["rate_budget"]["$ref"],
+        "#/$defs/rate_budget"
+    );
+    assert_eq!(
+        sync_schema["$defs"]["rate_budget"]["required"],
+        json!(["best_effort", "stale_after_seconds", "observations"])
+    );
+    assert_eq!(
+        sync_schema["$defs"]["rate_budget"]["properties"]["stale_after_seconds"]["const"],
+        300
+    );
     assert_eq!(
         sync_schema["properties"]["target"]["$ref"],
         "#/$defs/target"
@@ -2030,7 +2228,13 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     let status_sync = &status_schema["$defs"]["sync"];
     assert_eq!(
         status_sync["required"],
-        json!(["last_sync_at", "cursors", "backoff", "scheduler"])
+        json!([
+            "last_sync_at",
+            "cursors",
+            "backoff",
+            "scheduler",
+            "rate_budget"
+        ])
     );
     assert_eq!(status_sync["additionalProperties"], false);
     assert_eq!(
@@ -2039,6 +2243,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "backoff".to_string(),
             "cursors".to_string(),
             "last_sync_at".to_string(),
+            "rate_budget".to_string(),
             "scheduler".to_string(),
         ])
     );
@@ -2112,18 +2317,29 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     let sync_scheduler = &status_schema["$defs"]["sync_scheduler"];
     assert_eq!(
         sync_scheduler["required"],
-        json!(["max_in_flight_requests", "hard_cap"])
+        json!([
+            "mode",
+            "max_in_flight_requests",
+            "hard_cap",
+            "configured_max_in_flight_requests",
+            "configuration_hard_cap"
+        ])
     );
     assert_eq!(sync_scheduler["additionalProperties"], false);
+    assert_eq!(sync_scheduler["properties"]["mode"]["const"], "sequential");
     assert_eq!(
-        sync_scheduler["properties"]["max_in_flight_requests"]["minimum"],
+        sync_scheduler["properties"]["max_in_flight_requests"]["const"],
         1
     );
+    assert_eq!(sync_scheduler["properties"]["hard_cap"]["const"], 1);
     assert_eq!(
-        sync_scheduler["properties"]["max_in_flight_requests"]["maximum"],
+        sync_scheduler["properties"]["configuration_hard_cap"]["const"],
         16
     );
-    assert_eq!(sync_scheduler["properties"]["hard_cap"]["const"], 16);
+    assert_eq!(
+        status_sync["properties"]["rate_budget"]["$ref"],
+        "#/$defs/rate_budget"
+    );
     let status_reconciliation = &status_schema["$defs"]["reconciliation"];
     assert_eq!(
         status_reconciliation["required"],
@@ -2561,7 +2777,9 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     let included = artifact["acceptance_snapshot"]["included_in_mvp_gate"]
         .as_array()
         .unwrap();
-    assert!(included.iter().any(|id| id == "AC-28"));
+    for id in ["AC-28", "AC-29", "AC-30", "AC-31"] {
+        assert!(included.iter().any(|included| included == id));
+    }
     assert!(!included.iter().any(|id| id == "AC-13"));
     assert!(!included.iter().any(|id| id == "AC-20"));
     assert_eq!(
@@ -2587,6 +2805,9 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "privacy no-egress",
         "DB/index permissions",
         "doctor output",
+        "single-flight sync and rate-budget observation",
+        "bounded explicit-profile schedule coordinator",
+        "LaunchAgent and systemd user timer lifecycle",
         "search eval result",
         "brew install juicyjusung/tap/qgh",
         "juicyjusung/homebrew-tap",
@@ -2652,6 +2873,12 @@ fn readme_onboarding_matches_released_cli_and_mcp_contracts() {
         "gh auth status",
         "qgh init -y",
         "qgh sync",
+        "qgh schedule run",
+        "qgh schedule start",
+        "qgh schedule status",
+        "qgh schedule stop",
+        "20% observed quota reserve",
+        "never installs a cron fallback",
         "qgh sync --all",
         "qgh sync --backfill",
         "coverage: partial",
@@ -2694,6 +2921,7 @@ fn readme_onboarding_matches_released_cli_and_mcp_contracts() {
         "docs/local-qwen-models.md",
         "docs/error-codes.md",
         "docs/agent-skills.md",
+        "docs/scheduling.md",
     ] {
         assert!(
             readme.contains(&format!("]({relative_path})")),
@@ -3061,6 +3289,7 @@ fn cli_help_teaches_workflow_and_side_effect_boundaries() {
     for workflow_step in [
         "qgh init",
         "qgh sync",
+        "qgh schedule run",
         "qgh query",
         "qgh get",
         "cite",
@@ -3079,6 +3308,7 @@ fn cli_help_teaches_workflow_and_side_effect_boundaries() {
         "Open authoritative local sources before citing them",
         "Inspect local search readiness without network access",
         "Probe GitHub connectivity and local model health",
+        "Run bounded explicit-profile sync passes or manage user scheduling",
         "Serve the read-only query/get/status MCP tools over stdio",
     ] {
         assert!(
@@ -3148,6 +3378,20 @@ fn cli_help_teaches_workflow_and_side_effect_boundaries() {
     let doctor = stdout_text(&qgh(&["doctor", "--help"]));
     assert!(doctor.contains("contacts GitHub"));
     assert!(doctor.contains("loads the configured local model runtime"));
+    let schedule_run = stdout_text(&qgh(&["schedule", "run", "--help"]));
+    assert!(schedule_run.contains("explicit profile list"));
+    assert!(schedule_run.contains("may contact configured GitHub hosts"));
+    assert!(schedule_run.contains("never performs hidden bootstrap"));
+    let schedule_start = stdout_text(&qgh(&["schedule", "start", "--help"]));
+    assert!(schedule_start.contains("macOS LaunchAgent or Linux systemd timer"));
+    assert!(schedule_start.contains("does not contact GitHub"));
+    assert!(schedule_start.contains("never installs a cron fallback"));
+    let schedule_status = stdout_text(&qgh(&["schedule", "status", "--help"]));
+    assert!(schedule_status.contains("does not contact GitHub"));
+    assert!(schedule_status.contains("does not contact"));
+    let schedule_stop = stdout_text(&qgh(&["schedule", "stop", "--help"]));
+    assert!(schedule_stop.contains("does not contact GitHub"));
+    assert!(schedule_stop.contains("does not install a fallback scheduler"));
 
     let profile_with_model = qgh(&[
         "--profile",
@@ -3547,6 +3791,7 @@ fn stable_external_error_codes_from_source(root: &std::path::Path) -> BTreeSet<S
         "freshness.query_snapshot_stale",
         "publication.activation_failed",
         "publication.incomplete_snapshot_deferred",
+        "schedule.partial_failure",
     ];
     const DEBUG_OR_TEST_ONLY_CODES: &[&str] = &["embedding.generation_cleanup_injected_failure"];
     const NON_ERROR_LITERALS: &[&str] = &[
@@ -3556,6 +3801,7 @@ fn stable_external_error_codes_from_source(root: &std::path::Path) -> BTreeSet<S
         "model.onnx",
         "model.onnx_data",
         "model.safetensors",
+        "sync.lock",
     ];
     let warning_codes = WARNING_CODES.iter().copied().collect::<BTreeSet<_>>();
     let debug_or_test_only_codes = DEBUG_OR_TEST_ONLY_CODES
@@ -3624,6 +3870,7 @@ fn stable_error_prefixes() -> &'static [&'static str] {
         "model.",
         "publication.",
         "purge.",
+        "schedule.",
         "source.",
         "storage.",
         "sync.",

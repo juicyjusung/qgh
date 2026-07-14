@@ -132,6 +132,26 @@ _Avoid_: remote freshness, live check, true currency
 An explicit sync pass for a named source entity, independent of age or scheduled coverage priority.
 _Avoid_: hidden auto-sync, live probe
 
+**Profile Sync Lease**:
+The stable OS advisory lock that permits one profile writer sync at a time and is released by process exit without deleting the lock inode.
+_Avoid_: PID file, queue, stale lock cleanup
+
+**Rate Budget Observation**:
+A content-free best-effort local snapshot derived from GitHub response headers, with an explicit fresh, partial, or stale state. It is not a reservation or remote quota probe.
+_Avoid_: rate-limit guarantee, `/rate_limit` poll, token budget
+
+**Foreground Coordinator**:
+The bounded `schedule run` pass over an explicit profile list. It plans locally, serializes by host, admits work from observed budget, and delegates only ordinary freshness sync.
+_Avoid_: daemon, implicit all-profile scheduler, maintenance worker
+
+**Schedule Pass**:
+One coordinator invocation with a maximum of one attempt per profile and eight remote attempts overall, plus persisted host round-robin cursors.
+_Avoid_: retry loop, backfill cycle, reconciliation job
+
+**User Schedule Adapter**:
+The single per-user LaunchAgent or systemd timer that invokes a foreground coordinator pass. It owns lifecycle artifacts, not sync policy.
+_Avoid_: cron fallback, shared server, background sync engine
+
 **Status Snapshot**:
 A local-only report of profile, store, index, sync, and reconciliation state. It does not perform network or model probes.
 _Avoid_: health check, live probe

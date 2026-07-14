@@ -15,6 +15,7 @@ fastembed-provider = ["vector-search", "dep:fastembed", "dep:hf-hub", "dep:token
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+fs2 = "0.4"
 fastembed = { version = "5.17.2", default-features = false, features = ["ort-download-binaries-rustls-tls", "qwen3"], optional = true }
 candle-core = { version = "=0.10.2", default-features = false, optional = true }
 candle-nn = { version = "=0.10.2", default-features = false, optional = true }

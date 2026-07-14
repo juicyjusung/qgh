@@ -1,0 +1,31 @@
+name: schedule-manager-gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile_ids:
+        description: "Space-separated disposable github_cli profile ids"
+        required: true
+        default: "schedule-gate"
+
+jobs:
+  platform-manager:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            runner: qgh-schedule-gate-macos
+          - platform: linux
+            runner: qgh-schedule-gate-linux
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build qgh
+        run: cargo build
+      - name: verify the real user manager
+        env:
+          PROFILE_IDS: "${{ inputs.profile_ids }}"
+        run: scripts/verify-schedule-manager.sh target/debug/qgh $PROFILE_IDS

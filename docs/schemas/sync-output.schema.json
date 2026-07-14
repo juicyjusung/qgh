@@ -3,7 +3,7 @@
   "$id": "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/sync-output.schema.json",
   "title": "qgh sync data",
   "type": "object",
-  "required": ["profile_id", "sync_state"],
+  "required": ["profile_id", "sync_state", "rate_budget", "scheduler"],
   "properties": {
     "profile_id": {
       "type": "string"
@@ -41,6 +41,9 @@
     },
     "coverage": {
       "$ref": "#/$defs/coverage"
+    },
+    "rate_budget": {
+      "$ref": "#/$defs/rate_budget"
     },
     "scheduler": {
       "$ref": "#/$defs/scheduler"
@@ -306,15 +309,95 @@
     },
     "scheduler": {
       "type": "object",
-      "required": ["max_in_flight_requests", "hard_cap"],
+      "required": [
+        "mode",
+        "max_in_flight_requests",
+        "hard_cap",
+        "configured_max_in_flight_requests",
+        "configuration_hard_cap"
+      ],
       "properties": {
+        "mode": {
+          "const": "sequential"
+        },
         "max_in_flight_requests": {
+          "const": 1
+        },
+        "hard_cap": {
+          "const": 1
+        },
+        "configured_max_in_flight_requests": {
           "type": "integer",
           "minimum": 1,
           "maximum": 16
         },
-        "hard_cap": {
+        "configuration_hard_cap": {
           "const": 16
+        }
+      },
+      "additionalProperties": false
+    },
+    "rate_budget": {
+      "type": "object",
+      "required": ["best_effort", "stale_after_seconds", "observations"],
+      "properties": {
+        "best_effort": {
+          "const": true
+        },
+        "stale_after_seconds": {
+          "const": 300
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/rate_budget_observation"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "rate_budget_observation": {
+      "type": "object",
+      "required": [
+        "host",
+        "resource",
+        "limit",
+        "remaining",
+        "reset_at",
+        "observed_at",
+        "best_effort",
+        "state",
+        "stale"
+      ],
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "resource": {
+          "type": ["string", "null"]
+        },
+        "limit": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "remaining": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "reset_at": {
+          "type": ["string", "null"]
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "best_effort": {
+          "const": true
+        },
+        "state": {
+          "enum": ["fresh", "partial", "stale"]
+        },
+        "stale": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false

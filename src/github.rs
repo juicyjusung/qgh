@@ -1,8 +1,10 @@
 use crate::config::{Profile, RepoRef};
 use crate::error::QghError;
 use crate::model::{
-    CommentRecord, CursorUpdate, IssueRecord, ReconciliationCandidate, StoredCursor,
+    CommentRecord, CursorUpdate, IssueRecord, RateBudgetObservation, ReconciliationCandidate,
+    StoredCursor,
 };
+use crate::rate_budget;
 use crate::time::now_rfc3339;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -178,6 +180,7 @@ pub enum ProgressEvent {
         scope: String,
         retry_after_seconds: i64,
     },
+    RateBudgetObserved(RateBudgetObservation),
     ReconciliationProgress {
         checked: usize,
         total: usize,
@@ -484,6 +487,7 @@ async fn fetch_issues_classified_with_client(
             };
             let status = response.status();
             let headers = response.headers().clone();
+            emit_rate_budget_observation(progress, profile, &headers);
             if let Some(backoff) = backoff_from_response(status, &headers, &endpoint) {
                 emit_backoff(progress, &backoff);
                 wait_for_backoff(&backoff);
@@ -924,6 +928,7 @@ async fn fetch_backfill_issues_classified_inner(
             };
             let status = response.status();
             let headers = response.headers().clone();
+            emit_rate_budget_observation(progress, profile, &headers);
             if let Some(plan) = backoff_from_response(status, &headers, &history_endpoint) {
                 emit_backoff(progress, &plan);
                 wait_for_backoff(&plan);
@@ -1344,6 +1349,7 @@ async fn fetch_target_issue_classified_with_client_and_transition_commit(
         };
         let status = response.status();
         let headers = response.headers().clone();
+        emit_rate_budget_observation(progress, profile, &headers);
         let scope = format!(
             "issue:{}#{}",
             current_repo.full_name(),
@@ -1800,6 +1806,7 @@ async fn fetch_issue_comments(
         };
         let status = response.status();
         let headers = response.headers().clone();
+        emit_rate_budget_observation(progress, profile, &headers);
         if let Some(backoff) = backoff_from_response(status, &headers, &endpoint) {
             emit_backoff(progress, &backoff);
             return CommentFetchOutcome::Backoff(backoff);
@@ -2054,6 +2061,7 @@ async fn fetch_repo_comments_classified_inner(
             };
             let status = response.status();
             let headers = response.headers().clone();
+            emit_rate_budget_observation(progress, profile, &headers);
             if let Some(plan) = backoff_from_response(status, &headers, &endpoint) {
                 emit_backoff(progress, &plan);
                 wait_for_backoff(&plan);
@@ -2259,6 +2267,7 @@ async fn classify_parent(
     };
     let status = response.status();
     let headers = response.headers().clone();
+    emit_rate_budget_observation(progress, profile, &headers);
     if let Some(backoff) = backoff_from_response(status, &headers, &repo_comment_endpoint(repo)) {
         emit_backoff(progress, &backoff);
         return ParentClass::Backoff(backoff);
@@ -2334,6 +2343,17 @@ fn emit_backoff(progress: Option<&dyn ProgressReporter>, backoff: &BackoffPlan) 
             scope: backoff.scope.clone(),
             retry_after_seconds: backoff.retry_after_seconds,
         },
+    );
+}
+
+fn emit_rate_budget_observation(
+    progress: Option<&dyn ProgressReporter>,
+    profile: &Profile,
+    headers: &HeaderMap,
+) {
+    emit(
+        progress,
+        ProgressEvent::RateBudgetObserved(rate_budget::observe(&profile.host, headers)),
     );
 }
 
@@ -2479,8 +2499,17 @@ async fn repository_access_attempt(
     profile: &Profile,
     token: &str,
     repo: &RepoRef,
+    progress: Option<&dyn ProgressReporter>,
 ) -> ResponseDisposition {
-    repository_access_attempt_at(client, &profile.api_base_url, token, repo).await
+    repository_access_attempt_at(
+        client,
+        &profile.api_base_url,
+        token,
+        repo,
+        Some(&profile.host),
+        progress,
+    )
+    .await
 }
 
 async fn repository_access_attempt_at(
@@ -2488,6 +2517,8 @@ async fn repository_access_attempt_at(
     api_base_url: &str,
     token: &str,
     repo: &RepoRef,
+    observation_host: Option<&str>,
+    progress: Option<&dyn ProgressReporter>,
 ) -> ResponseDisposition {
     let url = repository_object_url_at(api_base_url, repo);
     let scope = format!("repository:{}", repo.full_name());
@@ -2503,6 +2534,12 @@ async fn repository_access_attempt_at(
     };
     let status = response.status();
     let headers = response.headers().clone();
+    if let Some(host) = observation_host {
+        emit(
+            progress,
+            ProgressEvent::RateBudgetObserved(rate_budget::observe(host, &headers)),
+        );
+    }
     let body = if status == StatusCode::FORBIDDEN {
         response.text().await.unwrap_or_default()
     } else {
@@ -2519,7 +2556,7 @@ async fn confirm_source_denial_with_repository(
     first: PermissionEvidence,
     progress: Option<&dyn ProgressReporter>,
 ) -> ClassifiedLifecycleCheck {
-    let second = repository_access_attempt(client, profile, token, repo).await;
+    let second = repository_access_attempt(client, profile, token, repo, progress).await;
     if let ResponseDisposition::Backoff(plan) = &second {
         emit_backoff(progress, plan);
     }
@@ -2533,7 +2570,7 @@ async fn confirm_repository_after_prior_denial(
     repo: &RepoRef,
     progress: Option<&dyn ProgressReporter>,
 ) -> RepositoryAccessOutcome {
-    let second = repository_access_attempt(client, profile, token, repo).await;
+    let second = repository_access_attempt(client, profile, token, repo, progress).await;
     if let ResponseDisposition::Backoff(plan) = &second {
         emit_backoff(progress, plan);
     }
@@ -2566,14 +2603,16 @@ async fn check_repository_access_with_client(
     repo: &RepoRef,
     progress: Option<&dyn ProgressReporter>,
 ) -> RepositoryAccessOutcome {
-    let first = repository_access_attempt_at(client, api_base_url, token, repo).await;
+    let first =
+        repository_access_attempt_at(client, api_base_url, token, repo, None, progress).await;
     if !matches!(first, ResponseDisposition::PermissionCandidate { .. }) {
         if let ResponseDisposition::Backoff(plan) = &first {
             emit_backoff(progress, plan);
         }
         return repository_outcome(repo, first);
     }
-    let second = repository_access_attempt_at(client, api_base_url, token, repo).await;
+    let second =
+        repository_access_attempt_at(client, api_base_url, token, repo, None, progress).await;
     if let ResponseDisposition::Backoff(plan) = &second {
         emit_backoff(progress, plan);
     }
@@ -2760,6 +2799,7 @@ async fn check_candidate_lifecycle_classified(
     };
     let status = response.status();
     let headers = response.headers().clone();
+    emit_rate_budget_observation(progress, profile, &headers);
     let scope = format!("lifecycle:{}", candidate.repo);
     let body = if status == StatusCode::FORBIDDEN {
         response.text().await.unwrap_or_default()
@@ -4808,8 +4848,15 @@ mod permission_classification_tests {
     async fn prior_source_denial_consumes_only_one_repository_confirmation_attempt() {
         let (base_url, request_count, handle) = spawn_responses(vec![NOT_FOUND_RESPONSE]);
         let client = lifecycle_client_with_timeout(StdDuration::from_secs(1)).unwrap();
-        let second =
-            repository_access_attempt_at(&client, &base_url, "test-token", &test_repo()).await;
+        let second = repository_access_attempt_at(
+            &client,
+            &base_url,
+            "test-token",
+            &test_repo(),
+            None,
+            None,
+        )
+        .await;
         let outcome =
             resolve_source_confirmation(PermissionEvidence::NotFound { http_status: 404 }, second);
         handle.join().unwrap();
@@ -4839,6 +4886,8 @@ mod permission_classification_tests {
             &format!("http://{address}"),
             "sensitive-marker-must-not-escape",
             &test_repo(),
+            None,
+            None,
         )
         .await;
         handle.join().unwrap();

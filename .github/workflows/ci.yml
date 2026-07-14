@@ -27,3 +27,19 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: test (all features)
         run: cargo test --all-features
+
+  schedule-platform-contract:
+    name: schedule adapter contract (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: lifecycle adapter contract
+        run: cargo test --lib schedule_lifecycle
+      - name: foreground and local lifecycle contract
+        run: cargo test --test issue_body_tracer schedule_

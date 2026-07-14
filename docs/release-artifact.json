@@ -5,12 +5,12 @@
     "product_core": "CLI-first local retrieval with strict --json envelopes and SQLite/Tantivy behavior",
     "contract_source_of_truth": ["CLI args", "docs/schemas/*.schema.json", "local SQLite/Tantivy retrieval behavior"],
     "schema_object_closure": "released schema object shapes are closed by default; only envelope.data and error.details are documented extension points",
-    "cli_commands": ["init", "sync", "embed", "model", "query", "search", "get", "status", "doctor", "mcp"],
-    "canonical_cli_commands": ["init", "sync", "embed", "model", "query", "get", "status", "doctor"],
+    "cli_commands": ["init", "sync", "embed", "model", "query", "search", "get", "status", "doctor", "schedule", "mcp"],
+    "canonical_cli_commands": ["init", "sync", "embed", "model", "query", "get", "status", "doctor", "schedule"],
     "cli_aliases": {
       "search": "query"
     },
-    "cli_only_commands": ["init", "sync", "embed", "model", "doctor"],
+    "cli_only_commands": ["init", "sync", "embed", "model", "doctor", "schedule"],
     "human_output": "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v1 envelopes",
     "primary_install_channel": {
       "manager": "homebrew",
@@ -56,6 +56,24 @@
     "supported_token_sources": ["github_cli", "env"],
     "command_resolution_sources": ["explicit", "repo_policy", "git_remote"],
     "sync_default_scope": "effective_repo_scope_when_available",
+    "sync_scheduler": {
+      "effective_max_in_flight_requests": 1,
+      "runtime_hard_cap": 1,
+      "configured_value_range": [1, 16],
+      "single_flight_profile_writer": true,
+      "rate_budget_observation": "best-effort content-free response headers; status is local-only"
+    },
+    "schedule": {
+      "profile_selection": "explicit positional profile ids only",
+      "foreground_policy": "host serial; unknown budget max 1; reserve 20%; max 1 per profile; max 8 per pass",
+      "forbidden_hidden_work": ["bootstrap", "backfill", "reconciliation", "model"],
+      "user_managers": ["macOS LaunchAgent", "Linux systemd user timer"],
+      "lifecycle_single_flight": true,
+      "manager_activation_repair": true,
+      "lifecycle_network_access": false,
+      "cron_fallback": false,
+      "real_manager_gate": ".github/workflows/schedule-manager-gate.yml -> scripts/verify-schedule-manager.sh"
+    },
     "optional_semantic": {
       "new_config_default_preset": "qwen3-embedding-0.6b",
       "weights_bundled": false,
@@ -77,6 +95,7 @@
       "eval",
       "embed",
       "model",
+      "schedule",
       "delete",
       "update",
       "write",
@@ -98,6 +117,7 @@
     "docs/schemas/error.schema.json",
     "docs/schemas/init-output.schema.json",
     "docs/schemas/sync-output.schema.json",
+    "docs/schemas/schedule-output.schema.json",
     "docs/schemas/embed-output.schema.json",
     "docs/schemas/command-action.schema.json",
     "docs/schemas/model-output.schema.json",
@@ -133,7 +153,10 @@
       "AC-25",
       "AC-26",
       "AC-27",
-      "AC-28"
+      "AC-28",
+      "AC-29",
+      "AC-30",
+      "AC-31"
     ],
     "excluded_from_mvp_gate": [
       {
@@ -160,6 +183,9 @@
     "privacy no-egress",
     "DB/index permissions",
     "doctor output",
+    "single-flight sync and rate-budget observation",
+    "bounded explicit-profile schedule coordinator",
+    "LaunchAgent and systemd user timer lifecycle",
     "search eval result",
     "one-command Homebrew install",
     "cargo-dist plan/build",
@@ -175,6 +201,7 @@
     "GHES remains best-effort until a dedicated compatibility pass",
     "Linux ARM64, Windows packages, and homebrew/core submission are later distribution targets",
     "Public unauthenticated Homebrew installs require the qgh repository and release assets to remain public",
-    "Live dogfood against juicyjusung/qgh is manual and not a blocking CI gate"
+    "Live dogfood against juicyjusung/qgh is manual and not a blocking CI gate",
+    "Scheduled Linux execution requires an active systemd user manager; qgh installs no cron fallback"
   ]
 }

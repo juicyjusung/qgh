@@ -43,6 +43,37 @@ field tell the user to retry the interrupted command rather than inventing a
 different command. Agents should execute `retry_action.json_command`; it keeps
 JSON output mode even when the interrupted command came from a human terminal.
 
+Every successful `sync` payload and `status.data.sync` includes a strict
+`rate_budget` block derived only from response headers already received during
+sync. Each observation is `fresh`, `partial`, or `stale`; missing fields are
+`null`, never guessed from an older complete observation. `best_effort: true`
+means this is admission evidence, not a reservation or a live GitHub quota
+claim. `status` does not contact GitHub. Sync payloads also separate the
+effective sequential scheduler (`max_in_flight_requests: 1`, `hard_cap: 1`)
+from the validated legacy configured value and its config cap (`16`).
+
+Profile writer sync is single-flight. A concurrent `sync` or `sync issue`
+returns retryable `sync.busy` (exit `5`) with only the profile id in details.
+The stable advisory lock is released by normal process exit or crash.
+
+`schedule` is CLI-only. `schedule run <PROFILE_ID>...` accepts only a unique,
+explicit profile list and emits one bounded pass with per-host and per-profile
+outcomes. It never discovers profiles, bootstraps a never-synced profile, or
+runs backfill, reconciliation, or model work. Host execution is sequential;
+unknown/partial/stale budget permits one attempt, usable budget preserves a
+20% reserve, each profile receives at most one attempt, and a pass starts at
+most eight remote syncs. A minimal persisted cursor rotates the next pass.
+
+`schedule start <PROFILE_ID>...`, `schedule status`, and `schedule stop` manage
+one user-scoped macOS LaunchAgent or Linux systemd timer. Lifecycle operations
+do not contact GitHub, do not store tokens, and do not install cron/system
+fallbacks. Scheduled profiles must use `github_cli`; foreground `schedule run`
+may still use an explicit `env` token source. `status` inspects only local
+registration and artifact state. Mutating lifecycle operations share a stable
+lease and return retryable `schedule.busy` on overlap. `start` reports
+`reloaded` when unchanged local artifacts had to be re-enabled in the user
+manager; Linux `stop` disables the timer before stopping a running service.
+
 `sync issue <number>` is the explicit targeted refresh path for one issue and
 its complete per-issue comment list. Its `sync` envelope includes `target`,
 `lifecycle`, and comment diff counts (`added`, `updated`, `deleted`) in addition
@@ -80,6 +111,7 @@ Released schema snapshots:
 - `docs/schemas/error.schema.json`: stable error taxonomy and exit-code classes.
 - `docs/schemas/init-output.schema.json`: CLI-only `init` data payload.
 - `docs/schemas/sync-output.schema.json`: `sync` data payload.
+- `docs/schemas/schedule-output.schema.json`: CLI-only `schedule` run/lifecycle data payloads.
 - `docs/schemas/embed-output.schema.json`: CLI-only `embed` data payload.
 - `docs/schemas/command-action.schema.json`: content-free human and JSON-mode remediation commands.
 - `docs/schemas/model-output.schema.json`: CLI-only `model install` data payload.
@@ -138,6 +170,7 @@ outside qgh-managed generation paths are not deleted by qgh. Neither `status`
 nor `doctor` retries or starts a purge. MCP exposes `status`, but not `doctor`.
 CLI-only top-level `init` bootstraps profile config plus repo scope. `init repo`
 creates tracked repo policy only. Neither command is exposed to MCP.
+`schedule` is also CLI-only and is not exposed to MCP.
 
 ## Human Output
 
@@ -164,6 +197,9 @@ human-output override even on a decorated terminal.
   open coverage, then to `sync --backfill --all` for older closed issues. A
   scoped pass cannot claim profile-wide completion. Completion is also
   invalidated when the configured profile repository membership changes.
+- `schedule`: foreground pass state plus each explicit profile outcome, or the
+  local user-scheduler lifecycle state/action/platform. Automation must use
+  the schedule schema instead of parsing this summary.
 - `embed`: text chunks rebuilt, vectors generated, and content-free foreground
   progress. `--force` remains required for a standalone full rebuild.
 - `query`/`search`: source-candidate list, not answers. It states that snippets
