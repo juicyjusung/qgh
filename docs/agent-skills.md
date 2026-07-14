@@ -49,12 +49,13 @@ Review an external skill's `SKILL.md` and referenced resources before installing
 The qgh skill enforces these boundaries in every route:
 
 1. Issue-aware invocation first decides whether local qgh evidence helps; a trigger alone does not run qgh.
-2. `command -v qgh` and `qgh status --json` establish local availability and readiness when qgh retrieval is selected.
-3. `qgh query --json` finds candidates; snippets and ranking scores are not evidence or confidence.
-4. `qgh get '<get_args.source_id>' --profile-id '<get_args.profile_id>' --json` opens the authoritative body through the exact emitted round-trip values.
-5. Citations include the canonical URL and source version, plus freshness and coverage caveats.
-6. qgh represents a local snapshot. `gh` is separate live GitHub truth and the authorized write path.
-7. Retrieval or skill invocation alone never authorizes `init`, `sync`, `doctor`, `embed`, `model install`, or `get --verify-lifecycle`. An explicitly requested operator task may run only its stated operation after disclosing the boundary.
+2. `command -v qgh` and `qgh status --json` establish local availability and readiness when qgh retrieval is selected. Agents check `ok` before reading command-specific `data`.
+3. `qgh query --json` finds candidates. Known repo-scoped Issue numbers use exact `#N` plus `--repo`/`--issue N`; supplied URLs pass through unchanged instead of being reconstructed from a guessed host.
+4. Successful candidates use the documented `entity_type` and preserve each result's exact `get_args.source_id`/`get_args.profile_id`. Snippets and ranking scores are not evidence or confidence.
+5. `qgh get '<get_args.source_id>' --profile-id '<get_args.profile_id>' --json` opens the authoritative body. Two to 20 results from one profile can use one batch `get`, with every item checked before synthesis.
+6. Citations include the canonical URL and source version, plus freshness and coverage caveats.
+7. qgh represents a local snapshot. `gh` is separate live GitHub truth and the authorized write path.
+8. Retrieval or skill invocation alone never authorizes `init`, `sync`, `doctor`, `embed`, `model install`, or `get --verify-lifecycle`. An explicitly requested operator task may run only its stated operation after disclosing the boundary.
 
 BM25 remains a complete model-free path. A missing embedding model affects hybrid retrieval, not the ability to perform `query -> get -> cite` with BM25.
 

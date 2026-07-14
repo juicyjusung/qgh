@@ -34,6 +34,18 @@ Use only terms derived from the current question. Never copy a reference example
 
 If a relied-on candidate cannot round-trip through `get`, mark it as a gap and do not synthesize it as evidence.
 
+## Multiple Issue Sets
+
+When the user names multiple Issue relationships or asks for a relationship map, keep the set bounded and deterministic:
+
+1. Query each supplied repo-scoped number as an exact locator with `#N`, `--repo`, and `--issue N`; do not manufacture URLs.
+2. Check each envelope's `ok` before reading `data.results`, then require the intended `entity_type`.
+3. Collect only the `get_args.source_id` and `get_args.profile_id` emitted by those results.
+4. Open sources sharing one profile with one batch `get` when the set contains no more than 20 IDs; split larger sets into bounded batches.
+5. Check each batch item before using its full body. Build relationships from opened sources, not query snippets, guessed links, or ranking proximity.
+
+If comments or parent context determine a relationship, retrieve and open those sources separately under the same contract. A named Issue set does not by itself authorize live `gh`, sync, lifecycle verification, or another network operation.
+
 ## Evidence Quality
 
 Classify each opened source:

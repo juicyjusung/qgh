@@ -2819,6 +2819,11 @@ fn public_agent_skills_are_discoverable_safe_and_evaluated() {
         "repository-scoped `#N`",
         "`gh issue`",
         "live-only state",
+        "Check `ok` before reading `data.results`",
+        "`entity_type`",
+        "batch `get`",
+        "one to 20",
+        "multiple Issue relationships",
     ] {
         assert!(
             packaged_contract.contains(phrase),
@@ -2837,8 +2842,8 @@ fn public_agent_skills_are_discoverable_safe_and_evaluated() {
         .unwrap_or_else(|| panic!("qgh evals must be an array"));
     assert_eq!(
         cases.len(),
-        7,
-        "qgh must cover retrieval, research, setup, recovery, missing binary, and live Issue read/write routing"
+        8,
+        "qgh must cover retrieval, research, multi-Issue batching, setup, recovery, missing binary, and live Issue read/write routing"
     );
     assert!(cases.iter().all(|case| {
         case["prompt"]
@@ -2863,6 +2868,41 @@ fn public_agent_skills_are_discoverable_safe_and_evaluated() {
                     .any(|expectation| expectation.starts_with(gate))
             })
     }));
+    let multi_issue_cases = cases
+        .iter()
+        .filter(|case| case["id"] == 8)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        multi_issue_cases.len(),
+        1,
+        "qgh must ship exactly one multi-Issue regression eval with id 8"
+    );
+    let multi_issue_expectations = multi_issue_cases[0]["expectations"]
+        .as_array()
+        .expect("qgh multi-Issue regression expectations must be an array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let multi_issue_route_gate = multi_issue_expectations
+        .iter()
+        .find(|expectation| expectation.starts_with("[GATE: route]"))
+        .expect("qgh multi-Issue eval must have a route gate");
+    for phrase in ["--issue N", "without constructing a GitHub or GHES URL"] {
+        assert!(
+            multi_issue_route_gate.contains(phrase),
+            "qgh multi-Issue route gate missing locator regression: {phrase}"
+        );
+    }
+    let multi_issue_evidence_gate = multi_issue_expectations
+        .iter()
+        .find(|expectation| expectation.starts_with("[GATE: evidence]"))
+        .expect("qgh multi-Issue eval must have an evidence gate");
+    for phrase in ["ok", "data.results", "entity_type", "batch get"] {
+        assert!(
+            multi_issue_evidence_gate.contains(phrase),
+            "qgh multi-Issue evidence gate missing retrieval regression: {phrase}"
+        );
+    }
     let eval_contract = fs::read_to_string(skill_dir.join("evals/README.md")).unwrap();
     for phrase in [
         "fails when any applicable expectation",

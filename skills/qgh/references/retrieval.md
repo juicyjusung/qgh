@@ -22,15 +22,30 @@ Check these fields before retrieval:
 
 Do not copy local database, cache, index, or log paths from status into external reports.
 
+## Machine-Safe Envelopes
+
+Check `ok` before reading `data.results`. A failed command has an `error` object and no successful `data` object; stop that retrieval branch and report only the content-free `error.code`, `error.message`, and safe remediation metadata. Do not let a secondary JSON parsing failure hide the qgh error.
+
+For a successful query, use the documented result fields:
+
+- `entity_type` is `issue` or `issue_comment`; there is no `source_kind` field.
+- `get_args.source_id` and `get_args.profile_id` belong to that exact result.
+- An empty `results` array is a successful no-match, not an error envelope.
+
+Project only the fields needed for the task. Do not dump complete status, query, or get envelopes into transcripts or artifacts.
+
 ## Query Planning
 
 Prefer the smallest explicit scope:
 
 ```sh
 qgh query '<issue-or-comment-url>' --json
+qgh query '#<issue-number>' --repo owner/repo --issue <issue-number> --json
 qgh query '<distinctive identifier>' --repo owner/repo --json
 qgh query '<concise terms>' --repo owner/repo --json
 ```
+
+When the user supplies a repo-scoped issue number, prefer the number form above. Do not construct a GitHub or GHES URL from a guessed web host. A URL supplied by the user remains a valid locator and must be passed through unchanged.
 
 The current repository policy may resolve scope, but never infer or discover an organization-wide scope. If the intended repo is ambiguous, ask for it or use an explicitly provided `owner/repo`.
 
@@ -56,6 +71,14 @@ qgh get '<get_args.source_id>' --profile-id '<get_args.profile_id>' --json
 `status.meta.profile_id` validates readiness but is not a substitute for the query result's `get_args.profile_id`. This preserves round trips across working directories and multi-profile stores.
 
 Single-source `get` returns a full authoritative `data.source` object. Cite only after reading its `body`, `canonical_url`, `source_id`, `source_version`, and lifecycle metadata. CLI batch `get` accepts 1 to 20 source IDs and reports per-item failures.
+
+For two or more results from the same profile, prefer one batch `get` instead of opening each source separately:
+
+```sh
+qgh get '<source-id-1>' '<source-id-2>' --profile-id '<profile-id>' --json
+```
+
+A batch `get` accepts one to 20 source IDs. Split larger sets into bounded batches. Require the top-level `ok` and every relied-on item's `ok`; never synthesize from a failed item. Do not mix profile IDs or reconstruct source IDs from URLs.
 
 Default `get` is local-only. Do not add `--verify-lifecycle` unless the user explicitly authorizes its GitHub request and possible purge.
 

@@ -3946,7 +3946,13 @@ pub fn query(
         let overrides = freshness_overrides(args.max_age.as_deref(), args.require_fresh)?;
         let publication = store.active_retrieval_publication()?;
         let active_index_path = ensure_query_publication_is_safe(&store)?;
-        if let Some(results) = exact_results(&store, &args.query, &filters, &profile.id)? {
+        if let Some(results) = exact_results(
+            &store,
+            &args.query,
+            &filters,
+            &profile.id,
+            &profile.web_base_url,
+        )? {
             let last_successful_sync_at =
                 query_freshness_sync_time(&store, &profile, &filters, &results)?;
             let freshness = freshness::evaluate(
@@ -5805,10 +5811,12 @@ fn exact_results(
     query_text: &str,
     filters: &QueryFilters,
     profile_id: &str,
+    web_base_url: &str,
 ) -> Result<Option<QueryResults>, QghError> {
-    if let Some(source) = exact_url_result(store, query_text)? {
+    if let Some(kind) = configured_exact_url_kind(query_text, web_base_url) {
+        let source = find_exact_url_source(store, query_text, kind)?;
         let mut results = QueryResults::default();
-        if filters.matches(&source) {
+        if let Some(source) = source.filter(|source| filters.matches(source)) {
             results.push(source, Ranking::Exact, profile_id, None, None);
         }
         return Ok(Some(results));
@@ -5840,18 +5848,58 @@ fn exact_results(
     Ok(Some(results))
 }
 
-fn exact_url_result(store: &Store, query_text: &str) -> Result<Option<StoredSource>, QghError> {
-    if !query_text.starts_with("https://github.com/") {
-        return Ok(None);
-    }
-    if query_text.contains("#issuecomment-") {
-        return store
+enum ExactUrlKind {
+    Issue,
+    Comment,
+}
+
+fn find_exact_url_source(
+    store: &Store,
+    query_text: &str,
+    kind: ExactUrlKind,
+) -> Result<Option<StoredSource>, QghError> {
+    match kind {
+        ExactUrlKind::Issue => store
+            .find_issue_by_canonical_url(query_text)
+            .map(|issue| issue.map(StoredSource::Issue)),
+        ExactUrlKind::Comment => store
             .find_comment_by_canonical_url(query_text)
-            .map(|comment| comment.map(StoredSource::Comment));
+            .map(|comment| comment.map(StoredSource::Comment)),
     }
-    store
-        .find_issue_by_canonical_url(query_text)
-        .map(|issue| issue.map(StoredSource::Issue))
+}
+
+fn configured_exact_url_kind(query_text: &str, web_base_url: &str) -> Option<ExactUrlKind> {
+    let Ok(locator) = reqwest::Url::parse(query_text) else {
+        return None;
+    };
+    let Ok(base) = reqwest::Url::parse(web_base_url) else {
+        return None;
+    };
+    if locator.origin() != base.origin()
+        || !locator.username().is_empty()
+        || locator.password().is_some()
+        || locator.query().is_some()
+    {
+        return None;
+    }
+    let segments = locator.path_segments()?;
+    let segments = segments.collect::<Vec<_>>();
+    if segments.len() != 4
+        || segments[0].is_empty()
+        || segments[1].is_empty()
+        || segments[2] != "issues"
+        || !segments[3].parse::<u64>().is_ok_and(|number| number > 0)
+    {
+        return None;
+    }
+    match locator.fragment() {
+        None => Some(ExactUrlKind::Issue),
+        Some(fragment) => fragment
+            .strip_prefix("issuecomment-")
+            .and_then(|id| id.parse::<u64>().ok())
+            .filter(|id| *id > 0)
+            .map(|_| ExactUrlKind::Comment),
+    }
 }
 
 fn parse_issue_number(query_text: &str) -> Option<i64> {
