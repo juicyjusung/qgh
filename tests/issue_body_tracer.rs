@@ -1,4 +1,4 @@
-use chrono::{Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 #[cfg(feature = "vector-search")]
 use qgh::embedding::LOCAL_MODEL_REVISION;
 #[cfg(feature = "fastembed-provider")]
@@ -767,7 +767,7 @@ fn non_json_cli_commands_print_human_summaries_without_weakening_json_contract()
 
     let json_query = fixture.qgh(["query", "BM25 tracer", "--json"]);
     assert_success(&json_query);
-    assert_eq!(stdout_json(&json_query)["schema_version"], "qgh.v1");
+    assert_eq!(stdout_json(&json_query)["schema_version"], "qgh.v2");
     assert!(stderr_text(&json_query).is_empty());
 }
 
@@ -837,7 +837,7 @@ fn terminal_decoration_is_opt_in_and_no_color_is_authoritative() {
         .output()
         .unwrap();
     assert_success(&json);
-    assert_eq!(stdout_json(&json)["schema_version"], "qgh.v1");
+    assert_eq!(stdout_json(&json)["schema_version"], "qgh.v2");
     assert!(!stdout_text(&json).contains("\u{1b}["));
     assert!(stderr_text(&json).is_empty());
 
@@ -2160,7 +2160,7 @@ fn init_repo_honors_parent_json_flag() {
     assert_success(&init);
     assert!(stderr_text(&init).is_empty());
     let init_json = stdout_json(&init);
-    assert_eq!(init_json["schema_version"], "qgh.v1");
+    assert_eq!(init_json["schema_version"], "qgh.v2");
     assert_eq!(init_json["data"]["repo"], "owner/repo");
     assert_eq!(init_json["data"]["repo_source"], "cli");
 }
@@ -6719,6 +6719,53 @@ fn schedule_shares_active_backoff_even_when_source_profile_is_fresh() {
     assert_eq!(json["data"]["summary"]["started"], 0);
     assert_eq!(json["data"]["profiles"][0]["reason"], "fresh");
     assert_eq!(json["data"]["profiles"][1]["reason"], "host_cooldown");
+
+    server.clear_requests();
+    let subset = fixture.qgh_without_profile(["schedule", "run", "alt", "--json"]);
+    assert_success(&subset);
+    let subset_json = stdout_json(&subset);
+    assert_eq!(subset_json["data"]["summary"]["started"], 0);
+    assert_eq!(
+        subset_json["data"]["profiles"][0]["reason"],
+        "host_cooldown"
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn schedule_promotes_a_global_guard_when_all_selected_profiles_are_in_backoff() {
+    let fixture = TestFixture::new("schedule-all-selected-backoff-promotion");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_work_and_alt_profiles_stale(&server.base_url);
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "work", ["sync", "--all", "--json"]));
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "alt", ["sync", "--all", "--json"]));
+    fixture.mark_profile_sync_stale("work");
+    fixture.mark_profile_sync_stale("alt");
+    fixture.set_profile_backoff("work");
+    fixture.set_profile_backoff("alt");
+    server.clear_requests();
+
+    let first = fixture.qgh_without_profile(["schedule", "run", "work", "alt", "--json"]);
+    assert_success(&first);
+    let first_json = stdout_json(&first);
+    assert_eq!(first_json["data"]["summary"]["started"], 0);
+    assert!(first_json["data"]["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|profile| profile["reason"] == "host_cooldown"));
+    assert!(server.requests().is_empty());
+
+    fixture.clear_profile_backoff("alt");
+    let subset = fixture.qgh_without_profile(["schedule", "run", "alt", "--json"]);
+    assert_success(&subset);
+    let subset_json = stdout_json(&subset);
+    assert_eq!(subset_json["data"]["summary"]["started"], 0);
+    assert_eq!(
+        subset_json["data"]["profiles"][0]["reason"],
+        "host_cooldown"
+    );
+    assert!(server.requests().is_empty());
 }
 
 #[test]
@@ -6730,6 +6777,8 @@ fn schedule_secondary_limit_stops_remaining_profiles_on_the_same_host() {
     assert_success(&fixture.qgh_in_profile(&fixture.root, "alt", ["sync", "--all", "--json"]));
     fixture.mark_profile_sync_stale("work");
     fixture.mark_profile_sync_stale("alt");
+    fixture.clear_profile_rate_budget("work");
+    fixture.clear_profile_rate_budget("alt");
     server.set_mode(MULTI_REPO_OWNER_SECONDARY_RATE_LIMIT);
     server.clear_requests();
 
@@ -6749,6 +6798,34 @@ fn schedule_secondary_limit_stops_remaining_profiles_on_the_same_host() {
     assert!(!requests
         .iter()
         .any(|request| request.contains("/repos/other/repo/issues?")));
+
+    let guard_path = fs::read_dir(fixture.data_home.join("qgh/schedule/hosts"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.ends_with(".guard.json"))
+        })
+        .unwrap();
+    let guard: Value = serde_json::from_slice(&fs::read(guard_path).unwrap()).unwrap();
+    let guarded_until =
+        DateTime::parse_from_rfc3339(guard["guarded_until"].as_str().expect("guard deadline"))
+            .unwrap()
+            .with_timezone(&Utc);
+    assert!(guarded_until > Utc::now() + Duration::minutes(50));
+
+    let request_count = server.requests().len();
+    let subset = fixture.qgh_without_profile(["schedule", "run", "alt", "--json"]);
+    assert_success(&subset);
+    let subset_json = stdout_json(&subset);
+    assert_eq!(subset_json["data"]["summary"]["started"], 0);
+    assert_eq!(
+        subset_json["data"]["profiles"][0]["reason"],
+        "host_cooldown"
+    );
+    assert_eq!(server.requests().len(), request_count);
 }
 
 #[test]
@@ -6762,22 +6839,316 @@ fn schedule_rechecks_budget_after_each_profile_and_stops_when_headers_disappear(
     fixture.mark_profile_sync_stale("alt");
     fixture.set_profile_rate_budget("work", 5_000, 4_000);
     fixture.set_profile_rate_budget("alt", 5_000, 4_000);
+    server.set_mode(MULTI_REPO_MISSING_RATE_HEADERS);
     server.clear_requests();
 
     let scheduled = fixture.qgh_without_profile(["schedule", "run", "work", "alt", "--json"]);
     assert_success(&scheduled);
     let json = stdout_json(&scheduled);
     assert_eq!(json["data"]["summary"]["started"], 1);
-    assert_eq!(json["data"]["profiles"][0]["outcome"], "completed");
-    assert_eq!(json["data"]["profiles"][1]["outcome"], "deferred");
+    assert_eq!(json["data"]["profiles"][0]["outcome"], "deferred");
     assert_eq!(
-        json["data"]["profiles"][1]["reason"],
+        json["data"]["profiles"][0]["reason"],
         "unknown_budget_limit"
+    );
+    assert_eq!(json["data"]["profiles"][1]["outcome"], "deferred");
+    assert_eq!(json["data"]["profiles"][1]["reason"], "host_cooldown");
+    assert_eq!(
+        json["data"]["profiles"][1]["budget_snapshot"]["observations"][0]["state"],
+        "partial"
     );
     assert!(server
         .requests()
         .iter()
         .all(|request| !request.contains("/repos/other/repo")));
+
+    server.clear_requests();
+    let second = fixture.qgh_without_profile(["schedule", "run", "alt", "--json"]);
+    assert_success(&second);
+    let second_json = stdout_json(&second);
+    assert_eq!(second_json["data"]["summary"]["started"], 0);
+    assert_eq!(second_json["data"]["summary"]["deferred"], 1);
+    assert_eq!(
+        second_json["data"]["profiles"][0]["reason"],
+        "host_cooldown"
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn scheduled_request_gate_stops_at_the_observed_core_reserve_before_any_follow_up() {
+    let fixture = TestFixture::new("schedule-per-request-reserve-gate");
+    let server = ScheduledBudgetGateFakeGitHub::start();
+    fixture.write_config_with_work_and_alt_profiles_stale(&server.base_url);
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "work", ["sync", "--all", "--json"]));
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "alt", ["sync", "--all", "--json"]));
+    fixture.mark_profile_sync_stale("work");
+    fixture.mark_profile_sync_stale("alt");
+    fixture.set_profile_rate_budget("work", 10, 3);
+    fixture.set_profile_rate_budget("alt", 10, 3);
+    server.set_mode(SCHEDULED_BUDGET_KNOWN_RESERVE);
+    server.clear_requests();
+
+    let scheduled = fixture.qgh_without_profile(["schedule", "run", "work", "alt", "--json"]);
+
+    assert_success(&scheduled);
+    let json = stdout_json(&scheduled);
+    assert_eq!(json["data"]["summary"]["started"], 1);
+    assert_eq!(json["data"]["summary"]["completed"], 0);
+    assert_eq!(json["data"]["summary"]["deferred"], 2);
+    assert_eq!(json["data"]["profiles"][0]["reason"], "rate_budget_reserve");
+    assert_eq!(json["data"]["profiles"][1]["reason"], "host_cooldown");
+    assert_eq!(
+        json["data"]["profiles"][0]["budget_snapshot"]["observations"][0]["remaining"],
+        2
+    );
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "unexpected follow-up request: {requests:?}"
+    );
+    assert!(requests[0].contains("/repos/owner/repo/issues?"));
+}
+
+#[test]
+fn scheduled_mixed_budget_allows_one_probe_then_blocks_when_headers_remain_partial() {
+    let fixture = TestFixture::new("schedule-per-request-unknown-gate");
+    let server = ScheduledBudgetGateFakeGitHub::start();
+    fixture.write_config_with_work_and_alt_profiles_stale(&server.base_url);
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "work", ["sync", "--all", "--json"]));
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "alt", ["sync", "--all", "--json"]));
+    fixture.mark_profile_sync_stale("work");
+    fixture.mark_profile_sync_stale("alt");
+    fixture.set_profile_unknown_resource_rate_budget("work", 5_000, 4_000);
+    fixture.set_profile_rate_budget("alt", 5_000, 4_000);
+    server.set_mode(SCHEDULED_BUDGET_UNKNOWN);
+    server.clear_requests();
+
+    let scheduled = fixture.qgh_without_profile(["schedule", "run", "work", "alt", "--json"]);
+
+    assert_success(&scheduled);
+    let json = stdout_json(&scheduled);
+    assert_eq!(json["data"]["summary"]["started"], 1);
+    assert_eq!(json["data"]["summary"]["completed"], 0);
+    assert_eq!(json["data"]["summary"]["deferred"], 2);
+    assert_eq!(
+        json["data"]["profiles"][0]["reason"],
+        "unknown_budget_limit"
+    );
+    assert_eq!(json["data"]["profiles"][1]["reason"], "host_cooldown");
+    assert_eq!(
+        json["data"]["profiles"][0]["budget_snapshot"]["observations"][0]["state"],
+        "partial"
+    );
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "unexpected follow-up request: {requests:?}"
+    );
+    assert!(requests[0].contains("/repos/owner/repo/issues?"));
+}
+
+#[test]
+fn scheduled_transport_without_headers_consumes_the_last_known_request_for_the_pass() {
+    let fixture = TestFixture::new("schedule-per-request-transport-gate");
+    let server = ScheduledBudgetGateFakeGitHub::start();
+    fixture.write_config_with_work_and_alt_profiles_stale(&server.base_url);
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "work", ["sync", "--all", "--json"]));
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "alt", ["sync", "--all", "--json"]));
+    fixture.mark_profile_sync_stale("work");
+    fixture.mark_profile_sync_stale("alt");
+    fixture.set_profile_rate_budget("work", 10, 3);
+    fixture.set_profile_rate_budget("alt", 10, 3);
+    server.set_mode(SCHEDULED_BUDGET_TRANSPORT_DROP);
+    server.clear_requests();
+
+    let scheduled = fixture.qgh_without_profile(["schedule", "run", "work", "alt", "--json"]);
+
+    assert_success(&scheduled);
+    let json = stdout_json(&scheduled);
+    assert_eq!(json["data"]["summary"]["started"], 1);
+    assert_eq!(json["data"]["summary"]["failed"], 1);
+    assert_eq!(json["data"]["summary"]["deferred"], 1);
+    assert_eq!(json["data"]["profiles"][0]["outcome"], "failed");
+    assert_eq!(json["data"]["profiles"][0]["started"], true);
+    assert_eq!(json["data"]["profiles"][1]["outcome"], "deferred");
+    assert_eq!(json["data"]["profiles"][1]["reason"], "host_cooldown");
+    assert_eq!(json["data"]["profiles"][1]["started"], false);
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "unexpected retry after EOF: {requests:?}"
+    );
+
+    server.clear_requests();
+    let second_pass = fixture.qgh_without_profile(["schedule", "run", "alt", "--json"]);
+    assert_success(&second_pass);
+    let second_json = stdout_json(&second_pass);
+    assert_eq!(second_json["data"]["summary"]["started"], 0);
+    assert_eq!(second_json["data"]["summary"]["deferred"], 1);
+    assert_eq!(
+        second_json["data"]["profiles"][0]["reason"],
+        "host_cooldown"
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn scheduled_final_missing_headers_keep_the_host_guard_after_a_completed_sync() {
+    let fixture = TestFixture::new("schedule-final-missing-headers-guard");
+    let server = ScheduledBudgetGateFakeGitHub::start();
+    fixture.write_config_with_work_and_alt_profiles_stale(&server.base_url);
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "work", ["sync", "--all", "--json"]));
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "alt", ["sync", "--all", "--json"]));
+    fixture.mark_profile_sync_stale("work");
+    fixture.mark_profile_sync_stale("alt");
+    fixture.set_profile_rate_budget("work", 10, 8);
+    fixture.set_profile_rate_budget("alt", 10, 8);
+    server.set_mode(SCHEDULED_BUDGET_FINAL_MISSING_HEADERS);
+    server.clear_requests();
+
+    let first = fixture.qgh_without_profile(["schedule", "run", "work", "alt", "--json"]);
+    assert_success(&first);
+    let first_json = stdout_json(&first);
+    assert_eq!(first_json["data"]["summary"]["started"], 1);
+    assert_eq!(first_json["data"]["summary"]["completed"], 1);
+    assert_eq!(first_json["data"]["summary"]["deferred"], 1);
+    assert_eq!(first_json["data"]["profiles"][0]["reason"], "synced");
+    assert_eq!(first_json["data"]["profiles"][1]["reason"], "host_cooldown");
+    assert_eq!(server.requests().len(), 2);
+
+    let second = fixture.qgh_without_profile(["schedule", "run", "alt", "--json"]);
+    assert_success(&second);
+    let second_json = stdout_json(&second);
+    assert_eq!(second_json["data"]["summary"]["started"], 0);
+    assert_eq!(second_json["data"]["summary"]["deferred"], 1);
+    assert_eq!(
+        second_json["data"]["profiles"][0]["reason"],
+        "host_cooldown"
+    );
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[test]
+fn managed_schedule_run_revalidates_github_cli_credentials_before_network() {
+    let fixture = TestFixture::new("schedule-managed-credential-revalidation");
+    let server = RateLimitFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    let scheduled =
+        fixture.qgh_without_profile(["schedule", "run", "--manager-invoked", "work", "--json"]);
+
+    assert_eq!(scheduled.status.code(), Some(2));
+    assert_eq!(
+        stdout_json(&scheduled)["error"]["code"],
+        "schedule.credentials_unsupported"
+    );
+    assert_eq!(server.request_count(), 0);
+}
+
+#[test]
+fn schedule_executes_the_profile_snapshot_planned_before_a_config_change() {
+    let fixture = TestFixture::new("schedule-planned-profile-snapshot");
+    let bootstrap = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config_with_two_hosts_same_repo(&bootstrap.base_url);
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "work", ["sync", "--all", "--json"]));
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "alt", ["sync", "--all", "--json"]));
+    drop(bootstrap);
+
+    let server = SlowFirstRequestFakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config_with_two_hosts_same_repo(&server.base_url);
+    fixture.mark_profile_sync_stale("work");
+    fixture.mark_profile_sync_stale("alt");
+
+    let mut command = fixture.base_command();
+    command
+        .args(["schedule", "run", "work", "alt", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let scheduled = command.spawn().unwrap();
+    server.wait_until_first_request();
+
+    fixture.replace_profile_token_env("alt", "QGH_MISSING_AFTER_PLAN");
+    server.release_first_request();
+    let scheduled = scheduled.wait_with_output().unwrap();
+    assert_success(&scheduled);
+    let json = stdout_json(&scheduled);
+    assert_eq!(json["data"]["summary"]["completed"], 2);
+    assert_eq!(json["data"]["summary"]["failed"], 0);
+}
+
+#[test]
+fn schedule_rechecks_host_cooldown_after_waiting_for_another_profile() {
+    let fixture = TestFixture::new("schedule-latest-host-cooldown");
+    let bootstrap = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config_with_work_and_alt_same_repo(&bootstrap.base_url);
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "work", ["sync", "--all", "--json"]));
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "alt", ["sync", "--all", "--json"]));
+    drop(bootstrap);
+
+    let server = SlowFirstRequestFakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config_with_work_and_alt_same_repo(&server.base_url);
+    fixture.mark_profile_sync_stale("work");
+    fixture.mark_profile_sync_stale("alt");
+    fixture.set_profile_rate_budget("work", 5_000, 4_000);
+    fixture.set_profile_rate_budget("alt", 5_000, 4_000);
+
+    let mut command = fixture.base_command();
+    command
+        .args(["schedule", "run", "work", "alt", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let scheduled = command.spawn().unwrap();
+    server.wait_until_first_request();
+
+    fixture.set_profile_backoff("alt");
+    server.release_first_request();
+    let scheduled = scheduled.wait_with_output().unwrap();
+    assert_success(&scheduled);
+    let json = stdout_json(&scheduled);
+    assert_eq!(json["data"]["profiles"][0]["outcome"], "completed");
+    assert_eq!(json["data"]["profiles"][1]["outcome"], "deferred");
+    assert_eq!(json["data"]["profiles"][1]["reason"], "host_cooldown");
+    assert_eq!(json["data"]["profiles"][1]["started"], false);
+}
+
+#[test]
+fn schedule_rotates_host_start_order_after_the_global_cap() {
+    let fixture = TestFixture::new("schedule-host-order-rotation");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    let profile_ids = fixture.write_config_with_nine_hosts(&server.base_url);
+    for profile_id in &profile_ids {
+        assert_success(&fixture.qgh_in_profile(
+            &fixture.root,
+            profile_id,
+            ["sync", "--all", "--json"],
+        ));
+        fixture.mark_profile_sync_stale(profile_id);
+    }
+
+    let mut first_args = vec!["schedule", "run"];
+    first_args.extend(profile_ids.iter().map(String::as_str));
+    first_args.push("--json");
+    let mut first_command = fixture.base_command();
+    let first = first_command.args(&first_args).output().unwrap();
+    assert_success(&first);
+    let first_json = stdout_json(&first);
+    assert_eq!(first_json["data"]["summary"]["started"], 8);
+    assert_eq!(first_json["data"]["profiles"][8]["reason"], "pass_limit");
+
+    for profile_id in &profile_ids {
+        fixture.mark_profile_sync_stale(profile_id);
+    }
+    let mut second_command = fixture.base_command();
+    let second = second_command.args(&first_args).output().unwrap();
+    assert_success(&second);
+    let second_json = stdout_json(&second);
+    assert_eq!(second_json["data"]["summary"]["started"], 8);
+    assert_eq!(second_json["data"]["profiles"][8]["outcome"], "completed");
+    assert_eq!(second_json["data"]["profiles"][7]["reason"], "pass_limit");
 }
 
 #[test]
@@ -6823,6 +7194,41 @@ fn schedule_auth_failure_does_not_consume_unknown_host_attempt() {
     assert!(!requests
         .iter()
         .any(|request| request.contains("/repos/owner/repo/issues?")));
+}
+
+#[cfg(unix)]
+#[test]
+fn schedule_pre_network_purge_failure_does_not_consume_unknown_host_attempt() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("schedule-purge-preflight-attempt-accounting");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_work_two_repos_and_alt(&server.base_url, true);
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "work", ["sync", "--all", "--json"]));
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "alt", ["sync", "--all", "--json"]));
+
+    fixture.write_config_with_work_two_repos_and_alt(&server.base_url, false);
+    fixture.mark_profile_sync_stale("alt");
+    let work_profile = fixture.data_home.join("qgh/profiles/work");
+    let index_root = work_profile.join("tantivy");
+    fs::rename(&index_root, work_profile.join("tantivy-before-purge")).unwrap();
+    let user_backup = fixture.root.join("user-index-backup");
+    fs::create_dir_all(user_backup.join("generation-999")).unwrap();
+    symlink(&user_backup, &index_root).unwrap();
+
+    let scheduled = fixture.qgh_without_profile(["schedule", "run", "work", "alt", "--json"]);
+    assert_success(&scheduled);
+    let json = stdout_json(&scheduled);
+    assert_eq!(json["data"]["pass_state"], "completed_with_failures");
+    assert_eq!(json["data"]["summary"]["failed"], 1);
+    assert_eq!(json["data"]["summary"]["completed"], 1);
+    assert_eq!(json["data"]["profiles"][0]["started"], false);
+    assert_eq!(
+        json["data"]["profiles"][0]["error_code"],
+        "purge.retry_failed"
+    );
+    assert_eq!(json["data"]["profiles"][1]["started"], true);
+    assert_eq!(json["data"]["profiles"][1]["outcome"], "completed");
 }
 
 #[test]
@@ -6898,7 +7304,7 @@ fn schedule_status_and_absent_stop_are_local_only_and_idempotent() {
 }
 
 #[test]
-fn schedule_unknown_budget_attempts_one_profile_and_rotates_next_pass() {
+fn schedule_unknown_budget_guard_blocks_next_explicit_subset_until_fallback_expires() {
     let fixture = TestFixture::new("schedule-unknown-budget-rotation");
     let server = MultiRepoFakeGitHub::start();
     fixture.write_config_with_work_and_alt_profiles_stale(&server.base_url);
@@ -6906,18 +7312,22 @@ fn schedule_unknown_budget_attempts_one_profile_and_rotates_next_pass() {
     assert_success(&fixture.qgh_in_profile(&fixture.root, "alt", ["sync", "--all", "--json"]));
     fixture.mark_profile_sync_stale("work");
     fixture.mark_profile_sync_stale("alt");
+    fixture.clear_profile_rate_budget("work");
+    fixture.clear_profile_rate_budget("alt");
+    server.set_mode(MULTI_REPO_MISSING_RATE_HEADERS);
     server.clear_requests();
 
     let first = fixture.qgh_without_profile(["schedule", "run", "work", "alt", "--json"]);
     assert_success(&first);
     let first_json = stdout_json(&first);
     assert_eq!(first_json["data"]["summary"]["started"], 1);
-    assert_eq!(first_json["data"]["profiles"][0]["outcome"], "completed");
-    assert_eq!(first_json["data"]["profiles"][1]["outcome"], "deferred");
+    assert_eq!(first_json["data"]["profiles"][0]["outcome"], "deferred");
     assert_eq!(
-        first_json["data"]["profiles"][1]["reason"],
+        first_json["data"]["profiles"][0]["reason"],
         "unknown_budget_limit"
     );
+    assert_eq!(first_json["data"]["profiles"][1]["outcome"], "deferred");
+    assert_eq!(first_json["data"]["profiles"][1]["reason"], "host_cooldown");
     let first_requests = server.requests();
     assert!(first_requests
         .iter()
@@ -6930,7 +7340,11 @@ fn schedule_unknown_budget_attempts_one_profile_and_rotates_next_pass() {
         .unwrap()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .find(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.ends_with(".json") && !name.ends_with(".guard.json"))
+        })
         .unwrap();
     let host_state = fs::read_to_string(&host_state_path).unwrap();
     assert!(host_state.contains("cursor_profile_id"));
@@ -6948,23 +7362,134 @@ fn schedule_unknown_budget_attempts_one_profile_and_rotates_next_pass() {
         fs::metadata(host_state_path).unwrap().permissions().mode() & 0o077,
         0
     );
+    let guard_path = fs::read_dir(&host_state_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.ends_with(".guard.json"))
+        })
+        .unwrap();
+    let guard_state = fs::read_to_string(&guard_path).unwrap();
+    assert!(guard_state.contains("qgh.schedule-budget-guard.v1"));
+    for forbidden in [
+        "fixture-token",
+        "owner/repo",
+        "other/repo",
+        root_marker.as_str(),
+    ] {
+        assert!(!guard_state.contains(forbidden));
+    }
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(guard_path).unwrap().permissions().mode() & 0o077,
+        0
+    );
 
     fixture.mark_profile_sync_stale("work");
     fixture.mark_profile_sync_stale("alt");
+    fixture.clear_profile_rate_budget("work");
+    fixture.clear_profile_rate_budget("alt");
     server.clear_requests();
-    let second = fixture.qgh_without_profile(["schedule", "run", "work", "alt", "--json"]);
+    let second = fixture.qgh_without_profile(["schedule", "run", "alt", "--json"]);
+    assert_success(&second);
+    let second_json = stdout_json(&second);
+    assert_eq!(second_json["data"]["summary"]["started"], 0);
+    assert_eq!(second_json["data"]["summary"]["deferred"], 1);
+    assert_eq!(second_json["data"]["profiles"][0]["outcome"], "deferred");
+    assert_eq!(
+        second_json["data"]["profiles"][0]["reason"],
+        "host_cooldown"
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn schedule_unknown_at_pass_start_attempts_only_one_profile_after_a_successful_probe() {
+    let fixture = TestFixture::new("schedule-unknown-budget-sticky-pass-limit");
+    let server = MultiRepoFakeGitHub::start();
+    fixture.write_config_with_work_and_alt_profiles_stale(&server.base_url);
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "work", ["sync", "--all", "--json"]));
+    assert_success(&fixture.qgh_in_profile(&fixture.root, "alt", ["sync", "--all", "--json"]));
+    fixture.mark_profile_sync_stale("work");
+    fixture.mark_profile_sync_stale("alt");
+    fixture.clear_profile_rate_budget("work");
+    fixture.clear_profile_rate_budget("alt");
+    server.clear_requests();
+
+    let first = fixture.qgh_without_profile(["schedule", "run", "work", "alt", "--json"]);
+    assert_success(&first);
+    let first_json = stdout_json(&first);
+    assert_eq!(first_json["data"]["summary"]["started"], 1);
+    assert_eq!(first_json["data"]["summary"]["completed"], 1);
+    assert_eq!(first_json["data"]["summary"]["deferred"], 1);
+    assert_eq!(first_json["data"]["profiles"][0]["reason"], "synced");
+    assert_eq!(
+        first_json["data"]["profiles"][1]["reason"],
+        "unknown_budget_limit"
+    );
+    let first_requests = server.requests();
+    assert!(first_requests
+        .iter()
+        .any(|request| request.contains("/repos/owner/repo/issues?")));
+    assert!(!first_requests
+        .iter()
+        .any(|request| request.contains("/repos/other/repo/issues?")));
+
+    server.clear_requests();
+    let second = fixture.qgh_without_profile(["schedule", "run", "alt", "--json"]);
     assert_success(&second);
     let second_json = stdout_json(&second);
     assert_eq!(second_json["data"]["summary"]["started"], 1);
-    assert_eq!(second_json["data"]["profiles"][0]["outcome"], "deferred");
-    assert_eq!(second_json["data"]["profiles"][1]["outcome"], "completed");
-    let second_requests = server.requests();
-    assert!(second_requests
+    assert_eq!(second_json["data"]["summary"]["completed"], 1);
+    assert!(server
+        .requests()
         .iter()
         .any(|request| request.contains("/repos/other/repo/issues?")));
-    assert!(!second_requests
-        .iter()
-        .any(|request| request.contains("/repos/owner/repo/issues?")));
+}
+
+#[test]
+fn scheduled_write_ahead_budget_guard_survives_process_termination_and_blocks_explicit_subset() {
+    let fixture = TestFixture::new("schedule-write-ahead-budget-guard-process-termination");
+    {
+        let bootstrap_server = MultiRepoFakeGitHub::start();
+        fixture.write_config_with_work_and_alt_profiles_stale(&bootstrap_server.base_url);
+        assert_success(&fixture.qgh_in_profile(&fixture.root, "work", ["sync", "--all", "--json"]));
+        assert_success(&fixture.qgh_in_profile(&fixture.root, "alt", ["sync", "--all", "--json"]));
+    }
+
+    let server = SlowFirstRequestFakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config_with_work_and_alt_profiles_stale(&server.base_url);
+    fixture.mark_profile_sync_stale("work");
+    fixture.mark_profile_sync_stale("alt");
+    fixture.set_profile_rate_budget("work", 10, 3);
+    fixture.set_profile_rate_budget("alt", 10, 3);
+
+    let mut interrupted_command = fixture.base_command();
+    interrupted_command
+        .args(["schedule", "run", "work", "alt", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut interrupted = interrupted_command.spawn().unwrap();
+    server.wait_until_first_request();
+    interrupted.kill().unwrap();
+    let interrupted = interrupted.wait_with_output().unwrap();
+    assert!(!interrupted.status.success());
+    server.release_first_request();
+    assert_eq!(server.accepted_request_count(), 1);
+
+    let second = fixture.qgh_without_profile(["schedule", "run", "alt", "--json"]);
+    assert_success(&second);
+    let second_json = stdout_json(&second);
+    assert_eq!(second_json["data"]["summary"]["started"], 0);
+    assert_eq!(second_json["data"]["summary"]["deferred"], 1);
+    assert_eq!(
+        second_json["data"]["profiles"][0]["reason"],
+        "host_cooldown"
+    );
+    assert_eq!(server.accepted_request_count(), 1);
 }
 
 #[test]
@@ -7578,7 +8103,7 @@ fn mcp_lists_only_read_only_query_get_status_tools_with_strict_schemas() {
         validation["structuredContent"]["error"]["code"],
         "validation.mcp"
     );
-    assert_eq!(validation["structuredContent"]["schema_version"], "qgh.v1");
+    assert_eq!(validation["structuredContent"]["schema_version"], "qgh.v2");
     assert!(validation["content"][0]["text"]
         .as_str()
         .unwrap()
@@ -8746,7 +9271,7 @@ fn schema_snapshots_define_envelope_outputs_and_error_taxonomy() {
     assert!(docs.contains("source.tombstoned"));
 
     let cli_contract = fs::read_to_string(root.join("docs/cli-json-contract.md")).unwrap();
-    assert!(cli_contract.contains("qgh.v1"));
+    assert!(cli_contract.contains("qgh.v2"));
     assert!(cli_contract.contains("docs/schemas/envelope.schema.json"));
     assert!(cli_contract.contains("docs/schemas/error.schema.json"));
 }
@@ -10325,6 +10850,155 @@ env = "QGH_TEST_TOKEN"
         fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
     }
 
+    fn write_config_with_work_and_alt_same_repo(&self, api_base_url: &str) {
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+
+[profiles.alt]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.alt.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
+    }
+
+    fn write_config_with_work_two_repos_and_alt(
+        &self,
+        api_base_url: &str,
+        include_removed_repo: bool,
+    ) {
+        let work_repos = if include_removed_repo {
+            r#"["owner/repo", "other/repo"]"#
+        } else {
+            r#"["owner/repo"]"#
+        };
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = {work_repos}
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+
+[profiles.alt]
+host = "github.com"
+api_base_url = "{api_base_url}"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.alt.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
+    }
+
+    fn write_config_with_two_hosts_same_repo(&self, api_base_url: &str) {
+        let config = format!(
+            r#"
+schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "a.example"
+api_base_url = "{api_base_url}"
+web_base_url = "https://a.example"
+repos = ["owner/repo"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+
+[profiles.alt]
+host = "b.example"
+api_base_url = "{api_base_url}"
+web_base_url = "https://b.example"
+repos = ["owner/repo"]
+
+[profiles.alt.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#
+        );
+        fs::write(self.config_home.join("qgh/config.toml"), config).unwrap();
+    }
+
+    fn write_config_with_nine_hosts(&self, api_base_url: &str) -> Vec<String> {
+        let profile_ids = (0..9)
+            .map(|index| format!("p{index:02}"))
+            .collect::<Vec<_>>();
+        let profiles = profile_ids
+            .iter()
+            .enumerate()
+            .map(|(index, profile_id)| {
+                format!(
+                    r#"
+[profiles.{profile_id}]
+host = "h{index:02}.example"
+api_base_url = "{api_base_url}"
+web_base_url = "https://h{index:02}.example"
+repos = ["owner/repo"]
+
+[profiles.{profile_id}.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#
+                )
+            })
+            .collect::<String>();
+        fs::write(
+            self.config_home.join("qgh/config.toml"),
+            format!("schema_version = \"qgh.config.v1\"\n{profiles}"),
+        )
+        .unwrap();
+        profile_ids
+    }
+
+    fn replace_profile_token_env(&self, profile_id: &str, token_env: &str) {
+        let path = self.config_home.join("qgh/config.toml");
+        let mut config = fs::read_to_string(&path).unwrap();
+        let profile_start = config
+            .find(&format!("[profiles.{profile_id}]"))
+            .expect("profile must exist");
+        let token_start = config[profile_start..]
+            .find(&format!("[profiles.{profile_id}.token_source]"))
+            .map(|offset| profile_start + offset)
+            .expect("profile token source must exist");
+        let env_start = config[token_start..]
+            .find("env = \"")
+            .map(|offset| token_start + offset + "env = \"".len())
+            .expect("profile token env must exist");
+        let env_end = config[env_start..]
+            .find('"')
+            .map(|offset| env_start + offset)
+            .expect("profile token env must close");
+        config.replace_range(env_start..env_end, token_env);
+        fs::write(path, config).unwrap();
+    }
+
     fn write_config_with_work_and_alt_profiles_stale(&self, api_base_url: &str) {
         let config = format!(
             r#"
@@ -10661,6 +11335,47 @@ limit = 10
         .unwrap();
     }
 
+    fn clear_profile_rate_budget(&self, profile_id: &str) {
+        let db_path = self
+            .data_home
+            .join(format!("qgh/profiles/{profile_id}/qgh.sqlite3"));
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "DELETE FROM rate_budget_observations WHERE lower(host) = 'github.com'",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn set_profile_unknown_resource_rate_budget(
+        &self,
+        profile_id: &str,
+        limit: i64,
+        remaining: i64,
+    ) {
+        let db_path = self
+            .data_home
+            .join(format!("qgh/profiles/{profile_id}/qgh.sqlite3"));
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "DELETE FROM rate_budget_observations WHERE lower(host) = 'github.com'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rate_budget_observations
+                (host, resource_key, resource, limit_value, remaining, reset_at, observed_at, best_effort)
+             VALUES ('github.com', '', NULL, ?1, ?2, ?3, ?4, 1)",
+            rusqlite::params![
+                limit,
+                remaining,
+                (Utc::now() + Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true),
+                Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+            ],
+        )
+        .unwrap();
+    }
+
     fn set_profile_backoff(&self, profile_id: &str) {
         let db_path = self
             .data_home
@@ -10684,6 +11399,14 @@ limit = 10
             ],
         )
         .unwrap();
+    }
+
+    fn clear_profile_backoff(&self, profile_id: &str) {
+        let db_path = self
+            .data_home
+            .join(format!("qgh/profiles/{profile_id}/qgh.sqlite3"));
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute("DELETE FROM sync_backoff_state", []).unwrap();
     }
 
     fn qgh<const N: usize>(&self, args: [&str; N]) -> Output {
@@ -11755,6 +12478,7 @@ const MULTI_REPO_OWNER_TWO_ISSUES: usize = 2;
 const MULTI_REPO_OWNER_PERMISSION_LOSS: usize = 3;
 const MULTI_REPO_OWNER_BULK_PERMISSION_LOSS: usize = 4;
 const MULTI_REPO_OWNER_SECONDARY_RATE_LIMIT: usize = 5;
+const MULTI_REPO_MISSING_RATE_HEADERS: usize = 6;
 
 fn handle_multi_repo_connection(
     mut stream: TcpStream,
@@ -11821,9 +12545,11 @@ fn handle_multi_repo_connection(
     let rate_headers = if mode == MULTI_REPO_OWNER_SECONDARY_RATE_LIMIT
         && request_line.starts_with("GET /repos/owner/repo/issues?")
     {
-        "retry-after: 60\r\nx-ratelimit-remaining: 42\r\n"
+        "retry-after: 3600\r\nx-ratelimit-remaining: 42\r\n".to_string()
+    } else if mode == MULTI_REPO_MISSING_RATE_HEADERS {
+        String::new()
     } else {
-        "x-ratelimit-remaining: 4999\r\n"
+        "x-ratelimit-resource: core\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 4999\r\nx-ratelimit-reset: 4102444800\r\n".to_string()
     };
     let response = format!(
         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{rate_headers}\r\n{body}",
@@ -12297,7 +13023,7 @@ fn handle_connection(
         "404 Not Found"
     };
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-ratelimit-remaining: 4999\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-ratelimit-resource: core\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 4999\r\nx-ratelimit-reset: 4102444800\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(response.as_bytes());
@@ -12743,6 +13469,124 @@ fn handle_rate_limit_connection(mut stream: TcpStream, mode: &Arc<AtomicUsize>) 
     };
     let response = format!(
         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{rate_headers}\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
+const SCHEDULED_BUDGET_BOOTSTRAP: usize = 1;
+const SCHEDULED_BUDGET_KNOWN_RESERVE: usize = 2;
+const SCHEDULED_BUDGET_UNKNOWN: usize = 3;
+const SCHEDULED_BUDGET_TRANSPORT_DROP: usize = 4;
+const SCHEDULED_BUDGET_FINAL_MISSING_HEADERS: usize = 5;
+
+struct ScheduledBudgetGateFakeGitHub {
+    base_url: String,
+    mode: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ScheduledBudgetGateFakeGitHub {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let mode = Arc::new(AtomicUsize::new(SCHEDULED_BUDGET_BOOTSTRAP));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_mode = Arc::clone(&mode);
+        let thread_requests = Arc::clone(&requests);
+        let thread_stop = Arc::clone(&stop);
+        let thread_base_url = base_url.clone();
+
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                match stream {
+                    Ok(stream) => handle_scheduled_budget_gate_connection(
+                        stream,
+                        &thread_mode,
+                        &thread_requests,
+                        &thread_base_url,
+                    ),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            base_url,
+            mode,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn set_mode(&self, mode: usize) {
+        self.mode.store(mode, Ordering::SeqCst);
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn clear_requests(&self) {
+        self.requests.lock().unwrap().clear();
+    }
+}
+
+impl Drop for ScheduledBudgetGateFakeGitHub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.base_url.strip_prefix("http://").unwrap());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn handle_scheduled_budget_gate_connection(
+    mut stream: TcpStream,
+    mode: &Arc<AtomicUsize>,
+    requests: &Arc<Mutex<Vec<String>>>,
+    base_url: &str,
+) {
+    let mut buffer = [0_u8; 8192];
+    let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let request_line = request.lines().next().unwrap_or("").to_string();
+    let request_number = {
+        let mut requests = requests.lock().unwrap();
+        requests.push(request_line.clone());
+        requests.len()
+    };
+
+    let mode = mode.load(Ordering::SeqCst);
+    if mode == SCHEDULED_BUDGET_TRANSPORT_DROP {
+        return;
+    }
+    let is_issue_listing = request_line.contains("/issues?") && request_line.contains("state=all");
+    let body = "[]";
+    let link = if mode != SCHEDULED_BUDGET_BOOTSTRAP && is_issue_listing {
+        format!("link: <{base_url}/repos/owner/repo/issues?page=2>; rel=\"next\"\r\n")
+    } else {
+        String::new()
+    };
+    let rate_headers = match mode {
+        SCHEDULED_BUDGET_BOOTSTRAP => "x-ratelimit-resource: core\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 4999\r\nx-ratelimit-reset: 4102444800\r\n".to_string(),
+        SCHEDULED_BUDGET_KNOWN_RESERVE => "x-ratelimit-resource: core\r\nx-ratelimit-limit: 10\r\nx-ratelimit-remaining: 2\r\nx-ratelimit-reset: 4102444800\r\n".to_string(),
+        SCHEDULED_BUDGET_UNKNOWN => String::new(),
+        SCHEDULED_BUDGET_FINAL_MISSING_HEADERS if request_number == 1 => "x-ratelimit-resource: core\r\nx-ratelimit-limit: 10\r\nx-ratelimit-remaining: 7\r\nx-ratelimit-reset: 4102444800\r\n".to_string(),
+        SCHEDULED_BUDGET_FINAL_MISSING_HEADERS => String::new(),
+        _ => unreachable!("unsupported scheduled budget test mode"),
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{link}{rate_headers}\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();

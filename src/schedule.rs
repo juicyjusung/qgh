@@ -1,6 +1,6 @@
 use crate::cli::{ScheduleArgs, ScheduleCommand};
 use crate::commands::{self, LocalReadOutcome, DEFAULT_SYNC_MAX_AGE_SECONDS};
-use crate::config::{load_profile, Profile};
+use crate::config::{load_profile, Profile, TokenSource};
 use crate::error::QghError;
 use crate::freshness;
 use crate::lease::{FileLease, LeaseAvailability};
@@ -21,10 +21,12 @@ use std::path::{Path, PathBuf};
 
 const MAX_REMOTE_ATTEMPTS_PER_PASS: usize = 8;
 const RESERVE_PERCENT: i64 = 20;
+const HOST_BUDGET_GUARD_MAX_SECONDS: i64 = 24 * 60 * 60;
+const HOST_BUDGET_GUARD_SCHEMA_VERSION: &str = "qgh.schedule-budget-guard.v1";
 
 pub(crate) async fn execute(args: &ScheduleArgs) -> Result<LocalReadOutcome, QghError> {
     match &args.command {
-        ScheduleCommand::Run(args) => run_foreground(&args.profile_ids).await,
+        ScheduleCommand::Run(args) => run_foreground(&args.profile_ids, args.manager_invoked).await,
         ScheduleCommand::Start(args) => {
             schedule_lifecycle::start(&args.profile_ids, &args.interval)
         }
@@ -51,44 +53,41 @@ enum PlannedState {
 }
 
 #[derive(Debug, Clone)]
-enum HostBudget {
-    Unknown,
-    Fresh(RateBudgetObservation),
+struct HostBudget {
+    admission: Option<RateBudgetObservation>,
+    evidence: Vec<RateBudgetObservation>,
 }
 
 impl HostBudget {
     fn state(&self) -> &'static str {
-        match self {
-            Self::Unknown => "unknown",
-            Self::Fresh(_) => "fresh",
+        if self.admission.is_some() {
+            "fresh"
+        } else {
+            "unknown"
         }
     }
 
     fn snapshot(&self) -> Value {
-        match self {
-            Self::Unknown => Value::Null,
-            Self::Fresh(observation) => rate_budget::block(std::slice::from_ref(observation)),
+        if self.evidence.is_empty() {
+            Value::Null
+        } else {
+            rate_budget::block(&self.evidence)
         }
     }
 
-    fn reserve_exhausted(&self) -> bool {
-        let Self::Fresh(observation) = self else {
-            return false;
-        };
-        let (Some(limit), Some(remaining)) = (observation.limit, observation.remaining) else {
-            return true;
-        };
-        let reserve = (limit.saturating_add(4)) / 5;
-        remaining <= reserve
+    fn is_unknown(&self) -> bool {
+        self.admission.is_none()
     }
 
-    fn revalidated(self) -> Self {
-        match self {
-            Self::Fresh(observation) if rate_budget::is_fresh(&observation) => {
-                Self::Fresh(observation)
-            }
-            Self::Fresh(_) | Self::Unknown => Self::Unknown,
+    fn revalidated(mut self) -> Self {
+        if self
+            .admission
+            .as_ref()
+            .is_some_and(|observation| !rate_budget::is_fresh_core(observation))
+        {
+            self.admission = None;
         }
+        self
     }
 }
 
@@ -99,11 +98,32 @@ struct HostCursorState {
     cursor_profile_id: String,
 }
 
-async fn run_foreground(profile_ids: &[String]) -> Result<LocalReadOutcome, QghError> {
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HostOrderCursorState {
+    schema_version: String,
+    cursor_host_key: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HostBudgetGuardState {
+    schema_version: String,
+    guarded_until: String,
+}
+
+async fn run_foreground(
+    profile_ids: &[String],
+    manager_invoked: bool,
+) -> Result<LocalReadOutcome, QghError> {
     validate_profile_ids(profile_ids)?;
     let mut plans = Vec::with_capacity(profile_ids.len());
     for profile_id in profile_ids {
-        plans.push(plan_profile(load_profile(profile_id)?)?);
+        let profile = load_profile(profile_id)?;
+        if manager_invoked && !matches!(profile.token_source, TokenSource::GithubCli) {
+            return Err(managed_credentials_unsupported(profile_id));
+        }
+        plans.push(plan_profile(profile)?);
     }
 
     let mut groups = BTreeMap::<String, Vec<usize>>::new();
@@ -166,19 +186,43 @@ async fn run_foreground(profile_ids: &[String]) -> Result<LocalReadOutcome, QghE
         }
     }
 
+    let host_order_state_path = host_order_state_path()?;
+    let host_order_cursor_before = read_host_order_cursor(&host_order_state_path)?;
+    let hosts = groups.keys().cloned().collect::<Vec<_>>();
+    let ordered_hosts = rotate_hosts_after_cursor(&hosts, host_order_cursor_before.as_deref());
     let mut host_reports = Vec::with_capacity(groups.len());
     let mut remote_attempts = 0usize;
-    for (host, indexes) in groups {
+    for host in ordered_hosts {
+        let indexes = groups
+            .remove(&host)
+            .expect("ordered host must come from grouped plans");
         let state_path = host_state_path(&host)?;
+        let budget_guard_path = host_budget_guard_path(&host)?;
         let has_eligible_profiles = indexes.iter().any(|index| {
             matches!(
                 plans[*index].state,
                 PlannedState::Eligible | PlannedState::SyncBusy
             )
         });
+        let has_selected_backoff = indexes.iter().any(|index| plans[*index].active_backoff);
+        let host_profiles = indexes
+            .iter()
+            .map(|index| plans[*index].profile.clone())
+            .collect::<Vec<_>>();
+        let needs_host_lease = has_eligible_profiles || has_selected_backoff;
         let host_lock_path = state_path.with_extension("lock");
-        let host_lease = if has_eligible_profiles {
+        let host_lease = if needs_host_lease {
             FileLease::try_acquire_schedule_host(&host_lock_path)?
+        } else {
+            None
+        };
+        let active_budget_guard = if host_lease.is_some() {
+            read_active_host_budget_guard(&budget_guard_path, Utc::now())?
+        } else {
+            None
+        };
+        let selected_backoff_deadline = if host_lease.is_some() {
+            max_active_host_backoff_deadline(&host_profiles, Utc::now())?
         } else {
             None
         };
@@ -199,9 +243,23 @@ async fn run_foreground(profile_ids: &[String]) -> Result<LocalReadOutcome, QghE
             .collect::<Vec<_>>();
         let mut budget = derive_host_budget(&plans, &indexes);
         let initial_budget = budget.clone();
-        let initial_budget_unknown = matches!(initial_budget, HostBudget::Unknown);
+        let initial_budget_unknown = initial_budget.is_unknown();
+        let mut host_budget_unknown = initial_budget_unknown;
         let mut host_attempts = 0usize;
-        let mut host_cooldown = indexes.iter().any(|index| plans[*index].active_backoff);
+        let mut host_consumed_remote = false;
+        let mut host_cooldown = active_budget_guard.is_some()
+            || has_selected_backoff
+            || selected_backoff_deadline.is_some();
+        let mut host_guard_reset = later_host_guard_reset(
+            max_fresh_core_reset(&budget.evidence, Utc::now()),
+            later_host_guard_reset(active_budget_guard, selected_backoff_deadline),
+        );
+        if host_lease.is_some() && selected_backoff_deadline.is_some() {
+            write_host_budget_guard(
+                &budget_guard_path,
+                host_budget_guard_deadline(Utc::now(), host_guard_reset.as_ref()),
+            )?;
+        }
 
         if has_eligible_profiles && host_lease.is_none() {
             for index in eligible_indexes {
@@ -241,24 +299,7 @@ async fn run_foreground(profile_ids: &[String]) -> Result<LocalReadOutcome, QghE
                     );
                     continue;
                 }
-                if remote_attempts >= MAX_REMOTE_ATTEMPTS_PER_PASS {
-                    results.insert(
-                        plan.profile.id.clone(),
-                        profile_result(
-                            &plan.profile,
-                            false,
-                            "deferred",
-                            "pass_limit",
-                            None,
-                            None,
-                            budget.snapshot(),
-                        ),
-                    );
-                    continue;
-                }
-                if (initial_budget_unknown || matches!(budget, HostBudget::Unknown))
-                    && host_attempts >= 1
-                {
+                if initial_budget_unknown && host_attempts >= 1 {
                     results.insert(
                         plan.profile.id.clone(),
                         profile_result(
@@ -268,19 +309,19 @@ async fn run_foreground(profile_ids: &[String]) -> Result<LocalReadOutcome, QghE
                             "unknown_budget_limit",
                             None,
                             None,
-                            Value::Null,
+                            budget.snapshot(),
                         ),
                     );
                     continue;
                 }
-                if budget.reserve_exhausted() {
+                if remote_attempts >= MAX_REMOTE_ATTEMPTS_PER_PASS {
                     results.insert(
                         plan.profile.id.clone(),
                         profile_result(
                             &plan.profile,
                             false,
                             "deferred",
-                            "rate_budget_reserve",
+                            "pass_limit",
                             None,
                             None,
                             budget.snapshot(),
@@ -306,45 +347,88 @@ async fn run_foreground(profile_ids: &[String]) -> Result<LocalReadOutcome, QghE
                     continue;
                 }
 
-                let outcome = commands::sync(
-                    &plan.profile.id,
-                    None,
-                    None,
-                    true,
-                    None,
-                    false,
-                    None,
-                    None,
-                    true,
-                    None,
-                    true,
-                    false,
-                    false,
+                write_host_budget_guard(
+                    &budget_guard_path,
+                    host_budget_guard_deadline(Utc::now(), host_guard_reset.as_ref()),
+                )?;
+                let execution = commands::sync_scheduled(
+                    plan.profile.clone(),
+                    &host_profiles,
+                    host_attempts,
+                    host_budget_unknown,
+                    manager_invoked,
                 )
                 .await;
-                let skipped_fresh = matches!(
-                    &outcome,
-                    Ok(outcome)
-                        if outcome.data.get("sync_state").and_then(Value::as_str)
-                            == Some("skipped_fresh")
-                );
-                let consumed_remote_attempt = !skipped_fresh
-                    && !matches!(
-                        &outcome,
-                        Err(error)
-                            if error.code == "sync.busy"
-                                || error.code == "auth.token_unavailable"
-                    );
-                if consumed_remote_attempt {
+                if execution.remote_started {
                     host_attempts += 1;
                     remote_attempts += 1;
+                    host_consumed_remote = true;
                 }
-                cursor_after = Some(plan.profile.id.clone());
-                write_cursor(&state_path, &plan.profile.id)?;
+                let advance_profile_cursor = execution.remote_started || execution.result.is_err();
+                if advance_profile_cursor {
+                    cursor_after = Some(plan.profile.id.clone());
+                    write_cursor(&state_path, &plan.profile.id)?;
+                }
                 let latest_budget = load_rate_budget(&plan.profile)?;
+                let active_backoff_deadline =
+                    max_active_host_backoff_deadline(&host_profiles, Utc::now())?;
+                host_guard_reset = later_host_guard_reset(
+                    later_host_guard_reset(
+                        host_guard_reset,
+                        max_fresh_core_reset(&latest_budget, Utc::now()),
+                    ),
+                    active_backoff_deadline,
+                );
                 budget = update_budget_after_attempt(budget, &latest_budget);
-                match outcome {
-                    Ok(outcome) => {
+                host_budget_unknown = budget.is_unknown();
+                if execution.budget_uncertain {
+                    host_budget_unknown = true;
+                    budget.admission = None;
+                }
+                let completed_with_confirmed_headroom = matches!(
+                    &execution.result,
+                    Ok(commands::ScheduledSyncResult::Completed(_))
+                ) && !execution.budget_uncertain
+                    && fresh_core_has_headroom(&latest_budget);
+                let may_clear_guard = active_backoff_deadline.is_none()
+                    && (!execution.remote_started || completed_with_confirmed_headroom);
+                if may_clear_guard {
+                    remove_host_budget_guard(&budget_guard_path)?;
+                } else {
+                    write_host_budget_guard(
+                        &budget_guard_path,
+                        host_budget_guard_deadline(Utc::now(), host_guard_reset.as_ref()),
+                    )?;
+                    host_cooldown = true;
+                }
+                match execution.result {
+                    Ok(commands::ScheduledSyncResult::Deferred {
+                        reason,
+                        rate_budget: latest_evidence,
+                    }) => {
+                        budget = host_budget_from_observations(latest_evidence);
+                        if reason == commands::ScheduleSyncDeferral::UnknownBudgetLimit {
+                            host_budget_unknown = true;
+                            budget.admission = None;
+                        }
+                        let reason = reason.reason();
+                        if reason == "host_cooldown" {
+                            host_cooldown = true;
+                        }
+                        results.insert(
+                            plan.profile.id.clone(),
+                            profile_result(
+                                &plan.profile,
+                                execution.remote_started,
+                                "deferred",
+                                reason,
+                                None,
+                                None,
+                                budget.snapshot(),
+                            ),
+                        );
+                    }
+                    Ok(commands::ScheduledSyncResult::Completed(outcome)) => {
                         let sync_state = outcome
                             .data
                             .get("sync_state")
@@ -359,7 +443,7 @@ async fn run_foreground(profile_ids: &[String]) -> Result<LocalReadOutcome, QghE
                             plan.profile.id.clone(),
                             profile_result(
                                 &plan.profile,
-                                !skipped_fresh,
+                                execution.remote_started,
                                 profile_outcome,
                                 reason,
                                 None,
@@ -388,7 +472,7 @@ async fn run_foreground(profile_ids: &[String]) -> Result<LocalReadOutcome, QghE
                             plan.profile.id.clone(),
                             profile_result(
                                 &plan.profile,
-                                true,
+                                execution.remote_started,
                                 "deferred",
                                 "host_cooldown",
                                 Some("sync.backoff"),
@@ -402,7 +486,7 @@ async fn run_foreground(profile_ids: &[String]) -> Result<LocalReadOutcome, QghE
                             plan.profile.id.clone(),
                             profile_result(
                                 &plan.profile,
-                                false,
+                                execution.remote_started,
                                 "failed",
                                 "sync_failed",
                                 Some("auth.token_unavailable"),
@@ -416,7 +500,7 @@ async fn run_foreground(profile_ids: &[String]) -> Result<LocalReadOutcome, QghE
                             plan.profile.id.clone(),
                             profile_result(
                                 &plan.profile,
-                                true,
+                                execution.remote_started,
                                 "failed",
                                 "sync_failed",
                                 Some(&error.code),
@@ -427,6 +511,10 @@ async fn run_foreground(profile_ids: &[String]) -> Result<LocalReadOutcome, QghE
                     }
                 }
             }
+        }
+        if host_consumed_remote {
+            let key = host_key(&host);
+            write_host_order_cursor(&host_order_state_path, &key)?;
         }
         drop(host_lease);
         host_reports.push(json!({
@@ -523,58 +611,99 @@ fn plan_profile(profile: Profile) -> Result<PlannedProfile, QghError> {
     })
 }
 
-fn backoff_is_active(backoff: &BackoffView) -> bool {
-    let retry_at = backoff
+fn parsed_backoff_deadline(backoff: &BackoffView) -> Option<DateTime<Utc>> {
+    let reset_at = backoff
         .reset_at
         .as_deref()
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc));
+    let retry_after_seconds = backoff
+        .retry_after_seconds
+        .clamp(0, HOST_BUDGET_GUARD_MAX_SECONDS);
+    let retry_at = DateTime::parse_from_rfc3339(&backoff.observed_at)
+        .ok()
         .map(|value| value.with_timezone(&Utc))
-        .or_else(|| {
-            DateTime::parse_from_rfc3339(&backoff.observed_at)
-                .ok()
-                .map(|value| value.with_timezone(&Utc))
-                .and_then(|observed_at| {
-                    Duration::try_seconds(backoff.retry_after_seconds.max(0))
-                        .and_then(|duration| observed_at.checked_add_signed(duration))
-                })
+        .and_then(|observed_at| {
+            Duration::try_seconds(retry_after_seconds)
+                .and_then(|duration| observed_at.checked_add_signed(duration))
         });
-    retry_at.is_none_or(|value| value > Utc::now())
+    reset_at.into_iter().chain(retry_at).max()
+}
+
+fn backoff_is_active(backoff: &BackoffView) -> bool {
+    parsed_backoff_deadline(backoff).is_none_or(|value| value > Utc::now())
+}
+
+fn active_backoff_guard_deadline(
+    backoff: &BackoffView,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    match parsed_backoff_deadline(backoff) {
+        Some(deadline) if deadline > now => Some(deadline),
+        Some(_) => None,
+        None => Some(now + Duration::seconds(HOST_BUDGET_GUARD_MAX_SECONDS)),
+    }
 }
 
 fn derive_host_budget(plans: &[PlannedProfile], indexes: &[usize]) -> HostBudget {
     let mut candidate = None::<RateBudgetObservation>;
+    let mut evidence = Vec::new();
+    let mut complete = true;
     for index in indexes {
         let observations = &plans[*index].rate_budget;
-        if observations.is_empty() || observations.iter().any(|item| !rate_budget::is_fresh(item)) {
-            return HostBudget::Unknown;
+        let profile_core = fresh_core_observation(observations);
+        if profile_core.is_none() {
+            complete = false;
         }
-        for observation in observations {
+        evidence.extend(observations.iter().cloned());
+        if let Some(observation) = profile_core {
             candidate = Some(match candidate {
-                None => observation.clone(),
-                Some(current) => conservative_observation(current, observation.clone()),
+                None => observation,
+                Some(current) => conservative_observation(current, observation),
             });
         }
     }
-    candidate.map_or(HostBudget::Unknown, HostBudget::Fresh)
+    HostBudget {
+        admission: complete.then_some(candidate).flatten(),
+        evidence,
+    }
 }
 
 fn update_budget_after_attempt(
     current: HostBudget,
     observations: &[RateBudgetObservation],
 ) -> HostBudget {
-    if observations.is_empty() || observations.iter().any(|item| !rate_budget::is_fresh(item)) {
-        return HostBudget::Unknown;
+    let latest = fresh_core_observation(observations);
+    if latest.is_none() {
+        return HostBudget {
+            admission: None,
+            evidence: observations.to_vec(),
+        };
     }
-    let latest = observations
+    let admission = match (current.revalidated().admission, latest) {
+        (_, None) => None,
+        (None, Some(observation)) => Some(observation),
+        (Some(current), Some(latest)) => Some(conservative_observation(current, latest)),
+    };
+    HostBudget {
+        admission,
+        evidence: observations.to_vec(),
+    }
+}
+
+fn fresh_core_observation(observations: &[RateBudgetObservation]) -> Option<RateBudgetObservation> {
+    observations
         .iter()
+        .filter(|observation| rate_budget::is_fresh_core(observation))
         .cloned()
-        .reduce(conservative_observation);
-    match (current.revalidated(), latest) {
-        (_, None) => HostBudget::Unknown,
-        (HostBudget::Unknown, Some(observation)) => HostBudget::Fresh(observation),
-        (HostBudget::Fresh(current), Some(latest)) => {
-            HostBudget::Fresh(conservative_observation(current, latest))
-        }
+        .reduce(conservative_observation)
+}
+
+fn host_budget_from_observations(observations: Vec<RateBudgetObservation>) -> HostBudget {
+    let admission = fresh_core_observation(&observations);
+    HostBudget {
+        admission,
+        evidence: observations,
     }
 }
 
@@ -582,11 +711,9 @@ fn conservative_observation(
     left: RateBudgetObservation,
     right: RateBudgetObservation,
 ) -> RateBudgetObservation {
-    let left_limit = left.limit.unwrap_or(1).max(1) as i128;
-    let right_limit = right.limit.unwrap_or(1).max(1) as i128;
-    let left_remaining = left.remaining.unwrap_or(0) as i128;
-    let right_remaining = right.remaining.unwrap_or(0) as i128;
-    if left_remaining.saturating_mul(right_limit) <= right_remaining.saturating_mul(left_limit) {
+    let left_allowance = rate_budget::scheduled_additional_requests(&left).unwrap_or(0);
+    let right_allowance = rate_budget::scheduled_additional_requests(&right).unwrap_or(0);
+    if left_allowance <= right_allowance {
         left
     } else {
         right
@@ -596,6 +723,26 @@ fn conservative_observation(
 fn load_rate_budget(profile: &Profile) -> Result<Vec<RateBudgetObservation>, QghError> {
     let store = Store::open_for_read(&profile.paths)?;
     store.rate_budget_observations(&profile.host)
+}
+
+fn max_active_host_backoff_deadline(
+    profiles: &[Profile],
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, QghError> {
+    let mut deadline = None;
+    for profile in profiles {
+        if !profile.paths.db_path.exists() {
+            continue;
+        }
+        let store = Store::open_for_read(&profile.paths)?;
+        let status = store.status()?;
+        let observed = status
+            .backoff
+            .as_ref()
+            .and_then(|backoff| active_backoff_guard_deadline(backoff, now));
+        deadline = later_host_guard_reset(deadline, observed);
+    }
+    Ok(deadline)
 }
 
 fn rotate_after_cursor(
@@ -671,13 +818,233 @@ fn validate_profile_ids(profile_ids: &[String]) -> Result<(), QghError> {
     Ok(())
 }
 
-fn host_state_path(host: &str) -> Result<PathBuf, QghError> {
-    let digest = Sha256::digest(host.as_bytes());
-    let key = digest
+fn managed_credentials_unsupported(profile_id: &str) -> QghError {
+    QghError::new(
+        "schedule.credentials_unsupported",
+        "Scheduled profiles must use the github_cli token source.",
+        2,
+    )
+    .with_details(json!({
+        "profile_id": profile_id,
+        "supported_token_source": "github_cli"
+    }))
+    .with_hint("Update the profile to use GitHub CLI credentials available to the user manager.")
+}
+
+fn host_key(host: &str) -> String {
+    Sha256::digest(host.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Ok(schedule_hosts_dir()?.join(format!("{key}.json")))
+        .collect()
+}
+
+fn host_state_path(host: &str) -> Result<PathBuf, QghError> {
+    Ok(schedule_hosts_dir()?.join(format!("{}.json", host_key(host))))
+}
+
+fn host_budget_guard_path(host: &str) -> Result<PathBuf, QghError> {
+    Ok(schedule_hosts_dir()?.join(format!("{}.guard.json", host_key(host))))
+}
+
+fn max_fresh_core_reset(
+    observations: &[RateBudgetObservation],
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    observations
+        .iter()
+        .filter(|observation| rate_budget::is_fresh_core(observation))
+        .filter_map(|observation| observation.reset_at.as_deref())
+        .filter_map(|reset_at| DateTime::parse_from_rfc3339(reset_at).ok())
+        .map(|reset_at| reset_at.with_timezone(&Utc))
+        .filter(|reset_at| *reset_at > now)
+        .max()
+}
+
+fn later_host_guard_reset(
+    current: Option<DateTime<Utc>>,
+    observed: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    current.into_iter().chain(observed).max()
+}
+
+fn host_budget_guard_deadline(
+    now: DateTime<Utc>,
+    known_reset: Option<&DateTime<Utc>>,
+) -> DateTime<Utc> {
+    let fallback = now + Duration::seconds(rate_budget::STALE_AFTER_SECONDS);
+    let cap = now + Duration::seconds(HOST_BUDGET_GUARD_MAX_SECONDS);
+    known_reset
+        .filter(|reset_at| **reset_at > now)
+        .cloned()
+        .unwrap_or(fallback)
+        .min(cap)
+}
+
+fn fresh_core_has_headroom(observations: &[RateBudgetObservation]) -> bool {
+    fresh_core_observation(observations).is_some_and(|observation| {
+        rate_budget::scheduled_additional_requests(&observation).is_some_and(|value| value > 0)
+    })
+}
+
+fn read_active_host_budget_guard(
+    path: &Path,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, QghError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)
+        .map_err(|_| QghError::storage("Could not read schedule host budget guard."))?;
+    let state: HostBudgetGuardState = serde_json::from_slice(&bytes)
+        .map_err(|_| QghError::storage("Schedule host budget guard is invalid."))?;
+    if state.schema_version != HOST_BUDGET_GUARD_SCHEMA_VERSION {
+        return Err(QghError::storage(
+            "Schedule host budget guard schema is unsupported.",
+        ));
+    }
+    let guarded_until = DateTime::parse_from_rfc3339(&state.guarded_until)
+        .map_err(|_| QghError::storage("Schedule host budget guard timestamp is invalid."))?
+        .with_timezone(&Utc);
+    if guarded_until > now {
+        return Ok(Some(guarded_until));
+    }
+    remove_host_budget_guard(path)?;
+    Ok(None)
+}
+
+fn write_host_budget_guard(path: &Path, guarded_until: DateTime<Utc>) -> Result<(), QghError> {
+    let Some(parent) = path.parent() else {
+        return Err(QghError::storage(
+            "Schedule host budget guard path is invalid.",
+        ));
+    };
+    ensure_private_dir(parent)?;
+    let temporary = parent.join(format!(
+        ".schedule-budget-guard-{}.tmp",
+        now_run_id_suffix()
+    ));
+    let state = HostBudgetGuardState {
+        schema_version: HOST_BUDGET_GUARD_SCHEMA_VERSION.to_string(),
+        guarded_until: guarded_until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    };
+    let bytes = serde_json::to_vec(&state)
+        .map_err(|_| QghError::storage("Could not serialize schedule host budget guard."))?;
+    let write_result = (|| -> Result<(), QghError> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|_| QghError::storage("Could not create schedule host budget guard."))?;
+        set_private_file(&temporary)?;
+        file.write_all(&bytes)
+            .map_err(|_| QghError::storage("Could not write schedule host budget guard."))?;
+        file.sync_all()
+            .map_err(|_| QghError::storage("Could not sync schedule host budget guard."))?;
+        fs::rename(&temporary, path)
+            .map_err(|_| QghError::storage("Could not publish schedule host budget guard."))?;
+        set_private_file(path)?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| {
+                QghError::storage("Could not sync schedule host budget guard directory.")
+            })?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn remove_host_budget_guard(path: &Path) -> Result<(), QghError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_file(path)
+        .map_err(|_| QghError::storage("Could not remove schedule host budget guard."))?;
+    let Some(parent) = path.parent() else {
+        return Err(QghError::storage(
+            "Schedule host budget guard path is invalid.",
+        ));
+    };
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| QghError::storage("Could not sync schedule host budget guard directory."))?;
+    Ok(())
+}
+
+fn host_order_state_path() -> Result<PathBuf, QghError> {
+    let hosts = schedule_hosts_dir()?;
+    let Some(schedule_dir) = hosts.parent() else {
+        return Err(QghError::storage("Schedule host order path is invalid."));
+    };
+    Ok(schedule_dir.join("host-order.json"))
+}
+
+fn rotate_hosts_after_cursor(hosts: &[String], cursor_key: Option<&str>) -> Vec<String> {
+    let Some(position) =
+        cursor_key.and_then(|cursor| hosts.iter().position(|host| host_key(host) == cursor))
+    else {
+        return hosts.to_vec();
+    };
+    hosts[position + 1..]
+        .iter()
+        .chain(hosts[..=position].iter())
+        .cloned()
+        .collect()
+}
+
+fn read_host_order_cursor(path: &Path) -> Result<Option<String>, QghError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes =
+        fs::read(path).map_err(|_| QghError::storage("Could not read schedule host order."))?;
+    let state: HostOrderCursorState = serde_json::from_slice(&bytes)
+        .map_err(|_| QghError::storage("Schedule host order is invalid."))?;
+    if state.schema_version != "qgh.schedule-host-order.v1" {
+        return Err(QghError::storage(
+            "Schedule host order schema is unsupported.",
+        ));
+    }
+    Ok(Some(state.cursor_host_key))
+}
+
+fn write_host_order_cursor(path: &Path, cursor_host_key: &str) -> Result<(), QghError> {
+    let Some(parent) = path.parent() else {
+        return Err(QghError::storage("Schedule host order path is invalid."));
+    };
+    ensure_private_dir(parent)?;
+    let temporary = parent.join(format!(".host-order-{}.tmp", now_run_id_suffix()));
+    let state = HostOrderCursorState {
+        schema_version: "qgh.schedule-host-order.v1".to_string(),
+        cursor_host_key: cursor_host_key.to_string(),
+    };
+    let bytes = serde_json::to_vec(&state)
+        .map_err(|_| QghError::storage("Could not serialize schedule host order."))?;
+    let write_result = (|| -> Result<(), QghError> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|_| QghError::storage("Could not create schedule host order."))?;
+        set_private_file(&temporary)?;
+        file.write_all(&bytes)
+            .map_err(|_| QghError::storage("Could not write schedule host order."))?;
+        file.sync_all()
+            .map_err(|_| QghError::storage("Could not sync schedule host order."))?;
+        fs::rename(&temporary, path)
+            .map_err(|_| QghError::storage("Could not publish schedule host order."))?;
+        set_private_file(path)?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| QghError::storage("Could not sync schedule host order directory."))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
 }
 
 fn read_cursor(path: &Path) -> Result<Option<String>, QghError> {
@@ -737,19 +1104,102 @@ fn write_cursor(path: &Path, profile_id: &str) -> Result<(), QghError> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn conservative_budget_uses_lowest_remaining_ratio() {
-        let observation = |limit, remaining| RateBudgetObservation {
+    fn observation(limit: i64, remaining: i64, reset_at: DateTime<Utc>) -> RateBudgetObservation {
+        RateBudgetObservation {
             host: "github.com".to_string(),
             resource: Some("core".to_string()),
             limit: Some(limit),
             remaining: Some(remaining),
-            reset_at: Some("2100-01-01T00:00:00Z".to_string()),
+            reset_at: Some(reset_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
             observed_at: crate::time::now_rfc3339(),
             best_effort: true,
+        }
+    }
+
+    #[test]
+    fn conservative_budget_uses_lowest_scheduled_allowance() {
+        let reset_at = Utc::now() + Duration::hours(1);
+        let selected = conservative_observation(
+            observation(10, 3, reset_at),
+            observation(5_000, 1_200, reset_at),
+        );
+        assert_eq!(selected.limit, Some(10));
+        assert_eq!(selected.remaining, Some(3));
+    }
+
+    #[test]
+    fn host_budget_guard_uses_latest_fresh_core_reset_and_caps_it_at_twenty_four_hours() {
+        let now = DateTime::parse_from_rfc3339(
+            &Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .unwrap()
+        .with_timezone(&Utc);
+        let observations = vec![
+            observation(10, 3, now + Duration::hours(1)),
+            observation(5_000, 4_000, now + Duration::hours(2)),
+        ];
+
+        let reset = max_fresh_core_reset(&observations, now).unwrap();
+        assert_eq!(reset, now + Duration::hours(2));
+        assert_eq!(host_budget_guard_deadline(now, Some(&reset)), reset);
+
+        let far_reset = now + Duration::hours(48);
+        assert_eq!(
+            host_budget_guard_deadline(now, Some(&far_reset)),
+            now + Duration::hours(24)
+        );
+    }
+
+    #[test]
+    fn host_budget_guard_uses_active_backoff_and_clamps_extreme_retry_after() {
+        let now = DateTime::parse_from_rfc3339(
+            &Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .unwrap()
+        .with_timezone(&Utc);
+        let backoff = BackoffView {
+            reason: "secondary_rate_limit".to_string(),
+            scope: "host".to_string(),
+            retry_command: None,
+            retry_action: None,
+            retry_after_seconds: i64::MAX,
+            reset_at: Some(
+                (now + Duration::hours(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ),
+            observed_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            last_successful_sync: None,
         };
-        let selected = conservative_observation(observation(5_000, 1_000), observation(100, 10));
-        assert_eq!(selected.limit, Some(100));
-        assert_eq!(selected.remaining, Some(10));
+
+        let deadline = active_backoff_guard_deadline(&backoff, now).unwrap();
+        assert_eq!(deadline, now + Duration::hours(24));
+        assert_eq!(
+            host_budget_guard_deadline(now, Some(&deadline)),
+            now + Duration::hours(24)
+        );
+    }
+
+    #[test]
+    fn expired_host_budget_guard_is_removed_and_active_state_is_private_and_content_free() {
+        let directory =
+            std::env::temp_dir().join(format!("qgh-schedule-guard-test-{}", now_run_id_suffix()));
+        let path = directory.join("host.guard.json");
+        let now = Utc::now();
+
+        write_host_budget_guard(&path, now + Duration::minutes(5)).unwrap();
+        assert!(read_active_host_budget_guard(&path, now).unwrap().is_some());
+        let state = fs::read_to_string(&path).unwrap();
+        assert!(state.contains(HOST_BUDGET_GUARD_SCHEMA_VERSION));
+        assert!(!state.contains("github.com"));
+        assert!(!state.contains("owner/repo"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        }
+
+        write_host_budget_guard(&path, now - Duration::seconds(1)).unwrap();
+        assert!(read_active_host_budget_guard(&path, now).unwrap().is_none());
+        assert!(!path.exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

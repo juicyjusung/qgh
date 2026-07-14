@@ -4,9 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       profile_ids:
-        description: "Space-separated disposable github_cli profile ids"
+        description: "At least two space-separated disposable github_cli profile ids"
         required: true
-        default: "schedule-gate"
+      catch_up_observation:
+        description: "Recorded physical sleep/offline-resume result and host/run reference"
+        required: true
 
 jobs:
   platform-manager:
@@ -28,4 +30,11 @@ jobs:
       - name: verify the real user manager
         env:
           PROFILE_IDS: "${{ inputs.profile_ids }}"
-        run: scripts/verify-schedule-manager.sh target/debug/qgh $PROFILE_IDS
+        run: |
+          read -r -a profiles <<< "$PROFILE_IDS"
+          scripts/verify-schedule-manager.sh target/debug/qgh "${profiles[@]}"
+      - name: record physical catch-up observation
+        env:
+          CATCH_UP_OBSERVATION: "${{ inputs.catch_up_observation }}"
+        run: |
+          printf 'Physical catch-up observation: %s\n' "$CATCH_UP_OBSERVATION" >> "$GITHUB_STEP_SUMMARY"

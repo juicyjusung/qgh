@@ -4,6 +4,8 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use std::fmt::{self, Write as _};
 
+pub(crate) const ENVELOPE_SCHEMA_VERSION: &str = "qgh.v2";
+
 #[derive(Debug, Clone, Copy)]
 pub enum SuccessOutputKind {
     Init,
@@ -23,7 +25,7 @@ pub fn success_envelope_with_meta_and_warnings(
     warnings: Vec<Value>,
 ) -> Value {
     json!({
-        "schema_version": "qgh.v1",
+        "schema_version": ENVELOPE_SCHEMA_VERSION,
         "ok": true,
         "data": data,
         "warnings": warnings,
@@ -33,7 +35,7 @@ pub fn success_envelope_with_meta_and_warnings(
 
 pub fn error_envelope(error: &QghError) -> Value {
     json!({
-        "schema_version": "qgh.v1",
+        "schema_version": ENVELOPE_SCHEMA_VERSION,
         "ok": false,
         "error": error,
         "warnings": [],

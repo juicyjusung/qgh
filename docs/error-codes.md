@@ -1,6 +1,6 @@
 # Error Codes
 
-qgh machine-readable output uses the `qgh.v1` envelope for success and failure. No-result query responses are successful: `ok: true` with `data.results: []`.
+qgh machine-readable output uses the `qgh.v2` envelope for success and failure. No-result query responses are successful: `ok: true` with `data.results: []`.
 
 Stable error families:
 
@@ -52,7 +52,7 @@ stable lock file to recover this condition.
 - `schedule.credentials_unsupported`: `schedule start` selected an `env` token source instead of `github_cli`.
 - `schedule.busy`: another `schedule start` or `schedule stop` owns the stable lifecycle lease; retry after it finishes.
 - `schedule.credentials_unavailable`: `HOME`, `gh`, or scheduled GitHub CLI credentials are unavailable.
-- `schedule.binary_unavailable`: the invoked qgh executable cannot be pinned as an existing absolute file.
+- `schedule.binary_unavailable`: the invoked qgh executable cannot be pinned as an existing executable absolute file.
 - `schedule.environment_invalid`: a required manager environment value/path cannot be encoded safely.
 - `schedule.platform_unsupported`: the OS has no macOS LaunchAgent or Linux systemd user adapter; no cron fallback is installed.
 - `schedule.manager_unsupported`: the supported OS lacks an active user manager session; manual `schedule run` remains available.
@@ -60,6 +60,7 @@ stable lock file to recover this condition.
 - `schedule.platform_mismatch`: registration state belongs to another platform adapter.
 - `schedule.storage_failed`: private scheduler artifact/state publication or removal failed.
 - `schedule.state_invalid`: strict local registration state is malformed or unsupported.
+- `schedule.ownership_ambiguous`: the fixed user-manager identity is active, orphaned, or has legacy state whose exact artifact owner cannot be proven; qgh makes no lifecycle mutation.
 
 These errors omit tokens, source content, repository names, local DB paths, and
 raw manager stderr. `schedule.partial_failure` is a warning in a successful

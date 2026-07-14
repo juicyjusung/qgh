@@ -142,11 +142,16 @@
       "allOf": [
         { "$ref": "#/$defs/lifecycle" },
         {
+          "type": "object",
           "properties": {
             "operation": { "const": "start" },
             "action": { "enum": ["installed", "updated", "reloaded", "unchanged"] },
             "schedule_state": { "const": "active" },
-            "installed": { "const": true }
+            "installed": { "const": true },
+            "profile_ids": { "$ref": "#/$defs/start_lifecycle_profiles" },
+            "interval": { "const": "1h" },
+            "jitter": { "$ref": "#/$defs/jitter" },
+            "manager_checked": { "const": true }
           }
         }
       ]
@@ -191,6 +196,7 @@
       "allOf": [
         { "$ref": "#/$defs/lifecycle" },
         {
+          "type": "object",
           "properties": {
             "operation": { "const": "stop" },
             "action": { "enum": ["removed", "unchanged"] },
@@ -226,7 +232,7 @@
         "profile_ids": { "$ref": "#/$defs/lifecycle_profiles" },
         "interval": { "type": ["string", "null"] },
         "jitter": { "$ref": "#/$defs/nullable_jitter" },
-        "manager_checked": { "type": "boolean" },
+        "manager_checked": { "const": true },
         "network_access": { "const": false },
         "foreground_command": { "const": "schedule run" }
       },
@@ -238,7 +244,13 @@
     "lifecycle_profiles": {
       "type": "array",
       "uniqueItems": true,
-      "items": { "type": "string" }
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "start_lifecycle_profiles": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
     },
     "nullable_jitter": {
       "anyOf": [

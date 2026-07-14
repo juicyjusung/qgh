@@ -124,8 +124,13 @@ qgh schedule run work personal
 ```
 
 The pass plans from local state first, serializes requests by GitHub host,
-preserves a 20% observed quota reserve, limits unknown budget to one attempt,
-and starts at most eight profile syncs. It does not discover profiles or hide
+checks a shared gate before every GitHub send, preserves a 20% observed quota reserve,
+limits unknown budget to one probe request, and starts at most eight
+profile syncs. Complete core headers can unlock bounded follow-up requests;
+when a pass starts unknown, only that profile may continue and no second
+same-host profile starts in the pass. Missing headers defer follow-ups and
+leave a private host guard for a later pass. This constrains qgh requests, not other clients
+sharing the quota. It does not discover profiles or hide
 bootstrap, backfill, reconciliation, or model work. A never-synced profile is
 skipped with an explicit `qgh sync --all --profile PROFILE` next action.
 
@@ -167,7 +172,7 @@ credentials, logs, and recovery.
 ## JSON for Agents and Scripts
 
 Human output is designed for reading and may evolve. Add `--json` for the
-versioned, machine-stable `qgh.v1` envelope:
+versioned, machine-stable `qgh.v2` envelope:
 
 ```sh
 qgh query "search terms" --json

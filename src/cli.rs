@@ -4,8 +4,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "qgh",
     version,
-    about = "Local GitHub Issues retrieval with human output by default; use --json for qgh.v1 envelopes",
-    after_help = "WORKFLOW:\n  qgh init                         Configure a repository and profile\n  qgh sync                         Refresh the explicit GitHub scope\n  qgh schedule run <profile>...    Run one bounded multi-profile freshness pass\n  qgh query \"<terms>\"              Find source candidates\n  qgh get <source_id>              Open the full source before you cite it\n  qgh status                       Inspect local readiness without network access\n\nUse query -> get -> cite. Add --json to a command for stable qgh.v1 agent output."
+    about = "Local GitHub Issues retrieval with human output by default; use --json for qgh.v2 envelopes",
+    after_help = "WORKFLOW:\n  qgh init                         Configure a repository and profile\n  qgh sync                         Refresh the explicit GitHub scope\n  qgh schedule run <profile>...    Run one bounded multi-profile freshness pass\n  qgh query \"<terms>\"              Find source candidates\n  qgh get <source_id>              Open the full source before you cite it\n  qgh status                       Inspect local readiness without network access\n\nUse query -> get -> cite. Add --json to a command for stable qgh.v2 agent output."
 )]
 pub struct Cli {
     #[arg(
@@ -82,7 +82,7 @@ pub enum Command {
             help = "Opt in to a lifecycle check that contacts GitHub and purges confirmed unavailable local content"
         )]
         verify_lifecycle: bool,
-        #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+        #[arg(long, help = "Emit a qgh.v2 JSON envelope instead of a human summary")]
         json: bool,
     },
     #[command(about = "Inspect local search readiness without network access")]
@@ -94,7 +94,7 @@ pub enum Command {
         long_about = "Run explicit diagnostics. This command contacts GitHub and loads the configured local model runtime; use status for a local-only readiness check."
     )]
     Doctor {
-        #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+        #[arg(long, help = "Emit a qgh.v2 JSON envelope instead of a human summary")]
         json: bool,
     },
     #[command(about = "Serve the read-only query/get/status MCP tools over stdio")]
@@ -128,7 +128,7 @@ pub enum ModelCommand {
 pub struct ModelInstallArgs {
     #[arg(value_enum, help = "Supported embedding or reranker preset to install")]
     pub model: ModelPresetArg,
-    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    #[arg(long, help = "Emit a qgh.v2 JSON envelope instead of a human summary")]
     pub json: bool,
 }
 
@@ -161,7 +161,7 @@ pub struct EmbedArgs {
         help = "Hide progress on stderr and keep the final human summary plain"
     )]
     pub quiet: bool,
-    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    #[arg(long, help = "Emit a qgh.v2 JSON envelope instead of a human summary")]
     pub json: bool,
 }
 
@@ -208,7 +208,7 @@ pub struct SyncArgs {
         help = "Hide progress on stderr and keep the final human summary plain"
     )]
     pub quiet: bool,
-    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    #[arg(long, help = "Emit a qgh.v2 JSON envelope instead of a human summary")]
     pub json: bool,
     #[command(subcommand)]
     pub target: Option<SyncTarget>,
@@ -262,7 +262,7 @@ pub struct SyncIssueArgs {
         help = "Hide progress on stderr and keep the final human summary plain"
     )]
     pub quiet: bool,
-    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    #[arg(long, help = "Emit a qgh.v2 JSON envelope instead of a human summary")]
     pub json: bool,
 }
 
@@ -302,7 +302,7 @@ pub struct InitArgs {
         help = "Overwrite an existing .qgh.toml repository policy after explicit confirmation"
     )]
     pub force: bool,
-    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    #[arg(long, help = "Emit a qgh.v2 JSON envelope instead of a human summary")]
     pub json: bool,
 }
 
@@ -341,7 +341,7 @@ pub struct InitRepoArgs {
     pub repo: Option<String>,
     #[arg(long, help = "Overwrite an existing .qgh.toml repository policy")]
     pub force: bool,
-    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    #[arg(long, help = "Emit a qgh.v2 JSON envelope instead of a human summary")]
     pub json: bool,
 }
 
@@ -392,7 +392,7 @@ pub struct QueryArgs {
     pub max_age: Option<String>,
     #[arg(long, help = "Fail this run if the local snapshot is stale")]
     pub require_fresh: bool,
-    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    #[arg(long, help = "Emit a qgh.v2 JSON envelope instead of a human summary")]
     pub json: bool,
 }
 
@@ -406,7 +406,7 @@ pub struct StatusArgs {
     pub max_age: Option<String>,
     #[arg(long, help = "Fail this run if the local snapshot is stale")]
     pub require_fresh: bool,
-    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    #[arg(long, help = "Emit a qgh.v2 JSON envelope instead of a human summary")]
     pub json: bool,
 }
 
@@ -459,12 +459,14 @@ pub enum ScheduleCommand {
 pub struct ScheduleRunArgs {
     #[arg(required = true, num_args = 1.., help = "Explicit profile ids to coordinate")]
     pub profile_ids: Vec<String>,
+    #[arg(long, hide = true)]
+    pub manager_invoked: bool,
     #[arg(
         long,
         help = "Hide progress on stderr and keep the final human summary plain"
     )]
     pub quiet: bool,
-    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    #[arg(long, help = "Emit a qgh.v2 JSON envelope instead of a human summary")]
     pub json: bool,
 }
 
@@ -474,18 +476,18 @@ pub struct ScheduleStartArgs {
     pub profile_ids: Vec<String>,
     #[arg(long, default_value = "1h", help = "Fixed schedule interval")]
     pub interval: String,
-    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    #[arg(long, help = "Emit a qgh.v2 JSON envelope instead of a human summary")]
     pub json: bool,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct ScheduleStatusArgs {
-    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    #[arg(long, help = "Emit a qgh.v2 JSON envelope instead of a human summary")]
     pub json: bool,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct ScheduleStopArgs {
-    #[arg(long, help = "Emit a qgh.v1 JSON envelope instead of a human summary")]
+    #[arg(long, help = "Emit a qgh.v2 JSON envelope instead of a human summary")]
     pub json: bool,
 }

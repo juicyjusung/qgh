@@ -1,7 +1,12 @@
 {
   "schema_version": "qgh.release.v1",
   "contract": {
-    "envelope_schema_version": "qgh.v1",
+    "envelope_schema_version": "qgh.v2",
+    "envelope_migration": {
+      "from": "qgh.v1",
+      "compatibility": "breaking",
+      "reason": "closed sync/status payloads and strict schedule lifecycle contracts changed"
+    },
     "product_core": "CLI-first local retrieval with strict --json envelopes and SQLite/Tantivy behavior",
     "contract_source_of_truth": ["CLI args", "docs/schemas/*.schema.json", "local SQLite/Tantivy retrieval behavior"],
     "schema_object_closure": "released schema object shapes are closed by default; only envelope.data and error.details are documented extension points",
@@ -11,7 +16,7 @@
       "search": "query"
     },
     "cli_only_commands": ["init", "sync", "embed", "model", "doctor", "schedule"],
-    "human_output": "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v1 envelopes",
+    "human_output": "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v2 envelopes",
     "primary_install_channel": {
       "manager": "homebrew",
       "command": "brew install juicyjusung/tap/qgh",
@@ -65,14 +70,17 @@
     },
     "schedule": {
       "profile_selection": "explicit positional profile ids only",
-      "foreground_policy": "host serial; unknown budget max 1; reserve 20%; max 1 per profile; max 8 per pass",
+      "foreground_policy": "host serial; shared gate before every send; unknown budget max 1 probe request and 1 profile per unknown-start pass; observed reserve 20%; max 1 per profile; max 8 per pass",
+      "host_budget_guard": "content-free per-host write-ahead guard; active backoff or uncertain started request survives process exit; reset/backoff deadline or 5 minute fallback; 24 hour cap",
       "forbidden_hidden_work": ["bootstrap", "backfill", "reconciliation", "model"],
       "user_managers": ["macOS LaunchAgent", "Linux systemd user timer"],
       "lifecycle_single_flight": true,
       "manager_activation_repair": true,
       "lifecycle_network_access": false,
       "cron_fallback": false,
-      "real_manager_gate": ".github/workflows/schedule-manager-gate.yml -> scripts/verify-schedule-manager.sh"
+      "real_manager_gate": ".github/workflows/schedule-manager-gate.yml -> scripts/verify-schedule-manager.sh",
+      "gate_profile_set_update": true,
+      "physical_catch_up_observation": "required manual workflow evidence; not simulated"
     },
     "optional_semantic": {
       "new_config_default_preset": "qwen3-embedding-0.6b",

@@ -9,13 +9,15 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const REGISTRATION_SCHEMA: &str = "qgh.schedule-registration.v1";
+const REGISTRATION_SCHEMA: &str = "qgh.schedule-registration.v2";
+const LEGACY_REGISTRATION_SCHEMA: &str = "qgh.schedule-registration.v1";
+const OWNER_STATE_DIR: &str = ".local/state/qgh/schedule-owner";
 const FIXED_INTERVAL: &str = "1h";
 const JITTER_WINDOW_SECONDS: u32 = 15 * 60;
 const MACOS_LABEL: &str = "com.juicyjusung.qgh.schedule";
@@ -46,11 +48,20 @@ pub(crate) fn start(profile_ids: &[String], interval: &str) -> Result<LocalReadO
     }
 
     let adapter = PlatformAdapter::current()?;
-    let _lifecycle_lease = FileLease::acquire_schedule_lifecycle(&lifecycle_lock_path()?)?;
     let executable = invoked_executable()?;
     let environment = background_environment(&executable)?;
-    let desired = adapter.prepare(profile_ids, interval, &executable, &environment)?;
-    let action = reconcile_start(&adapter, &desired, &SystemManagerRunner)?;
+    let identity = current_owner_identity(adapter.kind(), environment.clone())?;
+    let owner_paths = LifecycleOwnerPaths::for_identity(&identity);
+    let _lifecycle_lease = FileLease::acquire_schedule_lifecycle(&owner_paths.lock)?;
+    let existing = resolve_existing_schedule(&owner_paths, &adapter, &identity)?;
+    let desired = adapter.prepare(&identity, profile_ids, interval, &executable, &environment)?;
+    let action = reconcile_start_owned(
+        &owner_paths,
+        &adapter,
+        &desired,
+        existing.as_ref(),
+        &SystemManagerRunner,
+    )?;
     Ok(outcome(
         "start",
         action,
@@ -63,8 +74,39 @@ pub(crate) fn start(profile_ids: &[String], interval: &str) -> Result<LocalReadO
 }
 
 pub(crate) fn status() -> Result<LocalReadOutcome, QghError> {
-    let adapter = PlatformAdapter::current()?;
-    let registration = read_registration(&adapter.registration_path())?;
+    let current_adapter = PlatformAdapter::current()?;
+    let identity = current_owner_identity(current_adapter.kind(), current_environment_capture()?)?;
+    let owner_paths = LifecycleOwnerPaths::for_identity(&identity);
+    let existing = resolve_existing_schedule(&owner_paths, &current_adapter, &identity)?;
+    let adapter = existing
+        .as_ref()
+        .map(|existing| &existing.adapter)
+        .unwrap_or(&current_adapter);
+    let registration = existing.as_ref().map(|existing| &existing.registration);
+    let state_path = existing
+        .as_ref()
+        .and_then(|existing| existing.legacy_path.as_ref())
+        .unwrap_or(&owner_paths.registration);
+    let (schedule_state, artifact_state) =
+        inspect_schedule_state(adapter, registration, state_path)?;
+
+    Ok(outcome(
+        "status",
+        "inspected",
+        schedule_state,
+        adapter,
+        registration,
+        false,
+        schedule_state == "active",
+    )
+    .with_artifact_state(artifact_state))
+}
+
+fn inspect_schedule_state(
+    adapter: &PlatformAdapter,
+    registration: Option<&ScheduleRegistration>,
+    state_path: &Path,
+) -> Result<(&'static str, &'static str), QghError> {
     let snapshots = snapshot_artifacts(&adapter.artifact_paths())?;
     let any_artifact = snapshots.iter().any(|snapshot| snapshot.bytes.is_some());
     let all_artifacts = snapshots.iter().all(|snapshot| snapshot.bytes.is_some());
@@ -72,8 +114,9 @@ pub(crate) fn status() -> Result<LocalReadOutcome, QghError> {
         .iter()
         .filter(|snapshot| snapshot.bytes.is_some())
         .all(|snapshot| is_private_file(&snapshot.path));
-
-    let (schedule_state, artifact_state) = match registration.as_ref() {
+    let runtime_present = adapter.runtime_files_present();
+    let runtime_ready = adapter.runtime_files_ready();
+    Ok(match registration {
         None if !any_artifact => ("not_installed", "missing"),
         None => ("drifted", "orphaned"),
         Some(registration) if registration.platform != adapter.kind() => {
@@ -83,57 +126,43 @@ pub(crate) fn status() -> Result<LocalReadOutcome, QghError> {
             let hash_matches = all_artifacts
                 && artifact_bundle_hash_from_snapshots(&snapshots)
                     .is_some_and(|hash| hash == registration.artifact_hash);
-            let state_private = is_private_file(&adapter.registration_path());
-            if hash_matches && artifacts_private && state_private {
+            if hash_matches && artifacts_private && is_private_file(state_path) && runtime_ready {
                 ("active", "ready")
-            } else if !all_artifacts {
+            } else if !all_artifacts || !runtime_present {
                 ("drifted", "missing")
             } else {
                 ("drifted", "changed")
             }
         }
-    };
-
-    Ok(outcome(
-        "status",
-        "inspected",
-        schedule_state,
-        &adapter,
-        registration.as_ref(),
-        false,
-        schedule_state == "active",
-    )
-    .with_artifact_state(artifact_state))
+    })
 }
 
 pub(crate) fn stop() -> Result<LocalReadOutcome, QghError> {
-    let adapter = PlatformAdapter::current()?;
-    let _lifecycle_lease = FileLease::acquire_schedule_lifecycle(&lifecycle_lock_path()?)?;
-    let registration = read_registration(&adapter.registration_path())?;
-    if registration
+    let current_adapter = PlatformAdapter::current()?;
+    let identity = current_owner_identity(current_adapter.kind(), current_environment_capture()?)?;
+    let owner_paths = LifecycleOwnerPaths::for_identity(&identity);
+    let _lifecycle_lease = FileLease::acquire_schedule_lifecycle(&owner_paths.lock)?;
+    let existing = resolve_existing_schedule(&owner_paths, &current_adapter, &identity)?;
+    let adapter = existing
         .as_ref()
-        .is_some_and(|registration| registration.platform != adapter.kind())
-    {
-        return Err(QghError::new(
-            "schedule.platform_mismatch",
-            "The local schedule was registered by another platform adapter.",
-            2,
-        )
-        .with_details(json!({
-            "registered_platform": registration.as_ref().map(|value| value.platform.as_str()),
-            "current_platform": adapter.kind().as_str()
-        }))
-        .with_hint("Stop the schedule on the platform that registered it."));
-    }
-    let prior_registration = registration.clone();
-    let action = reconcile_stop(&adapter, &SystemManagerRunner)?;
+        .map(|existing| &existing.adapter)
+        .unwrap_or(&current_adapter);
+    let prior_registration = existing
+        .as_ref()
+        .map(|existing| existing.registration.clone());
+    let action = reconcile_stop_owned(
+        &owner_paths,
+        adapter,
+        existing.as_ref(),
+        &SystemManagerRunner,
+    )?;
     Ok(outcome(
         "stop",
         action,
         "not_installed",
-        &adapter,
+        adapter,
         prior_registration.as_ref(),
-        action == "removed",
+        true,
         false,
     ))
 }
@@ -222,6 +251,37 @@ enum PlatformKind {
     LinuxSystemdUser,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ScheduleOwnerIdentity {
+    uid: String,
+    home: PathBuf,
+    manager_identity: String,
+    captured_environment: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct LifecycleOwnerPaths {
+    registration: PathBuf,
+    lock: PathBuf,
+}
+
+impl LifecycleOwnerPaths {
+    fn for_identity(identity: &ScheduleOwnerIdentity) -> Self {
+        // This directory intentionally ignores every XDG override. The launchd label and
+        // systemd unit name are one per OS user, so their ownership lock and record must have
+        // exactly the same scope.
+        let root = identity
+            .home
+            .join(OWNER_STATE_DIR)
+            .join(format!("uid-{}", identity.uid));
+        Self {
+            registration: root.join("registration.json"),
+            lock: root.join("lifecycle.lock"),
+        }
+    }
+}
+
 impl PlatformKind {
     fn as_str(self) -> &'static str {
         match self {
@@ -235,14 +295,12 @@ impl PlatformKind {
 enum PlatformAdapter {
     #[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
     Macos {
-        registration_path: PathBuf,
         plist_path: PathBuf,
         stdout_path: PathBuf,
         stderr_path: PathBuf,
     },
     #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
     Linux {
-        registration_path: PathBuf,
         service_path: PathBuf,
         timer_path: PathBuf,
     },
@@ -255,7 +313,6 @@ impl PlatformAdapter {
             let home = home_dir()?;
             let log_dir = crate::paths::qgh_cache_dir()?.join("schedule");
             Ok(Self::Macos {
-                registration_path: registration_path()?,
                 plist_path: home
                     .join("Library")
                     .join("LaunchAgents")
@@ -271,7 +328,6 @@ impl PlatformAdapter {
                 .unwrap_or(home_dir()?.join(".config"));
             let unit_dir = config_home.join("systemd").join("user");
             Ok(Self::Linux {
-                registration_path: registration_path()?,
                 service_path: unit_dir.join(SYSTEMD_SERVICE),
                 timer_path: unit_dir.join(SYSTEMD_TIMER),
             })
@@ -296,14 +352,19 @@ impl PlatformAdapter {
         }
     }
 
-    fn registration_path(&self) -> PathBuf {
-        match self {
-            Self::Macos {
-                registration_path, ..
-            }
-            | Self::Linux {
-                registration_path, ..
-            } => registration_path.clone(),
+    fn default_for_home(home: &Path, kind: PlatformKind) -> Self {
+        match kind {
+            PlatformKind::MacosLaunchd => Self::Macos {
+                plist_path: home
+                    .join("Library/LaunchAgents")
+                    .join(format!("{MACOS_LABEL}.plist")),
+                stdout_path: home.join(".cache/qgh/schedule/stdout.log"),
+                stderr_path: home.join(".cache/qgh/schedule/stderr.log"),
+            },
+            PlatformKind::LinuxSystemdUser => Self::Linux {
+                service_path: home.join(".config/systemd/user").join(SYSTEMD_SERVICE),
+                timer_path: home.join(".config/systemd/user").join(SYSTEMD_TIMER),
+            },
         }
     }
 
@@ -330,13 +391,176 @@ impl PlatformAdapter {
         }
     }
 
+    fn runtime_paths(&self) -> Vec<PathBuf> {
+        match self {
+            Self::Macos {
+                stdout_path,
+                stderr_path,
+                ..
+            } => vec![stdout_path.clone(), stderr_path.clone()],
+            Self::Linux { .. } => Vec::new(),
+        }
+    }
+
+    fn managed_file_paths(&self) -> Vec<PathBuf> {
+        self.artifact_paths()
+            .into_iter()
+            .map(|artifact| artifact.path)
+            .chain(self.runtime_paths())
+            .collect()
+    }
+
+    fn runtime_files_present(&self) -> bool {
+        self.runtime_paths()
+            .iter()
+            .all(|path| is_regular_file_entry(path))
+    }
+
+    fn runtime_files_ready(&self) -> bool {
+        self.runtime_paths()
+            .iter()
+            .all(|path| is_private_file(path))
+    }
+
+    #[cfg(test)]
+    fn registration_path(&self) -> PathBuf {
+        test_owner_paths(self).registration
+    }
+
+    fn capture(&self) -> CapturedManager {
+        match self {
+            Self::Macos {
+                plist_path,
+                stdout_path,
+                stderr_path,
+            } => CapturedManager::Macos {
+                plist_path: plist_path.clone(),
+                stdout_path: stdout_path.clone(),
+                stderr_path: stderr_path.clone(),
+            },
+            Self::Linux {
+                service_path,
+                timer_path,
+            } => CapturedManager::Linux {
+                service_path: service_path.clone(),
+                timer_path: timer_path.clone(),
+            },
+        }
+    }
+
+    fn from_registration(
+        registration: &ScheduleRegistration,
+        current_identity: &ScheduleOwnerIdentity,
+    ) -> Result<Self, QghError> {
+        if registration.owner.uid != current_identity.uid
+            || registration.owner.home != current_identity.home
+            || registration.owner.manager_identity != manager_identity(registration.platform)
+        {
+            return Err(ownership_ambiguous(
+                "The schedule owner record does not match the current OS user identity.",
+            ));
+        }
+        let adapter = match &registration.manager {
+            CapturedManager::Macos {
+                plist_path,
+                stdout_path,
+                stderr_path,
+            } => Self::Macos {
+                plist_path: plist_path.clone(),
+                stdout_path: stdout_path.clone(),
+                stderr_path: stderr_path.clone(),
+            },
+            CapturedManager::Linux {
+                service_path,
+                timer_path,
+            } => Self::Linux {
+                service_path: service_path.clone(),
+                timer_path: timer_path.clone(),
+            },
+        };
+        if adapter.kind() != registration.platform
+            || !adapter.has_safe_managed_paths(&registration.owner)?
+        {
+            return Err(ownership_ambiguous(
+                "The schedule owner record contains unsafe or mismatched managed paths.",
+            ));
+        }
+        Ok(adapter)
+    }
+
+    fn has_safe_managed_paths(&self, owner: &ScheduleOwnerIdentity) -> Result<bool, QghError> {
+        let mut paths = self.artifact_paths();
+        match self {
+            Self::Macos {
+                stdout_path,
+                stderr_path,
+                ..
+            } => {
+                paths.push(ArtifactPath {
+                    logical_name: "stdout",
+                    path: stdout_path.clone(),
+                });
+                paths.push(ArtifactPath {
+                    logical_name: "stderr",
+                    path: stderr_path.clone(),
+                });
+            }
+            Self::Linux { .. } => {}
+        }
+        if paths.iter().any(|path| {
+            !path.path.is_absolute()
+                || path
+                    .path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+        }) {
+            return Ok(false);
+        }
+        Ok(match self {
+            Self::Macos {
+                plist_path,
+                stdout_path,
+                stderr_path,
+            } => {
+                let cache_home = captured_path(owner, "XDG_CACHE_HOME")
+                    .unwrap_or_else(|| owner.home.join(".cache"));
+                let log_dir = cache_home.join("qgh/schedule");
+                plist_path
+                    == &owner
+                        .home
+                        .join("Library/LaunchAgents")
+                        .join(format!("{MACOS_LABEL}.plist"))
+                    && stdout_path == &log_dir.join("stdout.log")
+                    && stderr_path == &log_dir.join("stderr.log")
+            }
+            Self::Linux {
+                service_path,
+                timer_path,
+            } => {
+                let config_home = captured_path(owner, "XDG_CONFIG_HOME")
+                    .unwrap_or_else(|| owner.home.join(".config"));
+                let unit_dir = config_home.join("systemd/user");
+                service_path == &unit_dir.join(SYSTEMD_SERVICE)
+                    && timer_path == &unit_dir.join(SYSTEMD_TIMER)
+            }
+        })
+    }
+
     fn prepare(
         &self,
+        owner: &ScheduleOwnerIdentity,
         profile_ids: &[String],
         interval: &str,
         executable: &Path,
         environment: &BTreeMap<String, String>,
     ) -> Result<PreparedSchedule, QghError> {
+        if !self.has_safe_managed_paths(owner)? {
+            return Err(QghError::new(
+                "schedule.environment_invalid",
+                "The selected schedule manager paths do not match the captured user environment.",
+                2,
+            ));
+        }
         let jitter_offset_seconds = deterministic_jitter_seconds(profile_ids);
         let artifacts = match self {
             Self::Macos {
@@ -387,6 +611,8 @@ impl PlatformAdapter {
             registration: ScheduleRegistration {
                 schema_version: REGISTRATION_SCHEMA.to_string(),
                 platform: self.kind(),
+                owner: owner.clone(),
+                manager: self.capture(),
                 profile_ids: profile_ids.to_vec(),
                 interval: interval.to_string(),
                 jitter_strategy,
@@ -410,12 +636,7 @@ impl PlatformAdapter {
                     .ok_or_else(|| storage_error("Schedule log path is invalid."))?;
                 ensure_private_dir(log_dir)?;
                 for path in [stdout_path, stderr_path] {
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(path)
-                        .map_err(|_| storage_error("Could not create a private schedule log."))?;
-                    set_private_file(path)?;
+                    open_private_runtime_file(path)?;
                 }
                 Ok(())
             }
@@ -556,9 +777,99 @@ impl PlatformAdapter {
     }
 }
 
+fn open_private_runtime_file(path: &Path) -> Result<(), QghError> {
+    let file = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|_| storage_error("Could not open a private schedule log."))?,
+        Ok(_) => {
+            return Err(ownership_ambiguous(
+                "A managed schedule runtime path is not a regular file.",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(path)
+            .map_err(|_| storage_error("Could not create a private schedule log."))?,
+        Err(_) => return Err(storage_error("Could not inspect a schedule runtime path.")),
+    };
+    if !path_refers_to_open_file(path, &file)? {
+        return Err(ownership_ambiguous(
+            "A managed schedule runtime path changed while it was being opened.",
+        ));
+    }
+    set_private_open_file(&file)
+}
+
+#[cfg(unix)]
+fn path_refers_to_open_file(path: &Path, file: &File) -> Result<bool, QghError> {
+    use std::os::unix::fs::MetadataExt;
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|_| storage_error("Could not verify a schedule runtime path."))?;
+    let file_metadata = file
+        .metadata()
+        .map_err(|_| storage_error("Could not verify an open schedule runtime file."))?;
+    Ok(path_metadata.file_type().is_file()
+        && path_metadata.dev() == file_metadata.dev()
+        && path_metadata.ino() == file_metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn path_refers_to_open_file(path: &Path, _file: &File) -> Result<bool, QghError> {
+    Ok(is_regular_file_entry(path))
+}
+
+#[cfg(unix)]
+fn set_private_open_file(file: &File) -> Result<(), QghError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = file
+        .metadata()
+        .map_err(|_| storage_error("Could not inspect an open schedule runtime file."))?
+        .permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)
+        .map_err(|_| storage_error("Could not make a schedule runtime file private."))
+}
+
+#[cfg(not(unix))]
+fn set_private_open_file(_file: &File) -> Result<(), QghError> {
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ScheduleRegistration {
+    schema_version: String,
+    platform: PlatformKind,
+    owner: ScheduleOwnerIdentity,
+    manager: CapturedManager,
+    profile_ids: Vec<String>,
+    interval: String,
+    jitter_strategy: String,
+    jitter_offset_seconds: Option<u32>,
+    jitter_max_seconds: u32,
+    artifact_hash: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum CapturedManager {
+    Macos {
+        plist_path: PathBuf,
+        stdout_path: PathBuf,
+        stderr_path: PathBuf,
+    },
+    Linux {
+        service_path: PathBuf,
+        timer_path: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyScheduleRegistration {
     schema_version: String,
     platform: PlatformKind,
     profile_ids: Vec<String>,
@@ -570,6 +881,13 @@ struct ScheduleRegistration {
 }
 
 #[derive(Debug, Clone)]
+struct ExistingSchedule {
+    registration: ScheduleRegistration,
+    adapter: PlatformAdapter,
+    legacy_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ArtifactPath {
     logical_name: &'static str,
     path: PathBuf,
@@ -595,83 +913,139 @@ struct FileSnapshot {
     bytes: Option<Vec<u8>>,
 }
 
-fn reconcile_start(
+fn reconcile_start_owned(
+    owner_paths: &LifecycleOwnerPaths,
     adapter: &PlatformAdapter,
     desired: &PreparedSchedule,
+    existing: Option<&ExistingSchedule>,
     runner: &dyn ManagerRunner,
 ) -> Result<&'static str, QghError> {
-    let registration_path = adapter.registration_path();
-    let old_registration_bytes = read_optional_file(&registration_path)?;
-    let old_registration = old_registration_bytes
-        .as_deref()
-        .map(parse_registration)
-        .transpose()?;
-    if old_registration
-        .as_ref()
-        .is_some_and(|registration| registration.platform != adapter.kind())
+    let old_adapter = existing
+        .map(|existing| &existing.adapter)
+        .unwrap_or(adapter);
+    validate_runtime_repair_targets(old_adapter)?;
+    let old_owner_bytes = read_optional_file(&owner_paths.registration)?;
+    let old_legacy_bytes = existing
+        .and_then(|existing| existing.legacy_path.as_ref())
+        .map(|path| read_optional_file(path))
+        .transpose()?
+        .flatten();
+    let old_artifacts = snapshot_artifacts(&old_adapter.artifact_paths())?;
+    reject_unowned_destination_entries(old_adapter, adapter)?;
+    let old_managed_paths = old_adapter.managed_file_paths();
+    let new_runtime_cleanup = adapter
+        .runtime_paths()
+        .into_iter()
+        .filter(|path| !old_managed_paths.contains(path))
+        .collect::<Vec<_>>();
+    let new_artifacts = snapshot_artifacts(&adapter.artifact_paths())?;
+    let rollback_artifacts = merge_snapshots(&old_artifacts, &new_artifacts);
+    if existing.is_none()
+        && (rollback_artifacts
+            .iter()
+            .any(|snapshot| snapshot.bytes.is_some())
+            || adapter.is_active(runner)?)
     {
-        return Err(QghError::new(
-            "schedule.platform_mismatch",
-            "The local schedule was registered by another platform adapter.",
-            2,
-        )
-        .with_hint("Stop the schedule on the platform that registered it."));
+        return Err(ownership_ambiguous(
+            "The fixed user manager identity is active or has artifacts without a provable owner record.",
+        ));
     }
-    let old_artifacts = snapshot_artifacts(&adapter.artifact_paths())?;
-    let desired_matches = old_registration.as_ref() == Some(&desired.registration)
-        && desired.artifacts.iter().all(|artifact| {
-            old_artifacts.iter().any(|snapshot| {
-                snapshot.logical_name == artifact.logical_name
-                    && snapshot.bytes.as_deref() == Some(artifact.bytes.as_slice())
-                    && is_private_file(&snapshot.path)
-            })
+    let state_path = existing
+        .and_then(|existing| existing.legacy_path.as_ref())
+        .unwrap_or(&owner_paths.registration);
+    let desired_matches = existing.is_some_and(|existing| {
+        existing.legacy_path.is_none() && existing.registration == desired.registration
+    }) && desired.artifacts.iter().all(|artifact| {
+        old_artifacts.iter().any(|snapshot| {
+            snapshot.logical_name == artifact.logical_name
+                && snapshot.bytes.as_deref() == Some(artifact.bytes.as_slice())
+                && is_private_file(&snapshot.path)
         })
-        && is_private_file(&registration_path);
+    }) && is_private_file(state_path)
+        && old_adapter.runtime_files_ready();
     if desired_matches {
-        if adapter.is_active(runner)? {
+        if old_adapter.is_active(runner)? {
             return Ok("unchanged");
         }
-        adapter.activate(runner)?;
+        old_adapter.activate(runner)?;
         return Ok("reloaded");
     }
 
-    let had_existing = old_registration.is_some()
-        || old_artifacts
+    let had_existing = existing.is_some()
+        || rollback_artifacts
             .iter()
             .any(|snapshot| snapshot.bytes.is_some());
+    let old_manager_active = if had_existing {
+        old_adapter.is_active(runner)?
+    } else {
+        false
+    };
     if had_existing {
-        if let Err(error) = adapter.deactivate(runner) {
-            let _ = adapter.activate(runner);
+        if let Err(error) = old_adapter.deactivate(runner) {
+            if old_manager_active {
+                let _ = old_adapter.activate(runner);
+            }
             return Err(error);
         }
     }
     let attempt = (|| -> Result<(), QghError> {
+        remove_snapshots(&old_artifacts)?;
         adapter.prepare_runtime_files()?;
         write_artifacts(&desired.artifacts)?;
         adapter.activate(runner)?;
-        write_registration(&registration_path, &desired.registration)?;
+        if let Some(legacy_path) = existing.and_then(|existing| existing.legacy_path.as_ref()) {
+            remove_file_if_exists(legacy_path)?;
+        }
+        // The fixed owner record is the commit point. Artifacts and manager activation are
+        // complete before readers can discover the new ownership.
+        write_registration(&owner_paths.registration, &desired.registration)?;
         Ok(())
     })();
     if let Err(error) = attempt {
-        rollback_start(
-            adapter,
+        rollback_start(StartRollback {
+            owner_paths,
+            new_adapter: adapter,
+            old_adapter,
             runner,
-            &old_artifacts,
-            old_registration_bytes.as_deref(),
-        );
+            artifacts: &rollback_artifacts,
+            old_owner: old_owner_bytes.as_deref(),
+            legacy_path: existing.and_then(|existing| existing.legacy_path.as_deref()),
+            old_legacy: old_legacy_bytes.as_deref(),
+            old_manager_active,
+            new_runtime_cleanup: &new_runtime_cleanup,
+        });
         return Err(error);
     }
     Ok(if had_existing { "updated" } else { "installed" })
 }
 
-fn reconcile_stop(
+fn reconcile_stop_owned(
+    owner_paths: &LifecycleOwnerPaths,
     adapter: &PlatformAdapter,
+    existing: Option<&ExistingSchedule>,
     runner: &dyn ManagerRunner,
 ) -> Result<&'static str, QghError> {
-    let registration_path = adapter.registration_path();
-    let old_registration = read_optional_file(&registration_path)?;
+    let old_registration = read_optional_file(&owner_paths.registration)?;
+    let old_legacy_registration = existing
+        .and_then(|existing| existing.legacy_path.as_ref())
+        .map(|path| read_optional_file(path))
+        .transpose()?
+        .flatten();
     let old_artifacts = snapshot_artifacts(&adapter.artifact_paths())?;
-    let had_existing = old_registration.is_some()
+    if existing.is_none() {
+        if old_artifacts
+            .iter()
+            .any(|snapshot| snapshot.bytes.is_some())
+            || adapter.is_active(runner)?
+        {
+            return Err(ownership_ambiguous(
+                "The fixed user manager identity is active or has artifacts without a provable owner record.",
+            ));
+        }
+        return Ok("unchanged");
+    }
+    let had_existing = existing.is_some()
+        || old_registration.is_some()
         || old_artifacts
             .iter()
             .any(|snapshot| snapshot.bytes.is_some());
@@ -679,37 +1053,227 @@ fn reconcile_stop(
         return Ok("unchanged");
     }
 
+    let old_manager_active = adapter.is_active(runner)?;
     if let Err(error) = adapter.deactivate(runner) {
-        let _ = adapter.activate(runner);
+        if old_manager_active {
+            let _ = adapter.activate(runner);
+        }
         return Err(error);
     }
     let attempt = (|| -> Result<(), QghError> {
         remove_snapshots(&old_artifacts)?;
-        remove_file_if_exists(&registration_path)?;
         adapter.reload_after_remove(runner)?;
+        if let Some(legacy_path) = existing.and_then(|existing| existing.legacy_path.as_ref()) {
+            remove_file_if_exists(legacy_path)?;
+        }
+        remove_file_if_exists(&owner_paths.registration)?;
         Ok(())
     })();
     if let Err(error) = attempt {
         restore_snapshots(&old_artifacts);
-        restore_optional_file(&registration_path, old_registration.as_deref());
-        let _ = adapter.activate(runner);
+        restore_optional_file(&owner_paths.registration, old_registration.as_deref());
+        if let Some(legacy_path) = existing.and_then(|existing| existing.legacy_path.as_ref()) {
+            restore_optional_file(legacy_path, old_legacy_registration.as_deref());
+        }
+        restore_manager_after_rollback(adapter, runner, &old_artifacts, old_manager_active);
         return Err(error);
     }
     Ok("removed")
 }
 
-fn rollback_start(
+struct StartRollback<'a> {
+    owner_paths: &'a LifecycleOwnerPaths,
+    new_adapter: &'a PlatformAdapter,
+    old_adapter: &'a PlatformAdapter,
+    runner: &'a dyn ManagerRunner,
+    artifacts: &'a [FileSnapshot],
+    old_owner: Option<&'a [u8]>,
+    legacy_path: Option<&'a Path>,
+    old_legacy: Option<&'a [u8]>,
+    old_manager_active: bool,
+    new_runtime_cleanup: &'a [PathBuf],
+}
+
+fn rollback_start(rollback: StartRollback<'_>) {
+    let _ = rollback.new_adapter.deactivate(rollback.runner);
+    for path in rollback.new_runtime_cleanup {
+        let _ = remove_file_if_exists(path);
+    }
+    restore_snapshots(rollback.artifacts);
+    restore_optional_file(&rollback.owner_paths.registration, rollback.old_owner);
+    if let Some(legacy_path) = rollback.legacy_path {
+        restore_optional_file(legacy_path, rollback.old_legacy);
+    }
+    restore_manager_after_rollback(
+        rollback.old_adapter,
+        rollback.runner,
+        rollback.artifacts,
+        rollback.old_manager_active,
+    );
+}
+
+fn merge_snapshots(first: &[FileSnapshot], second: &[FileSnapshot]) -> Vec<FileSnapshot> {
+    let mut merged = first.to_vec();
+    for snapshot in second {
+        if !merged.iter().any(|existing| existing.path == snapshot.path) {
+            merged.push(snapshot.clone());
+        }
+    }
+    merged
+}
+
+fn reject_unowned_destination_entries(
+    old_adapter: &PlatformAdapter,
+    new_adapter: &PlatformAdapter,
+) -> Result<(), QghError> {
+    let old_paths = old_adapter.managed_file_paths();
+    for destination in new_adapter.managed_file_paths() {
+        if old_paths.contains(&destination) {
+            continue;
+        }
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => {
+                return Err(ownership_ambiguous(
+                    "The destination manager location contains a file not owned by the current schedule record.",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(storage_error(
+                    "Could not inspect the destination schedule lifecycle state.",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_repair_targets(adapter: &PlatformAdapter) -> Result<(), QghError> {
+    for path in adapter.runtime_paths() {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(ownership_ambiguous(
+                    "A managed schedule runtime path is not a regular file.",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(storage_error("Could not inspect a schedule runtime path."));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn reconcile_start(
+    adapter: &PlatformAdapter,
+    desired: &PreparedSchedule,
+    runner: &dyn ManagerRunner,
+) -> Result<&'static str, QghError> {
+    let owner_paths = test_owner_paths(adapter);
+    let existing = test_existing_schedule(&owner_paths, &desired.registration.owner)?;
+    reconcile_start_owned(&owner_paths, adapter, desired, existing.as_ref(), runner)
+}
+
+#[cfg(test)]
+fn reconcile_stop(
+    adapter: &PlatformAdapter,
+    runner: &dyn ManagerRunner,
+) -> Result<&'static str, QghError> {
+    let owner_paths = test_owner_paths(adapter);
+    let identity = test_identity_for_adapter(adapter);
+    let existing = test_existing_schedule(&owner_paths, &identity)?;
+    let owned_adapter = existing
+        .as_ref()
+        .map(|existing| &existing.adapter)
+        .unwrap_or(adapter);
+    reconcile_stop_owned(&owner_paths, owned_adapter, existing.as_ref(), runner)
+}
+
+#[cfg(test)]
+fn test_existing_schedule(
+    owner_paths: &LifecycleOwnerPaths,
+    identity: &ScheduleOwnerIdentity,
+) -> Result<Option<ExistingSchedule>, QghError> {
+    let Some(bytes) = read_optional_file(&owner_paths.registration)? else {
+        return Ok(None);
+    };
+    let registration = parse_registration(&bytes)?;
+    let adapter = PlatformAdapter::from_registration(&registration, identity)?;
+    Ok(Some(ExistingSchedule {
+        registration,
+        adapter,
+        legacy_path: None,
+    }))
+}
+
+#[cfg(test)]
+fn test_owner_paths(adapter: &PlatformAdapter) -> LifecycleOwnerPaths {
+    let root = match adapter {
+        PlatformAdapter::Linux { service_path, .. } => service_path
+            .ancestors()
+            .nth(4)
+            .expect("test Linux adapter root"),
+        PlatformAdapter::Macos { plist_path, .. } => plist_path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("test macOS adapter root"),
+    };
+    LifecycleOwnerPaths {
+        registration: root.join("data/registration.json"),
+        lock: root.join("data/lifecycle.lock"),
+    }
+}
+
+#[cfg(test)]
+fn test_identity_for_adapter(adapter: &PlatformAdapter) -> ScheduleOwnerIdentity {
+    let root = test_owner_paths(adapter)
+        .registration
+        .parent()
+        .and_then(Path::parent)
+        .expect("test owner root")
+        .to_path_buf();
+    let captured_environment = match adapter {
+        PlatformAdapter::Linux { service_path, .. } => BTreeMap::from([(
+            "XDG_CONFIG_HOME".to_string(),
+            service_path
+                .ancestors()
+                .nth(3)
+                .expect("test config home")
+                .display()
+                .to_string(),
+        )]),
+        PlatformAdapter::Macos { stdout_path, .. } => BTreeMap::from([(
+            "XDG_CACHE_HOME".to_string(),
+            stdout_path
+                .ancestors()
+                .nth(3)
+                .expect("test cache home")
+                .display()
+                .to_string(),
+        )]),
+    };
+    ScheduleOwnerIdentity {
+        uid: "1000".to_string(),
+        home: root,
+        manager_identity: manager_identity(adapter.kind()).to_string(),
+        captured_environment,
+    }
+}
+
+fn restore_manager_after_rollback(
     adapter: &PlatformAdapter,
     runner: &dyn ManagerRunner,
     old_artifacts: &[FileSnapshot],
-    old_registration: Option<&[u8]>,
+    old_manager_active: bool,
 ) {
-    let _ = adapter.deactivate(runner);
-    restore_snapshots(old_artifacts);
-    restore_optional_file(&adapter.registration_path(), old_registration);
-    if old_artifacts
-        .iter()
-        .any(|snapshot| snapshot.bytes.is_some())
+    if old_manager_active
+        && old_artifacts
+            .iter()
+            .any(|snapshot| snapshot.bytes.is_some())
     {
         let _ = adapter.activate(runner);
     } else {
@@ -733,22 +1297,28 @@ fn render_macos_launch_agent(
         "schedule".to_string(),
         "run".to_string(),
         "--json".to_string(),
+        "--manager-invoked".to_string(),
     ];
     arguments.extend(profile_ids.iter().cloned());
     let arguments = arguments
         .iter()
-        .map(|argument| format!("        <string>{}</string>\n", xml_escape(argument)))
-        .collect::<String>();
+        .map(|argument| {
+            Ok(format!(
+                "        <string>{}</string>\n",
+                xml_escape(argument)?
+            ))
+        })
+        .collect::<Result<String, QghError>>()?;
     let environment = environment
         .iter()
         .map(|(key, value)| {
-            format!(
+            Ok(format!(
                 "        <key>{}</key>\n        <string>{}</string>\n",
-                xml_escape(key),
-                xml_escape(value)
-            )
+                xml_escape(key)?,
+                xml_escape(value)?
+            ))
         })
-        .collect::<String>();
+        .collect::<Result<String, QghError>>()?;
     let minute = jitter_offset_seconds / 60;
     Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -778,8 +1348,8 @@ fn render_macos_launch_agent(
     <string>{}</string>\n\
 </dict>\n\
 </plist>\n",
-        xml_escape(stdout_path),
-        xml_escape(stderr_path)
+        xml_escape(stdout_path)?,
+        xml_escape(stderr_path)?
     ))
 }
 
@@ -793,16 +1363,22 @@ fn render_systemd_service(
         "schedule".to_string(),
         "run".to_string(),
         "--json".to_string(),
+        "--manager-invoked".to_string(),
     ];
     arguments.extend(profile_ids.iter().cloned());
     let command = arguments
         .iter()
-        .map(|argument| systemd_quote(argument))
+        .map(|argument| systemd_exec_quote(argument))
         .collect::<Vec<_>>()
         .join(" ");
     let environment = environment
         .iter()
-        .map(|(key, value)| format!("Environment={}\n", systemd_quote(&format!("{key}={value}"))))
+        .map(|(key, value)| {
+            format!(
+                "Environment={}\n",
+                systemd_environment_quote(&format!("{key}={value}"))
+            )
+        })
         .collect::<String>();
     Ok(format!(
         "[Unit]\n\
@@ -853,6 +1429,9 @@ fn background_environment(executable: &Path) -> Result<BTreeMap<String, String>,
         "XDG_CACHE_HOME",
     ] {
         if let Some(value) = env_utf8(key)? {
+            if key == "GH_CONFIG_DIR" {
+                validate_scheduled_gh_config_dir(&value)?;
+            }
             environment.insert(key.to_string(), value);
         }
     }
@@ -861,7 +1440,7 @@ fn background_environment(executable: &Path) -> Result<BTreeMap<String, String>,
     if let Some(parent) = executable.parent() {
         path_entries.push(parent.to_path_buf());
     }
-    if let Some(gh) = find_program("gh") {
+    if let Some(gh) = find_program("gh").or_else(|| find_program_in_fixed_locations("gh")) {
         if let Some(parent) = gh.parent() {
             path_entries.push(parent.to_path_buf());
         }
@@ -903,6 +1482,17 @@ fn background_environment(executable: &Path) -> Result<BTreeMap<String, String>,
     Ok(environment)
 }
 
+fn validate_scheduled_gh_config_dir(value: &str) -> Result<(), QghError> {
+    if safe_absolute_path(Path::new(value)) {
+        return Ok(());
+    }
+    Err(QghError::new(
+        "schedule.environment_invalid",
+        "GH_CONFIG_DIR must be an absolute normalized path for the user schedule.",
+        2,
+    ))
+}
+
 fn invoked_executable() -> Result<PathBuf, QghError> {
     let invoked = env::args_os().next().ok_or_else(|| {
         QghError::new(
@@ -933,10 +1523,10 @@ fn invoked_executable() -> Result<PathBuf, QghError> {
             )
         })?
     };
-    if !absolute.is_absolute() || !absolute.is_file() {
+    if !absolute.is_absolute() || !is_executable_file(&absolute) {
         return Err(QghError::new(
             "schedule.binary_unavailable",
-            "The scheduled qgh executable must be an existing absolute file path.",
+            "The scheduled qgh executable must be an executable absolute file path.",
             2,
         ));
     }
@@ -948,11 +1538,50 @@ fn find_program(name: &str) -> Option<PathBuf> {
 }
 
 fn find_program_path(name: &OsString) -> Option<PathBuf> {
-    env::var_os("PATH")
+    env::var_os("PATH").and_then(|path| find_program_in_path(name, &path))
+}
+
+fn find_program_in_path(name: &OsStr, path: &OsStr) -> Option<PathBuf> {
+    find_program_in_directories(name, env::split_paths(path))
+}
+
+fn find_program_in_fixed_locations(name: &str) -> Option<PathBuf> {
+    find_program_in_directories(
+        OsStr::new(name),
+        [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
         .into_iter()
-        .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+        .map(PathBuf::from),
+    )
+}
+
+fn find_program_in_directories(
+    name: &OsStr,
+    directories: impl Iterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    directories
+        .filter(|directory| safe_absolute_path(directory))
         .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_executable_file(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn deterministic_jitter_seconds(profile_ids: &[String]) -> u32 {
@@ -1003,13 +1632,6 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
         .collect()
 }
 
-fn read_registration(path: &Path) -> Result<Option<ScheduleRegistration>, QghError> {
-    read_optional_file(path)?
-        .as_deref()
-        .map(parse_registration)
-        .transpose()
-}
-
 fn parse_registration(bytes: &[u8]) -> Result<ScheduleRegistration, QghError> {
     let registration: ScheduleRegistration = serde_json::from_slice(bytes)
         .map_err(|_| state_error("Schedule registration state is invalid."))?;
@@ -1021,6 +1643,10 @@ fn parse_registration(bytes: &[u8]) -> Result<ScheduleRegistration, QghError> {
             .artifact_hash
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || owner_path_environment(
+            registration.platform,
+            &registration.owner.captured_environment,
+        ) != registration.owner.captured_environment
         || !valid_jitter_contract(&registration)
     {
         return Err(state_error(
@@ -1038,6 +1664,238 @@ fn parse_registration(bytes: &[u8]) -> Result<ScheduleRegistration, QghError> {
         ));
     }
     Ok(registration)
+}
+
+fn parse_legacy_registration(bytes: &[u8]) -> Result<LegacyScheduleRegistration, QghError> {
+    let registration: LegacyScheduleRegistration = serde_json::from_slice(bytes)
+        .map_err(|_| state_error("Legacy schedule registration state is invalid."))?;
+    if registration.schema_version != LEGACY_REGISTRATION_SCHEMA
+        || registration.interval != FIXED_INTERVAL
+        || registration.profile_ids.is_empty()
+        || !valid_artifact_hash(&registration.artifact_hash)
+    {
+        return Err(state_error(
+            "Legacy schedule registration state has an unsupported contract.",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    if registration
+        .profile_ids
+        .iter()
+        .any(|profile_id| !valid_profile_id(profile_id) || !seen.insert(profile_id))
+    {
+        return Err(state_error(
+            "Legacy schedule registration state contains invalid profile ids.",
+        ));
+    }
+    let probe = ScheduleRegistration {
+        schema_version: REGISTRATION_SCHEMA.to_string(),
+        platform: registration.platform,
+        owner: ScheduleOwnerIdentity {
+            uid: "0".to_string(),
+            home: PathBuf::from("/"),
+            manager_identity: manager_identity(registration.platform).to_string(),
+            captured_environment: BTreeMap::new(),
+        },
+        manager: match registration.platform {
+            PlatformKind::MacosLaunchd => CapturedManager::Macos {
+                plist_path: PathBuf::from(format!("/{MACOS_LABEL}.plist")),
+                stdout_path: PathBuf::from("/stdout"),
+                stderr_path: PathBuf::from("/stderr"),
+            },
+            PlatformKind::LinuxSystemdUser => CapturedManager::Linux {
+                service_path: PathBuf::from(format!("/{SYSTEMD_SERVICE}")),
+                timer_path: PathBuf::from(format!("/{SYSTEMD_TIMER}")),
+            },
+        },
+        profile_ids: registration.profile_ids.clone(),
+        interval: registration.interval.clone(),
+        jitter_strategy: registration.jitter_strategy.clone(),
+        jitter_offset_seconds: registration.jitter_offset_seconds,
+        jitter_max_seconds: registration.jitter_max_seconds,
+        artifact_hash: registration.artifact_hash.clone(),
+    };
+    if !valid_jitter_contract(&probe) {
+        return Err(state_error(
+            "Legacy schedule registration state has an unsupported jitter contract.",
+        ));
+    }
+    Ok(registration)
+}
+
+fn valid_artifact_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn resolve_existing_schedule(
+    owner_paths: &LifecycleOwnerPaths,
+    current_adapter: &PlatformAdapter,
+    identity: &ScheduleOwnerIdentity,
+) -> Result<Option<ExistingSchedule>, QghError> {
+    if let Some(bytes) = read_optional_file(&owner_paths.registration)? {
+        if !is_private_file(&owner_paths.registration) {
+            return Err(ownership_ambiguous(
+                "The fixed schedule owner record is not private.",
+            ));
+        }
+        let version = registration_version(&bytes)?;
+        if version != REGISTRATION_SCHEMA {
+            return Err(ownership_ambiguous(
+                "The fixed schedule owner record uses a legacy or unknown schema.",
+            ));
+        }
+        let registration = parse_registration(&bytes)?;
+        if registration.platform != current_adapter.kind() {
+            return Err(QghError::new(
+                "schedule.platform_mismatch",
+                "The local schedule was registered by another platform adapter.",
+                2,
+            ));
+        }
+        let adapter = PlatformAdapter::from_registration(&registration, identity)?;
+        return Ok(Some(ExistingSchedule {
+            registration,
+            adapter,
+            legacy_path: None,
+        }));
+    }
+
+    resolve_legacy_schedule(current_adapter, identity)
+}
+
+fn registration_version(bytes: &[u8]) -> Result<&str, QghError> {
+    #[derive(Deserialize)]
+    struct Version<'a> {
+        #[serde(borrow)]
+        schema_version: &'a str,
+    }
+    serde_json::from_slice::<Version<'_>>(bytes)
+        .map(|version| version.schema_version)
+        .map_err(|_| state_error("Schedule registration state is invalid."))
+}
+
+fn resolve_legacy_schedule(
+    current_adapter: &PlatformAdapter,
+    identity: &ScheduleOwnerIdentity,
+) -> Result<Option<ExistingSchedule>, QghError> {
+    let mut registration_paths = vec![legacy_registration_path_current()?];
+    let default_registration = identity
+        .home
+        .join(".local/share/qgh/schedule/registration.json");
+    if !registration_paths.contains(&default_registration) {
+        registration_paths.push(default_registration);
+    }
+
+    let mut legacy_records = Vec::new();
+    for path in registration_paths {
+        if let Some(bytes) = read_optional_file(&path)? {
+            if !is_private_file(&path) {
+                return Err(ownership_ambiguous(
+                    "A legacy schedule owner record is not private.",
+                ));
+            }
+            if registration_version(&bytes)? != LEGACY_REGISTRATION_SCHEMA {
+                return Err(ownership_ambiguous(
+                    "A legacy schedule state location contains an unknown owner record.",
+                ));
+            }
+            legacy_records.push((path, parse_legacy_registration(&bytes)?));
+        }
+    }
+    if legacy_records.is_empty() {
+        return Ok(None);
+    }
+
+    let default_adapter = PlatformAdapter::default_for_home(&identity.home, current_adapter.kind());
+    let mut adapters = vec![current_adapter.clone()];
+    if default_adapter.artifact_paths() != current_adapter.artifact_paths() {
+        adapters.push(default_adapter);
+    }
+    prove_legacy_owner(legacy_records, adapters, identity)
+}
+
+fn prove_legacy_owner(
+    legacy_records: Vec<(PathBuf, LegacyScheduleRegistration)>,
+    adapters: Vec<PlatformAdapter>,
+    identity: &ScheduleOwnerIdentity,
+) -> Result<Option<ExistingSchedule>, QghError> {
+    let mut proven = Vec::new();
+    for (path, legacy) in &legacy_records {
+        for adapter in &adapters {
+            if adapter.kind() != legacy.platform || !legacy_artifacts_prove_owner(adapter, legacy)?
+            {
+                continue;
+            }
+            proven.push((path.clone(), legacy.clone(), adapter.clone()));
+        }
+    }
+    if proven.len() != 1 {
+        return Err(ownership_ambiguous(
+            "Legacy schedule ownership is not uniquely provable from the current or default manager artifacts.",
+        ));
+    }
+    let (legacy_path, legacy, adapter) = proven.pop().expect("one proven legacy owner");
+    let mut migrated_owner = identity.clone();
+    migrated_owner.captured_environment = inferred_environment(&migrated_owner.home, &adapter);
+    let registration = ScheduleRegistration {
+        schema_version: REGISTRATION_SCHEMA.to_string(),
+        platform: legacy.platform,
+        owner: migrated_owner,
+        manager: adapter.capture(),
+        profile_ids: legacy.profile_ids,
+        interval: legacy.interval,
+        jitter_strategy: legacy.jitter_strategy,
+        jitter_offset_seconds: legacy.jitter_offset_seconds,
+        jitter_max_seconds: legacy.jitter_max_seconds,
+        artifact_hash: legacy.artifact_hash,
+    };
+    Ok(Some(ExistingSchedule {
+        registration,
+        adapter,
+        legacy_path: Some(legacy_path),
+    }))
+}
+
+fn legacy_artifacts_prove_owner(
+    adapter: &PlatformAdapter,
+    registration: &LegacyScheduleRegistration,
+) -> Result<bool, QghError> {
+    let snapshots = snapshot_artifacts(&adapter.artifact_paths())?;
+    Ok(snapshots
+        .iter()
+        .all(|snapshot| snapshot.bytes.is_some() && is_private_file(&snapshot.path))
+        && artifact_bundle_hash_from_snapshots(&snapshots)
+            .is_some_and(|hash| hash == registration.artifact_hash))
+}
+
+fn inferred_environment(home: &Path, adapter: &PlatformAdapter) -> BTreeMap<String, String> {
+    let mut captured = BTreeMap::new();
+    match adapter {
+        PlatformAdapter::Macos { stdout_path, .. } => {
+            if let Some(cache_home) = stdout_path.ancestors().nth(3) {
+                if cache_home != home.join(".cache") {
+                    captured.insert(
+                        "XDG_CACHE_HOME".to_string(),
+                        cache_home.display().to_string(),
+                    );
+                }
+            }
+        }
+        PlatformAdapter::Linux { service_path, .. } => {
+            if let Some(config_home) = service_path.ancestors().nth(3) {
+                if config_home != home.join(".config") {
+                    captured.insert(
+                        "XDG_CONFIG_HOME".to_string(),
+                        config_home.display().to_string(),
+                    );
+                }
+            }
+        }
+    }
+    captured
 }
 
 fn valid_jitter_contract(registration: &ScheduleRegistration) -> bool {
@@ -1184,14 +2042,22 @@ fn sync_parent(path: &Path) -> Result<(), QghError> {
 #[cfg(unix)]
 fn is_private_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    fs::metadata(path)
-        .map(|metadata| metadata.permissions().mode() & 0o077 == 0)
+    fs::symlink_metadata(path)
+        .map(|metadata| {
+            metadata.file_type().is_file() && metadata.permissions().mode() & 0o077 == 0
+        })
         .unwrap_or(false)
 }
 
 #[cfg(not(unix))]
 fn is_private_file(path: &Path) -> bool {
     path.is_file()
+}
+
+fn is_regular_file_entry(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
 }
 
 trait ManagerRunner {
@@ -1282,14 +2148,36 @@ fn run_state_check(
             "The user lifecycle manager session is unavailable.",
         ));
     }
-    Ok(false)
+    if manager_state_inactive(platform, operation, &result) {
+        return Ok(false);
+    }
+    Err(classify_manager_failure(platform, operation, &result))
+}
+
+fn manager_state_inactive(platform: PlatformKind, operation: &str, result: &ManagerResult) -> bool {
+    if manager_target_absent(platform, result) {
+        return true;
+    }
+    let stderr = result.stderr.trim().to_ascii_lowercase();
+    match (platform, operation, result.status_code) {
+        (PlatformKind::LinuxSystemdUser, "inspect_enabled", Some(1)) => {
+            stderr.is_empty()
+                || stderr.contains("disabled")
+                || stderr.contains("masked")
+                || stderr.contains("static")
+        }
+        (PlatformKind::LinuxSystemdUser, "inspect_active", Some(3)) => {
+            stderr.is_empty() || stderr.contains("inactive") || stderr.contains("dead")
+        }
+        _ => false,
+    }
 }
 
 fn manager_target_absent(platform: PlatformKind, result: &ManagerResult) -> bool {
     let stderr = result.stderr.to_ascii_lowercase();
     match platform {
         PlatformKind::MacosLaunchd => {
-            matches!(result.status_code, Some(3 | 5))
+            result.status_code == Some(3)
                 || stderr.contains("could not find service")
                 || stderr.contains("no such process")
         }
@@ -1384,12 +2272,118 @@ fn systemctl_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/usr/bin/systemctl"))
 }
 
-fn registration_path() -> Result<PathBuf, QghError> {
+fn legacy_registration_path_current() -> Result<PathBuf, QghError> {
     Ok(qgh_data_dir()?.join("schedule").join("registration.json"))
 }
 
-fn lifecycle_lock_path() -> Result<PathBuf, QghError> {
-    Ok(qgh_data_dir()?.join("schedule").join("lifecycle.lock"))
+fn manager_identity(platform: PlatformKind) -> &'static str {
+    match platform {
+        PlatformKind::MacosLaunchd => MACOS_LABEL,
+        PlatformKind::LinuxSystemdUser => SYSTEMD_TIMER,
+    }
+}
+
+fn captured_path(owner: &ScheduleOwnerIdentity, key: &str) -> Option<PathBuf> {
+    owner.captured_environment.get(key).map(PathBuf::from)
+}
+
+fn current_owner_identity(
+    platform: PlatformKind,
+    captured_environment: BTreeMap<String, String>,
+) -> Result<ScheduleOwnerIdentity, QghError> {
+    let home = home_dir()?;
+    validate_owner_environment(&home, &captured_environment)?;
+    let captured_environment = owner_path_environment(platform, &captured_environment);
+    Ok(ScheduleOwnerIdentity {
+        uid: current_user_id()?,
+        home,
+        manager_identity: manager_identity(platform).to_string(),
+        captured_environment,
+    })
+}
+
+fn owner_path_environment(
+    platform: PlatformKind,
+    environment: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let key = match platform {
+        PlatformKind::MacosLaunchd => "XDG_CACHE_HOME",
+        PlatformKind::LinuxSystemdUser => "XDG_CONFIG_HOME",
+    };
+    environment
+        .get(key)
+        .map(|value| BTreeMap::from([(key.to_string(), value.clone())]))
+        .unwrap_or_default()
+}
+
+fn validate_owner_environment(
+    home: &Path,
+    captured_environment: &BTreeMap<String, String>,
+) -> Result<(), QghError> {
+    if !safe_absolute_path(home)
+        || ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"]
+            .into_iter()
+            .filter_map(|key| captured_environment.get(key))
+            .map(Path::new)
+            .any(|path| !safe_absolute_path(path))
+    {
+        return Err(QghError::new(
+            "schedule.environment_invalid",
+            "HOME and captured XDG schedule paths must be absolute and normalized.",
+            2,
+        ));
+    }
+    Ok(())
+}
+
+fn safe_absolute_path(path: &Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+fn current_environment_capture() -> Result<BTreeMap<String, String>, QghError> {
+    let mut captured = BTreeMap::new();
+    for key in [
+        "HOME",
+        "GH_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+    ] {
+        if let Some(value) = env_utf8(key)? {
+            captured.insert(key.to_string(), value);
+        }
+    }
+    Ok(captured)
+}
+
+fn current_user_id() -> Result<String, QghError> {
+    let id = ["/usr/bin/id", "/bin/id"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| Path::new("/usr/bin/id"));
+    let output = Command::new(id).arg("-u").output().map_err(|_| {
+        QghError::new(
+            "schedule.environment_invalid",
+            "The OS user id is required for schedule ownership.",
+            2,
+        )
+    })?;
+    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success()
+        || uid.is_empty()
+        || !uid.chars().all(|character| character.is_ascii_digit())
+    {
+        return Err(QghError::new(
+            "schedule.environment_invalid",
+            "The OS user id is invalid for schedule ownership.",
+            2,
+        ));
+    }
+    Ok(uid)
 }
 
 fn home_dir() -> Result<PathBuf, QghError> {
@@ -1430,23 +2424,44 @@ fn env_utf8(key: &str) -> Result<Option<String>, QghError> {
         .transpose()
 }
 
-fn xml_escape(value: &str) -> String {
-    value
+fn xml_escape(value: &str) -> Result<String, QghError> {
+    if value.chars().any(|character| {
+        !matches!(
+            character,
+            '\u{9}' | '\u{A}' | '\u{D}' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}'
+        )
+    }) {
+        return Err(QghError::new(
+            "schedule.environment_invalid",
+            "Schedule manager values must contain only XML 1.0 characters.",
+            2,
+        ));
+    }
+
+    Ok(value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+        .replace('\'', "&apos;"))
 }
 
-fn systemd_quote(value: &str) -> String {
+fn systemd_exec_quote(value: &str) -> String {
+    systemd_quote(value, true)
+}
+
+fn systemd_environment_quote(value: &str) -> String {
+    systemd_quote(value, false)
+}
+
+fn systemd_quote(value: &str, escape_dollar: bool) -> String {
     let mut quoted = String::from("\"");
     for character in value.chars() {
         match character {
             '\\' => quoted.push_str("\\\\"),
             '"' => quoted.push_str("\\\""),
             '%' => quoted.push_str("%%"),
-            '$' => quoted.push_str("$$"),
+            '$' if escape_dollar => quoted.push_str("$$"),
             '\n' => quoted.push_str("\\x0a"),
             '\r' => quoted.push_str("\\x0d"),
             '\t' => quoted.push_str("\\x09"),
@@ -1468,6 +2483,11 @@ fn storage_error(message: &str) -> QghError {
 
 fn state_error(message: &str) -> QghError {
     QghError::new("schedule.state_invalid", message, 6)
+}
+
+fn ownership_ambiguous(message: &str) -> QghError {
+    QghError::new("schedule.ownership_ambiguous", message, 6)
+        .with_hint("Inspect and remove stale schedule state only after proving which user manager artifact owns the fixed manager identity.")
 }
 
 #[cfg(test)]
@@ -1497,31 +2517,71 @@ mod tests {
     #[derive(Default)]
     struct FakeRunner {
         calls: RefCell<Vec<Vec<String>>>,
+        active: Cell<bool>,
         fail_enable_once: Cell<bool>,
+        fail_bootstrap_once: Cell<bool>,
         fail_disable_once: Cell<bool>,
         fail_stop_once: Cell<bool>,
+        fail_inspect_once: Cell<bool>,
         inactive_check_once: Cell<bool>,
     }
 
     impl ManagerRunner for FakeRunner {
         fn run(&self, _program: &Path, arguments: &[String]) -> std::io::Result<ManagerResult> {
             self.calls.borrow_mut().push(arguments.to_vec());
-            let inactive = arguments
+            let forced_inactive = arguments
                 .iter()
                 .any(|argument| argument == "is-enabled" || argument == "print")
                 && self.inactive_check_once.replace(false);
+            if forced_inactive {
+                self.active.set(false);
+            }
+            let state_check = arguments.iter().any(|argument| {
+                argument == "is-enabled" || argument == "is-active" || argument == "print"
+            });
+            if state_check && self.fail_inspect_once.replace(false) {
+                return Ok(ManagerResult {
+                    success: false,
+                    status_code: Some(5),
+                    stderr: "Input/output error".to_string(),
+                });
+            }
             let should_fail = arguments.iter().any(|argument| argument == "enable")
                 && self.fail_enable_once.replace(false);
+            let should_fail_bootstrap = arguments.iter().any(|argument| argument == "bootstrap")
+                && self.fail_bootstrap_once.replace(false);
             let should_fail_disable = arguments.iter().any(|argument| argument == "disable")
                 && self.fail_disable_once.replace(false);
             let should_fail_stop = arguments.iter().any(|argument| argument == "stop")
                 && self.fail_stop_once.replace(false);
+            let failed =
+                should_fail || should_fail_bootstrap || should_fail_disable || should_fail_stop;
+            let absent = state_check && !self.active.get();
+            let success = !failed && !absent;
+            if success
+                && arguments
+                    .iter()
+                    .any(|argument| argument == "enable" || argument == "bootstrap")
+            {
+                self.active.set(true);
+            }
+            if success
+                && arguments
+                    .iter()
+                    .any(|argument| argument == "disable" || argument == "bootout")
+            {
+                self.active.set(false);
+            }
             Ok(ManagerResult {
-                success: !should_fail && !should_fail_disable && !should_fail_stop && !inactive,
-                status_code: Some(if should_fail || should_fail_disable || should_fail_stop {
+                success,
+                status_code: Some(if failed {
                     1
-                } else if inactive {
-                    3
+                } else if absent {
+                    if arguments.iter().any(|argument| argument == "is-enabled") {
+                        1
+                    } else {
+                        3
+                    }
                 } else {
                     0
                 }),
@@ -1532,22 +2592,30 @@ mod tests {
 
     fn linux_adapter(root: &Path) -> PlatformAdapter {
         PlatformAdapter::Linux {
-            registration_path: root.join("data/registration.json"),
-            service_path: root.join("config/qgh-schedule.service"),
-            timer_path: root.join("config/qgh-schedule.timer"),
+            service_path: root.join("config/systemd/user/qgh-schedule.service"),
+            timer_path: root.join("config/systemd/user/qgh-schedule.timer"),
         }
     }
 
     fn macos_adapter(root: &Path) -> PlatformAdapter {
         PlatformAdapter::Macos {
-            registration_path: root.join("data/registration.json"),
-            plist_path: root.join("Library/LaunchAgents/qgh-schedule.plist"),
-            stdout_path: root.join("cache/stdout.log"),
-            stderr_path: root.join("cache/stderr.log"),
+            plist_path: root
+                .join("Library/LaunchAgents")
+                .join(format!("{MACOS_LABEL}.plist")),
+            stdout_path: root.join("cache/qgh/schedule/stdout.log"),
+            stderr_path: root.join("cache/qgh/schedule/stderr.log"),
         }
     }
 
     fn prepared(adapter: &PlatformAdapter, marker: &str) -> PreparedSchedule {
+        prepared_with_identity(adapter, &test_identity_for_adapter(adapter), marker)
+    }
+
+    fn prepared_with_identity(
+        adapter: &PlatformAdapter,
+        identity: &ScheduleOwnerIdentity,
+        marker: &str,
+    ) -> PreparedSchedule {
         let artifacts = adapter
             .artifact_paths()
             .into_iter()
@@ -1557,18 +2625,37 @@ mod tests {
                 bytes: format!("{marker}-{}", path.logical_name).into_bytes(),
             })
             .collect::<Vec<_>>();
+        let (jitter_strategy, jitter_offset_seconds) = match adapter.kind() {
+            PlatformKind::MacosLaunchd => ("deterministic_minute_offset".to_string(), Some(0)),
+            PlatformKind::LinuxSystemdUser => ("systemd_fixed_random_delay".to_string(), None),
+        };
         PreparedSchedule {
             registration: ScheduleRegistration {
                 schema_version: REGISTRATION_SCHEMA.to_string(),
                 platform: adapter.kind(),
+                owner: identity.clone(),
+                manager: adapter.capture(),
                 profile_ids: vec!["work".to_string()],
                 interval: FIXED_INTERVAL.to_string(),
-                jitter_strategy: "systemd_fixed_random_delay".to_string(),
-                jitter_offset_seconds: None,
+                jitter_strategy,
+                jitter_offset_seconds,
                 jitter_max_seconds: JITTER_WINDOW_SECONDS,
                 artifact_hash: artifact_bundle_hash(&artifacts),
             },
             artifacts,
+        }
+    }
+
+    fn legacy_from_registration(registration: &ScheduleRegistration) -> LegacyScheduleRegistration {
+        LegacyScheduleRegistration {
+            schema_version: LEGACY_REGISTRATION_SCHEMA.to_string(),
+            platform: registration.platform,
+            profile_ids: registration.profile_ids.clone(),
+            interval: registration.interval.clone(),
+            jitter_strategy: registration.jitter_strategy.clone(),
+            jitter_offset_seconds: registration.jitter_offset_seconds,
+            jitter_max_seconds: registration.jitter_max_seconds,
+            artifact_hash: registration.artifact_hash.clone(),
         }
     }
 
@@ -1591,6 +2678,7 @@ mod tests {
         assert!(rendered.contains("<string>/opt/homebrew/bin/qgh</string>"));
         assert!(rendered.contains("<string>schedule</string>"));
         assert!(rendered.contains("<string>run</string>"));
+        assert!(rendered.contains("<string>--manager-invoked</string>"));
         assert!(rendered.contains("<key>StartCalendarInterval</key>"));
         assert!(rendered.contains("<integer>12</integer>"));
         assert!(rendered.contains("<key>RunAtLoad</key>"));
@@ -1599,6 +2687,27 @@ mod tests {
         assert!(!rendered.contains("/bin/sh"));
         assert!(!rendered.contains("GH_TOKEN"));
         assert!(!rendered.contains("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn macos_artifact_rejects_xml_forbidden_control_characters() {
+        let environment = BTreeMap::from([
+            ("HOME".to_string(), "/Users/test\u{1}".to_string()),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ]);
+
+        let error = render_macos_launch_agent(
+            &["work".to_string()],
+            Path::new("/opt/homebrew/bin/qgh"),
+            &environment,
+            Path::new("/tmp/qgh-out"),
+            Path::new("/tmp/qgh-err"),
+            12 * 60,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "schedule.environment_invalid");
+        assert_eq!(error.exit_code, 2);
     }
 
     #[test]
@@ -1617,7 +2726,7 @@ mod tests {
         assert!(service.contains("Type=oneshot"));
         assert!(service.contains("UMask=0077"));
         assert!(service
-            .contains("ExecStart=\"/home/test/bin/qgh\" \"schedule\" \"run\" \"--json\" \"work\""));
+            .contains("ExecStart=\"/home/test/bin/qgh\" \"schedule\" \"run\" \"--json\" \"--manager-invoked\" \"work\""));
         assert!(!service.contains("/bin/sh"));
         assert!(timer.contains("Persistent=true"));
         assert!(timer.contains("RandomizedDelaySec=15m"));
@@ -1625,20 +2734,20 @@ mod tests {
     }
 
     #[test]
-    fn systemd_artifact_escapes_dollar_expansion() {
+    fn systemd_artifact_uses_directive_specific_dollar_and_percent_escaping() {
         let environment = BTreeMap::from([
-            ("HOME".to_string(), "/home/$USER".to_string()),
-            ("PATH".to_string(), "$PATH:/usr/bin".to_string()),
+            ("HOME".to_string(), "/home/$USER/%n".to_string()),
+            ("PATH".to_string(), "$PATH:/usr/bin/%n".to_string()),
         ]);
         let service = render_systemd_service(
             &["work".to_string()],
-            Path::new("/home/$USER/bin/qgh"),
+            Path::new("/home/$USER/%n/bin/qgh"),
             &environment,
         )
         .unwrap();
-        assert!(service.contains("\"/home/$$USER/bin/qgh\""));
-        assert!(service.contains("\"HOME=/home/$$USER\""));
-        assert!(service.contains("\"PATH=$$PATH:/usr/bin\""));
+        assert!(service.contains("\"/home/$$USER/%%n/bin/qgh\""));
+        assert!(service.contains("\"HOME=/home/$USER/%%n\""));
+        assert!(service.contains("\"PATH=$PATH:/usr/bin/%%n\""));
     }
 
     #[test]
@@ -1661,16 +2770,23 @@ mod tests {
         assert_eq!(reconcile_stop(&adapter, &runner).unwrap(), "removed");
         let calls_after_stop = runner.calls.borrow().len();
         assert_eq!(reconcile_stop(&adapter, &runner).unwrap(), "unchanged");
-        assert_eq!(runner.calls.borrow().len(), calls_after_stop);
+        assert_eq!(runner.calls.borrow().len(), calls_after_stop + 1);
         let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 7);
-        assert_eq!(calls[0], ["--user", "daemon-reload"]);
-        assert_eq!(calls[1], ["--user", "enable", "--now", SYSTEMD_TIMER]);
-        assert_eq!(calls[2], ["--user", "is-enabled", "--quiet", SYSTEMD_TIMER]);
-        assert_eq!(calls[3], ["--user", "is-active", "--quiet", SYSTEMD_TIMER]);
-        assert_eq!(calls[4], ["--user", "disable", "--now", SYSTEMD_TIMER]);
-        assert_eq!(calls[5], ["--user", "stop", SYSTEMD_SERVICE]);
-        assert_eq!(calls[6], ["--user", "daemon-reload"]);
+        assert_eq!(calls.len(), 11);
+        assert_eq!(calls[0], ["--user", "is-enabled", "--quiet", SYSTEMD_TIMER]);
+        assert_eq!(calls[1], ["--user", "daemon-reload"]);
+        assert_eq!(calls[2], ["--user", "enable", "--now", SYSTEMD_TIMER]);
+        assert_eq!(calls[3], ["--user", "is-enabled", "--quiet", SYSTEMD_TIMER]);
+        assert_eq!(calls[4], ["--user", "is-active", "--quiet", SYSTEMD_TIMER]);
+        assert_eq!(calls[5], ["--user", "is-enabled", "--quiet", SYSTEMD_TIMER]);
+        assert_eq!(calls[6], ["--user", "is-active", "--quiet", SYSTEMD_TIMER]);
+        assert_eq!(calls[7], ["--user", "disable", "--now", SYSTEMD_TIMER]);
+        assert_eq!(calls[8], ["--user", "stop", SYSTEMD_SERVICE]);
+        assert_eq!(calls[9], ["--user", "daemon-reload"]);
+        assert_eq!(
+            calls[10],
+            ["--user", "is-enabled", "--quiet", SYSTEMD_TIMER]
+        );
     }
 
     #[test]
@@ -1715,6 +2831,412 @@ mod tests {
         assert!(is_private_file(&path));
     }
 
+    fn xdg_linux_adapter(root: &Path, name: &str) -> PlatformAdapter {
+        PlatformAdapter::Linux {
+            service_path: root.join(name).join("systemd/user").join(SYSTEMD_SERVICE),
+            timer_path: root.join(name).join("systemd/user").join(SYSTEMD_TIMER),
+        }
+    }
+
+    fn xdg_identity(root: &Path, name: &str) -> ScheduleOwnerIdentity {
+        ScheduleOwnerIdentity {
+            uid: "1000".to_string(),
+            home: root.join("home"),
+            manager_identity: manager_identity(PlatformKind::LinuxSystemdUser).to_string(),
+            captured_environment: BTreeMap::from([(
+                "XDG_CONFIG_HOME".to_string(),
+                root.join(name).display().to_string(),
+            )]),
+        }
+    }
+
+    #[test]
+    fn owner_record_environment_keeps_only_the_managed_path_root() {
+        let environment = BTreeMap::from([
+            ("HOME".to_string(), "/home/user".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            (
+                "GH_CONFIG_DIR".to_string(),
+                "/home/user/.config/gh".to_string(),
+            ),
+            ("XDG_CONFIG_HOME".to_string(), "/config".to_string()),
+            ("XDG_DATA_HOME".to_string(), "/data".to_string()),
+            ("XDG_CACHE_HOME".to_string(), "/cache".to_string()),
+        ]);
+
+        assert_eq!(
+            owner_path_environment(PlatformKind::LinuxSystemdUser, &environment),
+            BTreeMap::from([("XDG_CONFIG_HOME".to_string(), "/config".to_string())])
+        );
+        assert_eq!(
+            owner_path_environment(PlatformKind::MacosLaunchd, &environment),
+            BTreeMap::from([("XDG_CACHE_HOME".to_string(), "/cache".to_string())])
+        );
+    }
+
+    #[test]
+    fn xdg_b_resolves_and_stops_artifacts_owned_by_xdg_a() {
+        let root = TestDirectory::new("xdg-stop-recorded-owner");
+        let adapter_a = xdg_linux_adapter(&root.0, "config-a");
+        let adapter_b = xdg_linux_adapter(&root.0, "config-b");
+        let identity_a = xdg_identity(&root.0, "config-a");
+        let identity_b = xdg_identity(&root.0, "config-b");
+        let owner_paths = LifecycleOwnerPaths::for_identity(&identity_a);
+        assert_eq!(
+            owner_paths.lock,
+            LifecycleOwnerPaths::for_identity(&identity_b).lock
+        );
+        let desired = prepared_with_identity(&adapter_a, &identity_a, "a");
+        let runner = FakeRunner::default();
+
+        reconcile_start_owned(&owner_paths, &adapter_a, &desired, None, &runner).unwrap();
+        let existing = resolve_existing_schedule(&owner_paths, &adapter_b, &identity_b)
+            .unwrap()
+            .expect("fixed owner record");
+        assert_eq!(
+            existing.adapter.artifact_paths(),
+            adapter_a.artifact_paths()
+        );
+        assert!(snapshot_artifacts(&existing.adapter.artifact_paths())
+            .unwrap()
+            .iter()
+            .all(|snapshot| snapshot.bytes.is_some()));
+
+        assert_eq!(
+            reconcile_stop_owned(&owner_paths, &existing.adapter, Some(&existing), &runner,)
+                .unwrap(),
+            "removed"
+        );
+        assert!(!owner_paths.registration.exists());
+        assert!(adapter_a
+            .artifact_paths()
+            .iter()
+            .all(|artifact| !artifact.path.exists()));
+        assert!(adapter_b
+            .artifact_paths()
+            .iter()
+            .all(|artifact| !artifact.path.exists()));
+        assert!(!runner.active.get());
+        assert!(runner
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.iter().any(|argument| argument == "disable")));
+    }
+
+    #[test]
+    fn xdg_update_moves_artifacts_and_publishes_new_owner_last() {
+        let root = TestDirectory::new("xdg-update");
+        let adapter_a = xdg_linux_adapter(&root.0, "config-a");
+        let adapter_b = xdg_linux_adapter(&root.0, "config-b");
+        let identity_a = xdg_identity(&root.0, "config-a");
+        let identity_b = xdg_identity(&root.0, "config-b");
+        let owner_paths = LifecycleOwnerPaths::for_identity(&identity_a);
+        let first = prepared_with_identity(&adapter_a, &identity_a, "a");
+        let second = prepared_with_identity(&adapter_b, &identity_b, "b");
+        let runner = FakeRunner::default();
+        reconcile_start_owned(&owner_paths, &adapter_a, &first, None, &runner).unwrap();
+        let existing = resolve_existing_schedule(&owner_paths, &adapter_b, &identity_b)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            reconcile_start_owned(&owner_paths, &adapter_b, &second, Some(&existing), &runner,)
+                .unwrap(),
+            "updated"
+        );
+        assert!(adapter_a
+            .artifact_paths()
+            .iter()
+            .all(|artifact| !artifact.path.exists()));
+        assert!(adapter_b
+            .artifact_paths()
+            .iter()
+            .all(|artifact| artifact.path.exists()));
+        let registration =
+            parse_registration(&fs::read(&owner_paths.registration).unwrap()).unwrap();
+        assert_eq!(registration.manager, adapter_b.capture());
+    }
+
+    #[test]
+    fn xdg_update_rejects_a_foreign_destination_without_touching_a() {
+        let root = TestDirectory::new("xdg-update-destination-collision");
+        let adapter_a = xdg_linux_adapter(&root.0, "config-a");
+        let adapter_b = xdg_linux_adapter(&root.0, "config-b");
+        let identity_a = xdg_identity(&root.0, "config-a");
+        let identity_b = xdg_identity(&root.0, "config-b");
+        let owner_paths = LifecycleOwnerPaths::for_identity(&identity_a);
+        let first = prepared_with_identity(&adapter_a, &identity_a, "a");
+        let second = prepared_with_identity(&adapter_b, &identity_b, "b");
+        let runner = FakeRunner::default();
+        reconcile_start_owned(&owner_paths, &adapter_a, &first, None, &runner).unwrap();
+        let before_owner = fs::read(&owner_paths.registration).unwrap();
+        let before_a = snapshot_artifacts(&adapter_a.artifact_paths()).unwrap();
+        let foreign_path = &adapter_b.artifact_paths()[0].path;
+        write_atomic_private(foreign_path, b"foreign-owner").unwrap();
+        let calls_before = runner.calls.borrow().len();
+        let existing = resolve_existing_schedule(&owner_paths, &adapter_b, &identity_b)
+            .unwrap()
+            .unwrap();
+
+        let error =
+            reconcile_start_owned(&owner_paths, &adapter_b, &second, Some(&existing), &runner)
+                .unwrap_err();
+        assert_eq!(error.code, "schedule.ownership_ambiguous");
+        assert_eq!(fs::read(&owner_paths.registration).unwrap(), before_owner);
+        assert_eq!(fs::read(foreign_path).unwrap(), b"foreign-owner");
+        assert_eq!(
+            snapshot_artifacts(&adapter_a.artifact_paths())
+                .unwrap()
+                .iter()
+                .map(|snapshot| snapshot.bytes.clone())
+                .collect::<Vec<_>>(),
+            before_a
+                .iter()
+                .map(|snapshot| snapshot.bytes.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(runner.calls.borrow().len(), calls_before);
+        assert!(runner.active.get());
+    }
+
+    #[test]
+    fn xdg_activation_failure_restores_full_a_state() {
+        let root = TestDirectory::new("xdg-update-rollback");
+        let adapter_a = xdg_linux_adapter(&root.0, "config-a");
+        let adapter_b = xdg_linux_adapter(&root.0, "config-b");
+        let identity_a = xdg_identity(&root.0, "config-a");
+        let identity_b = xdg_identity(&root.0, "config-b");
+        let owner_paths = LifecycleOwnerPaths::for_identity(&identity_a);
+        let first = prepared_with_identity(&adapter_a, &identity_a, "a");
+        let second = prepared_with_identity(&adapter_b, &identity_b, "b");
+        let runner = FakeRunner::default();
+        reconcile_start_owned(&owner_paths, &adapter_a, &first, None, &runner).unwrap();
+        let before_owner = fs::read(&owner_paths.registration).unwrap();
+        let before_a = snapshot_artifacts(&adapter_a.artifact_paths()).unwrap();
+        let existing = resolve_existing_schedule(&owner_paths, &adapter_b, &identity_b)
+            .unwrap()
+            .unwrap();
+        runner.fail_enable_once.set(true);
+
+        let error =
+            reconcile_start_owned(&owner_paths, &adapter_b, &second, Some(&existing), &runner)
+                .unwrap_err();
+        assert_eq!(error.code, "schedule.manager_failed");
+        assert_eq!(fs::read(&owner_paths.registration).unwrap(), before_owner);
+        assert_eq!(
+            snapshot_artifacts(&adapter_a.artifact_paths())
+                .unwrap()
+                .iter()
+                .map(|snapshot| snapshot.bytes.clone())
+                .collect::<Vec<_>>(),
+            before_a
+                .iter()
+                .map(|snapshot| snapshot.bytes.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(adapter_b
+            .artifact_paths()
+            .iter()
+            .all(|artifact| !artifact.path.exists()));
+        assert!(runner.active.get());
+    }
+
+    #[test]
+    fn xdg_variants_share_one_home_and_uid_anchored_lifecycle_lock() {
+        let root = TestDirectory::new("xdg-shared-lock");
+        let identity_a = xdg_identity(&root.0, "config-a");
+        let identity_b = xdg_identity(&root.0, "config-b");
+        let paths_a = LifecycleOwnerPaths::for_identity(&identity_a);
+        let paths_b = LifecycleOwnerPaths::for_identity(&identity_b);
+        assert_eq!(paths_a.lock, paths_b.lock);
+
+        let owner = FileLease::acquire_schedule_lifecycle(&paths_a.lock).unwrap();
+        let error = FileLease::acquire_schedule_lifecycle(&paths_b.lock).unwrap_err();
+        assert_eq!(error.code, "schedule.busy");
+        drop(owner);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_private_fixed_owner_record_is_not_trusted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDirectory::new("owner-permissions");
+        let adapter = xdg_linux_adapter(&root.0, "config-a");
+        let identity = xdg_identity(&root.0, "config-a");
+        let owner_paths = LifecycleOwnerPaths::for_identity(&identity);
+        let desired = prepared_with_identity(&adapter, &identity, "a");
+        let runner = FakeRunner::default();
+        reconcile_start_owned(&owner_paths, &adapter, &desired, None, &runner).unwrap();
+        fs::set_permissions(&owner_paths.registration, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = resolve_existing_schedule(&owner_paths, &adapter, &identity).unwrap_err();
+        assert_eq!(error.code, "schedule.ownership_ambiguous");
+        assert!(runner.active.get());
+    }
+
+    #[test]
+    fn ambiguous_legacy_ownership_fails_without_mutation() {
+        let root = TestDirectory::new("legacy-ambiguous");
+        let adapter_a = xdg_linux_adapter(&root.0, "config-a");
+        let adapter_b = xdg_linux_adapter(&root.0, "config-b");
+        let identity = xdg_identity(&root.0, "config-a");
+        let prepared_a = prepared_with_identity(&adapter_a, &identity, "same");
+        let prepared_b = prepared_with_identity(&adapter_b, &identity, "same");
+        write_artifacts(&prepared_a.artifacts).unwrap();
+        write_artifacts(&prepared_b.artifacts).unwrap();
+        let legacy_path = root.0.join("legacy/registration.json");
+        let legacy = legacy_from_registration(&prepared_a.registration);
+        write_atomic_private(&legacy_path, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let before_a = snapshot_artifacts(&adapter_a.artifact_paths()).unwrap();
+        let before_b = snapshot_artifacts(&adapter_b.artifact_paths()).unwrap();
+        let before_legacy = fs::read(&legacy_path).unwrap();
+        let runner = FakeRunner::default();
+
+        let error = prove_legacy_owner(
+            vec![(legacy_path.clone(), legacy)],
+            vec![adapter_a.clone(), adapter_b.clone()],
+            &identity,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "schedule.ownership_ambiguous");
+        assert_eq!(fs::read(&legacy_path).unwrap(), before_legacy);
+        assert_eq!(
+            snapshot_artifacts(&adapter_a.artifact_paths())
+                .unwrap()
+                .iter()
+                .map(|s| s.bytes.clone())
+                .collect::<Vec<_>>(),
+            before_a.iter().map(|s| s.bytes.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            snapshot_artifacts(&adapter_b.artifact_paths())
+                .unwrap()
+                .iter()
+                .map(|s| s.bytes.clone())
+                .collect::<Vec<_>>(),
+            before_b.iter().map(|s| s.bytes.clone()).collect::<Vec<_>>()
+        );
+        assert!(runner.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn uniquely_proven_legacy_owner_migrates_to_v2_on_update() {
+        let root = TestDirectory::new("legacy-unique");
+        let adapter = xdg_linux_adapter(&root.0, "config-a");
+        let identity = xdg_identity(&root.0, "config-a");
+        let desired = prepared_with_identity(&adapter, &identity, "same");
+        write_artifacts(&desired.artifacts).unwrap();
+        let legacy_path = root.0.join("legacy-data/qgh/schedule/registration.json");
+        let legacy = legacy_from_registration(&desired.registration);
+        write_atomic_private(&legacy_path, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let existing = prove_legacy_owner(
+            vec![(legacy_path.clone(), legacy)],
+            vec![adapter.clone()],
+            &identity,
+        )
+        .unwrap()
+        .expect("unique legacy owner");
+        let owner_paths = LifecycleOwnerPaths::for_identity(&identity);
+        let runner = FakeRunner::default();
+
+        assert_eq!(
+            reconcile_start_owned(&owner_paths, &adapter, &desired, Some(&existing), &runner,)
+                .unwrap(),
+            "updated"
+        );
+        assert!(!legacy_path.exists());
+        let registration =
+            parse_registration(&fs::read(owner_paths.registration).unwrap()).unwrap();
+        assert_eq!(registration.schema_version, REGISTRATION_SCHEMA);
+        assert_eq!(registration.manager, adapter.capture());
+    }
+
+    #[test]
+    fn desired_adapter_must_match_captured_xdg_environment() {
+        let root = TestDirectory::new("desired-path-validation");
+        let adapter = xdg_linux_adapter(&root.0, "config-a");
+        let mismatched_identity = xdg_identity(&root.0, "config-b");
+
+        let error = adapter
+            .prepare(
+                &mismatched_identity,
+                &["work".to_string()],
+                FIXED_INTERVAL,
+                Path::new("/usr/local/bin/qgh"),
+                &BTreeMap::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "schedule.environment_invalid");
+        assert!(adapter
+            .artifact_paths()
+            .iter()
+            .all(|artifact| !artifact.path.exists()));
+    }
+
+    #[test]
+    fn relative_xdg_owner_environment_is_rejected_before_lifecycle_work() {
+        let root = TestDirectory::new("relative-xdg");
+        let captured =
+            BTreeMap::from([("XDG_CONFIG_HOME".to_string(), "relative/config".to_string())]);
+
+        let error = validate_owner_environment(&root.0.join("home"), &captured).unwrap_err();
+        assert_eq!(error.code, "schedule.environment_invalid");
+    }
+
+    #[test]
+    fn active_fixed_manager_without_owner_record_fails_closed() {
+        let root = TestDirectory::new("active-without-owner");
+        let adapter = xdg_linux_adapter(&root.0, "config-a");
+        let identity = xdg_identity(&root.0, "config-a");
+        let owner_paths = LifecycleOwnerPaths::for_identity(&identity);
+        let desired = prepared_with_identity(&adapter, &identity, "a");
+        let runner = FakeRunner::default();
+        runner.active.set(true);
+
+        let error =
+            reconcile_start_owned(&owner_paths, &adapter, &desired, None, &runner).unwrap_err();
+        assert_eq!(error.code, "schedule.ownership_ambiguous");
+        assert!(!owner_paths.registration.exists());
+        assert!(adapter
+            .artifact_paths()
+            .iter()
+            .all(|artifact| !artifact.path.exists()));
+        assert!(runner.active.get());
+
+        let stop_error = reconcile_stop_owned(&owner_paths, &adapter, None, &runner).unwrap_err();
+        assert_eq!(stop_error.code, "schedule.ownership_ambiguous");
+        assert!(runner.active.get());
+        assert!(runner.calls.borrow().iter().all(|call| {
+            !call
+                .iter()
+                .any(|argument| argument == "disable" || argument == "bootout")
+        }));
+    }
+
+    #[test]
+    fn indeterminate_macos_inspection_fails_closed_before_ownerless_start() {
+        let root = TestDirectory::new("macos-inspect-failure");
+        let adapter = macos_adapter(&root.0);
+        let identity = test_identity_for_adapter(&adapter);
+        let owner_paths = test_owner_paths(&adapter);
+        let desired = prepared_with_identity(&adapter, &identity, "a");
+        let runner = FakeRunner::default();
+        runner.fail_inspect_once.set(true);
+
+        let error =
+            reconcile_start_owned(&owner_paths, &adapter, &desired, None, &runner).unwrap_err();
+        assert_eq!(error.code, "schedule.manager_failed");
+        assert!(!owner_paths.registration.exists());
+        assert!(adapter
+            .managed_file_paths()
+            .iter()
+            .all(|path| !path.exists()));
+        assert_eq!(runner.calls.borrow().len(), 1);
+        assert_eq!(runner.calls.borrow()[0][0], "print");
+    }
+
     #[test]
     fn macos_lifecycle_installs_reloads_and_uninstalls_one_launch_agent() {
         let root = TestDirectory::new("macos-lifecycle");
@@ -1725,6 +3247,7 @@ mod tests {
         ]);
         let first = adapter
             .prepare(
+                &test_identity_for_adapter(&adapter),
                 &["work".to_string()],
                 FIXED_INTERVAL,
                 Path::new("/usr/local/bin/qgh"),
@@ -1733,6 +3256,7 @@ mod tests {
             .unwrap();
         let updated = adapter
             .prepare(
+                &test_identity_for_adapter(&adapter),
                 &["work".to_string(), "personal".to_string()],
                 FIXED_INTERVAL,
                 Path::new("/usr/local/bin/qgh"),
@@ -1752,24 +3276,153 @@ mod tests {
         assert_eq!(reconcile_stop(&adapter, &runner).unwrap(), "removed");
 
         let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 4);
-        assert_eq!(calls[0][0], "bootstrap");
-        assert_eq!(calls[1][0], "bootout");
-        assert_eq!(calls[2][0], "bootstrap");
+        assert_eq!(calls.len(), 7);
+        assert_eq!(calls[0][0], "print");
+        assert_eq!(calls[1][0], "bootstrap");
+        assert_eq!(calls[2][0], "print");
         assert_eq!(calls[3][0], "bootout");
-        assert!(calls[0]
+        assert_eq!(calls[4][0], "bootstrap");
+        assert_eq!(calls[5][0], "print");
+        assert_eq!(calls[6][0], "bootout");
+        assert!(calls[1]
             .last()
-            .is_some_and(|path| path.ends_with("qgh-schedule.plist")));
-        assert!(calls[2]
+            .is_some_and(|path| path.ends_with(&format!("{MACOS_LABEL}.plist"))));
+        assert!(calls[4]
             .last()
-            .is_some_and(|path| path.ends_with("qgh-schedule.plist")));
-        assert!(calls[1][1].ends_with(MACOS_LABEL));
+            .is_some_and(|path| path.ends_with(&format!("{MACOS_LABEL}.plist"))));
         assert!(calls[3][1].ends_with(MACOS_LABEL));
+        assert!(calls[6][1].ends_with(MACOS_LABEL));
         assert!(!adapter.registration_path().exists());
         assert!(adapter
             .artifact_paths()
             .iter()
             .all(|artifact| !artifact.path.exists()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_runtime_logs_must_exist_and_be_private_before_ready() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDirectory::new("macos-runtime-integrity");
+        let adapter = macos_adapter(&root.0);
+        let desired = prepared(&adapter, "v1");
+        let runner = FakeRunner::default();
+        reconcile_start(&adapter, &desired, &runner).unwrap();
+        let registration_path = adapter.registration_path();
+        let runtime_paths = adapter.runtime_paths();
+
+        fs::set_permissions(&runtime_paths[0], fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            inspect_schedule_state(&adapter, Some(&desired.registration), &registration_path,)
+                .unwrap(),
+            ("drifted", "changed")
+        );
+        assert_eq!(
+            reconcile_start(&adapter, &desired, &runner).unwrap(),
+            "updated"
+        );
+        assert!(is_private_file(&runtime_paths[0]));
+
+        fs::remove_file(&runtime_paths[1]).unwrap();
+        assert_eq!(
+            inspect_schedule_state(&adapter, Some(&desired.registration), &registration_path,)
+                .unwrap(),
+            ("drifted", "missing")
+        );
+        assert_eq!(
+            reconcile_start(&adapter, &desired, &runner).unwrap(),
+            "updated"
+        );
+        assert!(runtime_paths[1].is_file());
+        assert!(is_private_file(&runtime_paths[1]));
+
+        let symlink_target = root.0.join("foreign-log-target");
+        fs::write(&symlink_target, b"foreign").unwrap();
+        let target_mode_before = fs::metadata(&symlink_target).unwrap().permissions().mode();
+        fs::remove_file(&runtime_paths[0]).unwrap();
+        std::os::unix::fs::symlink(&symlink_target, &runtime_paths[0]).unwrap();
+        let calls_before = runner.calls.borrow().len();
+        let error = reconcile_start(&adapter, &desired, &runner).unwrap_err();
+        assert_eq!(error.code, "schedule.ownership_ambiguous");
+        assert!(fs::symlink_metadata(&runtime_paths[0])
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&symlink_target).unwrap(), b"foreign");
+        assert_eq!(
+            fs::metadata(&symlink_target).unwrap().permissions().mode(),
+            target_mode_before
+        );
+        assert_eq!(runner.calls.borrow().len(), calls_before);
+        assert!(runner.active.get());
+    }
+
+    #[test]
+    fn failed_macos_cache_move_removes_new_logs_and_allows_retry() {
+        let root = TestDirectory::new("macos-cache-move-rollback");
+        let make_adapter = |cache_name: &str| PlatformAdapter::Macos {
+            plist_path: root
+                .0
+                .join("home/Library/LaunchAgents")
+                .join(format!("{MACOS_LABEL}.plist")),
+            stdout_path: root.0.join(cache_name).join("qgh/schedule/stdout.log"),
+            stderr_path: root.0.join(cache_name).join("qgh/schedule/stderr.log"),
+        };
+        let make_identity = |cache_name: &str| ScheduleOwnerIdentity {
+            uid: "1000".to_string(),
+            home: root.0.join("home"),
+            manager_identity: manager_identity(PlatformKind::MacosLaunchd).to_string(),
+            captured_environment: BTreeMap::from([(
+                "XDG_CACHE_HOME".to_string(),
+                root.0.join(cache_name).display().to_string(),
+            )]),
+        };
+        let adapter_a = make_adapter("cache-a");
+        let adapter_b = make_adapter("cache-b");
+        let identity_a = make_identity("cache-a");
+        let identity_b = make_identity("cache-b");
+        let owner_paths = LifecycleOwnerPaths::for_identity(&identity_a);
+        let first = prepared_with_identity(&adapter_a, &identity_a, "a");
+        let second = prepared_with_identity(&adapter_b, &identity_b, "b");
+        let runner = FakeRunner::default();
+        reconcile_start_owned(&owner_paths, &adapter_a, &first, None, &runner).unwrap();
+        let before_owner = fs::read(&owner_paths.registration).unwrap();
+        let before_a = snapshot_artifacts(&adapter_a.artifact_paths()).unwrap();
+        let existing = resolve_existing_schedule(&owner_paths, &adapter_b, &identity_b)
+            .unwrap()
+            .unwrap();
+        runner.fail_bootstrap_once.set(true);
+
+        let error =
+            reconcile_start_owned(&owner_paths, &adapter_b, &second, Some(&existing), &runner)
+                .unwrap_err();
+        assert_eq!(error.code, "schedule.manager_failed");
+        assert_eq!(fs::read(&owner_paths.registration).unwrap(), before_owner);
+        assert_eq!(
+            snapshot_artifacts(&adapter_a.artifact_paths())
+                .unwrap()
+                .iter()
+                .map(|snapshot| snapshot.bytes.clone())
+                .collect::<Vec<_>>(),
+            before_a
+                .iter()
+                .map(|snapshot| snapshot.bytes.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(adapter_a.runtime_files_ready());
+        assert!(adapter_b.runtime_paths().iter().all(|path| !path.exists()));
+        assert!(runner.active.get());
+
+        let existing = resolve_existing_schedule(&owner_paths, &adapter_b, &identity_b)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reconcile_start_owned(&owner_paths, &adapter_b, &second, Some(&existing), &runner,)
+                .unwrap(),
+            "updated"
+        );
+        assert!(adapter_b.runtime_files_ready());
     }
 
     #[test]
@@ -1842,6 +3495,49 @@ mod tests {
     }
 
     #[test]
+    fn failed_stop_preserves_a_previously_inactive_linux_timer() {
+        let root = TestDirectory::new("inactive-stop-rollback");
+        let adapter = linux_adapter(&root.0);
+        let desired = prepared(&adapter, "v1");
+        let runner = FakeRunner::default();
+        reconcile_start(&adapter, &desired, &runner).unwrap();
+        runner.calls.borrow_mut().clear();
+        runner.inactive_check_once.set(true);
+        runner.fail_stop_once.set(true);
+
+        let error = reconcile_stop(&adapter, &runner).unwrap_err();
+        assert_eq!(error.code, "schedule.manager_failed");
+        let calls = runner.calls.borrow();
+        assert_eq!(calls[0], ["--user", "is-enabled", "--quiet", SYSTEMD_TIMER]);
+        assert!(calls
+            .iter()
+            .all(|call| !call.iter().any(|arg| arg == "enable")));
+    }
+
+    #[test]
+    fn failed_update_restores_a_previously_inactive_linux_timer() {
+        let root = TestDirectory::new("inactive-update-rollback");
+        let adapter = linux_adapter(&root.0);
+        let first = prepared(&adapter, "v1");
+        let second = prepared(&adapter, "v2");
+        let runner = FakeRunner::default();
+        reconcile_start(&adapter, &first, &runner).unwrap();
+        runner.calls.borrow_mut().clear();
+        runner.inactive_check_once.set(true);
+        runner.fail_enable_once.set(true);
+
+        let error = reconcile_start(&adapter, &second, &runner).unwrap_err();
+        assert_eq!(error.code, "schedule.manager_failed");
+        let calls = runner.calls.borrow();
+        let enable_attempts = calls
+            .iter()
+            .filter(|call| call.iter().any(|argument| argument == "enable"))
+            .count();
+        assert_eq!(enable_attempts, 1, "rollback must not enable the old timer");
+        assert_eq!(calls.last().unwrap(), &["--user", "daemon-reload"]);
+    }
+
+    #[test]
     fn failed_linux_timer_disable_reenables_timer_and_preserves_local_state() {
         let root = TestDirectory::new("disable-timer-rollback");
         let adapter = linux_adapter(&root.0);
@@ -1899,18 +3595,79 @@ mod tests {
 
     #[test]
     fn registration_parser_rejects_unknown_fields() {
-        let bytes = br#"{
-            "schema_version":"qgh.schedule-registration.v1",
-            "platform":"linux_systemd_user",
-            "profile_ids":["work"],
-            "interval":"1h",
-            "jitter_strategy":"systemd_fixed_random_delay",
-            "jitter_offset_seconds":null,
-            "jitter_max_seconds":900,
-            "artifact_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "token":"must-not-be-accepted"
-        }"#;
-        let error = parse_registration(bytes).unwrap_err();
+        let root = TestDirectory::new("registration-unknown-field");
+        let adapter = linux_adapter(&root.0);
+        let mut value = serde_json::to_value(prepared(&adapter, "v1").registration).unwrap();
+        value["token"] = json!("must-not-be-accepted");
+        let error = parse_registration(&serde_json::to_vec(&value).unwrap()).unwrap_err();
         assert_eq!(error.code, "schedule.state_invalid");
+    }
+
+    #[test]
+    fn macos_exit_five_without_an_absence_message_is_not_treated_as_absent() {
+        let result = ManagerResult {
+            success: false,
+            status_code: Some(5),
+            stderr: "Input/output error".to_string(),
+        };
+
+        assert!(!manager_target_absent(PlatformKind::MacosLaunchd, &result));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn program_lookup_skips_a_non_executable_file_earlier_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDirectory::new("program-lookup");
+        let first = root.0.join("first");
+        let second = root.0.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let non_executable = first.join("gh");
+        let executable = second.join("gh");
+        fs::write(&non_executable, b"not executable").unwrap();
+        fs::write(&executable, b"executable").unwrap();
+        fs::set_permissions(&non_executable, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = env::join_paths([first, second]).unwrap();
+
+        assert_eq!(
+            find_program_in_path(&OsString::from("gh"), &path),
+            Some(executable)
+        );
+    }
+
+    #[test]
+    fn scheduled_gh_config_dir_requires_an_absolute_normalized_path() {
+        for invalid in ["relative/gh", "../gh", "/tmp/../gh"] {
+            let error = validate_scheduled_gh_config_dir(invalid).unwrap_err();
+            assert_eq!(error.code, "schedule.environment_invalid");
+        }
+        validate_scheduled_gh_config_dir("/Users/test/.config/gh").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn program_lookup_skips_an_executable_from_a_relative_path_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cwd = env::current_dir().unwrap();
+        let directory = cwd
+            .join("target")
+            .join(format!("qgh-relative-path-{}", now_run_id_suffix()));
+        let root = TestDirectory(directory.clone());
+        fs::create_dir_all(&root.0).unwrap();
+        let executable = root.0.join("gh");
+        fs::write(&executable, b"executable").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let relative = root.0.strip_prefix(&cwd).unwrap();
+        let path = env::join_paths([relative]).unwrap();
+
+        assert_eq!(find_program_in_path(OsStr::new("gh"), &path), None);
+        assert_eq!(
+            find_program_in_directories(OsStr::new("gh"), [root.0.clone()].into_iter()),
+            Some(executable)
+        );
     }
 }

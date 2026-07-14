@@ -42,7 +42,7 @@ qgh model install qwen3-embedding-0.6b
 qgh model install qwen3-reranker-0.6b
 ```
 
-Add `--json` when a `qgh.v1` machine-readable install result is required.
+Add `--json` when a `qgh.v2` machine-readable install result is required.
 
 The installer downloads the pinned model revision into a staging directory,
 verifies the complete artifact hash manifest, and atomically publishes it in

@@ -2,12 +2,19 @@
 
 ## Envelope
 
-Machine-readable CLI output uses one versioned `qgh.v1` envelope on stdout
+Machine-readable CLI output uses one versioned `qgh.v2` envelope on stdout
 when `--json` is passed. Without `--json`, successful CLI commands print
 human-readable summaries on stdout. Diagnostics and human-readable failures go
 to stderr.
 
-The product contract is CLI-first. CLI args, the `qgh.v1` JSON envelope,
+`qgh.v2` replaces `qgh.v1` because the closed `sync` and `status` payloads gained
+scheduler/rate-budget fields and `schedule` added bounded policy and lifecycle
+outputs. qgh emits only `qgh.v2`; strict `qgh.v1` consumers must upgrade
+their envelope and command-payload schemas instead of silently accepting the
+new shape. Internal config, database, and schedule-registration schema versions
+are independent and are not changed by this envelope migration.
+
+The product contract is CLI-first. CLI args, the `qgh.v2` JSON envelope,
 released schema snapshots, and local SQLite/Tantivy retrieval behavior are the
 source of truth for new features. Agents can use `qgh query --json`, `qgh get
 --json`, and `qgh status --json` without MCP. MCP is a read-only thin adapter
@@ -59,10 +66,28 @@ The stable advisory lock is released by normal process exit or crash.
 `schedule` is CLI-only. `schedule run <PROFILE_ID>...` accepts only a unique,
 explicit profile list and emits one bounded pass with per-host and per-profile
 outcomes. It never discovers profiles, bootstraps a never-synced profile, or
-runs backfill, reconciliation, or model work. Host execution is sequential;
-unknown/partial/stale budget permits one attempt, usable budget preserves a
-20% reserve, each profile receives at most one attempt, and a pass starts at
-most eight remote syncs. A minimal persisted cursor rotates the next pass.
+runs backfill, reconciliation, or model work. Host execution is sequential and
+one shared scheduled gate is checked immediately before every GitHub HTTP send.
+Unknown/partial/stale core budget permits exactly one probe request; complete
+fresh core headers transition the same run to a known budget, while missing or
+partial headers defer all follow-ups. If the pass began unknown, learned
+headers may continue only that profile's request sequence; no second same-host
+profile starts in that pass. A known gate permits at most
+`remaining - ceil(limit * 20%)` additional sends and qgh starts no additional
+request after its latest observation reaches the reserve. This constrains qgh,
+not other clients sharing the quota, so it is not an absolute quota guarantee.
+Already committed page/cursor work remains durable, the interrupted sync is not
+marked successful, and same-host profiles are deferred. Each profile receives
+at most one sync attempt and a pass starts at most eight remote syncs. A minimal
+persisted cursor rotates the next pass. Immediately before remote work, qgh
+atomically writes a content-free per-host guard. A started request clears it
+only after a completed profile sync with usable fresh core headroom; active
+selected-profile backoff also retains or promotes the guard. Its deadline uses
+the latest applicable host reset or backoff, capped at 24 hours, and falls back
+to the five-minute observation TTL when neither is usable. Later schedule
+passes, including an explicit subset with another same-host profile, report
+`host_cooldown` and start no request during the guard. The stored rate-header
+observation is not replaced with a guessed decrement.
 
 `schedule start <PROFILE_ID>...`, `schedule status`, and `schedule stop` manage
 one user-scoped macOS LaunchAgent or Linux systemd timer. Lifecycle operations
@@ -87,7 +112,7 @@ working directory.
 
 Success:
 
-- `schema_version`: `qgh.v1`
+- `schema_version`: `qgh.v2`
 - `ok`: `true`
 - `data`: command-specific payload
 - `warnings`: array of `{code, severity, message, action?}` objects. Optional
@@ -99,7 +124,7 @@ Success:
 
 Failure:
 
-- `schema_version`: `qgh.v1`
+- `schema_version`: `qgh.v2`
 - `ok`: `false`
 - `error`: structured error object
 - `warnings`: array

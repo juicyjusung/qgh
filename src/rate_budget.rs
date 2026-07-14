@@ -56,6 +56,23 @@ pub(crate) fn is_fresh(observation: &RateBudgetObservation) -> bool {
     state(observation) == "fresh"
 }
 
+pub(crate) fn is_fresh_core(observation: &RateBudgetObservation) -> bool {
+    observation.resource.as_deref() == Some("core") && is_fresh(observation)
+}
+
+pub(crate) fn scheduled_additional_requests(observation: &RateBudgetObservation) -> Option<i64> {
+    if !is_fresh_core(observation) {
+        return None;
+    }
+    let limit = observation.limit?;
+    let remaining = observation.remaining?;
+    if limit < 0 || remaining < 0 || remaining > limit {
+        return Some(0);
+    }
+    let reserve = limit / 5 + i64::from(limit % 5 != 0);
+    Some(remaining.saturating_sub(reserve).max(0))
+}
+
 fn view(observation: &RateBudgetObservation) -> Value {
     let state = state(observation);
     json!({
@@ -156,5 +173,64 @@ mod tests {
 
         assert_eq!(state(&observation), "stale");
         assert!(!is_fresh(&observation));
+    }
+
+    #[test]
+    fn remaining_above_limit_is_not_usable_scheduled_core_evidence() {
+        let observation = RateBudgetObservation {
+            host: "github.com".to_string(),
+            resource: Some("core".to_string()),
+            limit: Some(10),
+            remaining: Some(11),
+            reset_at: Some(
+                (Utc::now() + chrono::Duration::hours(1))
+                    .to_rfc3339_opts(SecondsFormat::Secs, true),
+            ),
+            observed_at: now_rfc3339(),
+            best_effort: true,
+        };
+
+        assert!(is_fresh(&observation));
+        assert!(is_fresh_core(&observation));
+        assert_eq!(scheduled_additional_requests(&observation), Some(0));
+    }
+
+    #[test]
+    fn zero_limit_is_usable_as_an_exhausted_scheduled_core_budget() {
+        let observation = RateBudgetObservation {
+            host: "github.com".to_string(),
+            resource: Some("core".to_string()),
+            limit: Some(0),
+            remaining: Some(0),
+            reset_at: Some(
+                (Utc::now() + chrono::Duration::hours(1))
+                    .to_rfc3339_opts(SecondsFormat::Secs, true),
+            ),
+            observed_at: now_rfc3339(),
+            best_effort: true,
+        };
+
+        assert!(is_fresh_core(&observation));
+        assert_eq!(scheduled_additional_requests(&observation), Some(0));
+    }
+
+    #[test]
+    fn scheduled_allowance_uses_ceil_twenty_percent_reserve() {
+        let mut observation = RateBudgetObservation {
+            host: "github.com".to_string(),
+            resource: Some("core".to_string()),
+            limit: Some(11),
+            remaining: Some(4),
+            reset_at: Some(
+                (Utc::now() + chrono::Duration::hours(1))
+                    .to_rfc3339_opts(SecondsFormat::Secs, true),
+            ),
+            observed_at: now_rfc3339(),
+            best_effort: true,
+        };
+
+        assert_eq!(scheduled_additional_requests(&observation), Some(1));
+        observation.remaining = Some(3);
+        assert_eq!(scheduled_additional_requests(&observation), Some(0));
     }
 }

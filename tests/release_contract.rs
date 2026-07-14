@@ -1,3 +1,4 @@
+use boon::{Compiler, Schemas};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -128,6 +129,8 @@ fn schedule_manager_gate_exercises_real_user_manager_lifecycle_commands() {
         "qgh-schedule-gate-macos",
         "qgh-schedule-gate-linux",
         "scripts/verify-schedule-manager.sh",
+        "catch_up_observation:",
+        "Physical catch-up observation:",
     ] {
         assert!(
             workflow.contains(required),
@@ -146,16 +149,131 @@ fn schedule_manager_gate_exercises_real_user_manager_lifecycle_commands() {
         "systemctl --user is-enabled",
         "systemctl --user disable --now",
         "systemctl --user stop qgh-schedule.service",
-        "systemctl --user start --no-block qgh-schedule.service",
+        "systemctl --user start qgh-schedule.service",
+        "systemctl --user show qgh-schedule.service --property=Result --value",
+        "journalctl --user -u qgh-schedule.service _COMM=qgh",
         "Persistent=true",
+        ".data.pass_state == \"completed\"",
+        ".data.action == \"updated\"",
         ".data.action == \"reloaded\"",
         ".data.action == \"unchanged\"",
+        ".data.schedule_state == \"not_installed\"",
+        ".data.artifact_state == \"missing\"",
     ] {
         assert!(
             gate.contains(required),
             "missing real-manager gate phrase: {required}"
         );
     }
+    let preflight = &gate[..gate.find("case \"$(uname -s)\"").unwrap()];
+    assert!(preflight.contains(".data.schedule_state == \"not_installed\""));
+    assert!(preflight.contains(".data.artifact_state == \"missing\""));
+    assert!(
+        !preflight.contains(".data.installed"),
+        "manager preflight must reject drift instead of trusting installed=false"
+    );
+}
+
+#[test]
+fn schedule_lifecycle_schema_validates_real_payload_shapes_with_draft_2020_12() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema_path = root.join("docs/schemas/schedule-output.schema.json");
+    let mut compiler = Compiler::new();
+    let mut schemas = Schemas::new();
+    let command_action: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/command-action.schema.json")).unwrap(),
+    )
+    .unwrap();
+    compiler
+        .add_resource(
+            "https://github.com/juicyjusung/qgh/raw/main/docs/schemas/command-action.schema.json",
+            command_action,
+        )
+        .unwrap();
+    let schema_index = compiler
+        .compile(schema_path.to_str().unwrap(), &mut schemas)
+        .expect("schedule output schema must compile as Draft 2020-12");
+
+    let start = json!({
+        "operation": "start",
+        "action": "installed",
+        "schedule_state": "active",
+        "installed": true,
+        "platform": "linux_systemd_user",
+        "manager_scope": "user",
+        "profile_ids": ["work", "personal"],
+        "interval": "1h",
+        "jitter": {
+            "strategy": "systemd_fixed_random_delay",
+            "offset_seconds": null,
+            "max_seconds": 900
+        },
+        "manager_checked": true,
+        "network_access": false,
+        "foreground_command": "schedule run"
+    });
+    schemas
+        .validate(&start, schema_index)
+        .expect("actual schedule start payload shape must validate");
+
+    let runtime_root = std::env::temp_dir().join(format!(
+        "qgh-schedule-schema-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&runtime_root).unwrap();
+    let run_lifecycle = |operation: &str| {
+        let output = Command::new(binary())
+            .args(["schedule", operation, "--json"])
+            .env("HOME", runtime_root.join("home"))
+            .env("XDG_CONFIG_HOME", runtime_root.join("config"))
+            .env("XDG_DATA_HOME", runtime_root.join("data"))
+            .env("XDG_CACHE_HOME", runtime_root.join("cache"))
+            .output()
+            .unwrap();
+        assert_success(&output);
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["schema_version"], "qgh.v2");
+        envelope["data"].clone()
+    };
+
+    let status = run_lifecycle("status");
+    assert_eq!(status["schedule_state"], "not_installed");
+    assert_eq!(status["artifact_state"], "missing");
+    schemas
+        .validate(&status, schema_index)
+        .expect("actual absent schedule status payload shape must validate");
+
+    let stop = run_lifecycle("stop");
+    assert_eq!(stop["action"], "unchanged");
+    schemas
+        .validate(&stop, schema_index)
+        .expect("actual absent schedule stop payload shape must validate");
+
+    for (name, invalid) in [
+        ("empty profiles", json!({"profile_ids": []})),
+        (
+            "duplicate profiles",
+            json!({"profile_ids": ["work", "work"]}),
+        ),
+        ("nullable interval", json!({"interval": null})),
+        ("nullable jitter", json!({"jitter": null})),
+        ("unchecked manager", json!({"manager_checked": false})),
+    ] {
+        let mut invalid_start = start.clone();
+        invalid_start
+            .as_object_mut()
+            .unwrap()
+            .extend(invalid.as_object().unwrap().clone());
+        assert!(
+            schemas.validate(&invalid_start, schema_index).is_err(),
+            "schedule start schema must reject {name}"
+        );
+    }
+    fs::remove_dir_all(runtime_root).unwrap();
 }
 
 #[cfg(not(feature = "vector-search"))]
@@ -322,7 +440,7 @@ env = "QGH_RELEASE_CONTRACT_TOKEN"
     assert_eq!(output.status.code(), Some(6));
     assert!(stderr_text(&output).is_empty());
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(envelope["schema_version"], "qgh.v1");
+    assert_eq!(envelope["schema_version"], "qgh.v2");
     assert_eq!(envelope["ok"], false);
     assert!(envelope.get("data").is_none());
     assert_eq!(
@@ -353,7 +471,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert_success(&help);
     let help_text = stdout_text(&help);
     assert!(help_text.contains("human output by default"));
-    assert!(help_text.contains("use --json for qgh.v1 envelopes"));
+    assert!(help_text.contains("use --json for qgh.v2 envelopes"));
     for command in [
         "init", "sync", "embed", "model", "query", "search", "get", "status", "doctor", "schedule",
         "mcp",
@@ -522,6 +640,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         assert_eq!(tool["outputSchema"]["type"], "object");
         assert_eq!(tool["outputSchema"]["additionalProperties"], false);
         assert_eq!(
+            tool["outputSchema"]["properties"]["schema_version"]["const"],
+            "qgh.v2"
+        );
+        assert_eq!(
             tool["outputSchema"]["oneOf"][0]["required"],
             json!(["data"])
         );
@@ -552,6 +674,12 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         serde_json::from_str(&fs::read_to_string(root.join("docs/release-artifact.json")).unwrap())
             .unwrap();
     assert_eq!(artifact["schema_version"], "qgh.release.v1");
+    assert_eq!(artifact["contract"]["envelope_schema_version"], "qgh.v2");
+    assert_eq!(artifact["contract"]["envelope_migration"]["from"], "qgh.v1");
+    assert_eq!(
+        artifact["contract"]["envelope_migration"]["compatibility"],
+        "breaking"
+    );
     assert_eq!(
         artifact["contract"]["mcp_tools"],
         json!(["query", "get", "status"])
@@ -610,7 +738,15 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     );
     assert_eq!(
         artifact["contract"]["human_output"],
-        "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v1 envelopes"
+        "default successful CLI stdout is command-specific human summaries; pass --json for stable qgh.v2 envelopes"
+    );
+    assert_eq!(
+        artifact["contract"]["schedule"]["gate_profile_set_update"],
+        true
+    );
+    assert_eq!(
+        artifact["contract"]["schedule"]["physical_catch_up_observation"],
+        "required manual workflow evidence; not simulated"
     );
     assert_eq!(
         artifact["contract"]["primary_install_channel"]["command"],
@@ -879,6 +1015,14 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             serde_json::from_str(&fs::read_to_string(root.join(path)).unwrap()).unwrap();
         assert_released_schema_objects_are_closed_or_documented(path, &schema);
     }
+    let envelope_schema: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("docs/schemas/envelope.schema.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        envelope_schema["properties"]["schema_version"]["const"],
+        artifact["contract"]["envelope_schema_version"]
+    );
     let init_schema: Value = serde_json::from_str(
         &fs::read_to_string(root.join("docs/schemas/init-output.schema.json")).unwrap(),
     )
@@ -2894,7 +3038,7 @@ fn readme_onboarding_matches_released_cli_and_mcp_contracts() {
         "explicit repository scope",
         "organization-wide scope",
         "no GitHub write-back",
-        "qgh.v1",
+        "qgh.v2",
         "qgh status",
         "qgh doctor",
         "qgh mcp",
@@ -3648,6 +3792,7 @@ fn collect_schema_object_closure_violations(
             if matches!(object.get("type"), Some(Value::String(kind)) if kind == "object")
                 && !object.contains_key("additionalProperties")
                 && !is_documented_schema_extension_point(schema_path, json_path)
+                && !is_closed_composition_refinement(schema_path, json_path)
             {
                 violations.push(format!(
                     "{schema_location} is an object schema without additionalProperties"
@@ -3668,6 +3813,18 @@ fn collect_schema_object_closure_violations(
         }
         _ => {}
     }
+}
+
+fn is_closed_composition_refinement(schema_path: &str, json_path: &[String]) -> bool {
+    schema_path == "docs/schemas/schedule-output.schema.json"
+        && matches!(
+            json_path,
+            [defs, operation, all_of, branch]
+                if defs == "$defs"
+                    && matches!(operation.as_str(), "start" | "stop")
+                    && all_of == "allOf"
+                    && branch == "1"
+        )
 }
 
 fn is_documented_schema_extension_point(schema_path: &str, json_path: &[String]) -> bool {

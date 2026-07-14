@@ -188,6 +188,7 @@
         "schedule.platform_mismatch",
         "schedule.storage_failed",
         "schedule.state_invalid",
+        "schedule.ownership_ambiguous",
         "validation.lifecycle_failed",
         "embedding.acquisition_artifact_invalid",
         "embedding.acquisition_artifact_mismatch",
