@@ -13,8 +13,8 @@ Choose the smallest route that completes the task. Read only its reference:
 
 | Need | Reference |
 | --- | --- |
-| One decision, issue, comment, or small evidence set | [references/retrieval.md](references/retrieval.md) |
-| Decision archaeology, root-cause synthesis, or an implementation/review brief | [references/evidence-research.md](references/evidence-research.md), after the retrieval contract |
+| One decision, Issue, comment, or directly opened source | [references/retrieval.md](references/retrieval.md) |
+| Multiple Issue relationships, decision archaeology, root-cause synthesis, or an implementation/review brief | [references/evidence-research.md](references/evidence-research.md), after the retrieval contract |
 | Missing binary, initialization, sync, coverage, model, readiness, or repair | [references/setup-and-recovery.md](references/setup-and-recovery.md) |
 
 For a mixed task, complete setup only to the explicitly authorized state, then return to retrieval. Changing routes never grants additional authorization.

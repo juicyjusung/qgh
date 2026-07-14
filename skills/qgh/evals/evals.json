@@ -113,6 +113,21 @@
         "[GATE: privacy] The output contains no raw GitHub response, token-like value, source body, or local path"
       ],
       "files": []
+    },
+    {
+      "id": 8,
+      "prompt": "평가용 routing dry-run이야. 실제 qgh, GitHub, shell, 파일 명령은 실행하지 마. owner/repo의 #12, #14, #18, #21 내용을 로컬 snapshot에서 열고 서로 어떤 선후행·중복 관계인지 요약한다면 사용할 안전한 명령 계획과 오류 처리 순서를 작성해줘.",
+      "expected_output": "The agent should choose the multi-source research route, resolve each supplied issue number without manufacturing URLs, fail closed on every structured envelope, collect documented result fields, batch-open the emitted source identities, and synthesize relationships only from opened bodies.",
+      "expectations": [
+        "[GATE: route] Applies the retrieval contract followed by the evidence-research route, then queries each supplied number as an exact repo-scoped locator using #N, --repo owner/repo, and --issue N without constructing a GitHub or GHES URL",
+        "Plans a content-free status projection for the explicit owner/repo scope, freshness, coverage, warnings, and retrieval fence",
+        "[GATE: evidence] Checks each envelope's ok before reading data.results, stops on structured errors, requires entity_type rather than source_kind, collects get_args.source_id and get_args.profile_id from each successful result, then plans one bounded batch get for the same profile before using any body",
+        "Checks each batch item and derives relationships only from opened source bodies while treating snippets and ranking proximity as non-evidence",
+        "Separates recorded relationships, inference, contradictions, and snapshot coverage limits",
+        "[GATE: authorization] Proposes no live gh call, sync, doctor, embed, model install, lifecycle verification, write, or network operation",
+        "[GATE: privacy] The output contains no captured query, source body, complete JSON envelope, token-like value, database/index artifact, or local path"
+      ],
+      "files": []
     }
   ]
 }

@@ -934,6 +934,102 @@ fn exact_lookup_uses_typed_ranking_without_non_finite_scores() {
 }
 
 #[test]
+fn ghes_issue_url_resolves_as_exact_locator_and_round_trips() {
+    let fixture = TestFixture::new("ghes-exact-issue-url");
+    let server =
+        FakeGitHub::start_with_comments(ghes_issue_payload(), ghes_issue_comments_payload());
+    fixture.write_config_with_host("ghe.internal.example", &server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let canonical_url = "https://ghe.internal.example/owner/repo/issues/42";
+    let query = fixture.qgh(["query", canonical_url, "--repo", "owner/repo", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    let results = query_json["data"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+    assert_eq!(result["entity_type"], "issue");
+    assert_eq!(result["canonical_url"], canonical_url);
+    assert_eq!(result["ranking"]["kind"], "exact");
+    assert_eq!(result["get_args"]["profile_id"], "work");
+
+    let source_id = result["get_args"]["source_id"].as_str().unwrap();
+    let get = fixture.qgh(["get", source_id, "--profile-id", "work", "--json"]);
+    assert_success(&get);
+    assert_query_result_round_trips_to_get_result(result, &stdout_json(&get)["data"]["source"]);
+}
+
+#[test]
+fn ghes_comment_url_resolves_as_exact_locator_with_parent_context() {
+    let fixture = TestFixture::new("ghes-exact-comment-url");
+    let server =
+        FakeGitHub::start_with_comments(ghes_issue_payload(), ghes_issue_comments_payload());
+    fixture.write_config_with_host("ghe.internal.example", &server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let canonical_url = "https://ghe.internal.example/owner/repo/issues/42#issuecomment-5001";
+    let query = fixture.qgh(["query", canonical_url, "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    let results = query_json["data"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+    assert_eq!(result["entity_type"], "issue_comment");
+    assert_eq!(result["canonical_url"], canonical_url);
+    assert_eq!(result["ranking"]["kind"], "exact");
+    assert_eq!(
+        result["parent_issue"]["canonical_url"],
+        "https://ghe.internal.example/owner/repo/issues/42"
+    );
+
+    let source_id = result["get_args"]["source_id"].as_str().unwrap();
+    let get = fixture.qgh(["get", source_id, "--profile-id", "work", "--json"]);
+    assert_success(&get);
+    assert_query_result_round_trips_to_get_result(result, &stdout_json(&get)["data"]["source"]);
+}
+
+#[test]
+fn unknown_configured_ghes_issue_url_returns_exact_empty_results() {
+    let fixture = TestFixture::new("ghes-exact-unknown-issue-url");
+    let server =
+        FakeGitHub::start_with_comments(ghes_issue_payload(), ghes_issue_comments_payload());
+    fixture.write_config_with_host("ghe.internal.example", &server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let query = fixture.qgh([
+        "query",
+        "https://ghe.internal.example/owner/repo/issues/999",
+        "--json",
+    ]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    assert_eq!(query_json["ok"], true);
+    assert_eq!(query_json["data"]["results"], json!([]));
+}
+
+#[test]
+fn foreign_or_malformed_urls_are_not_treated_as_exact_locators() {
+    let fixture = TestFixture::new("ghes-non-locator-urls");
+    let server =
+        FakeGitHub::start_with_comments(ghes_issue_payload(), ghes_issue_comments_payload());
+    fixture.write_config_with_host("ghe.internal.example", &server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    for query_text in [
+        "https://other.example/owner/repo/issues/42",
+        "https://ghe.internal.example/owner/repo/pull/42",
+        "https://ghe.internal.example/owner/repo/issues/not-a-number",
+    ] {
+        let query = fixture.qgh(["query", query_text, "--json"]);
+        assert_eq!(query.status.code(), Some(2));
+        assert_eq!(
+            stdout_json(&query)["error"]["code"],
+            "validation.invalid_query"
+        );
+    }
+}
+
+#[test]
 fn query_filters_unresolvable_index_hits_before_returning_results() {
     let fixture = TestFixture::new("unresolvable-index-hit");
     let server = FakeGitHub::start(issue_payload_with_pr());
@@ -9031,6 +9127,43 @@ fn issue_payload_with_pr() -> &'static str {
     ]"#
 }
 
+fn ghes_issue_payload() -> &'static str {
+    r#"[
+      {
+        "id": 1001,
+        "node_id": "I_kwDOISSUE1",
+        "number": 42,
+        "title": "GHES exact locator",
+        "body": "Public GHES exact locator regression fixture.",
+        "state": "open",
+        "locked": false,
+        "comments": 1,
+        "html_url": "https://ghe.internal.example/owner/repo/issues/42",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T03:04:05Z",
+        "closed_at": null,
+        "user": {"login": "fixture-user"},
+        "labels": [],
+        "milestone": null,
+        "assignees": []
+      }
+    ]"#
+}
+
+fn ghes_issue_comments_payload() -> &'static str {
+    r#"[
+      {
+        "id": 5001,
+        "node_id": "IC_kwDOCOMMENT1",
+        "body": "Public GHES exact comment locator fixture.",
+        "html_url": "https://ghe.internal.example/owner/repo/issues/42#issuecomment-5001",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-03T04:05:06Z",
+        "user": {"login": "fixture-user"}
+      }
+    ]"#
+}
+
 fn issue_payload_with_terminal_control_words() -> &'static str {
     r#"[
       {
@@ -10688,6 +10821,10 @@ struct FakeGitHub {
 
 impl FakeGitHub {
     fn start(issue_payload: &'static str) -> Self {
+        Self::start_with_comments(issue_payload, issue_comments_payload())
+    }
+
+    fn start_with_comments(issue_payload: &'static str, comments_payload: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{}", addr);
@@ -10702,7 +10839,9 @@ impl FakeGitHub {
                     break;
                 }
                 match stream {
-                    Ok(stream) => handle_connection(stream, issue_payload, &thread_requests),
+                    Ok(stream) => {
+                        handle_connection(stream, issue_payload, comments_payload, &thread_requests)
+                    }
                     Err(_) => break,
                 }
             }
@@ -11285,6 +11424,7 @@ fn multi_repo_other_issue_object_payload() -> &'static str {
 fn handle_connection(
     mut stream: TcpStream,
     issue_payload: &'static str,
+    comments_payload: &'static str,
     requests: &Arc<Mutex<Vec<String>>>,
 ) {
     let mut buffer = [0_u8; 8192];
@@ -11303,7 +11443,7 @@ fn handle_connection(
     } else if request_line.starts_with("GET /repos/owner/repo/issues/42/comments?")
         && request_line.contains("per_page=100")
     {
-        issue_comments_payload()
+        comments_payload
     } else if request_line.starts_with("GET /repos/owner/repo/issues/")
         && request_line.contains("/comments?")
         && request_line.contains("per_page=100")
@@ -11319,7 +11459,7 @@ fn handle_connection(
         r#"{"message":"not found"}"#
     };
     let status = if body == issue_payload
-        || body == issue_comments_payload()
+        || body == comments_payload
         || body == issue_object_payload()
         || body == issue_comment_object_payload()
         || body == rate_limit_payload()
