@@ -2160,6 +2160,8 @@ fn manager_state_inactive(platform: PlatformKind, operation: &str, result: &Mana
     }
     let stderr = result.stderr.trim().to_ascii_lowercase();
     match (platform, operation, result.status_code) {
+        // systemctl uses LSB status 4 for a missing unit; --quiet suppresses its text state.
+        (PlatformKind::LinuxSystemdUser, "inspect_enabled" | "inspect_active", Some(4)) => true,
         (PlatformKind::LinuxSystemdUser, "inspect_enabled", Some(1)) => {
             stderr.is_empty()
                 || stderr.contains("disabled")
@@ -3612,6 +3614,36 @@ mod tests {
         };
 
         assert!(!manager_target_absent(PlatformKind::MacosLaunchd, &result));
+    }
+
+    #[test]
+    fn linux_is_enabled_exit_four_without_output_means_target_is_absent() {
+        let result = ManagerResult {
+            success: false,
+            status_code: Some(4),
+            stderr: String::new(),
+        };
+
+        assert!(manager_state_inactive(
+            PlatformKind::LinuxSystemdUser,
+            "inspect_enabled",
+            &result
+        ));
+    }
+
+    #[test]
+    fn linux_is_active_exit_four_without_output_means_target_is_absent() {
+        let result = ManagerResult {
+            success: false,
+            status_code: Some(4),
+            stderr: String::new(),
+        };
+
+        assert!(manager_state_inactive(
+            PlatformKind::LinuxSystemdUser,
+            "inspect_active",
+            &result
+        ));
     }
 
     #[cfg(unix)]
