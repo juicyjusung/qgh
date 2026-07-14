@@ -3,6 +3,8 @@ name: issue-triage
 description: >
   qgh backlog-health loop. Reads product GitHub Issues as tracker SSOT, then
   updates GitHub issue-backed loop state in #18/#19. Never mutates product issues in L1.
+metadata:
+  internal: true
 user_invocable: true
 ---
 

@@ -3,6 +3,8 @@ name: loop-triage
 description: >
   qgh daily operating-state loop. Reads GitHub issue-backed loop state,
   GitHub Issues, recent git changes, and qgh docs, then updates issue #18/#19.
+metadata:
+  internal: true
 user_invocable: true
 ---
 

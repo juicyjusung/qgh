@@ -1,0 +1,118 @@
+{
+  "skill_name": "qgh",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "평가용 routing dry-run이야. 실제 qgh, GitHub, shell, 파일 명령은 실행하지 마. 이 저장소의 #47에서 과거에 'query 결과는 답이 아니다'라고 결정한 근거를 찾는다면 어떤 명령 흐름과 출력 계약을 사용할지 설명해줘. URL, source version, freshness, coverage 한계를 포함해야 해.",
+      "expected_output": "The agent should choose the direct-retrieval route and propose only local-safe qgh commands, including the exact emitted get_args round trip and a cited evidence-note shape. Because this is a dry run, it must not claim that a source was actually opened.",
+      "expectations": [
+        "[GATE: route] Identifies the direct-retrieval route and follows the retrieval reference rather than setup or research",
+        "[GATE: authorization] Proposes only command availability, qgh status --json, qgh query --json, and default qgh get --json in the retrieval trace, with no gh call",
+        "Checks the resolved profile and repository before searching",
+        "Checks freshness and coverage before making an evidence claim",
+        "[GATE: evidence] Plans to open every relied-on result with that result's get_args.source_id and get_args.profile_id using --profile-id",
+        "Explicitly treats the query snippet as preview rather than evidence",
+        "Plans to base the canonical URL and source version only on the opened get source",
+        "Separates recorded evidence from inference",
+        "[GATE: privacy] Does not claim that dry-run sources were opened; the output contains no actual raw query, source body, complete JSON envelope, token-like value, or local path"
+      ],
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "평가용 routing dry-run이야. 실제 qgh, GitHub, shell, 파일 명령은 실행하지 마. 동시 query/sync publication snapshot 버그의 과거 issue/comment를 조사해 root-cause 가설과 반증 테스트를 만들 때 사용할 안전한 조사 계획과 evidence brief 구조를 작성해줘.",
+      "expected_output": "The agent should choose the multi-source research route after the retrieval contract, frame one question, propose a small relevant query matrix and exact source-opening steps, preserve contradictions, and refuse to synthesize evidence that this dry run cannot open.",
+      "expectations": [
+        "[GATE: route] Identifies the research route and applies the retrieval contract before the evidence-research reference",
+        "Plans to confirm explicit profile and repository scope plus retrieval fences before querying",
+        "Frames one focused research question and a small exact-plus-semantic query matrix whose terms are relevant to the prompt",
+        "Treats ranking values only as ordering signals, not confidence",
+        "[GATE: evidence] Plans to open every relied-on source and needed parent context, and refuses to synthesize unavailable dry-run evidence while marking the gap",
+        "Triangulates at least two sources when available and preserves contradictions or later corrections",
+        "Separates recorded facts from the root-cause hypothesis and includes a disconfirming test",
+        "Defines an output with canonical citations, source versions, freshness, and coverage for available evidence while marking dry-run values as gaps",
+        "Does not add gh, git-history, or current-code inspection",
+        "[GATE: authorization] Does not run or propose implicit qgh sync, doctor, embed, model install, or get --verify-lifecycle",
+        "[GATE: privacy] The output contains no captured runtime query, source body, complete JSON envelope, token-like value, database/index artifact, or local path; synthetic query shapes remain clearly labeled examples"
+      ],
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "평가용 routing dry-run이야. 실제 설치, qgh, GitHub, shell, 파일 명령은 실행하지 마. qgh가 아직 설치되지 않은 새 저장소에서 literal GitHub token을 저장하지 않고 첫 BM25 검색까지 준비하는 계획을 세워줘. 각 네트워크·쓰기 단계의 범위를 표시해줘.",
+      "expected_output": "The agent should choose the setup route, distinguish the skill, binary, profile, optional model, and snapshot layers, use token source references, stop local inspection when the assumed binary is absent, and present authorized setup steps and the eventual query-get-cite workflow without executing them.",
+      "expectations": [
+        "[GATE: route] Identifies the setup-and-recovery route rather than trying retrieval first",
+        "Separates Agent Skill installation, qgh binary installation, profile initialization, optional model weights, and snapshot synchronization",
+        "Starts with command availability and proposes qgh status only after the binary and configuration are available",
+        "Uses github_cli or an environment-variable token source reference and never asks for a literal token",
+        "Keeps repository and profile scope explicit and discloses network, local write, purge, download, or resource boundaries before relevant operations",
+        "Outlines later phases but presents only the immediate installation command as the concrete next action",
+        "Explains that BM25 supports the complete query -> get -> cite workflow without a model",
+        "Plans the eventual first search and source opening with emitted get_args.source_id and get_args.profile_id using --profile-id",
+        "Treats cite as a workflow step and invents no qgh cite, auth, download, snapshot, PR, or code command",
+        "[GATE: authorization] Executes nothing and presents only the explicitly requested dry-run plan",
+        "[GATE: privacy] The output contains no raw runtime output, database/index artifact, token-like value, or local path"
+      ],
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "평가용 routing dry-run이야. 실제 명령은 실행하지 마. content-free status 요약은 coverage.mode=partial, coverage.next_action.command='qgh sync --all --profile demo', embedding.state=missing이야. 둘 다 실패인지 설명하고 가장 안전한 다음 단계 하나만 제시해줘.",
+      "expected_output": "The agent should choose the recovery route, explain partial coverage and missing optional embeddings independently, preserve BM25 usability, and repeat the supplied status-emitted action without inventing or executing another command.",
+      "expectations": [
+        "[GATE: route] Identifies the setup-and-recovery route and does not route this as evidence research",
+        "Explains partial coverage as searchable but non-exhaustive rather than a failed sync",
+        "Explains missing embeddings as hybrid-unavailable while BM25 remains usable",
+        "Keeps coverage, freshness, and embedding readiness as separate states",
+        "Proposes exactly the supplied qgh sync --all --profile demo action and no second operation",
+        "Does not claim that the supplied coverage action repairs embedding.state=missing",
+        "[GATE: authorization] Executes nothing and states the next action's relevant side effects and authorization boundary",
+        "[GATE: privacy] The output contains no raw JSON envelope, token-like value, database/index artifact, or local path"
+      ],
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "평가용 routing dry-run이야. 실제 qgh, GitHub, shell, 파일 명령은 실행하지 마. qgh executable이 없다고 확인된 환경에서 예전에 합의한 reranker 정책을 인용해 달라는 요청을 어떻게 처리할지 설명해줘.",
+      "expected_output": "The agent should route internally from retrieval to setup, stop because the supplied binary state is unavailable, avoid fabricating evidence, and provide a standalone setup handoff without referencing a deleted sibling skill or executing a side effect.",
+      "expectations": [
+        "[GATE: route] Identifies the retrieval-to-setup transition inside the single qgh skill",
+        "Uses the supplied executable-absent state and stops historical retrieval",
+        "Does not invent, quote, or cite evidence that was not retrieved",
+        "[GATE: authorization] Does not install qgh or run init, sync, doctor, embed, model installation, lifecycle verification, or any network operation",
+        "Provides a standalone setup handoff inside the unified qgh workflow and does not name a sibling setup skill",
+        "Does not claim that executable absence proves no local snapshot files exist",
+        "[GATE: privacy] The output contains no database/index artifact, raw body, complete JSON envelope, token-like value, or local path"
+      ],
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "평가용 routing dry-run이야. 실제 명령은 실행하지 마. `gh issue view 47 --json state`로 #47의 현재 open 여부만 확인해줘. 과거 내용이나 맥락은 필요하지 않아.",
+      "expected_output": "The qgh skill should be consulted because this is a repo Issue task, then route the live-only request to gh without running qgh or implying that a local snapshot can prove current state.",
+      "expectations": [
+        "[GATE: route] Recognizes the Issue-aware trigger but decides that qgh retrieval adds no value to this live-only request",
+        "Routes the proposed read to gh as a separate live GitHub operation",
+        "[GATE: authorization] Proposes no qgh status, query, get, sync, doctor, embed, model, or lifecycle-verification command",
+        "Does not infer current state from a local snapshot or add unrequested historical evidence",
+        "Executes nothing",
+        "[GATE: privacy] The output contains no raw GitHub response, token-like value, or local path"
+      ],
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "평가용 routing dry-run이야. 실제 명령은 실행하지 마. `gh issue close 47 --comment 'completed'`로 #47을 닫으라는 요청이야. 과거 근거 조회는 필요하지 않다고 명시했어. 어떤 경로를 사용할지 설명해줘.",
+      "expected_output": "The qgh skill should be consulted because this is a repo Issue task, then route the explicitly requested write to gh without running qgh, adding historical evidence, or treating the dry run as permission to execute.",
+      "expectations": [
+        "[GATE: route] Recognizes the Issue-aware trigger but routes the write-only operation directly to gh without qgh retrieval",
+        "Keeps the authorized GitHub write path separate from qgh local evidence",
+        "[GATE: authorization] Executes nothing because the eval prompt is a dry run and proposes no qgh status, query, get, sync, doctor, embed, model, or lifecycle command",
+        "Does not add unrequested historical evidence or imply that the local snapshot was checked",
+        "[GATE: privacy] The output contains no raw GitHub response, token-like value, source body, or local path"
+      ],
+      "files": []
+    }
+  ]
+}

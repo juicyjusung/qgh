@@ -1,6 +1,8 @@
 ---
 name: issue-grill-with-docs
 description: Use when user gives a GitHub issue number and wants qgh issue design sharpened, grilled, clarified, prepared before implementation, or tracked as concise Korean GitHub issue decision comments. Prefer this over raw grill-with-docs for issue-number-driven qgh work.
+metadata:
+  internal: true
 disable-model-invocation: true
 ---
 

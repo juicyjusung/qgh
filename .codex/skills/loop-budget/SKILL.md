@@ -3,6 +3,8 @@ name: loop-budget
 description: >
   qgh loop budget guard. Checks loop-budget.md plus GitHub issue-backed pause
   and run-log state before a loop run. L1 guard only; mutates only #18/#19 when needed.
+metadata:
+  internal: true
 user_invocable: true
 ---
 
