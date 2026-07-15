@@ -1,3 +1,4 @@
+use crate::config_mutation::ConfigMutation;
 use crate::embedding::{
     default_prepared_model_store, is_builtin_preset_id, parse_hf_model_reference,
     FastembedProviderOptions, PoolingKind, PreparedModelStore, QuantizationKind,
@@ -6,7 +7,7 @@ use crate::embedding::{
 use crate::error::QghError;
 use crate::freshness::{parse_duration_seconds, DEFAULT_QUERY_MAX_AGE_SECONDS};
 use crate::local_models::QWEN_EMBEDDING_PRESET_ID;
-use crate::paths::{config_file_path, ensure_private_dir, set_private_file, ProfilePaths};
+use crate::paths::{config_file_path, ProfilePaths};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -433,7 +434,11 @@ pub fn bootstrap_profile_repo(
     validate_token_source(&input.token_source)?;
 
     let config_path = config_file_path()?;
-    let existing_config = load_config_file_optional()?;
+    let mutation = ConfigMutation::begin(config_path.clone())?;
+    let existing_config = mutation
+        .read_optional()?
+        .map(|bytes| parse_config_file_bytes(&config_path, bytes))
+        .transpose()?;
     let creates_config = existing_config.is_none();
     let mut config = config_for_bootstrap(existing_config);
     let default_model_install = creates_config
@@ -491,18 +496,10 @@ pub fn bootstrap_profile_repo(
         }
     }
 
-    if config.schema_version != "qgh.config.v1" {
-        return Err(QghError::config("Unsupported config schema_version."));
-    }
-    let Some(parent) = config_path.parent() else {
-        return Err(QghError::config("Config path has no parent directory."));
-    };
-    ensure_private_dir(parent)?;
+    validate_config_for_publication(&config)?;
     let text = toml::to_string_pretty(&config)
         .map_err(|error| QghError::config(format!("Failed to serialize config: {error}")))?;
-    fs::write(&config_path, text)?;
-    set_private_file(&config_path)?;
-    load_profile(&input.profile_id)?;
+    mutation.commit(text.as_bytes())?;
 
     Ok(ProfileBootstrapOutcome {
         config_path,
@@ -661,14 +658,33 @@ fn load_config_file() -> Result<ConfigFile, QghError> {
             config_file.display()
         ))
     })?;
-    let config: ConfigFile = toml::from_str(&text).map_err(|error| {
+    parse_config_file_text(&text)
+}
+
+fn parse_config_file_bytes(path: &Path, bytes: Vec<u8>) -> Result<ConfigFile, QghError> {
+    let text = String::from_utf8(bytes).map_err(|_| {
+        QghError::config(format!(
+            "Failed to read config at {}: config is not valid UTF-8.",
+            path.display()
+        ))
+    })?;
+    parse_config_file_text(&text)
+}
+
+fn parse_config_file_text(text: &str) -> Result<ConfigFile, QghError> {
+    let config: ConfigFile = toml::from_str(text).map_err(|error| {
         QghError::config(redacted_toml_error(
             "Invalid config TOML",
-            &text,
+            text,
             error.span(),
             redacted_toml_reason(error.message()),
         ))
     })?;
+    validate_config_file_values(&config)?;
+    Ok(config)
+}
+
+fn validate_config_file_values(config: &ConfigFile) -> Result<(), QghError> {
     if config.schema_version != "qgh.config.v1" {
         return Err(QghError::config("Unsupported config schema_version."));
     }
@@ -678,9 +694,20 @@ fn load_config_file() -> Result<ConfigFile, QghError> {
     if let Some(reranker) = &config.reranker {
         parse_reranker_config(reranker)?;
     }
-    validate_config_profile_endpoints(&config)?;
-    validate_config_token_sources(&config)?;
-    Ok(config)
+    validate_config_profile_endpoints(config)?;
+    validate_config_token_sources(config)?;
+    Ok(())
+}
+
+fn validate_config_for_publication(config: &ConfigFile) -> Result<(), QghError> {
+    validate_config_file_values(config)?;
+    let embedding = config.embedding.as_ref().map(embedding_config_from_raw);
+    let reranker = config.reranker.as_ref().map(reranker_config_from_raw);
+    for (profile_id, raw_profile) in &config.profiles {
+        validate_profile_id(profile_id)?;
+        profile_from_raw(profile_id, raw_profile, embedding.clone(), reranker.clone())?;
+    }
+    Ok(())
 }
 
 fn load_config_file_optional() -> Result<Option<ConfigFile>, QghError> {

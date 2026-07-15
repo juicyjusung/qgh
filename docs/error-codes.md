@@ -25,6 +25,7 @@ Stable error families:
 - `internal.*`: unexpected internal failures.
 
 Common codes include `config.no_matching_profile`, `config.ambiguous_profile`,
+`config.busy`,
 `config.invalid_repo_policy`, `validation.cli`, `validation.mcp`,
 `validation.unsupported_filter`, `validation.batch_size`, `freshness.stale`,
 `auth.token_unavailable`, `source.not_found`, `source.tombstoned`,
@@ -47,6 +48,19 @@ from a read command. `retry_action.command` is the human retry and
 same profile writer lease. Details contain only `profile_id`; wait for the
 active process or its OS-released crash lease, then retry. qgh never deletes a
 stable lock file to recover this condition.
+
+`config.busy` is the retryable, exit-`5` result when `qgh init` cannot acquire
+the stable profile-config mutation lease within five seconds. The lease covers
+the read, validation, and atomic publication sequence, preventing lost updates
+between concurrent init processes. Wait for the active init operation and
+retry; qgh does not delete the stable lock file. An unsafe final
+`config.toml`/lock entry or a failed publication durability barrier instead
+returns exit-`6` `storage.failure`. A post-rename directory-sync failure carries
+content-free details `reason: "config_directory_sync_failed"` and
+`publication_state: "visible_durability_unconfirmed"`; the complete new config
+is visible, but crash durability was not confirmed. This instance is retryable:
+verify the visible config and rerun `qgh init`; every successful publication
+re-synchronizes the canonical config-directory ancestry.
 
 `schedule` validation and lifecycle may additionally return:
 

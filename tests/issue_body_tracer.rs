@@ -2310,6 +2310,39 @@ fn init_yes_bootstraps_profile_config_and_repo_policy_without_secret_or_store_pa
         );
     }
 
+    let config_dir = fixture.config_home.join("qgh");
+    let config_lock = config_dir.join("config.toml.lock");
+    assert!(fs::symlink_metadata(&config_lock)
+        .unwrap()
+        .file_type()
+        .is_file());
+    assert!(fs::read(&config_lock).unwrap().is_empty());
+    let staging_files = fs::read_dir(&config_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect::<Vec<_>>();
+    assert!(staging_files.is_empty(), "staging files: {staging_files:?}");
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(config_dir.join("config.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&config_lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
     let policy = fs::read_to_string(fixture.root.join(".qgh.toml")).unwrap();
     assert!(policy.contains(r#"github = "owner/repo""#));
     assert!(!policy.contains("QGH_TEST_TOKEN"));
@@ -2323,6 +2356,160 @@ fn init_yes_bootstraps_profile_config_and_repo_policy_without_secret_or_store_pa
         status_json["data"]["resolution"]["effective_repo_scope"],
         "owner/repo"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_rejects_symlinked_profile_config_without_mutating_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("init-symlinked-profile-config");
+    fixture.write_config("https://api.github.com");
+    let config_path = fixture.config_home.join("qgh/config.toml");
+    let target_path = fixture.root.join("managed-config.toml");
+    fs::rename(&config_path, &target_path).unwrap();
+    symlink(&target_path, &config_path).unwrap();
+    let original_target = fs::read(&target_path).unwrap();
+    let worktree = fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &worktree,
+        [
+            "--profile",
+            "fresh",
+            "init",
+            "--yes",
+            "--repo",
+            "other/repo",
+            "--host",
+            "github.com",
+            "--api-base-url",
+            "https://api.github.com",
+            "--web-base-url",
+            "https://github.com",
+            "--token-source",
+            "github_cli",
+            "--json",
+        ],
+    );
+
+    assert_eq!(init.status.code(), Some(6));
+    assert_eq!(stdout_json(&init)["error"]["code"], "storage.failure");
+    assert!(fs::symlink_metadata(&config_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read(&target_path).unwrap(), original_target);
+    assert!(!worktree.join(".qgh.toml").exists());
+}
+
+#[test]
+fn init_validation_failure_preserves_existing_profile_config_bytes() {
+    let fixture = TestFixture::new("init-invalid-existing-profile-preserved");
+    let config_path = fixture.config_home.join("qgh/config.toml");
+    fs::write(
+        &config_path,
+        r#"schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+max_in_flight_requests = 17
+
+[profiles.work.token_source]
+type = "github_cli"
+"#,
+    )
+    .unwrap();
+    let original = fs::read(&config_path).unwrap();
+    let worktree = fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &worktree,
+        [
+            "--profile",
+            "work",
+            "init",
+            "--yes",
+            "--repo",
+            "other/repo",
+            "--host",
+            "github.com",
+            "--api-base-url",
+            "https://api.github.com",
+            "--web-base-url",
+            "https://github.com",
+            "--token-source",
+            "github_cli",
+            "--json",
+        ],
+    );
+
+    assert_eq!(init.status.code(), Some(2));
+    assert_eq!(stdout_json(&init)["error"]["code"], "config.invalid");
+    assert_eq!(fs::read(&config_path).unwrap(), original);
+    assert!(!worktree.join(".qgh.toml").exists());
+}
+
+#[test]
+fn init_rejects_an_invalid_untouched_profile_before_publishing_config() {
+    let fixture = TestFixture::new("init-invalid-untouched-profile-preserved");
+    let config_path = fixture.config_home.join("qgh/config.toml");
+    fs::write(
+        &config_path,
+        r#"schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.work.token_source]
+type = "github_cli"
+
+[profiles.broken]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/existing"]
+max_in_flight_requests = 17
+
+[profiles.broken.token_source]
+type = "github_cli"
+"#,
+    )
+    .unwrap();
+    let original = fs::read(&config_path).unwrap();
+    let worktree = fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &worktree,
+        [
+            "--profile",
+            "work",
+            "init",
+            "--yes",
+            "--repo",
+            "other/repo",
+            "--host",
+            "github.com",
+            "--api-base-url",
+            "https://api.github.com",
+            "--web-base-url",
+            "https://github.com",
+            "--token-source",
+            "github_cli",
+            "--json",
+        ],
+    );
+
+    assert_eq!(init.status.code(), Some(2));
+    assert_eq!(stdout_json(&init)["error"]["code"], "config.invalid");
+    assert_eq!(fs::read(&config_path).unwrap(), original);
+    assert!(!worktree.join(".qgh.toml").exists());
 }
 
 #[test]

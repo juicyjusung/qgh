@@ -3,6 +3,7 @@ pub mod chunking;
 mod cli;
 mod commands;
 mod config;
+mod config_mutation;
 #[doc(hidden)]
 pub mod context;
 mod coverage;

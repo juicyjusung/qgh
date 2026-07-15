@@ -4,6 +4,40 @@ qgh separates config, data, and cache through XDG paths: strict TOML config at `
 
 Profiles remain the security boundary: GitHub host, token source reference, repo allowlist, and profile store are defined only in the XDG profile config. MVP does not provide arbitrary DB path override; the profile data path is derived from XDG and profile id.
 
+Read-only config loading retains compatibility with an existing symbolic link at
+the final `config.toml` entry. Config mutation is stricter: `qgh init` resolves
+the existing parent directory, then fails closed if the final config entry is a
+symbolic link or is not a regular file. This permits platform-managed symbolic
+links in parent XDG or HOME paths without allowing a config write to follow a
+redirected final entry.
+
+Profile-config mutation is a single-writer transaction scoped to
+`config.toml`. qgh opens a stable, private `config.toml.lock` without following
+a final lock symlink on supported Unix targets, acquires a bounded exclusive
+lease, and only then reads and validates the current config. Contention that
+lasts five seconds returns retryable `config.busy`; qgh never deletes the
+stable lock file to recover a lease because the OS releases the lease when the
+writer exits.
+
+After validating the complete candidate config, qgh writes a same-directory
+`0600` staging file, synchronizes it, atomically renames it over `config.toml`,
+and synchronizes the canonical config-directory ancestry through the filesystem
+root on macOS and Linux. The conservative ancestor barrier lets a later
+successful init confirm directory entries left uncertain by an interrupted or
+failed first init. A failure before the rename preserves the previous config
+and removes qgh's staging file. A directory-sync failure after the rename
+reports retryable `storage.failure` with
+`publication_state = "visible_durability_unconfirmed"`: the complete new file
+is visible, but crash durability was not confirmed. The XDG config directory
+and stable lock remain private (`0700` and `0600` on Unix). An uncatchable
+process termination may leave a private staging file; qgh never treats that
+file as config or publishes it implicitly.
+
+This transaction does not claim cross-file atomicity with a worktree
+`.qgh.toml`. Top-level `qgh init` validates the planned repo-policy action
+before mutating the profile config, then publishes each file independently; a
+later repo-policy filesystem failure is reported for explicit recovery.
+
 The derived Profile Store database entry must be a regular file. qgh does not
 follow a symbolic link at the final `qgh.sqlite3` path for either reads or
 writes; it fails closed instead. Parent XDG or HOME paths may resolve through
