@@ -4,6 +4,12 @@ qgh separates config, data, and cache through XDG paths: strict TOML config at `
 
 Profiles remain the security boundary: GitHub host, token source reference, repo allowlist, and profile store are defined only in the XDG profile config. MVP does not provide arbitrary DB path override; the profile data path is derived from XDG and profile id.
 
+The derived Profile Store database entry must be a regular file. qgh does not
+follow a symbolic link at the final `qgh.sqlite3` path for either reads or
+writes; it fails closed instead. Parent XDG or HOME paths may resolve through
+platform-managed symbolic links, so qgh canonicalizes the existing parent and
+applies no-follow semantics to the database entry itself.
+
 qgh may read a tracked repo policy from the current git worktree root to determine repo scope and safe default filters. The repo policy is not a credential source, cannot define a token source, and cannot widen access beyond a profile repo allowlist. Worktrees resolve their own root policy; qgh does not follow another checkout's policy file.
 
 Profile resolution uses explicit inputs first: CLI `--profile` overrides environment, and environment overrides automatic resolution. If no profile is explicit, qgh may auto-select a profile only when an effective repo scope exists and exactly one configured profile allowlists that repo scope. Effective scope may come from repo policy or from the current worktree Git `origin` remote as described in ADR-0011. Zero matches fail with `config.no_matching_profile`; multiple matches fail with `config.ambiguous_profile` and require `--profile`.

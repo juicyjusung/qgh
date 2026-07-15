@@ -16,8 +16,10 @@ use crate::model::{
     StoredCursor, StoredIssue, StoredSource, SyncSummary, TargetedSyncSummary, TombstoneView,
     VectorSearchFilters, VectorSearchHit,
 };
+use crate::paths::ensure_private_dir;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+use crate::paths::set_private_file;
 use crate::paths::ProfilePaths;
-use crate::paths::{ensure_private_dir, set_private_file};
 use crate::time::{now_rfc3339, now_run_id_suffix};
 use rusqlite::types::Value;
 use rusqlite::{
@@ -37,6 +39,7 @@ const CHUNK_EMBEDDING_VECTORS_TABLE: &str = "chunk_embedding_vectors";
 const CHUNK_EMBEDDING_VECTOR_CHUNKS_META_TABLE: &str = "chunk_embedding_vectors_chunks";
 const CHUNK_EMBEDDING_VECTOR_ROWIDS_TABLE: &str = "chunk_embedding_vectors_rowids";
 const CHUNK_EMBEDDING_VECTOR_CHUNKS_TABLE: &str = "chunk_embedding_vectors_vector_chunks00";
+pub(crate) const STORE_SCHEMA_VERSION: &str = "qgh.db.v1";
 const TANTIVY_COMMIT_INVENTORY_MIGRATION: &str = "qgh.tantivy.commit_inventory.v1";
 const TANTIVY_OWNERSHIP_MIGRATION: &str = "qgh.tantivy.ownership.v2";
 const TANTIVY_ADOPTION_OWNER_PID: i64 = -2;
@@ -399,6 +402,15 @@ impl RetrievalBuildSnapshot {
     }
 }
 
+/// Content-free metadata needed to decide whether a remote sync should run.
+/// Corpus counts, reconciliation rows, and cursors are intentionally outside
+/// this projection.
+#[derive(Debug, Clone)]
+pub(crate) struct SyncPlanningSnapshot {
+    pub(crate) last_sync_at: Option<String>,
+    pub(crate) backoff: Option<BackoffView>,
+}
+
 pub struct Store {
     conn: Connection,
     profile_dir: PathBuf,
@@ -523,17 +535,26 @@ impl Store {
     }
 
     pub fn open(paths: &ProfilePaths) -> Result<Self, QghError> {
-        ensure_private_dir(&paths.profile_dir)?;
-        ensure_private_dir(&paths.cache_dir)?;
-        ensure_private_dir(&paths.log_dir)?;
-        let conn = Connection::open(&paths.db_path)?;
-        set_private_file(&paths.db_path)?;
+        if database_path_exists(&paths.db_path)? {
+            preflight_store_schema(&paths.db_path)?;
+        } else {
+            ensure_private_dir(&paths.profile_dir)?;
+        }
+        let (database_path, database_file) = prepare_database_file_for_open(&paths.db_path)?;
+        let conn = Connection::open_with_flags(
+            &database_path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "secure_delete", "ON")?;
         let mut store = Self::from_connection(conn, paths);
         store.migrate()?;
+        tighten_private_database_file(&database_file, &database_path)?;
+        ensure_private_dir(&paths.profile_dir)?;
+        ensure_private_dir(&paths.cache_dir)?;
+        ensure_private_dir(&paths.log_dir)?;
+        store.conn.pragma_update(None, "journal_mode", "WAL")?;
         store.reconcile_legacy_tantivy_ownership()?;
         store.detach_unbound_tantivy_publication()?;
         store.detach_legacy_embedding_publication_identity()?;
@@ -549,24 +570,37 @@ impl Store {
     /// database is represented by an in-memory empty schema so read commands
     /// do not create profile, cache, log, or database files.
     pub fn open_for_read(paths: &ProfilePaths) -> Result<Self, QghError> {
-        if !paths.db_path.exists() {
-            let conn = Connection::open_in_memory()?;
-            conn.busy_timeout(std::time::Duration::from_secs(5))?;
-            conn.pragma_update(None, "secure_delete", "ON")?;
-            let mut store = Self::from_connection(conn, paths);
-            store.migrate()?;
-            store.content_write_epoch = read_content_write_epoch(&store.conn)?;
+        if let Some(store) = Self::open_existing_for_read(paths)? {
             return Ok(store);
         }
+        let conn = Connection::open_in_memory()?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "secure_delete", "ON")?;
+        let mut store = Self::from_connection(conn, paths);
+        store.migrate()?;
+        store.content_write_epoch = read_content_write_epoch(&store.conn)?;
+        Ok(store)
+    }
+
+    /// Opens only an existing Profile Store. Missing stores return `None`
+    /// without constructing an in-memory schema; unsafe path entries and
+    /// incompatible schemas still fail closed.
+    pub(crate) fn open_existing_for_read(paths: &ProfilePaths) -> Result<Option<Self>, QghError> {
+        if !database_path_exists(&paths.db_path)? {
+            return Ok(None);
+        }
+        let database_path = database_path_for_nofollow_open(&paths.db_path)?;
         let conn = Connection::open_with_flags(
-            &paths.db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            database_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let mut store = Self::from_connection(conn, paths);
         store.validate_read_schema()?;
         store.content_write_epoch = read_content_write_epoch(&store.conn)?;
-        Ok(store)
+        Ok(Some(store))
     }
 
     fn from_connection(conn: Connection, paths: &ProfilePaths) -> Self {
@@ -600,20 +634,7 @@ impl Store {
     }
 
     fn validate_read_schema(&self) -> Result<(), QghError> {
-        let schema_version = self
-            .conn
-            .query_row(
-                "SELECT value FROM profile_meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if schema_version.as_deref() != Some("qgh.db.v1") {
-            return Err(QghError::storage(
-                "The local store schema is not initialized for read-only retrieval. Run `qgh sync` to migrate it.",
-            ));
-        }
-        Ok(())
+        validate_store_schema(&self.conn, false)
     }
 
     fn reconcile_legacy_tantivy_ownership(&mut self) -> Result<(), QghError> {
@@ -6038,19 +6059,6 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
-        let last_sync_at: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT completed_at
-                 FROM sync_runs
-                 WHERE completed_successfully = 1
-                   AND snapshot_kind = 'remote_sync'
-                 ORDER BY completed_at DESC
-                 LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
         let last_reconciliation = self
             .conn
             .query_row(
@@ -6070,47 +6078,73 @@ impl Store {
                 },
             )
             .optional()?;
-        let retry_command_expr =
-            if table_has_column(&self.conn, "sync_backoff_state", "retry_command")? {
-                "retry_command"
-            } else {
-                "NULL"
-            };
-        let backoff_sql = format!(
-            "SELECT reason, scope, {retry_command_expr}, retry_after_seconds, reset_at, observed_at, last_successful_sync
-             FROM sync_backoff_state
-             WHERE id = 1"
-        );
-        let backoff = self
-            .conn
-            .query_row(&backoff_sql, [], |row| {
-                let retry_command: Option<String> = row.get(2)?;
-                let retry_action = retry_command
-                    .as_deref()
-                    .map(|command| CommandAction::from_retry_command("sync_backoff", command));
-                Ok(BackoffView {
-                    reason: row.get(0)?,
-                    scope: row.get(1)?,
-                    retry_command,
-                    retry_action,
-                    retry_after_seconds: row.get(3)?,
-                    reset_at: row.get(4)?,
-                    observed_at: row.get(5)?,
-                    last_successful_sync: row.get(6)?,
-                })
-            })
-            .optional()?;
+        let planning = self.sync_planning_snapshot()?;
         Ok(StatusSnapshot {
             issue_count,
             comment_count,
             tombstone_count,
             active_generation: active_generation.unwrap_or(0),
             dirty_task_count,
-            last_sync_at,
+            last_sync_at: planning.last_sync_at,
             last_reconciliation,
-            backoff,
+            backoff: planning.backoff,
             cursors: self.cursor_views()?,
         })
+    }
+
+    pub(crate) fn sync_planning_snapshot(&self) -> Result<SyncPlanningSnapshot, QghError> {
+        let retry_command_expr =
+            if table_has_column(&self.conn, "sync_backoff_state", "retry_command")? {
+                "backoff.retry_command"
+            } else {
+                "NULL"
+            };
+        let sql = format!(
+            "SELECT
+                (SELECT completed_at
+                 FROM sync_runs
+                 WHERE completed_successfully = 1
+                   AND snapshot_kind = 'remote_sync'
+                 ORDER BY completed_at DESC
+                 LIMIT 1),
+                backoff.reason,
+                backoff.scope,
+                {retry_command_expr},
+                backoff.retry_after_seconds,
+                backoff.reset_at,
+                backoff.observed_at,
+                backoff.last_successful_sync
+             FROM (SELECT 1) AS singleton
+             LEFT JOIN sync_backoff_state AS backoff ON backoff.id = 1"
+        );
+        self.conn
+            .query_row(&sql, [], |row| {
+                let reason = row.get::<_, Option<String>>(1)?;
+                let backoff = match reason {
+                    None => None,
+                    Some(reason) => {
+                        let retry_command: Option<String> = row.get(3)?;
+                        let retry_action = retry_command.as_deref().map(|command| {
+                            CommandAction::from_retry_command("sync_backoff", command)
+                        });
+                        Some(BackoffView {
+                            reason,
+                            scope: row.get(2)?,
+                            retry_command,
+                            retry_action,
+                            retry_after_seconds: row.get(4)?,
+                            reset_at: row.get(5)?,
+                            observed_at: row.get(6)?,
+                            last_successful_sync: row.get(7)?,
+                        })
+                    }
+                };
+                Ok(SyncPlanningSnapshot {
+                    last_sync_at: row.get(0)?,
+                    backoff,
+                })
+            })
+            .map_err(QghError::from)
     }
 
     #[allow(dead_code)]
@@ -8547,7 +8581,7 @@ impl Store {
 
     fn migrate(&mut self) -> Result<(), QghError> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = self.migrate_inner();
+        let result = validate_store_schema(&self.conn, true).and_then(|()| self.migrate_inner());
         match result {
             Ok(()) => {
                 self.conn.execute_batch("COMMIT")?;
@@ -8562,14 +8596,19 @@ impl Store {
 
     fn migrate_inner(&self) -> Result<(), QghError> {
         self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS profile_meta (
+            "CREATE TABLE IF NOT EXISTS profile_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );
-            INSERT INTO profile_meta (key, value)
-                VALUES ('schema_version', 'qgh.db.v1')
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            );",
+        )?;
+        self.conn.execute(
+            "INSERT INTO profile_meta (key, value)
+             VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO NOTHING",
+            params![STORE_SCHEMA_VERSION],
+        )?;
+        self.conn.execute_batch(
+            r#"
             INSERT INTO profile_meta (key, value)
                 VALUES ('content_write_epoch', '0')
                 ON CONFLICT(key) DO NOTHING;
@@ -9168,7 +9207,7 @@ impl Store {
             "INSERT INTO schema_migrations (version, applied_at)
              VALUES (?1, ?2)
              ON CONFLICT(version) DO NOTHING",
-            params!["qgh.db.v1", now_rfc3339()],
+            params![STORE_SCHEMA_VERSION, now_rfc3339()],
         )?;
         self.conn.execute(
             "INSERT INTO schema_migrations (version, applied_at)
@@ -9269,6 +9308,157 @@ impl Store {
         }
         Ok(inserted)
     }
+}
+
+fn preflight_store_schema(db_path: &Path) -> Result<(), QghError> {
+    if !database_path_exists(db_path)? {
+        return Ok(());
+    }
+    let database_path = database_path_for_nofollow_open(db_path)?;
+    let conn = Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    validate_store_schema(&conn, true)
+}
+
+fn database_path_for_nofollow_open(db_path: &Path) -> Result<PathBuf, QghError> {
+    let parent = db_path
+        .parent()
+        .ok_or_else(|| QghError::storage("The Profile Store database has no parent directory."))?;
+    let file_name = db_path
+        .file_name()
+        .ok_or_else(|| QghError::storage("The Profile Store database has no file name."))?;
+    Ok(fs::canonicalize(parent)?.join(file_name))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn prepare_database_file_for_open(db_path: &Path) -> Result<(PathBuf, fs::File), QghError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let database_path = database_path_for_nofollow_open(db_path)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(platform_database_file_open_flags())
+        .open(&database_path)?;
+    if !file.metadata()?.is_file() {
+        return Err(QghError::storage(
+            "The Profile Store database must be a regular file.",
+        ));
+    }
+    Ok((database_path, file))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn prepare_database_file_for_open(db_path: &Path) -> Result<(PathBuf, fs::File), QghError> {
+    let database_path = database_path_for_nofollow_open(db_path)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&database_path)?;
+    if !file.metadata()?.is_file() {
+        return Err(QghError::storage(
+            "The Profile Store database must be a regular file.",
+        ));
+    }
+    Ok((database_path, file))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn tighten_private_database_file(file: &fs::File, _path: &Path) -> Result<(), QghError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = file.metadata()?.permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn tighten_private_database_file(_file: &fs::File, path: &Path) -> Result<(), QghError> {
+    set_private_file(path)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_database_file_open_flags() -> std::os::raw::c_int {
+    const O_NONBLOCK: std::os::raw::c_int = 0x0000_0004;
+    const O_NOFOLLOW: std::os::raw::c_int = 0x0000_0100;
+    const O_CLOEXEC: std::os::raw::c_int = 0x0100_0000;
+    O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+}
+
+#[cfg(target_os = "linux")]
+fn platform_database_file_open_flags() -> std::os::raw::c_int {
+    const O_NONBLOCK: std::os::raw::c_int = 0o4000;
+    const O_NOFOLLOW: std::os::raw::c_int = 0o400000;
+    const O_CLOEXEC: std::os::raw::c_int = 0o2000000;
+    O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+}
+
+fn database_path_exists(db_path: &Path) -> Result<bool, QghError> {
+    let metadata = match fs::symlink_metadata(db_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(QghError::storage(
+            "The Profile Store database must not be a symbolic link.",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(QghError::storage(
+            "The Profile Store database must be a regular file.",
+        ));
+    }
+    Ok(true)
+}
+
+fn validate_store_schema(conn: &Connection, allow_uninitialized: bool) -> Result<(), QghError> {
+    let has_profile_meta = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'profile_meta'
+        )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_profile_meta {
+        let user_table_count = conn.query_row(
+            "SELECT count(*) FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if allow_uninitialized && user_table_count == 0 {
+            return Ok(());
+        }
+        return Err(QghError::unsupported_store_schema(
+            STORE_SCHEMA_VERSION,
+            None,
+        ));
+    }
+    let schema_version = conn
+        .query_row(
+            "SELECT value FROM profile_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if schema_version.as_deref() == Some(STORE_SCHEMA_VERSION) {
+        return Ok(());
+    }
+    Err(QghError::unsupported_store_schema(
+        STORE_SCHEMA_VERSION,
+        schema_version.as_deref(),
+    ))
 }
 
 impl Drop for Store {
@@ -11717,6 +11907,427 @@ mod tests {
             None
         );
         drop(migrated);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn writable_open_rejects_future_schema_without_mutating_store() {
+        let paths = temp_profile_paths("future schema write guard 한국어");
+        drop(Store::open(&paths).unwrap());
+
+        let future = Connection::open(&paths.db_path).unwrap();
+        future
+            .execute(
+                "UPDATE profile_meta SET value = 'qgh.db.v2' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        future
+            .execute_batch(
+                "CREATE TABLE future_schema_sentinel (
+                    id INTEGER PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO future_schema_sentinel (id, value)
+                VALUES (1, 'must-survive');
+                PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        drop(future);
+
+        let before = fs::read(&paths.db_path).unwrap();
+        let error = Store::open(&paths)
+            .err()
+            .expect("future schema must fail before writable migration");
+        let after = fs::read(&paths.db_path).unwrap();
+
+        assert_eq!(error.code, "storage.failure");
+        assert_eq!(error.details["reason"], "unsupported_schema");
+        assert_eq!(error.details["expected_schema_version"], "qgh.db.v1");
+        assert_eq!(error.details["actual_schema_version"], "qgh.db.v2");
+        assert!(!error.retryable);
+        assert_eq!(
+            after, before,
+            "rejected future stores must remain byte-identical"
+        );
+
+        let unchanged = Connection::open(&paths.db_path).unwrap();
+        let schema_version: String = unchanged
+            .query_row(
+                "SELECT value FROM profile_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let sentinel: String = unchanged
+            .query_row(
+                "SELECT value FROM future_schema_sentinel WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, "qgh.db.v2");
+        assert_eq!(sentinel, "must-survive");
+        drop(unchanged);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn writable_open_rejects_unidentified_nonempty_database_without_mutation() {
+        let paths = temp_profile_paths("unidentified-store-write-guard");
+        fs::create_dir_all(&paths.profile_dir).unwrap();
+        let unidentified = Connection::open(&paths.db_path).unwrap();
+        unidentified
+            .execute_batch(
+                "CREATE TABLE unrelated_sentinel (
+                    id INTEGER PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO unrelated_sentinel (id, value)
+                VALUES (1, 'not-a-qgh-store');",
+            )
+            .unwrap();
+        drop(unidentified);
+
+        let before = fs::read(&paths.db_path).unwrap();
+        let error = Store::open(&paths)
+            .err()
+            .expect("a populated database without qgh identity must fail closed");
+        let after = fs::read(&paths.db_path).unwrap();
+
+        assert_eq!(error.code, "storage.failure");
+        assert_eq!(error.details["reason"], "unsupported_schema");
+        assert_eq!(error.details["expected_schema_version"], "qgh.db.v1");
+        assert_eq!(
+            error.details["actual_schema_version"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            after, before,
+            "an unidentified database must remain byte-identical"
+        );
+
+        let unchanged = Connection::open(&paths.db_path).unwrap();
+        let sentinel: String = unchanged
+            .query_row(
+                "SELECT value FROM unrelated_sentinel WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let qgh_table_count: i64 = unchanged
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'profile_meta'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sentinel, "not-a-qgh-store");
+        assert_eq!(qgh_table_count, 0);
+        drop(unchanged);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn read_only_open_reports_the_future_schema_without_suggesting_migration() {
+        let paths = temp_profile_paths("future-schema-read-guard");
+        drop(Store::open(&paths).unwrap());
+
+        let future = Connection::open(&paths.db_path).unwrap();
+        future
+            .execute(
+                "UPDATE profile_meta SET value = 'qgh.db.v2' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        drop(future);
+
+        let error = Store::open_for_read(&paths)
+            .err()
+            .expect("read-only access must reject a future store schema");
+
+        assert_eq!(error.code, "storage.failure");
+        assert_eq!(error.details["reason"], "unsupported_schema");
+        assert_eq!(error.details["expected_schema_version"], "qgh.db.v1");
+        assert_eq!(error.details["actual_schema_version"], "qgh.db.v2");
+        assert!(!error.message.contains("Run `qgh sync`"));
+        assert!(!error
+            .hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("qgh sync"));
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn migration_revalidates_schema_inside_its_write_transaction() {
+        let paths = temp_profile_paths("future-schema-transaction-guard");
+        fs::create_dir_all(&paths.profile_dir).unwrap();
+        let conn = Connection::open(&paths.db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE profile_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO profile_meta (key, value)
+            VALUES ('schema_version', 'qgh.db.v2');
+            CREATE TABLE future_schema_sentinel (
+                id INTEGER PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        let mut store = Store::from_connection(conn, &paths);
+
+        let error = store
+            .migrate()
+            .expect_err("migration must revalidate schema after acquiring its write lock");
+
+        assert_eq!(error.code, "storage.failure");
+        assert_eq!(error.details["reason"], "unsupported_schema");
+        assert_eq!(error.details["actual_schema_version"], "qgh.db.v2");
+        assert!(!table_exists(&store.conn, "repositories").unwrap());
+        let schema_version: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM profile_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, "qgh.db.v2");
+        drop(store);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_open_rejects_a_dangling_database_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let paths = temp_profile_paths("dangling-database-symlink");
+        fs::create_dir_all(&paths.profile_dir).unwrap();
+        let foreign_target = paths.profile_dir.join("foreign.sqlite3");
+        symlink(&foreign_target, &paths.db_path).unwrap();
+
+        let error = Store::open(&paths)
+            .err()
+            .expect("a dangling database symlink must fail closed");
+
+        assert_eq!(error.code, "storage.failure");
+        assert!(error.message.to_ascii_lowercase().contains("symbolic link"));
+        assert!(!foreign_target.exists());
+        assert!(fs::symlink_metadata(&paths.db_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_and_write_open_reject_a_database_symlink_with_a_valid_target() {
+        use std::os::unix::fs::symlink;
+
+        let paths = temp_profile_paths("valid-database-symlink");
+        drop(Store::open(&paths).unwrap());
+        let foreign_target = paths.profile_dir.join("foreign.sqlite3");
+        fs::rename(&paths.db_path, &foreign_target).unwrap();
+        symlink(&foreign_target, &paths.db_path).unwrap();
+        let target_before = fs::read(&foreign_target).unwrap();
+
+        let read_error = Store::open_for_read(&paths)
+            .err()
+            .expect("read-only access must not follow a database symlink");
+        let write_error = Store::open(&paths)
+            .err()
+            .expect("writable access must not follow a database symlink");
+
+        assert_eq!(read_error.code, "storage.failure");
+        assert!(read_error
+            .message
+            .to_ascii_lowercase()
+            .contains("symbolic link"));
+        assert_eq!(write_error.code, "storage.failure");
+        assert_eq!(write_error.message, read_error.message);
+        assert_eq!(fs::read(&foreign_target).unwrap(), target_before);
+        assert!(fs::symlink_metadata(&paths.db_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn writable_preflight_observes_future_schema_in_uncheckpointed_wal() {
+        let paths = temp_profile_paths("future-schema-in-wal");
+        drop(Store::open(&paths).unwrap());
+
+        let writer = Connection::open(&paths.db_path).unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        writer
+            .execute(
+                "UPDATE profile_meta SET value = 'qgh.db.v2' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        let wal_path = PathBuf::from(format!("{}-wal", paths.db_path.display()));
+        assert!(
+            fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 0),
+            "fixture must keep the future marker in WAL"
+        );
+        let sidecars_before = sqlite_file_inventory(&paths.db_path);
+
+        let error = Store::open(&paths)
+            .err()
+            .expect("preflight must read the current WAL-backed schema marker");
+
+        assert_eq!(error.code, "storage.failure");
+        assert_eq!(error.details["reason"], "unsupported_schema");
+        assert_eq!(error.details["actual_schema_version"], "qgh.db.v2");
+        assert_eq!(sqlite_file_inventory(&paths.db_path), sidecars_before);
+        drop(writer);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn unsupported_schema_error_does_not_echo_unrecognized_metadata() {
+        let paths = temp_profile_paths("unrecognized-schema-redaction");
+        drop(Store::open(&paths).unwrap());
+        let secret_marker = "not-a-schema-private-marker";
+        let database = Connection::open(&paths.db_path).unwrap();
+        database
+            .execute(
+                "UPDATE profile_meta SET value = ?1 WHERE key = 'schema_version'",
+                params![secret_marker],
+            )
+            .unwrap();
+        drop(database);
+
+        let error = Store::open_for_read(&paths)
+            .err()
+            .expect("unrecognized schema metadata must be rejected");
+
+        assert_eq!(error.code, "storage.failure");
+        assert_eq!(error.details["reason"], "unsupported_schema");
+        assert_eq!(error.details["actual_schema_version"], "unrecognized");
+        assert!(!format!("{error:?}").contains(secret_marker));
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn sync_planning_snapshot_is_independent_of_cursor_cardinality() {
+        let paths = temp_profile_paths("schedule-planning-snapshot");
+        let store = Store::open(&paths).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "WITH RECURSIVE counter(value) AS (
+                    VALUES(1)
+                    UNION ALL
+                    SELECT value + 1 FROM counter WHERE value < 5000
+                )
+                INSERT INTO sync_cursors (endpoint, cursor, etag)
+                SELECT printf('endpoint-%05d', value),
+                       printf('cursor-%05d', value),
+                       printf('etag-%05d', value)
+                FROM counter;",
+            )
+            .unwrap();
+
+        let planning = store.sync_planning_snapshot().unwrap();
+        assert_eq!(planning.last_sync_at, None);
+        assert!(planning.backoff.is_none());
+        let cursor_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM sync_cursors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cursor_count, 5000);
+
+        drop(store);
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn existing_read_open_does_not_initialize_a_missing_profile() {
+        let paths = temp_profile_paths("missing-existing-read-open");
+
+        assert!(Store::open_existing_for_read(&paths).unwrap().is_none());
+        assert!(!paths.profile_dir.exists());
+        assert!(!paths.db_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_open_tightens_existing_database_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let paths = temp_profile_paths("database-permissions");
+        fs::create_dir_all(&paths.profile_dir).unwrap();
+        fs::write(&paths.db_path, []).unwrap();
+        let mut permissions = fs::metadata(&paths.db_path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(&paths.db_path, permissions).unwrap();
+
+        drop(Store::open(&paths).unwrap());
+
+        assert_eq!(
+            fs::metadata(&paths.db_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn future_store_rejection_precedes_permission_and_journal_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let paths = temp_profile_paths("future-store-no-persistent-mutation");
+        fs::create_dir_all(&paths.profile_dir).unwrap();
+        let future = Connection::open(&paths.db_path).unwrap();
+        future
+            .execute_batch(
+                "CREATE TABLE profile_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO profile_meta (key, value)
+                VALUES ('schema_version', 'qgh.db.v2');
+                PRAGMA journal_mode = DELETE;",
+            )
+            .unwrap();
+        drop(future);
+        let mut permissions = fs::metadata(&paths.db_path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(&paths.db_path, permissions).unwrap();
+
+        let error = Store::open(&paths)
+            .err()
+            .expect("future schema must fail before persistent setup");
+
+        assert_eq!(error.details["reason"], "unsupported_schema");
+        assert_eq!(
+            fs::metadata(&paths.db_path).unwrap().permissions().mode() & 0o777,
+            0o666
+        );
+        let unchanged = Connection::open(&paths.db_path).unwrap();
+        let journal_mode: String = unchanged
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "delete");
+        drop(unchanged);
+        assert!(!paths.cache_dir.exists());
+        assert!(!paths.log_dir.exists());
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -22952,5 +23563,18 @@ mod tests {
             cache_dir,
             profile_dir,
         }
+    }
+
+    fn sqlite_file_inventory(db_path: &Path) -> Vec<String> {
+        let file_name = db_path.file_name().unwrap().to_string_lossy();
+        let mut inventory = fs::read_dir(db_path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                name.starts_with(file_name.as_ref()).then_some(name)
+            })
+            .collect::<Vec<_>>();
+        inventory.sort();
+        inventory
     }
 }

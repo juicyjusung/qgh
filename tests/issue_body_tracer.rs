@@ -342,6 +342,78 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
 }
 
 #[test]
+fn status_and_sync_fail_closed_on_a_future_store_schema_before_network_access() {
+    let fixture = TestFixture::new("future-store-schema");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let db_path = fixture.data_home.join("qgh/profiles/work/qgh.sqlite3");
+    let database = rusqlite::Connection::open(&db_path).unwrap();
+    database
+        .execute_batch(
+            "UPDATE profile_meta
+             SET value = 'qgh.db.v2'
+             WHERE key = 'schema_version';
+             CREATE TABLE future_schema_sentinel (
+                 id INTEGER PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+             INSERT INTO future_schema_sentinel (id, value)
+             VALUES (1, 'must-survive');
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    drop(database);
+    let database_before = fs::read(&db_path).unwrap();
+    let requests_before = server.request_count();
+
+    for output in [
+        fixture.qgh(["status", "--json"]),
+        fixture.qgh(["sync", "--json"]),
+    ] {
+        assert_eq!(output.status.code(), Some(6));
+        let body = stdout_json(&output);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "storage.failure");
+        assert_eq!(body["error"]["details"]["reason"], "unsupported_schema");
+        assert_eq!(
+            body["error"]["details"]["expected_schema_version"],
+            "qgh.db.v1"
+        );
+        assert_eq!(
+            body["error"]["details"]["actual_schema_version"],
+            "qgh.db.v2"
+        );
+    }
+
+    assert_eq!(
+        server.request_count(),
+        requests_before,
+        "unsupported stores must fail before GitHub access"
+    );
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        database_before,
+        "read and write adapters must leave the rejected database byte-identical"
+    );
+    let unchanged = rusqlite::Connection::open(&db_path).unwrap();
+    let marker: (String, String) = unchanged
+        .query_row(
+            "SELECT
+                (SELECT value FROM profile_meta WHERE key = 'schema_version'),
+                (SELECT value FROM future_schema_sentinel WHERE id = 1)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        marker,
+        ("qgh.db.v2".to_string(), "must-survive".to_string())
+    );
+}
+
+#[test]
 fn malformed_tantivy_query_is_content_free_across_cli_and_mcp_errors() {
     let fixture = TestFixture::new("malformed-tantivy-query-content-free");
     let server = FakeGitHub::start(issue_payload_with_pr());

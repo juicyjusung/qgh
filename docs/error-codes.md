@@ -15,7 +15,12 @@ Stable error families:
 - `source.*`: missing or tombstoned source lookups.
 - `purge.*`: fail-closed purge, retry, publication, and read/write-fence failures.
 - `publication.*`: retrieval snapshot CAS, provenance, and artifact-readiness failures.
-- `storage.*`: SQLite or local filesystem storage failures.
+- `storage.*`: SQLite or local filesystem storage failures. A
+  `storage.failure` with `details.reason: "unsupported_schema"` rejects an
+  unknown or newer Profile Store before writable migration or content repair,
+  without widening the closed `qgh.v2` error-code enum. Recognized
+  `qgh.db.vN` markers are reported; arbitrary marker text is returned only as
+  `"unrecognized"`.
 - `index.*`: Tantivy index failures.
 - `internal.*`: unexpected internal failures.
 

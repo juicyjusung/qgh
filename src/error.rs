@@ -120,9 +120,37 @@ impl QghError {
         Self::new("storage.failure", message, 6)
     }
 
+    pub fn unsupported_store_schema(expected: &str, actual: Option<&str>) -> Self {
+        let actual = match actual {
+            Some(value) if reportable_store_schema_version(value) => json!(value),
+            Some(_) => json!("unrecognized"),
+            None => serde_json::Value::Null,
+        };
+        Self::new(
+            "storage.failure",
+            "The local store schema is not supported by this qgh version.",
+            6,
+        )
+        .with_details(json!({
+            "reason": "unsupported_schema",
+            "expected_schema_version": expected,
+            "actual_schema_version": actual
+        }))
+        .with_hint(
+            "Upgrade qgh or restore a compatible store backup; no schema migration or content repair was attempted.",
+        )
+    }
+
     pub fn index(message: impl Into<String>) -> Self {
         Self::new("index.failure", message, 6)
     }
+}
+
+fn reportable_store_schema_version(value: &str) -> bool {
+    let Some(version) = value.strip_prefix("qgh.db.v") else {
+        return false;
+    };
+    !version.is_empty() && version.len() <= 10 && version.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 impl From<rusqlite::Error> for QghError {

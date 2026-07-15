@@ -60,7 +60,7 @@ use crate::rate_budget;
 use crate::resolution::ResolvedRepoScope;
 use crate::store::{
     PendingPurgeView, PurgeTarget, PurgeTrigger, RetrievalBuildSnapshot, RetrievalPublicationView,
-    Store,
+    Store, STORE_SCHEMA_VERSION,
 };
 use crate::terminal::TerminalUi;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
@@ -169,8 +169,14 @@ impl ScheduleSyncDeferral {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScheduledSyncCompletion {
+    Synced,
+    SkippedFresh,
+}
+
 pub(crate) enum ScheduledSyncResult {
-    Completed(LocalReadOutcome),
+    Completed(ScheduledSyncCompletion),
     Deferred {
         reason: ScheduleSyncDeferral,
         rate_budget: Vec<RateBudgetObservation>,
@@ -184,11 +190,30 @@ pub(crate) struct ScheduledSyncExecution {
 }
 
 enum SyncBodyOutcome {
-    Completed(LocalReadOutcome),
+    Completed {
+        outcome: LocalReadOutcome,
+        scheduled_completion: ScheduledSyncCompletion,
+    },
     ScheduledDeferred {
         reason: ScheduleSyncDeferral,
         rate_budget: Vec<RateBudgetObservation>,
     },
+}
+
+impl SyncBodyOutcome {
+    fn synced(outcome: LocalReadOutcome) -> Self {
+        Self::Completed {
+            outcome,
+            scheduled_completion: ScheduledSyncCompletion::Synced,
+        }
+    }
+
+    fn skipped_fresh(outcome: LocalReadOutcome) -> Self {
+        Self::Completed {
+            outcome,
+            scheduled_completion: ScheduledSyncCompletion::SkippedFresh,
+        }
+    }
 }
 
 enum SyncInvocation<'a> {
@@ -297,7 +322,7 @@ pub async fn sync(
     )
     .await?
     {
-        SyncBodyOutcome::Completed(outcome) => Ok(outcome),
+        SyncBodyOutcome::Completed { outcome, .. } => Ok(outcome),
         SyncBodyOutcome::ScheduledDeferred { .. } => unreachable!("standard sync cannot defer"),
     }
 }
@@ -336,7 +361,10 @@ pub(crate) async fn sync_scheduled(
     )
     .await
     .map(|outcome| match outcome {
-        SyncBodyOutcome::Completed(outcome) => ScheduledSyncResult::Completed(outcome),
+        SyncBodyOutcome::Completed {
+            scheduled_completion,
+            ..
+        } => ScheduledSyncResult::Completed(scheduled_completion),
         SyncBodyOutcome::ScheduledDeferred {
             reason,
             rate_budget,
@@ -416,7 +444,7 @@ async fn sync_profile(
         if let Some(outcome) =
             skipped_fresh_sync_outcome(&store, &profile, if_stale_max_age_seconds, &progress)?
         {
-            return Ok(SyncBodyOutcome::Completed(outcome));
+            return Ok(SyncBodyOutcome::skipped_fresh(outcome));
         }
     }
     if let SyncInvocation::Scheduled {
@@ -456,7 +484,7 @@ async fn sync_profile(
         if let Some(outcome) =
             skipped_fresh_sync_outcome(&store, &profile, if_stale_max_age_seconds, &progress)?
         {
-            return Ok(SyncBodyOutcome::Completed(outcome));
+            return Ok(SyncBodyOutcome::skipped_fresh(outcome));
         }
     }
 
@@ -477,7 +505,7 @@ async fn sync_profile(
             &progress,
         )
         .await
-        .map(SyncBodyOutcome::Completed);
+        .map(SyncBodyOutcome::synced);
     }
 
     progress.line(format_args!(
@@ -572,7 +600,7 @@ async fn sync_profile(
                     backoff,
                     &retry_command,
                 )
-                .map(SyncBodyOutcome::Completed);
+                .map(SyncBodyOutcome::synced);
             }
             InterruptionDisposition::RequestBudget(reason) => {
                 return Ok(SyncBodyOutcome::ScheduledDeferred {
@@ -683,7 +711,7 @@ async fn sync_profile(
                 backoff,
                 &retry_command,
             )
-            .map(SyncBodyOutcome::Completed);
+            .map(SyncBodyOutcome::synced);
         }
     }
 
@@ -806,7 +834,7 @@ async fn sync_profile(
                             backoff,
                             &retry_command,
                         )
-                        .map(SyncBodyOutcome::Completed)
+                        .map(SyncBodyOutcome::synced)
                     }
                     InterruptionDisposition::RequestBudget(reason) => {
                         return Ok(SyncBodyOutcome::ScheduledDeferred {
@@ -859,7 +887,7 @@ async fn sync_profile(
         &profile.id,
     );
     let rate_budget = stored_rate_budget_block(&store, &profile.host)?;
-    Ok(SyncBodyOutcome::Completed(local_read_outcome(
+    Ok(SyncBodyOutcome::synced(local_read_outcome(
         json!({
             "profile_id": profile.id,
             "sync_state": "ok",
@@ -901,7 +929,7 @@ fn skipped_fresh_sync_outcome(
     let Some(max_age_seconds) = max_age_seconds else {
         return Ok(None);
     };
-    let last_sync = store.status()?.last_sync_at;
+    let last_sync = store.sync_planning_snapshot()?.last_sync_at;
     let Some(last_sync_at) = last_sync.as_deref() else {
         return Ok(None);
     };
@@ -959,8 +987,11 @@ fn revalidate_scheduled_host(
     let mut active_backoff = false;
     for profile in host_profiles {
         if profile.id == current_profile.id {
-            let status = current_store.status()?;
-            active_backoff |= status.backoff.as_ref().is_some_and(sync_backoff_is_active);
+            let planning = current_store.sync_planning_snapshot()?;
+            active_backoff |= planning
+                .backoff
+                .as_ref()
+                .is_some_and(sync_backoff_is_active);
             let profile_observations = current_store.rate_budget_observations(&profile.host)?;
             let profile_core = fresh_core_budget(&profile_observations);
             complete &= profile_core.is_some();
@@ -971,10 +1002,12 @@ fn revalidate_scheduled_host(
                 });
             }
             observations.extend(profile_observations);
-        } else if profile.paths.db_path.exists() {
-            let store = Store::open_for_read(&profile.paths)?;
-            let status = store.status()?;
-            active_backoff |= status.backoff.as_ref().is_some_and(sync_backoff_is_active);
+        } else if let Some(store) = Store::open_existing_for_read(&profile.paths)? {
+            let planning = store.sync_planning_snapshot()?;
+            active_backoff |= planning
+                .backoff
+                .as_ref()
+                .is_some_and(sync_backoff_is_active);
             let profile_observations = store.rate_budget_observations(&profile.host)?;
             let profile_core = fresh_core_budget(&profile_observations);
             complete &= profile_core.is_some();
@@ -6851,7 +6884,7 @@ pub fn status(
             "tombstone_count": status.tombstone_count
         },
         "database": {
-            "schema_version": "qgh.db.v1"
+            "schema_version": STORE_SCHEMA_VERSION
         },
         "index": {
             "active_generation": status.active_generation,
