@@ -15,6 +15,13 @@ A non-unique partial index on pending `source_id` keeps enqueue/coalescing work
 proportional to the pending queue while remaining compatible with older v1
 writers that may insert duplicate tasks.
 
+The source inventory digest is a versioned, ordered compatibility contract.
+Snapshot capture still materializes the source vector needed by the Tantivy
+builder, but reservation and publication validation re-scan active SQLite rows
+through an incremental digest accumulator instead of materializing a second
+corpus-sized vector. The scan preserves issue-first/comment-second ordering and
+fails closed when the declared active-source count and visited row count differ.
+
 A Tantivy generation is publishable only after its committed files and seal are
 complete, its shadow directory has been renamed without replacement, and the
 generation directory, `index_root`, and profile directory have crossed the

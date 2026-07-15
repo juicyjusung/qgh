@@ -640,34 +640,63 @@ pub(crate) fn rename_without_replacement(from: &Path, to: &Path) -> Result<(), Q
     fs::rename(from, to).map_err(|_| index_build_collision_error())
 }
 
-pub(crate) fn source_inventory_digest(sources: &[IndexSource]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"qgh.source_inventory.v1");
-    hasher.update((sources.len() as u64).to_le_bytes());
-    for source in sources {
-        hash_text(&mut hasher, &source.source_id);
-        hash_text(&mut hasher, &source.entity_type);
-        hash_text(&mut hasher, &source.repo);
-        hasher.update(source.issue_number.to_le_bytes());
-        hash_text(&mut hasher, &source.state);
-        hasher.update((source.labels.len() as u64).to_le_bytes());
+pub(crate) struct SourceInventoryAccumulator {
+    hasher: Sha256,
+    expected_count: usize,
+    observed_count: usize,
+}
+
+impl SourceInventoryAccumulator {
+    pub(crate) fn new(expected_count: usize) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"qgh.source_inventory.v1");
+        hasher.update((expected_count as u64).to_le_bytes());
+        Self {
+            hasher,
+            expected_count,
+            observed_count: 0,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, source: &IndexSource) {
+        hash_text(&mut self.hasher, &source.source_id);
+        hash_text(&mut self.hasher, &source.entity_type);
+        hash_text(&mut self.hasher, &source.repo);
+        self.hasher.update(source.issue_number.to_le_bytes());
+        hash_text(&mut self.hasher, &source.state);
+        self.hasher
+            .update((source.labels.len() as u64).to_le_bytes());
         for label in &source.labels {
-            hash_text(&mut hasher, label);
+            hash_text(&mut self.hasher, label);
         }
         match &source.author {
             Some(author) => {
-                hasher.update([1]);
-                hash_text(&mut hasher, author);
+                self.hasher.update([1]);
+                hash_text(&mut self.hasher, author);
             }
-            None => hasher.update([0]),
+            None => self.hasher.update([0]),
         }
-        hash_text(&mut hasher, &source.title);
-        hash_text(&mut hasher, &source.body);
-        hash_text(&mut hasher, &source.parent_issue_title);
-        hash_text(&mut hasher, &source.github_updated_at);
-        hash_text(&mut hasher, &source.indexed_at);
+        hash_text(&mut self.hasher, &source.title);
+        hash_text(&mut self.hasher, &source.body);
+        hash_text(&mut self.hasher, &source.parent_issue_title);
+        hash_text(&mut self.hasher, &source.github_updated_at);
+        hash_text(&mut self.hasher, &source.indexed_at);
+        self.observed_count = self.observed_count.saturating_add(1);
     }
-    digest_hex(hasher)
+
+    pub(crate) fn finish(self) -> Option<String> {
+        (self.observed_count == self.expected_count).then(|| digest_hex(self.hasher))
+    }
+}
+
+pub(crate) fn source_inventory_digest(sources: &[IndexSource]) -> String {
+    let mut accumulator = SourceInventoryAccumulator::new(sources.len());
+    for source in sources {
+        accumulator.observe(source);
+    }
+    accumulator
+        .finish()
+        .expect("a slice iterator must match its declared source count")
 }
 
 pub(crate) fn committed_source_inventory_digest(index: &Index) -> Result<Option<String>, QghError> {
@@ -1102,6 +1131,68 @@ mod tests {
     use super::*;
     use crate::model::IndexSource;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn source_inventory_v1_digest_is_stable_for_mixed_sources() {
+        let sources = mixed_inventory_sources();
+
+        assert_eq!(
+            source_inventory_digest(&sources),
+            "961e8fa7a13c289b76bd13c3e1c29d66a4b0754180b8e705cf3130f86b429693"
+        );
+    }
+
+    #[test]
+    fn source_inventory_accumulator_matches_materialized_digest_and_checks_count() {
+        let sources = mixed_inventory_sources();
+        let mut accumulator = SourceInventoryAccumulator::new(sources.len());
+        for source in &sources {
+            accumulator.observe(source);
+        }
+        assert_eq!(
+            accumulator.finish().as_deref(),
+            Some(source_inventory_digest(&sources).as_str())
+        );
+
+        let mut incomplete = SourceInventoryAccumulator::new(sources.len() + 1);
+        for source in &sources {
+            incomplete.observe(source);
+        }
+        assert_eq!(incomplete.finish(), None);
+    }
+
+    fn mixed_inventory_sources() -> Vec<IndexSource> {
+        vec![
+            IndexSource {
+                source_id: "qgh://github.com/issue/ISSUE_NODE".to_string(),
+                entity_type: "issue".to_string(),
+                repo: "owner/repo".to_string(),
+                issue_number: 47,
+                state: "open".to_string(),
+                labels: vec!["버그".to_string(), "ready-for-agent".to_string()],
+                author: None,
+                title: "동기화 안정성".to_string(),
+                body: "CJK 본문과 ASCII body".to_string(),
+                parent_issue_title: String::new(),
+                github_updated_at: "2026-07-15T01:02:03Z".to_string(),
+                indexed_at: "2026-07-15T01:02:04Z".to_string(),
+            },
+            IndexSource {
+                source_id: "qgh://github.com/issue-comment/COMMENT_NODE".to_string(),
+                entity_type: "issue_comment".to_string(),
+                repo: "owner/repo".to_string(),
+                issue_number: 47,
+                state: String::new(),
+                labels: Vec::new(),
+                author: Some("alice".to_string()),
+                title: String::new(),
+                body: "후속 comment".to_string(),
+                parent_issue_title: "동기화 안정성".to_string(),
+                github_updated_at: "2026-07-15T02:03:04Z".to_string(),
+                indexed_at: "2026-07-15T02:03:05Z".to_string(),
+            },
+        ]
+    }
 
     #[test]
     fn search_rejects_missing_artifact_instead_of_returning_empty_results() {

@@ -384,6 +384,12 @@ pub struct RetrievalBuildSnapshot {
     embedding_inventory_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceInventorySummary {
+    count: usize,
+    hash: String,
+}
+
 impl RetrievalBuildSnapshot {
     pub(crate) fn identity(&self) -> &SourceSnapshotIdentity {
         &self.identity
@@ -3940,39 +3946,58 @@ impl Store {
         Ok((tombstoned_issues, tombstoned_comments))
     }
 
-    pub fn active_issues(&self) -> Result<Vec<StoredIssue>, QghError> {
-        let mut stmt = self.conn.prepare(
+    pub fn active_index_sources(&self) -> Result<Vec<IndexSource>, QghError> {
+        let mut sources = Vec::new();
+        self.visit_active_index_sources(|source| sources.push(source))?;
+        Ok(sources)
+    }
+
+    fn active_source_inventory_summary(&self) -> Result<SourceInventorySummary, QghError> {
+        let expected_count = self.conn.query_row(
+            "SELECT count(*) FROM source_entities WHERE lifecycle_state = 'active'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let expected_count = usize::try_from(expected_count)
+            .map_err(|_| QghError::storage("Active source count exceeds the supported range."))?;
+        let mut accumulator = crate::index::SourceInventoryAccumulator::new(expected_count);
+        let observed_count = self.visit_active_index_sources(|source| {
+            accumulator.observe(&source);
+        })?;
+        let Some(hash) = accumulator.finish() else {
+            return Err(source_inventory_mismatch_error());
+        };
+        if observed_count != expected_count {
+            return Err(source_inventory_mismatch_error());
+        }
+        Ok(SourceInventorySummary {
+            count: observed_count,
+            hash,
+        })
+    }
+
+    fn visit_active_index_sources(
+        &self,
+        mut visit: impl FnMut(IndexSource),
+    ) -> Result<usize, QghError> {
+        let mut observed_count = 0usize;
+        let mut issue_stmt = self.conn.prepare(
             "SELECT im.source_id, im.repo, im.issue_number, im.title, im.body, im.state,
-                    im.labels_json, im.author, im.canonical_url,
-                    sv.body_hash, sv.github_updated_at, sv.indexed_at, sv.sync_run_id, sv.lifecycle_state
+                    im.labels_json, im.author, sv.github_updated_at, sv.indexed_at
              FROM issue_metadata im
              JOIN source_entities se ON se.source_id = im.source_id
              JOIN source_versions sv ON sv.id = im.latest_version_id
              WHERE se.lifecycle_state = 'active'
              ORDER BY im.repo, im.issue_number",
         )?;
-        let rows = stmt.query_map([], stored_issue_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
-    }
-
-    pub fn active_index_sources(&self) -> Result<Vec<IndexSource>, QghError> {
-        let mut sources = Vec::new();
-        for issue in self.active_issues()? {
-            sources.push(IndexSource {
-                source_id: issue.source_id,
-                entity_type: "issue".to_string(),
-                repo: issue.repo,
-                issue_number: issue.number,
-                state: issue.state,
-                labels: issue.labels,
-                author: issue.author,
-                title: issue.title,
-                body: issue.body,
-                parent_issue_title: String::new(),
-                github_updated_at: issue.source_version.github_updated_at,
-                indexed_at: issue.source_version.indexed_at,
-            });
+        let issue_rows = issue_stmt.query_map([], index_issue_source_from_row)?;
+        for source in issue_rows {
+            visit(source?);
+            observed_count = observed_count.checked_add(1).ok_or_else(|| {
+                QghError::storage("Active source count exceeds the supported range.")
+            })?;
         }
+
         let mut stmt = self.conn.prepare(
             "SELECT cm.source_id, cm.repo, cm.issue_number, cm.body, cm.author,
                     cm.parent_issue_title, sv.github_updated_at, sv.indexed_at
@@ -3982,24 +4007,14 @@ impl Store {
              WHERE se.lifecycle_state = 'active'
              ORDER BY cm.repo, cm.issue_number, cm.source_id",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(IndexSource {
-                source_id: row.get(0)?,
-                entity_type: "issue_comment".to_string(),
-                repo: row.get(1)?,
-                issue_number: row.get(2)?,
-                state: String::new(),
-                labels: Vec::new(),
-                author: row.get(4)?,
-                title: String::new(),
-                body: row.get(3)?,
-                parent_issue_title: row.get(5)?,
-                github_updated_at: row.get(6)?,
-                indexed_at: row.get(7)?,
-            })
-        })?;
-        sources.extend(rows.collect::<Result<Vec<_>, _>>()?);
-        Ok(sources)
+        let rows = stmt.query_map([], index_comment_source_from_row)?;
+        for source in rows {
+            visit(source?);
+            observed_count = observed_count.checked_add(1).ok_or_else(|| {
+                QghError::storage("Active source count exceeds the supported range.")
+            })?;
+        }
+        Ok(observed_count)
     }
 
     pub fn get_issue(&self, source_id: &str) -> Result<Option<StoredIssue>, QghError> {
@@ -5818,11 +5833,10 @@ impl Store {
         index_root: &Path,
         source_count: usize,
     ) -> Result<(i64, PathBuf), QghError> {
-        let sources = self.active_index_sources()?;
-        if sources.len() != source_count {
+        let inventory = self.active_source_inventory_summary()?;
+        if inventory.count != source_count {
             return Err(source_inventory_mismatch_error());
         }
-        let inventory_hash = crate::index::source_inventory_digest(&sources);
         let source_snapshot_epoch = read_source_snapshot_epoch(&self.conn)?;
         let identity = self
             .conn
@@ -5848,7 +5862,7 @@ impl Store {
             source_count,
             identity.as_ref(),
             expected_publication_id,
-            Some(&inventory_hash),
+            Some(&inventory.hash),
         )
     }
 
@@ -6274,10 +6288,9 @@ impl Store {
         if !identity_valid {
             return Err(changed_source_snapshot_error());
         }
-        let current_sources = self.active_index_sources()?;
-        if current_sources.len() != snapshot.sources.len()
-            || crate::index::source_inventory_digest(&current_sources)
-                != snapshot.source_inventory_hash
+        let current_inventory = self.active_source_inventory_summary()?;
+        if current_inventory.count != snapshot.sources.len()
+            || current_inventory.hash != snapshot.source_inventory_hash
         {
             return Err(source_inventory_mismatch_error());
         }
@@ -7363,9 +7376,7 @@ impl Store {
         let expected_generation_path = self
             .index_root
             .join(format!("generation-{tantivy_generation}"));
-        let authoritative_sources = self.active_index_sources()?;
-        let authoritative_source_inventory_hash =
-            crate::index::source_inventory_digest(&authoritative_sources);
+        let authoritative_source_inventory = self.active_source_inventory_summary()?;
         let authoritative_embedding_chunks = self.active_contextual_embedding_chunks()?;
         let authoritative_embedding_inventory_hash =
             embedding_inventory_hash(&authoritative_embedding_chunks);
@@ -7605,9 +7616,9 @@ impl Store {
             let _ = self.cleanup_owned_index_generation(tantivy_generation);
             return Err(changed_source_snapshot_error());
         }
-        if usize::try_from(source_count).ok() != Some(authoritative_sources.len())
+        if usize::try_from(source_count).ok() != Some(authoritative_source_inventory.count)
             || index_source_inventory_hash.as_deref()
-                != Some(authoritative_source_inventory_hash.as_str())
+                != Some(authoritative_source_inventory.hash.as_str())
         {
             drop(tx);
             let _ = self.cleanup_owned_index_generation(tantivy_generation);
@@ -7649,7 +7660,7 @@ impl Store {
         if let Err(error) = validate_tantivy_generation_artifact(
             &expected_generation_path,
             source_count,
-            &authoritative_source_inventory_hash,
+            &authoritative_source_inventory.hash,
         ) {
             drop(tx);
             let _ = self.cleanup_owned_index_generation(tantivy_generation);
@@ -11786,6 +11797,41 @@ fn stored_issue_from_row(row: &rusqlite::Row<'_>) -> Result<StoredIssue, rusqlit
             sync_run_id: row.get(12)?,
             lifecycle_state: row.get(13)?,
         },
+    })
+}
+
+fn index_issue_source_from_row(row: &rusqlite::Row<'_>) -> Result<IndexSource, rusqlite::Error> {
+    let labels_json: String = row.get(6)?;
+    Ok(IndexSource {
+        source_id: row.get(0)?,
+        entity_type: "issue".to_string(),
+        repo: row.get(1)?,
+        issue_number: row.get(2)?,
+        state: row.get(5)?,
+        labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+        author: row.get(7)?,
+        title: row.get(3)?,
+        body: row.get(4)?,
+        parent_issue_title: String::new(),
+        github_updated_at: row.get(8)?,
+        indexed_at: row.get(9)?,
+    })
+}
+
+fn index_comment_source_from_row(row: &rusqlite::Row<'_>) -> Result<IndexSource, rusqlite::Error> {
+    Ok(IndexSource {
+        source_id: row.get(0)?,
+        entity_type: "issue_comment".to_string(),
+        repo: row.get(1)?,
+        issue_number: row.get(2)?,
+        state: String::new(),
+        labels: Vec::new(),
+        author: row.get(4)?,
+        title: String::new(),
+        body: row.get(3)?,
+        parent_issue_title: row.get(5)?,
+        github_updated_at: row.get(6)?,
+        indexed_at: row.get(7)?,
     })
 }
 
@@ -20066,6 +20112,59 @@ mod tests {
             .validate_query_publication_snapshot(Some(&active))
             .unwrap_err();
         assert_eq!(query_error.code, "publication.source_snapshot_changed");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn active_source_inventory_summary_matches_materialized_mixed_sources() {
+        let paths = temp_profile_paths("streamed-source-inventory");
+        let mut store = Store::open(&paths).unwrap();
+        let issue_id = "qgh://github.com/issue/I_STREAMED_INVENTORY";
+        let comment_id = "qgh://github.com/issue-comment/IC_STREAMED_INVENTORY";
+        let mut issue = test_issue(issue_id, "owner/repo", "streamed-inventory");
+        issue.title = "동기화 안정성".to_string();
+        issue.body = "CJK 본문과 ASCII body".to_string();
+        issue.labels = vec!["버그".to_string(), "ready-for-agent".to_string()];
+        issue.author = None;
+        let mut comment = test_comment(comment_id, issue_id, "owner/repo", "streamed-inventory");
+        comment.body = "후속 comment".to_string();
+        comment.parent_issue_title = issue.title.clone();
+        store
+            .upsert_sources_for_run(
+                "sync-streamed-source-inventory",
+                &[issue],
+                &[comment],
+                0,
+                &[],
+            )
+            .unwrap();
+
+        let materialized = store.active_index_sources().unwrap();
+        let streamed = store.active_source_inventory_summary().unwrap();
+
+        assert_eq!(streamed.count, materialized.len());
+        assert_eq!(
+            streamed.hash,
+            crate::index::source_inventory_digest(&materialized)
+        );
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO source_entities
+                    (source_id, entity_type, host, repo, node_id, github_id,
+                     lifecycle_state, created_at, updated_at, last_seen_at)
+                 VALUES (?1, 'unsupported', 'github.com', 'owner/repo',
+                         'ROGUE_STREAMED_INVENTORY', 999, 'active', ?2, ?2, ?2)",
+                params![
+                    "qgh://github.com/unsupported/ROGUE_STREAMED_INVENTORY",
+                    "2026-07-15T03:04:05Z"
+                ],
+            )
+            .unwrap();
+        let error = store.active_source_inventory_summary().unwrap_err();
+        assert_eq!(error.code, "publication.source_inventory_mismatch");
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
