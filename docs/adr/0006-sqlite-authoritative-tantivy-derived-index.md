@@ -4,6 +4,15 @@ qgh stores source identity, source versions, aliases, tombstones, sync runs, and
 
 Sync writes SQLite first, records index work, and only exposes a Tantivy generation after shadow build and atomic publish. Query results must still round-trip through SQLite-backed `get`; a Tantivy hit that cannot be resolved by `get` is not a successful result.
 
+A Tantivy generation is publishable only after its committed files and seal are
+complete, its shadow directory has been renamed without replacement, and the
+generation directory, `index_root`, and profile directory have crossed the
+supported filesystem durability barriers. SQLite publication activation happens
+after those barriers. If any barrier fails, qgh returns a structured publication
+error and keeps the previous SQLite publication pointer unchanged. qgh uses the
+standard macOS/Linux filesystem synchronization contract; stronger guarantees
+against device-controller or sudden-power-loss behavior remain platform-dependent.
+
 The Profile Store marker has an independent compatibility lifecycle. Only
 backward-safe additive changes may retain `qgh.db.v1`; an incompatible writer
 change must bump the marker. An older binary must fail closed before migration

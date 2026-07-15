@@ -276,7 +276,7 @@ MVP implementation baseline은 다음을 따른다.
 - Tantivy fields: `source_id`, `entity_type`, `repo`, `issue_number`, `state`, `labels`, `author`, `title`, `body`, `parent_issue_title`, `updated_at`, `indexed_at`.
 - Sync writes committed SQLite rows first, then records `index_tasks`. Tantivy indexes only committed SQLite source versions.
 - Query reads Tantivy candidates, then resolves and filters them through SQLite. Tombstoned, unavailable, or `get`-unresolvable hits are not successful results.
-- Full index rebuild uses a shadow Tantivy directory and publishes a new `index_generations` record atomically. `status` exposes active generation and dirty task count.
+- Full index rebuild uses a shadow Tantivy directory. qgh seals the generation, performs a no-replace rename, and synchronizes the generation, `index_root`, and profile directory before atomically activating the new SQLite publication pointer. A failed filesystem durability barrier must leave the previous pointer active. `status` exposes active generation and dirty task count.
 
 ## 11. CLI and MCP Adapter Interface Requirements
 

@@ -8092,6 +8092,62 @@ mod tests {
     }
 
     #[test]
+    fn generation_durability_failure_preserves_previous_resolvable_publication() {
+        let paths = temp_profile_paths("generation-durability-failure");
+        let profile = bm25_test_profile(&paths);
+        let mut store = Store::open(&paths).unwrap();
+        seed_bm25_snapshot(
+            &mut store,
+            "sync-generation-durability-initial",
+            "I_DURABILITY_FAILURE",
+        );
+        rebuild_bm25_index(&profile, &mut store, &StderrSyncProgress::new(false)).unwrap();
+        let previous = store.active_retrieval_publication().unwrap().unwrap();
+        let previous_path = store.resolve_active_tantivy_artifact().unwrap().unwrap();
+        crate::index::reset_publication_directory_sync_paths();
+        crate::index::fail_publication_directory_sync_after(1);
+
+        let error = match rebuild_bm25_index(&profile, &mut store, &StderrSyncProgress::new(false))
+        {
+            Ok(_) => panic!("directory durability failure must stop before activation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
+        assert_eq!(
+            store
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            previous.publication_id
+        );
+        assert_eq!(
+            store.resolve_active_tantivy_artifact().unwrap().unwrap(),
+            previous_path
+        );
+
+        crate::index::reset_publication_directory_sync_paths();
+        drop(store);
+        let reopened = Store::open(&paths).unwrap();
+        assert_eq!(
+            reopened
+                .active_retrieval_publication()
+                .unwrap()
+                .unwrap()
+                .publication_id,
+            previous.publication_id
+        );
+        assert_eq!(
+            reopened.resolve_active_tantivy_artifact().unwrap().unwrap(),
+            previous_path
+        );
+
+        drop(reopened);
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
     fn repository_purge_subsumes_only_same_repo_targets() {
         let requests = vec![
             (
