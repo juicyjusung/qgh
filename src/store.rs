@@ -3578,7 +3578,8 @@ impl Store {
 
         for issue in issues {
             let repo = canonical_repository_identity(&tx, &issue.repo)?;
-            source_snapshot_changed |= !authoritative_issue_matches(&tx, issue, &repo)?;
+            let issue_changed = !authoritative_issue_matches(&tx, issue, &repo)?;
+            source_snapshot_changed |= issue_changed;
             let previous_title = tx
                 .query_row(
                     "SELECT title FROM issue_metadata WHERE source_id = ?1",
@@ -3669,11 +3670,9 @@ impl Store {
                 &issue.number.to_string(),
             )?;
             upsert_alias(&tx, &issue.source_id, "title", &issue.title)?;
-            tx.execute(
-                "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
-                 VALUES (?1, 'upsert', ?2, NULL)",
-                params![issue.source_id, now],
-            )?;
+            if issue_changed {
+                record_index_task(&tx, &issue.source_id, IndexTaskKind::Upsert, &now)?;
+            }
             if previous_title.as_deref() != Some(issue.title.as_str()) {
                 let comment_source_ids = {
                     let mut stmt = tx.prepare(
@@ -3695,12 +3694,7 @@ impl Store {
                         params![issue.source_id, issue.title],
                     )?;
                     for source_id in comment_source_ids {
-                        tx.execute(
-                            "INSERT INTO index_tasks
-                                (source_id, task_type, created_at, completed_at)
-                             VALUES (?1, 'upsert', ?2, NULL)",
-                            params![source_id, now],
-                        )?;
+                        record_index_task(&tx, &source_id, IndexTaskKind::Upsert, &now)?;
                     }
                 }
             }
@@ -3709,7 +3703,8 @@ impl Store {
 
         for comment in comments {
             let repo = canonical_repository_identity(&tx, &comment.repo)?;
-            source_snapshot_changed |= !authoritative_comment_matches(&tx, comment, &repo)?;
+            let comment_changed = !authoritative_comment_matches(&tx, comment, &repo)?;
+            source_snapshot_changed |= comment_changed;
             tx.execute(
                 "INSERT INTO source_entities
                     (source_id, entity_type, host, repo, node_id, github_id, lifecycle_state, created_at, updated_at, last_seen_at)
@@ -3785,11 +3780,9 @@ impl Store {
                 "rest_id",
                 &comment.github_id.to_string(),
             )?;
-            tx.execute(
-                "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
-                 VALUES (?1, 'upsert', ?2, NULL)",
-                params![comment.source_id, now],
-            )?;
+            if comment_changed {
+                record_index_task(&tx, &comment.source_id, IndexTaskKind::Upsert, &now)?;
+            }
             apply_pending_purge_guard(&tx, &comment.source_id, &repo, comment.parent_issue_number)?;
         }
 
@@ -5287,11 +5280,7 @@ impl Store {
             )?;
         }
         if changed > 0 {
-            tx.execute(
-                "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
-                 VALUES (?1, 'delete', ?2, NULL)",
-                params![source_id, observed_at],
-            )?;
+            record_index_task(&tx, source_id, IndexTaskKind::Delete, &observed_at)?;
         }
         if changed > 0 || previous_reason.as_deref() != Some(reason) {
             bump_source_snapshot_epoch(&tx)?;
@@ -5608,10 +5597,6 @@ impl Store {
              SET path = ?2, source_count = ?3, created_at = ?4, active = 1
              WHERE generation = ?1 AND write_epoch = ?5",
             params![generation, path, source_count as i64, now, expected_epoch],
-        )?;
-        tx.execute(
-            "UPDATE index_tasks SET completed_at = ?1 WHERE completed_at IS NULL",
-            params![now],
         )?;
         let ownership_retained = tx.execute(
             "UPDATE index_build_leases
@@ -7757,10 +7742,7 @@ impl Store {
             "UPDATE index_generations SET active = CASE WHEN generation = ?1 THEN 1 ELSE 0 END",
             params![tantivy_generation],
         )?;
-        tx.execute(
-            "UPDATE index_tasks SET completed_at = ?1 WHERE completed_at IS NULL",
-            params![now],
-        )?;
+        tx.execute("DELETE FROM index_tasks", [])?;
         if let Some(generation_id) = embedding_generation_id {
             tx.execute(
                 "UPDATE embedding_generations SET state = 'active', updated_at = ?2 WHERE id = ?1",
@@ -8858,6 +8840,10 @@ impl Store {
                 created_at TEXT NOT NULL,
                 completed_at TEXT
             );
+
+            CREATE INDEX IF NOT EXISTS idx_index_tasks_pending_source
+                ON index_tasks(source_id)
+                WHERE completed_at IS NULL;
 
             CREATE TABLE IF NOT EXISTS retrieval_publications (
                 publication_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -11445,6 +11431,42 @@ fn authoritative_comment_matches(
         |row| row.get(0),
     )
     .map_err(QghError::from)
+}
+
+#[derive(Clone, Copy)]
+enum IndexTaskKind {
+    Upsert,
+    Delete,
+}
+
+impl IndexTaskKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Upsert => "upsert",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// Keeps `index_tasks` as a current-work queue rather than an append-only log.
+/// The latest authoritative operation supersedes older pending work for the
+/// same source inside the caller's content transaction.
+fn record_index_task(
+    tx: &Transaction<'_>,
+    source_id: &str,
+    kind: IndexTaskKind,
+    created_at: &str,
+) -> Result<(), QghError> {
+    tx.execute(
+        "DELETE FROM index_tasks WHERE source_id = ?1 AND completed_at IS NULL",
+        params![source_id],
+    )?;
+    tx.execute(
+        "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
+         VALUES (?1, ?2, ?3, NULL)",
+        params![source_id, kind.as_str(), created_at],
+    )?;
+    Ok(())
 }
 
 fn issue_repo_from_cursor_endpoint(endpoint: &str) -> Option<&str> {
@@ -20026,6 +20048,17 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, "publication.source_snapshot_changed");
+        assert_eq!(store.status().unwrap().dirty_task_count, 1);
+        let pending_task: (String, String) = store
+            .conn
+            .query_row(
+                "SELECT source_id, task_type FROM index_tasks
+                 WHERE completed_at IS NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending_task, (source_id.to_string(), "upsert".to_string()));
         let active = store.active_retrieval_publication().unwrap().unwrap();
         assert_eq!(active.publication_id, first_publication);
         assert_eq!(active.tantivy_generation, first_generation);
@@ -20034,6 +20067,265 @@ mod tests {
             .unwrap_err();
         assert_eq!(query_error.code, "publication.source_snapshot_changed");
 
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn publication_failure_preserves_index_work_and_success_consumes_the_queue() {
+        let paths = temp_profile_paths("index-task-publication-consumption");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_INDEX_TASK_CONSUMPTION";
+        store
+            .upsert_sources_for_run(
+                "sync-index-task-consumption",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "index-task-consumption",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-index-task-consumption")
+            .unwrap();
+        assert_eq!(store.status().unwrap().dirty_task_count, 1);
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .conn
+            .execute(
+                "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
+                 VALUES ('legacy-completed-source', 'upsert', ?1, ?1)",
+                params!["2026-01-01T00:00:00Z"],
+            )
+            .unwrap();
+        store.fail_next_retrieval_publication_activation(QghError::new(
+            "publication.test_activation_failed",
+            "Fixture activation failed.",
+            6,
+        ));
+
+        let error = store
+            .activate_retrieval_publication("sync-index-task-consumption", generation, None, None)
+            .unwrap_err();
+
+        assert_eq!(error.code, "publication.test_activation_failed");
+        assert_eq!(store.status().unwrap().dirty_task_count, 1);
+        let retained_after_failure: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM index_tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained_after_failure, 2);
+
+        store
+            .activate_retrieval_publication("sync-index-task-consumption", generation, None, None)
+            .unwrap();
+
+        assert_eq!(store.status().unwrap().dirty_task_count, 0);
+        let retained_task_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM index_tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained_task_count, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn unchanged_source_replay_does_not_enqueue_index_work() {
+        let paths = temp_profile_paths("unchanged-index-task-replay");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_UNCHANGED_INDEX_TASK";
+        let comment_id = "qgh://github.com/issue-comment/IC_UNCHANGED_INDEX_TASK";
+        let issue = test_issue(source_id, "owner/repo", "unchanged-index-task");
+        let comment = test_comment(comment_id, source_id, "owner/repo", "unchanged-index-task");
+        store
+            .upsert_sources_for_run(
+                "sync-unchanged-index-task-initial",
+                std::slice::from_ref(&issue),
+                std::slice::from_ref(&comment),
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-unchanged-index-task-initial")
+            .unwrap();
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 2)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication(
+                "sync-unchanged-index-task-initial",
+                generation,
+                None,
+                None,
+            )
+            .unwrap();
+
+        store
+            .upsert_sources_for_run(
+                "sync-unchanged-index-task-replay",
+                std::slice::from_ref(&issue),
+                std::slice::from_ref(&comment),
+                0,
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(store.status().unwrap().dirty_task_count, 0);
+        let total_task_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM index_tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total_task_count, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn repeated_source_edits_coalesce_to_one_pending_index_task() {
+        let paths = temp_profile_paths("coalesced-index-task-edits");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_COALESCED_INDEX_TASK";
+        let mut issue = test_issue(source_id, "owner/repo", "coalesced-v1");
+
+        for revision in 1..=3 {
+            issue.title = format!("Coalesced title v{revision}");
+            issue.body = format!("Coalesced body v{revision}");
+            issue.body_hash = format!("coalesced-body-hash-v{revision}");
+            issue.updated_at = format!("2026-01-0{}T00:00:00Z", revision + 1);
+            issue.indexed_at = format!("2026-01-0{}T00:00:01Z", revision + 1);
+            store
+                .upsert_sources_for_run(
+                    &format!("sync-coalesced-index-task-v{revision}"),
+                    std::slice::from_ref(&issue),
+                    &[],
+                    0,
+                    &[],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.status().unwrap().dirty_task_count, 1);
+        let task: (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT count(*), min(task_type) FROM index_tasks
+                 WHERE source_id = ?1 AND completed_at IS NULL",
+                params![source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(task, (1, "upsert".to_string()));
+
+        store
+            .tombstone_source(source_id, "fixture deletion")
+            .unwrap();
+        let delete_task: (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT count(*), min(task_type) FROM index_tasks
+                 WHERE source_id = ?1 AND completed_at IS NULL",
+                params![source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(delete_task, (1, "delete".to_string()));
+
+        issue.title = "Coalesced title resurrected".to_string();
+        issue.body = "Coalesced body resurrected".to_string();
+        issue.body_hash = "coalesced-body-hash-resurrected".to_string();
+        issue.updated_at = "2026-01-05T00:00:00Z".to_string();
+        issue.indexed_at = "2026-01-05T00:00:01Z".to_string();
+        store
+            .upsert_sources_for_run(
+                "sync-coalesced-index-task-resurrected",
+                std::slice::from_ref(&issue),
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let resurrected_task: (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT count(*), min(task_type) FROM index_tasks
+                 WHERE source_id = ?1 AND completed_at IS NULL",
+                params![source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(resurrected_task, (1, "upsert".to_string()));
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn pending_index_task_coalescing_uses_a_source_lookup_index() {
+        let paths = temp_profile_paths("index-task-pending-lookup-index");
+        let store = Store::open(&paths).unwrap();
+
+        let index_sql: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'idx_index_tasks_pending_source'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_sql.contains("WHERE completed_at IS NULL"));
+
+        let mut plan = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 DELETE FROM index_tasks
+                 WHERE source_id = ?1 AND completed_at IS NULL",
+            )
+            .unwrap();
+        let details = plan
+            .query_map(params!["qgh://github.com/issue/I_PLAN"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_index_tasks_pending_source")),
+            "unexpected query plan: {details:?}"
+        );
+
+        drop(plan);
+        store
+            .conn
+            .execute("DROP INDEX idx_index_tasks_pending_source", [])
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(&paths).unwrap();
+        let restored: bool = reopened
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_schema
+                     WHERE type = 'index' AND name = 'idx_index_tasks_pending_source'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(restored);
+
+        drop(reopened);
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
@@ -23165,7 +23457,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(dirty_comment_tasks_after, dirty_comment_tasks_before + 1);
+        assert_eq!(dirty_comment_tasks_before, 1);
+        assert_eq!(dirty_comment_tasks_after, 1);
         let error = store
             .validate_embedding_generation(generation_id)
             .unwrap_err();

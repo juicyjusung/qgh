@@ -4,6 +4,17 @@ qgh stores source identity, source versions, aliases, tombstones, sync runs, and
 
 Sync writes SQLite first, records index work, and only exposes a Tantivy generation after shadow build and atomic publish. Query results must still round-trip through SQLite-backed `get`; a Tantivy hit that cannot be resolved by `get` is not a successful result.
 
+`index_tasks` is a durable pending-work queue, not publication history. qgh
+enqueues only an authoritative retrieval-state change and coalesces later
+pending operations for the same source to the latest `upsert` or `delete`.
+Successful publication consumes all queue rows in the same SQLite transaction as
+the publication-pointer change; a failed or rolled-back activation leaves them
+pending. The legacy `completed_at` column remains in `qgh.db.v1` for schema and
+older-writer compatibility, but completed rows are not retained as an audit log.
+A non-unique partial index on pending `source_id` keeps enqueue/coalescing work
+proportional to the pending queue while remaining compatible with older v1
+writers that may insert duplicate tasks.
+
 A Tantivy generation is publishable only after its committed files and seal are
 complete, its shadow directory has been renamed without replacement, and the
 generation directory, `index_root`, and profile directory have crossed the
