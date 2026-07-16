@@ -1,4 +1,9 @@
-# qgh
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/qgh-logo-dark.svg">
+    <img alt="qgh" src="assets/qgh-logo.svg" width="420">
+  </picture>
+</h1>
 
 qgh is a local-first, read-only CLI and MCP server for retrieving GitHub
 Issues and issue comments. It synchronizes an explicit repository scope to
