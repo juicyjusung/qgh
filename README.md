@@ -315,6 +315,8 @@ qgh doctor       # explicit GitHub connectivity and model-runtime probe
 | `coverage: partial` | Search is available but not exhaustive; follow the printed `next:` action for open sync or historical backfill. |
 | Embedding model is missing | Install the configured preset explicitly; BM25 remains available meanwhile. |
 | Snapshot is stale | Run the exact `qgh sync` action printed by query or status. |
+| Profile Store schema is unsupported or newer | Upgrade qgh or restore a compatible Profile Store backup. Do not force `qgh sync`; qgh will not migrate or repair an unsupported store. |
+| Profile Store database path is a symbolic link | Replace the final `qgh.sqlite3` link with a regular qgh-managed database file; qgh does not follow database symlinks. |
 | First hybrid sync is slow | Let the foreground progress and ETA finish; later syncs reuse unchanged vectors. |
 
 Errors are structured and documented in [Error codes](docs/error-codes.md).

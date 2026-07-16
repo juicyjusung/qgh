@@ -64,6 +64,26 @@ impl QghError {
         .with_hint("Run qgh with --profile <profile-id>.")
     }
 
+    pub fn ambiguous_init_profile(
+        repo: &str,
+        host: &str,
+        match_basis: &str,
+        matching_profile_ids: Vec<String>,
+    ) -> Self {
+        Self::new(
+            "config.ambiguous_profile",
+            "Multiple configured profiles are eligible for automatic init selection.",
+            2,
+        )
+        .with_details(json!({
+            "repo": repo,
+            "host": host,
+            "match_basis": match_basis,
+            "matching_profile_ids": matching_profile_ids
+        }))
+        .with_hint("Run qgh init with --profile <profile-id>.")
+    }
+
     pub fn config(message: impl Into<String>) -> Self {
         Self::new("config.invalid", message, 2)
     }
@@ -120,9 +140,37 @@ impl QghError {
         Self::new("storage.failure", message, 6)
     }
 
+    pub fn unsupported_store_schema(expected: &str, actual: Option<&str>) -> Self {
+        let actual = match actual {
+            Some(value) if reportable_store_schema_version(value) => json!(value),
+            Some(_) => json!("unrecognized"),
+            None => serde_json::Value::Null,
+        };
+        Self::new(
+            "storage.failure",
+            "The local store schema is not supported by this qgh version.",
+            6,
+        )
+        .with_details(json!({
+            "reason": "unsupported_schema",
+            "expected_schema_version": expected,
+            "actual_schema_version": actual
+        }))
+        .with_hint(
+            "Upgrade qgh or restore a compatible store backup; no schema migration or content repair was attempted.",
+        )
+    }
+
     pub fn index(message: impl Into<String>) -> Self {
         Self::new("index.failure", message, 6)
     }
+}
+
+fn reportable_store_schema_version(value: &str) -> bool {
+    let Some(version) = value.strip_prefix("qgh.db.v") else {
+        return false;
+    };
+    !version.is_empty() && version.len() <= 10 && version.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 impl From<rusqlite::Error> for QghError {

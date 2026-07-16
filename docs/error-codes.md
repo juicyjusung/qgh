@@ -15,11 +15,17 @@ Stable error families:
 - `source.*`: missing or tombstoned source lookups.
 - `purge.*`: fail-closed purge, retry, publication, and read/write-fence failures.
 - `publication.*`: retrieval snapshot CAS, provenance, and artifact-readiness failures.
-- `storage.*`: SQLite or local filesystem storage failures.
+- `storage.*`: SQLite or local filesystem storage failures. A
+  `storage.failure` with `details.reason: "unsupported_schema"` rejects an
+  unknown or newer Profile Store before writable migration or content repair,
+  without widening the closed `qgh.v2` error-code enum. Recognized
+  `qgh.db.vN` markers are reported; arbitrary marker text is returned only as
+  `"unrecognized"`.
 - `index.*`: Tantivy index failures.
 - `internal.*`: unexpected internal failures.
 
 Common codes include `config.no_matching_profile`, `config.ambiguous_profile`,
+`config.busy`,
 `config.invalid_repo_policy`, `validation.cli`, `validation.mcp`,
 `validation.unsupported_filter`, `validation.batch_size`, `freshness.stale`,
 `auth.token_unavailable`, `source.not_found`, `source.tombstoned`,
@@ -42,6 +48,27 @@ from a read command. `retry_action.command` is the human retry and
 same profile writer lease. Details contain only `profile_id`; wait for the
 active process or its OS-released crash lease, then retry. qgh never deletes a
 stable lock file to recover this condition.
+
+`config.busy` is the retryable, exit-`5` result when `qgh init` cannot acquire
+the stable profile-config mutation lease within five seconds. The lease covers
+the read, validation, and atomic publication sequence, preventing lost updates
+between concurrent init processes. Wait for the active init operation and
+retry; qgh does not delete the stable lock file. An unsafe final
+`config.toml`/lock entry or a failed publication durability barrier instead
+returns exit-`6` `storage.failure`. A post-rename directory-sync failure carries
+content-free details `reason: "config_directory_sync_failed"` and
+`publication_state: "visible_durability_unconfirmed"`; the complete new config
+is visible, but crash durability was not confirmed. This instance is retryable:
+verify the visible config and rerun `qgh init`; every successful publication
+re-synchronizes the canonical config-directory ancestry.
+
+Repo-policy mutation in either init form also returns `storage.failure` before
+following a final `.qgh.toml` symlink or accepting a non-regular entry. Create
+is no-replace and forced replacement is staged and atomic. If the final parent
+directory sync fails after publication, details contain
+`reason: "repo_policy_directory_sync_failed"` and
+`publication_state: "visible_durability_unconfirmed"`; verify the visible
+policy and rerun init.
 
 `schedule` validation and lifecycle may additionally return:
 
@@ -187,6 +214,11 @@ the index before retrying that filter.
 
 `init` may additionally return:
 
+- `config.ambiguous_profile`: promptless `qgh init --yes` may use this existing
+  code when it finds multiple repo-and-host matches, or no repo match and
+  multiple same-host profiles. Its content-free details add `host` and
+  `match_basis` alongside sorted `matching_profile_ids`; rerun with explicit
+  `--profile <profile-id>`.
 - `config.no_git_worktree`: `qgh init` was run outside a git worktree.
 - `config.git_remote_unavailable`: no usable `origin` remote was configured and `--repo` was omitted.
 - `config.unsupported_git_remote`: `origin` was malformed or not a supported GitHub remote URL.

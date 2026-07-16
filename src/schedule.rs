@@ -428,17 +428,8 @@ async fn run_foreground(
                             ),
                         );
                     }
-                    Ok(commands::ScheduledSyncResult::Completed(outcome)) => {
-                        let sync_state = outcome
-                            .data
-                            .get("sync_state")
-                            .and_then(Value::as_str)
-                            .unwrap_or("ok");
-                        let (profile_outcome, reason) = if sync_state == "skipped_fresh" {
-                            ("skipped", "fresh")
-                        } else {
-                            ("completed", "synced")
-                        };
+                    Ok(commands::ScheduledSyncResult::Completed(completion)) => {
+                        let (profile_outcome, reason) = scheduled_completion_outcome(completion);
                         results.insert(
                             plan.profile.id.clone(),
                             profile_result(
@@ -572,19 +563,18 @@ async fn run_foreground(
 }
 
 fn plan_profile(profile: Profile) -> Result<PlannedProfile, QghError> {
-    if !profile.paths.db_path.exists() {
+    let Some(store) = Store::open_existing_for_read(&profile.paths)? else {
         return Ok(PlannedProfile {
             profile,
             state: PlannedState::BootstrapRequired,
             active_backoff: false,
             rate_budget: Vec::new(),
         });
-    }
-    let store = Store::open_for_read(&profile.paths)?;
-    let status = store.status()?;
+    };
+    let planning = store.sync_planning_snapshot()?;
     let rate_budget = store.rate_budget_observations(&profile.host)?;
-    let active_backoff = status.backoff.as_ref().is_some_and(backoff_is_active);
-    let state = match status.last_sync_at.as_deref() {
+    let active_backoff = planning.backoff.as_ref().is_some_and(backoff_is_active);
+    let state = match planning.last_sync_at.as_deref() {
         None => PlannedState::BootstrapRequired,
         Some(last_sync_at) => {
             let max_age = profile
@@ -731,12 +721,11 @@ fn max_active_host_backoff_deadline(
 ) -> Result<Option<DateTime<Utc>>, QghError> {
     let mut deadline = None;
     for profile in profiles {
-        if !profile.paths.db_path.exists() {
+        let Some(store) = Store::open_existing_for_read(&profile.paths)? else {
             continue;
-        }
-        let store = Store::open_for_read(&profile.paths)?;
-        let status = store.status()?;
-        let observed = status
+        };
+        let planning = store.sync_planning_snapshot()?;
+        let observed = planning
             .backoff
             .as_ref()
             .and_then(|backoff| active_backoff_guard_deadline(backoff, now));
@@ -784,6 +773,15 @@ fn profile_result(
         "next_action": next_action,
         "budget_snapshot": budget_snapshot
     })
+}
+
+fn scheduled_completion_outcome(
+    completion: commands::ScheduledSyncCompletion,
+) -> (&'static str, &'static str) {
+    match completion {
+        commands::ScheduledSyncCompletion::Synced => ("completed", "synced"),
+        commands::ScheduledSyncCompletion::SkippedFresh => ("skipped", "fresh"),
+    }
 }
 
 fn summarize(results: &[Value]) -> Value {
@@ -1125,6 +1123,18 @@ mod tests {
         );
         assert_eq!(selected.limit, Some(10));
         assert_eq!(selected.remaining, Some(3));
+    }
+
+    #[test]
+    fn typed_sync_completion_maps_to_stable_schedule_outcomes() {
+        assert_eq!(
+            scheduled_completion_outcome(commands::ScheduledSyncCompletion::Synced),
+            ("completed", "synced")
+        );
+        assert_eq!(
+            scheduled_completion_outcome(commands::ScheduledSyncCompletion::SkippedFresh),
+            ("skipped", "fresh")
+        );
     }
 
     #[test]

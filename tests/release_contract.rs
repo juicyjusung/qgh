@@ -723,6 +723,20 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         artifact["contract"]["init_yes_aliases"],
         json!(["--yes", "-y"])
     );
+    assert_eq!(
+        artifact["contract"]["init_profile_selection"],
+        json!({
+            "explicit_precedence": ["cli", "env"],
+            "interactive_confirmation": "fixed",
+            "promptless_auto": "latest locked config snapshot; single repo-and-host match, then single same-host match, then collision-safe host-derived id",
+            "auto_profile_source": "cli",
+            "ambiguity_error": "config.ambiguous_profile"
+        })
+    );
+    assert_eq!(
+        artifact["contract"]["repo_policy_publication"],
+        "preflight plus apply-time CAS; no-replace create; staged atomic force replace; final symlink and non-regular entries fail closed"
+    );
     assert_eq!(artifact["contract"]["get_batch"]["max_source_ids"], 20);
     assert_eq!(
         artifact["contract"]["get_batch"]["item_errors"],
@@ -1022,6 +1036,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
     assert_eq!(
         envelope_schema["properties"]["schema_version"]["const"],
         artifact["contract"]["envelope_schema_version"]
+    );
+    assert_eq!(
+        envelope_schema["properties"]["meta"]["properties"]["profile_source"]["enum"],
+        json!(["cli", "env", "single_match", "get_args", null])
     );
     let init_schema: Value = serde_json::from_str(
         &fs::read_to_string(root.join("docs/schemas/init-output.schema.json")).unwrap(),

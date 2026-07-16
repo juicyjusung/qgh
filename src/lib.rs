@@ -3,6 +3,7 @@ pub mod chunking;
 mod cli;
 mod commands;
 mod config;
+mod config_mutation;
 #[doc(hidden)]
 pub mod context;
 mod coverage;
@@ -21,6 +22,7 @@ mod paths;
 #[cfg(feature = "fastembed-provider")]
 mod qwen;
 mod rate_budget;
+mod repo_policy_mutation;
 mod resolution;
 mod schedule;
 mod schedule_lifecycle;

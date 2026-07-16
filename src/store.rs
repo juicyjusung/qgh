@@ -16,8 +16,10 @@ use crate::model::{
     StoredCursor, StoredIssue, StoredSource, SyncSummary, TargetedSyncSummary, TombstoneView,
     VectorSearchFilters, VectorSearchHit,
 };
+use crate::paths::ensure_private_dir;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+use crate::paths::set_private_file;
 use crate::paths::ProfilePaths;
-use crate::paths::{ensure_private_dir, set_private_file};
 use crate::time::{now_rfc3339, now_run_id_suffix};
 use rusqlite::types::Value;
 use rusqlite::{
@@ -37,6 +39,7 @@ const CHUNK_EMBEDDING_VECTORS_TABLE: &str = "chunk_embedding_vectors";
 const CHUNK_EMBEDDING_VECTOR_CHUNKS_META_TABLE: &str = "chunk_embedding_vectors_chunks";
 const CHUNK_EMBEDDING_VECTOR_ROWIDS_TABLE: &str = "chunk_embedding_vectors_rowids";
 const CHUNK_EMBEDDING_VECTOR_CHUNKS_TABLE: &str = "chunk_embedding_vectors_vector_chunks00";
+pub(crate) const STORE_SCHEMA_VERSION: &str = "qgh.db.v1";
 const TANTIVY_COMMIT_INVENTORY_MIGRATION: &str = "qgh.tantivy.commit_inventory.v1";
 const TANTIVY_OWNERSHIP_MIGRATION: &str = "qgh.tantivy.ownership.v2";
 const TANTIVY_ADOPTION_OWNER_PID: i64 = -2;
@@ -381,6 +384,12 @@ pub struct RetrievalBuildSnapshot {
     embedding_inventory_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceInventorySummary {
+    count: usize,
+    hash: String,
+}
+
 impl RetrievalBuildSnapshot {
     pub(crate) fn identity(&self) -> &SourceSnapshotIdentity {
         &self.identity
@@ -397,6 +406,15 @@ impl RetrievalBuildSnapshot {
     pub(crate) fn embedding_chunks(&self) -> &[ContextualEmbeddingChunk] {
         &self.embedding_chunks
     }
+}
+
+/// Content-free metadata needed to decide whether a remote sync should run.
+/// Corpus counts, reconciliation rows, and cursors are intentionally outside
+/// this projection.
+#[derive(Debug, Clone)]
+pub(crate) struct SyncPlanningSnapshot {
+    pub(crate) last_sync_at: Option<String>,
+    pub(crate) backoff: Option<BackoffView>,
 }
 
 pub struct Store {
@@ -523,17 +541,26 @@ impl Store {
     }
 
     pub fn open(paths: &ProfilePaths) -> Result<Self, QghError> {
-        ensure_private_dir(&paths.profile_dir)?;
-        ensure_private_dir(&paths.cache_dir)?;
-        ensure_private_dir(&paths.log_dir)?;
-        let conn = Connection::open(&paths.db_path)?;
-        set_private_file(&paths.db_path)?;
+        if database_path_exists(&paths.db_path)? {
+            preflight_store_schema(&paths.db_path)?;
+        } else {
+            ensure_private_dir(&paths.profile_dir)?;
+        }
+        let (database_path, database_file) = prepare_database_file_for_open(&paths.db_path)?;
+        let conn = Connection::open_with_flags(
+            &database_path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "secure_delete", "ON")?;
         let mut store = Self::from_connection(conn, paths);
         store.migrate()?;
+        tighten_private_database_file(&database_file, &database_path)?;
+        ensure_private_dir(&paths.profile_dir)?;
+        ensure_private_dir(&paths.cache_dir)?;
+        ensure_private_dir(&paths.log_dir)?;
+        store.conn.pragma_update(None, "journal_mode", "WAL")?;
         store.reconcile_legacy_tantivy_ownership()?;
         store.detach_unbound_tantivy_publication()?;
         store.detach_legacy_embedding_publication_identity()?;
@@ -549,24 +576,37 @@ impl Store {
     /// database is represented by an in-memory empty schema so read commands
     /// do not create profile, cache, log, or database files.
     pub fn open_for_read(paths: &ProfilePaths) -> Result<Self, QghError> {
-        if !paths.db_path.exists() {
-            let conn = Connection::open_in_memory()?;
-            conn.busy_timeout(std::time::Duration::from_secs(5))?;
-            conn.pragma_update(None, "secure_delete", "ON")?;
-            let mut store = Self::from_connection(conn, paths);
-            store.migrate()?;
-            store.content_write_epoch = read_content_write_epoch(&store.conn)?;
+        if let Some(store) = Self::open_existing_for_read(paths)? {
             return Ok(store);
         }
+        let conn = Connection::open_in_memory()?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "secure_delete", "ON")?;
+        let mut store = Self::from_connection(conn, paths);
+        store.migrate()?;
+        store.content_write_epoch = read_content_write_epoch(&store.conn)?;
+        Ok(store)
+    }
+
+    /// Opens only an existing Profile Store. Missing stores return `None`
+    /// without constructing an in-memory schema; unsafe path entries and
+    /// incompatible schemas still fail closed.
+    pub(crate) fn open_existing_for_read(paths: &ProfilePaths) -> Result<Option<Self>, QghError> {
+        if !database_path_exists(&paths.db_path)? {
+            return Ok(None);
+        }
+        let database_path = database_path_for_nofollow_open(&paths.db_path)?;
         let conn = Connection::open_with_flags(
-            &paths.db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            database_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let mut store = Self::from_connection(conn, paths);
         store.validate_read_schema()?;
         store.content_write_epoch = read_content_write_epoch(&store.conn)?;
-        Ok(store)
+        Ok(Some(store))
     }
 
     fn from_connection(conn: Connection, paths: &ProfilePaths) -> Self {
@@ -600,20 +640,7 @@ impl Store {
     }
 
     fn validate_read_schema(&self) -> Result<(), QghError> {
-        let schema_version = self
-            .conn
-            .query_row(
-                "SELECT value FROM profile_meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if schema_version.as_deref() != Some("qgh.db.v1") {
-            return Err(QghError::storage(
-                "The local store schema is not initialized for read-only retrieval. Run `qgh sync` to migrate it.",
-            ));
-        }
-        Ok(())
+        validate_store_schema(&self.conn, false)
     }
 
     fn reconcile_legacy_tantivy_ownership(&mut self) -> Result<(), QghError> {
@@ -3557,7 +3584,8 @@ impl Store {
 
         for issue in issues {
             let repo = canonical_repository_identity(&tx, &issue.repo)?;
-            source_snapshot_changed |= !authoritative_issue_matches(&tx, issue, &repo)?;
+            let issue_changed = !authoritative_issue_matches(&tx, issue, &repo)?;
+            source_snapshot_changed |= issue_changed;
             let previous_title = tx
                 .query_row(
                     "SELECT title FROM issue_metadata WHERE source_id = ?1",
@@ -3648,11 +3676,9 @@ impl Store {
                 &issue.number.to_string(),
             )?;
             upsert_alias(&tx, &issue.source_id, "title", &issue.title)?;
-            tx.execute(
-                "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
-                 VALUES (?1, 'upsert', ?2, NULL)",
-                params![issue.source_id, now],
-            )?;
+            if issue_changed {
+                record_index_task(&tx, &issue.source_id, IndexTaskKind::Upsert, &now)?;
+            }
             if previous_title.as_deref() != Some(issue.title.as_str()) {
                 let comment_source_ids = {
                     let mut stmt = tx.prepare(
@@ -3674,12 +3700,7 @@ impl Store {
                         params![issue.source_id, issue.title],
                     )?;
                     for source_id in comment_source_ids {
-                        tx.execute(
-                            "INSERT INTO index_tasks
-                                (source_id, task_type, created_at, completed_at)
-                             VALUES (?1, 'upsert', ?2, NULL)",
-                            params![source_id, now],
-                        )?;
+                        record_index_task(&tx, &source_id, IndexTaskKind::Upsert, &now)?;
                     }
                 }
             }
@@ -3688,7 +3709,8 @@ impl Store {
 
         for comment in comments {
             let repo = canonical_repository_identity(&tx, &comment.repo)?;
-            source_snapshot_changed |= !authoritative_comment_matches(&tx, comment, &repo)?;
+            let comment_changed = !authoritative_comment_matches(&tx, comment, &repo)?;
+            source_snapshot_changed |= comment_changed;
             tx.execute(
                 "INSERT INTO source_entities
                     (source_id, entity_type, host, repo, node_id, github_id, lifecycle_state, created_at, updated_at, last_seen_at)
@@ -3764,11 +3786,9 @@ impl Store {
                 "rest_id",
                 &comment.github_id.to_string(),
             )?;
-            tx.execute(
-                "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
-                 VALUES (?1, 'upsert', ?2, NULL)",
-                params![comment.source_id, now],
-            )?;
+            if comment_changed {
+                record_index_task(&tx, &comment.source_id, IndexTaskKind::Upsert, &now)?;
+            }
             apply_pending_purge_guard(&tx, &comment.source_id, &repo, comment.parent_issue_number)?;
         }
 
@@ -3926,39 +3946,58 @@ impl Store {
         Ok((tombstoned_issues, tombstoned_comments))
     }
 
-    pub fn active_issues(&self) -> Result<Vec<StoredIssue>, QghError> {
-        let mut stmt = self.conn.prepare(
+    pub fn active_index_sources(&self) -> Result<Vec<IndexSource>, QghError> {
+        let mut sources = Vec::new();
+        self.visit_active_index_sources(|source| sources.push(source))?;
+        Ok(sources)
+    }
+
+    fn active_source_inventory_summary(&self) -> Result<SourceInventorySummary, QghError> {
+        let expected_count = self.conn.query_row(
+            "SELECT count(*) FROM source_entities WHERE lifecycle_state = 'active'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let expected_count = usize::try_from(expected_count)
+            .map_err(|_| QghError::storage("Active source count exceeds the supported range."))?;
+        let mut accumulator = crate::index::SourceInventoryAccumulator::new(expected_count);
+        let observed_count = self.visit_active_index_sources(|source| {
+            accumulator.observe(&source);
+        })?;
+        let Some(hash) = accumulator.finish() else {
+            return Err(source_inventory_mismatch_error());
+        };
+        if observed_count != expected_count {
+            return Err(source_inventory_mismatch_error());
+        }
+        Ok(SourceInventorySummary {
+            count: observed_count,
+            hash,
+        })
+    }
+
+    fn visit_active_index_sources(
+        &self,
+        mut visit: impl FnMut(IndexSource),
+    ) -> Result<usize, QghError> {
+        let mut observed_count = 0usize;
+        let mut issue_stmt = self.conn.prepare(
             "SELECT im.source_id, im.repo, im.issue_number, im.title, im.body, im.state,
-                    im.labels_json, im.author, im.canonical_url,
-                    sv.body_hash, sv.github_updated_at, sv.indexed_at, sv.sync_run_id, sv.lifecycle_state
+                    im.labels_json, im.author, sv.github_updated_at, sv.indexed_at
              FROM issue_metadata im
              JOIN source_entities se ON se.source_id = im.source_id
              JOIN source_versions sv ON sv.id = im.latest_version_id
              WHERE se.lifecycle_state = 'active'
              ORDER BY im.repo, im.issue_number",
         )?;
-        let rows = stmt.query_map([], stored_issue_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(QghError::from)
-    }
-
-    pub fn active_index_sources(&self) -> Result<Vec<IndexSource>, QghError> {
-        let mut sources = Vec::new();
-        for issue in self.active_issues()? {
-            sources.push(IndexSource {
-                source_id: issue.source_id,
-                entity_type: "issue".to_string(),
-                repo: issue.repo,
-                issue_number: issue.number,
-                state: issue.state,
-                labels: issue.labels,
-                author: issue.author,
-                title: issue.title,
-                body: issue.body,
-                parent_issue_title: String::new(),
-                github_updated_at: issue.source_version.github_updated_at,
-                indexed_at: issue.source_version.indexed_at,
-            });
+        let issue_rows = issue_stmt.query_map([], index_issue_source_from_row)?;
+        for source in issue_rows {
+            visit(source?);
+            observed_count = observed_count.checked_add(1).ok_or_else(|| {
+                QghError::storage("Active source count exceeds the supported range.")
+            })?;
         }
+
         let mut stmt = self.conn.prepare(
             "SELECT cm.source_id, cm.repo, cm.issue_number, cm.body, cm.author,
                     cm.parent_issue_title, sv.github_updated_at, sv.indexed_at
@@ -3968,24 +4007,14 @@ impl Store {
              WHERE se.lifecycle_state = 'active'
              ORDER BY cm.repo, cm.issue_number, cm.source_id",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(IndexSource {
-                source_id: row.get(0)?,
-                entity_type: "issue_comment".to_string(),
-                repo: row.get(1)?,
-                issue_number: row.get(2)?,
-                state: String::new(),
-                labels: Vec::new(),
-                author: row.get(4)?,
-                title: String::new(),
-                body: row.get(3)?,
-                parent_issue_title: row.get(5)?,
-                github_updated_at: row.get(6)?,
-                indexed_at: row.get(7)?,
-            })
-        })?;
-        sources.extend(rows.collect::<Result<Vec<_>, _>>()?);
-        Ok(sources)
+        let rows = stmt.query_map([], index_comment_source_from_row)?;
+        for source in rows {
+            visit(source?);
+            observed_count = observed_count.checked_add(1).ok_or_else(|| {
+                QghError::storage("Active source count exceeds the supported range.")
+            })?;
+        }
+        Ok(observed_count)
     }
 
     pub fn get_issue(&self, source_id: &str) -> Result<Option<StoredIssue>, QghError> {
@@ -5266,11 +5295,7 @@ impl Store {
             )?;
         }
         if changed > 0 {
-            tx.execute(
-                "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
-                 VALUES (?1, 'delete', ?2, NULL)",
-                params![source_id, observed_at],
-            )?;
+            record_index_task(&tx, source_id, IndexTaskKind::Delete, &observed_at)?;
         }
         if changed > 0 || previous_reason.as_deref() != Some(reason) {
             bump_source_snapshot_epoch(&tx)?;
@@ -5588,10 +5613,6 @@ impl Store {
              WHERE generation = ?1 AND write_epoch = ?5",
             params![generation, path, source_count as i64, now, expected_epoch],
         )?;
-        tx.execute(
-            "UPDATE index_tasks SET completed_at = ?1 WHERE completed_at IS NULL",
-            params![now],
-        )?;
         let ownership_retained = tx.execute(
             "UPDATE index_build_leases
              SET owner_pid = 0
@@ -5812,11 +5833,10 @@ impl Store {
         index_root: &Path,
         source_count: usize,
     ) -> Result<(i64, PathBuf), QghError> {
-        let sources = self.active_index_sources()?;
-        if sources.len() != source_count {
+        let inventory = self.active_source_inventory_summary()?;
+        if inventory.count != source_count {
             return Err(source_inventory_mismatch_error());
         }
-        let inventory_hash = crate::index::source_inventory_digest(&sources);
         let source_snapshot_epoch = read_source_snapshot_epoch(&self.conn)?;
         let identity = self
             .conn
@@ -5842,7 +5862,7 @@ impl Store {
             source_count,
             identity.as_ref(),
             expected_publication_id,
-            Some(&inventory_hash),
+            Some(&inventory.hash),
         )
     }
 
@@ -6038,19 +6058,6 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
-        let last_sync_at: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT completed_at
-                 FROM sync_runs
-                 WHERE completed_successfully = 1
-                   AND snapshot_kind = 'remote_sync'
-                 ORDER BY completed_at DESC
-                 LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
         let last_reconciliation = self
             .conn
             .query_row(
@@ -6070,47 +6077,73 @@ impl Store {
                 },
             )
             .optional()?;
-        let retry_command_expr =
-            if table_has_column(&self.conn, "sync_backoff_state", "retry_command")? {
-                "retry_command"
-            } else {
-                "NULL"
-            };
-        let backoff_sql = format!(
-            "SELECT reason, scope, {retry_command_expr}, retry_after_seconds, reset_at, observed_at, last_successful_sync
-             FROM sync_backoff_state
-             WHERE id = 1"
-        );
-        let backoff = self
-            .conn
-            .query_row(&backoff_sql, [], |row| {
-                let retry_command: Option<String> = row.get(2)?;
-                let retry_action = retry_command
-                    .as_deref()
-                    .map(|command| CommandAction::from_retry_command("sync_backoff", command));
-                Ok(BackoffView {
-                    reason: row.get(0)?,
-                    scope: row.get(1)?,
-                    retry_command,
-                    retry_action,
-                    retry_after_seconds: row.get(3)?,
-                    reset_at: row.get(4)?,
-                    observed_at: row.get(5)?,
-                    last_successful_sync: row.get(6)?,
-                })
-            })
-            .optional()?;
+        let planning = self.sync_planning_snapshot()?;
         Ok(StatusSnapshot {
             issue_count,
             comment_count,
             tombstone_count,
             active_generation: active_generation.unwrap_or(0),
             dirty_task_count,
-            last_sync_at,
+            last_sync_at: planning.last_sync_at,
             last_reconciliation,
-            backoff,
+            backoff: planning.backoff,
             cursors: self.cursor_views()?,
         })
+    }
+
+    pub(crate) fn sync_planning_snapshot(&self) -> Result<SyncPlanningSnapshot, QghError> {
+        let retry_command_expr =
+            if table_has_column(&self.conn, "sync_backoff_state", "retry_command")? {
+                "backoff.retry_command"
+            } else {
+                "NULL"
+            };
+        let sql = format!(
+            "SELECT
+                (SELECT completed_at
+                 FROM sync_runs
+                 WHERE completed_successfully = 1
+                   AND snapshot_kind = 'remote_sync'
+                 ORDER BY completed_at DESC
+                 LIMIT 1),
+                backoff.reason,
+                backoff.scope,
+                {retry_command_expr},
+                backoff.retry_after_seconds,
+                backoff.reset_at,
+                backoff.observed_at,
+                backoff.last_successful_sync
+             FROM (SELECT 1) AS singleton
+             LEFT JOIN sync_backoff_state AS backoff ON backoff.id = 1"
+        );
+        self.conn
+            .query_row(&sql, [], |row| {
+                let reason = row.get::<_, Option<String>>(1)?;
+                let backoff = match reason {
+                    None => None,
+                    Some(reason) => {
+                        let retry_command: Option<String> = row.get(3)?;
+                        let retry_action = retry_command.as_deref().map(|command| {
+                            CommandAction::from_retry_command("sync_backoff", command)
+                        });
+                        Some(BackoffView {
+                            reason,
+                            scope: row.get(2)?,
+                            retry_command,
+                            retry_action,
+                            retry_after_seconds: row.get(4)?,
+                            reset_at: row.get(5)?,
+                            observed_at: row.get(6)?,
+                            last_successful_sync: row.get(7)?,
+                        })
+                    }
+                };
+                Ok(SyncPlanningSnapshot {
+                    last_sync_at: row.get(0)?,
+                    backoff,
+                })
+            })
+            .map_err(QghError::from)
     }
 
     #[allow(dead_code)]
@@ -6255,10 +6288,9 @@ impl Store {
         if !identity_valid {
             return Err(changed_source_snapshot_error());
         }
-        let current_sources = self.active_index_sources()?;
-        if current_sources.len() != snapshot.sources.len()
-            || crate::index::source_inventory_digest(&current_sources)
-                != snapshot.source_inventory_hash
+        let current_inventory = self.active_source_inventory_summary()?;
+        if current_inventory.count != snapshot.sources.len()
+            || current_inventory.hash != snapshot.source_inventory_hash
         {
             return Err(source_inventory_mismatch_error());
         }
@@ -7344,9 +7376,7 @@ impl Store {
         let expected_generation_path = self
             .index_root
             .join(format!("generation-{tantivy_generation}"));
-        let authoritative_sources = self.active_index_sources()?;
-        let authoritative_source_inventory_hash =
-            crate::index::source_inventory_digest(&authoritative_sources);
+        let authoritative_source_inventory = self.active_source_inventory_summary()?;
         let authoritative_embedding_chunks = self.active_contextual_embedding_chunks()?;
         let authoritative_embedding_inventory_hash =
             embedding_inventory_hash(&authoritative_embedding_chunks);
@@ -7586,9 +7616,9 @@ impl Store {
             let _ = self.cleanup_owned_index_generation(tantivy_generation);
             return Err(changed_source_snapshot_error());
         }
-        if usize::try_from(source_count).ok() != Some(authoritative_sources.len())
+        if usize::try_from(source_count).ok() != Some(authoritative_source_inventory.count)
             || index_source_inventory_hash.as_deref()
-                != Some(authoritative_source_inventory_hash.as_str())
+                != Some(authoritative_source_inventory.hash.as_str())
         {
             drop(tx);
             let _ = self.cleanup_owned_index_generation(tantivy_generation);
@@ -7630,7 +7660,7 @@ impl Store {
         if let Err(error) = validate_tantivy_generation_artifact(
             &expected_generation_path,
             source_count,
-            &authoritative_source_inventory_hash,
+            &authoritative_source_inventory.hash,
         ) {
             drop(tx);
             let _ = self.cleanup_owned_index_generation(tantivy_generation);
@@ -7723,10 +7753,7 @@ impl Store {
             "UPDATE index_generations SET active = CASE WHEN generation = ?1 THEN 1 ELSE 0 END",
             params![tantivy_generation],
         )?;
-        tx.execute(
-            "UPDATE index_tasks SET completed_at = ?1 WHERE completed_at IS NULL",
-            params![now],
-        )?;
+        tx.execute("DELETE FROM index_tasks", [])?;
         if let Some(generation_id) = embedding_generation_id {
             tx.execute(
                 "UPDATE embedding_generations SET state = 'active', updated_at = ?2 WHERE id = ?1",
@@ -8547,7 +8574,7 @@ impl Store {
 
     fn migrate(&mut self) -> Result<(), QghError> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = self.migrate_inner();
+        let result = validate_store_schema(&self.conn, true).and_then(|()| self.migrate_inner());
         match result {
             Ok(()) => {
                 self.conn.execute_batch("COMMIT")?;
@@ -8562,14 +8589,19 @@ impl Store {
 
     fn migrate_inner(&self) -> Result<(), QghError> {
         self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS profile_meta (
+            "CREATE TABLE IF NOT EXISTS profile_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );
-            INSERT INTO profile_meta (key, value)
-                VALUES ('schema_version', 'qgh.db.v1')
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            );",
+        )?;
+        self.conn.execute(
+            "INSERT INTO profile_meta (key, value)
+             VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO NOTHING",
+            params![STORE_SCHEMA_VERSION],
+        )?;
+        self.conn.execute_batch(
+            r#"
             INSERT INTO profile_meta (key, value)
                 VALUES ('content_write_epoch', '0')
                 ON CONFLICT(key) DO NOTHING;
@@ -8819,6 +8851,10 @@ impl Store {
                 created_at TEXT NOT NULL,
                 completed_at TEXT
             );
+
+            CREATE INDEX IF NOT EXISTS idx_index_tasks_pending_source
+                ON index_tasks(source_id)
+                WHERE completed_at IS NULL;
 
             CREATE TABLE IF NOT EXISTS retrieval_publications (
                 publication_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -9168,7 +9204,7 @@ impl Store {
             "INSERT INTO schema_migrations (version, applied_at)
              VALUES (?1, ?2)
              ON CONFLICT(version) DO NOTHING",
-            params!["qgh.db.v1", now_rfc3339()],
+            params![STORE_SCHEMA_VERSION, now_rfc3339()],
         )?;
         self.conn.execute(
             "INSERT INTO schema_migrations (version, applied_at)
@@ -9269,6 +9305,157 @@ impl Store {
         }
         Ok(inserted)
     }
+}
+
+fn preflight_store_schema(db_path: &Path) -> Result<(), QghError> {
+    if !database_path_exists(db_path)? {
+        return Ok(());
+    }
+    let database_path = database_path_for_nofollow_open(db_path)?;
+    let conn = Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    validate_store_schema(&conn, true)
+}
+
+fn database_path_for_nofollow_open(db_path: &Path) -> Result<PathBuf, QghError> {
+    let parent = db_path
+        .parent()
+        .ok_or_else(|| QghError::storage("The Profile Store database has no parent directory."))?;
+    let file_name = db_path
+        .file_name()
+        .ok_or_else(|| QghError::storage("The Profile Store database has no file name."))?;
+    Ok(fs::canonicalize(parent)?.join(file_name))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn prepare_database_file_for_open(db_path: &Path) -> Result<(PathBuf, fs::File), QghError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let database_path = database_path_for_nofollow_open(db_path)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(platform_database_file_open_flags())
+        .open(&database_path)?;
+    if !file.metadata()?.is_file() {
+        return Err(QghError::storage(
+            "The Profile Store database must be a regular file.",
+        ));
+    }
+    Ok((database_path, file))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn prepare_database_file_for_open(db_path: &Path) -> Result<(PathBuf, fs::File), QghError> {
+    let database_path = database_path_for_nofollow_open(db_path)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&database_path)?;
+    if !file.metadata()?.is_file() {
+        return Err(QghError::storage(
+            "The Profile Store database must be a regular file.",
+        ));
+    }
+    Ok((database_path, file))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn tighten_private_database_file(file: &fs::File, _path: &Path) -> Result<(), QghError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = file.metadata()?.permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn tighten_private_database_file(_file: &fs::File, path: &Path) -> Result<(), QghError> {
+    set_private_file(path)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_database_file_open_flags() -> std::os::raw::c_int {
+    const O_NONBLOCK: std::os::raw::c_int = 0x0000_0004;
+    const O_NOFOLLOW: std::os::raw::c_int = 0x0000_0100;
+    const O_CLOEXEC: std::os::raw::c_int = 0x0100_0000;
+    O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+}
+
+#[cfg(target_os = "linux")]
+fn platform_database_file_open_flags() -> std::os::raw::c_int {
+    const O_NONBLOCK: std::os::raw::c_int = 0o4000;
+    const O_NOFOLLOW: std::os::raw::c_int = 0o400000;
+    const O_CLOEXEC: std::os::raw::c_int = 0o2000000;
+    O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+}
+
+fn database_path_exists(db_path: &Path) -> Result<bool, QghError> {
+    let metadata = match fs::symlink_metadata(db_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(QghError::storage(
+            "The Profile Store database must not be a symbolic link.",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(QghError::storage(
+            "The Profile Store database must be a regular file.",
+        ));
+    }
+    Ok(true)
+}
+
+fn validate_store_schema(conn: &Connection, allow_uninitialized: bool) -> Result<(), QghError> {
+    let has_profile_meta = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'profile_meta'
+        )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_profile_meta {
+        let user_table_count = conn.query_row(
+            "SELECT count(*) FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if allow_uninitialized && user_table_count == 0 {
+            return Ok(());
+        }
+        return Err(QghError::unsupported_store_schema(
+            STORE_SCHEMA_VERSION,
+            None,
+        ));
+    }
+    let schema_version = conn
+        .query_row(
+            "SELECT value FROM profile_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if schema_version.as_deref() == Some(STORE_SCHEMA_VERSION) {
+        return Ok(());
+    }
+    Err(QghError::unsupported_store_schema(
+        STORE_SCHEMA_VERSION,
+        schema_version.as_deref(),
+    ))
 }
 
 impl Drop for Store {
@@ -11257,6 +11444,42 @@ fn authoritative_comment_matches(
     .map_err(QghError::from)
 }
 
+#[derive(Clone, Copy)]
+enum IndexTaskKind {
+    Upsert,
+    Delete,
+}
+
+impl IndexTaskKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Upsert => "upsert",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// Keeps `index_tasks` as a current-work queue rather than an append-only log.
+/// The latest authoritative operation supersedes older pending work for the
+/// same source inside the caller's content transaction.
+fn record_index_task(
+    tx: &Transaction<'_>,
+    source_id: &str,
+    kind: IndexTaskKind,
+    created_at: &str,
+) -> Result<(), QghError> {
+    tx.execute(
+        "DELETE FROM index_tasks WHERE source_id = ?1 AND completed_at IS NULL",
+        params![source_id],
+    )?;
+    tx.execute(
+        "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
+         VALUES (?1, ?2, ?3, NULL)",
+        params![source_id, kind.as_str(), created_at],
+    )?;
+    Ok(())
+}
+
 fn issue_repo_from_cursor_endpoint(endpoint: &str) -> Option<&str> {
     endpoint.strip_prefix("issues:")
 }
@@ -11577,6 +11800,41 @@ fn stored_issue_from_row(row: &rusqlite::Row<'_>) -> Result<StoredIssue, rusqlit
     })
 }
 
+fn index_issue_source_from_row(row: &rusqlite::Row<'_>) -> Result<IndexSource, rusqlite::Error> {
+    let labels_json: String = row.get(6)?;
+    Ok(IndexSource {
+        source_id: row.get(0)?,
+        entity_type: "issue".to_string(),
+        repo: row.get(1)?,
+        issue_number: row.get(2)?,
+        state: row.get(5)?,
+        labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+        author: row.get(7)?,
+        title: row.get(3)?,
+        body: row.get(4)?,
+        parent_issue_title: String::new(),
+        github_updated_at: row.get(8)?,
+        indexed_at: row.get(9)?,
+    })
+}
+
+fn index_comment_source_from_row(row: &rusqlite::Row<'_>) -> Result<IndexSource, rusqlite::Error> {
+    Ok(IndexSource {
+        source_id: row.get(0)?,
+        entity_type: "issue_comment".to_string(),
+        repo: row.get(1)?,
+        issue_number: row.get(2)?,
+        state: String::new(),
+        labels: Vec::new(),
+        author: row.get(4)?,
+        title: String::new(),
+        body: row.get(3)?,
+        parent_issue_title: row.get(5)?,
+        github_updated_at: row.get(6)?,
+        indexed_at: row.get(7)?,
+    })
+}
+
 fn stored_comment_from_row(row: &rusqlite::Row<'_>) -> Result<StoredComment, rusqlite::Error> {
     let repo: String = row.get(1)?;
     let issue_number: i64 = row.get(2)?;
@@ -11717,6 +11975,427 @@ mod tests {
             None
         );
         drop(migrated);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn writable_open_rejects_future_schema_without_mutating_store() {
+        let paths = temp_profile_paths("future schema write guard 한국어");
+        drop(Store::open(&paths).unwrap());
+
+        let future = Connection::open(&paths.db_path).unwrap();
+        future
+            .execute(
+                "UPDATE profile_meta SET value = 'qgh.db.v2' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        future
+            .execute_batch(
+                "CREATE TABLE future_schema_sentinel (
+                    id INTEGER PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO future_schema_sentinel (id, value)
+                VALUES (1, 'must-survive');
+                PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        drop(future);
+
+        let before = fs::read(&paths.db_path).unwrap();
+        let error = Store::open(&paths)
+            .err()
+            .expect("future schema must fail before writable migration");
+        let after = fs::read(&paths.db_path).unwrap();
+
+        assert_eq!(error.code, "storage.failure");
+        assert_eq!(error.details["reason"], "unsupported_schema");
+        assert_eq!(error.details["expected_schema_version"], "qgh.db.v1");
+        assert_eq!(error.details["actual_schema_version"], "qgh.db.v2");
+        assert!(!error.retryable);
+        assert_eq!(
+            after, before,
+            "rejected future stores must remain byte-identical"
+        );
+
+        let unchanged = Connection::open(&paths.db_path).unwrap();
+        let schema_version: String = unchanged
+            .query_row(
+                "SELECT value FROM profile_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let sentinel: String = unchanged
+            .query_row(
+                "SELECT value FROM future_schema_sentinel WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, "qgh.db.v2");
+        assert_eq!(sentinel, "must-survive");
+        drop(unchanged);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn writable_open_rejects_unidentified_nonempty_database_without_mutation() {
+        let paths = temp_profile_paths("unidentified-store-write-guard");
+        fs::create_dir_all(&paths.profile_dir).unwrap();
+        let unidentified = Connection::open(&paths.db_path).unwrap();
+        unidentified
+            .execute_batch(
+                "CREATE TABLE unrelated_sentinel (
+                    id INTEGER PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO unrelated_sentinel (id, value)
+                VALUES (1, 'not-a-qgh-store');",
+            )
+            .unwrap();
+        drop(unidentified);
+
+        let before = fs::read(&paths.db_path).unwrap();
+        let error = Store::open(&paths)
+            .err()
+            .expect("a populated database without qgh identity must fail closed");
+        let after = fs::read(&paths.db_path).unwrap();
+
+        assert_eq!(error.code, "storage.failure");
+        assert_eq!(error.details["reason"], "unsupported_schema");
+        assert_eq!(error.details["expected_schema_version"], "qgh.db.v1");
+        assert_eq!(
+            error.details["actual_schema_version"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            after, before,
+            "an unidentified database must remain byte-identical"
+        );
+
+        let unchanged = Connection::open(&paths.db_path).unwrap();
+        let sentinel: String = unchanged
+            .query_row(
+                "SELECT value FROM unrelated_sentinel WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let qgh_table_count: i64 = unchanged
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'profile_meta'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sentinel, "not-a-qgh-store");
+        assert_eq!(qgh_table_count, 0);
+        drop(unchanged);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn read_only_open_reports_the_future_schema_without_suggesting_migration() {
+        let paths = temp_profile_paths("future-schema-read-guard");
+        drop(Store::open(&paths).unwrap());
+
+        let future = Connection::open(&paths.db_path).unwrap();
+        future
+            .execute(
+                "UPDATE profile_meta SET value = 'qgh.db.v2' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        drop(future);
+
+        let error = Store::open_for_read(&paths)
+            .err()
+            .expect("read-only access must reject a future store schema");
+
+        assert_eq!(error.code, "storage.failure");
+        assert_eq!(error.details["reason"], "unsupported_schema");
+        assert_eq!(error.details["expected_schema_version"], "qgh.db.v1");
+        assert_eq!(error.details["actual_schema_version"], "qgh.db.v2");
+        assert!(!error.message.contains("Run `qgh sync`"));
+        assert!(!error
+            .hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("qgh sync"));
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn migration_revalidates_schema_inside_its_write_transaction() {
+        let paths = temp_profile_paths("future-schema-transaction-guard");
+        fs::create_dir_all(&paths.profile_dir).unwrap();
+        let conn = Connection::open(&paths.db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE profile_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO profile_meta (key, value)
+            VALUES ('schema_version', 'qgh.db.v2');
+            CREATE TABLE future_schema_sentinel (
+                id INTEGER PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        let mut store = Store::from_connection(conn, &paths);
+
+        let error = store
+            .migrate()
+            .expect_err("migration must revalidate schema after acquiring its write lock");
+
+        assert_eq!(error.code, "storage.failure");
+        assert_eq!(error.details["reason"], "unsupported_schema");
+        assert_eq!(error.details["actual_schema_version"], "qgh.db.v2");
+        assert!(!table_exists(&store.conn, "repositories").unwrap());
+        let schema_version: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM profile_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, "qgh.db.v2");
+        drop(store);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_open_rejects_a_dangling_database_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let paths = temp_profile_paths("dangling-database-symlink");
+        fs::create_dir_all(&paths.profile_dir).unwrap();
+        let foreign_target = paths.profile_dir.join("foreign.sqlite3");
+        symlink(&foreign_target, &paths.db_path).unwrap();
+
+        let error = Store::open(&paths)
+            .err()
+            .expect("a dangling database symlink must fail closed");
+
+        assert_eq!(error.code, "storage.failure");
+        assert!(error.message.to_ascii_lowercase().contains("symbolic link"));
+        assert!(!foreign_target.exists());
+        assert!(fs::symlink_metadata(&paths.db_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_and_write_open_reject_a_database_symlink_with_a_valid_target() {
+        use std::os::unix::fs::symlink;
+
+        let paths = temp_profile_paths("valid-database-symlink");
+        drop(Store::open(&paths).unwrap());
+        let foreign_target = paths.profile_dir.join("foreign.sqlite3");
+        fs::rename(&paths.db_path, &foreign_target).unwrap();
+        symlink(&foreign_target, &paths.db_path).unwrap();
+        let target_before = fs::read(&foreign_target).unwrap();
+
+        let read_error = Store::open_for_read(&paths)
+            .err()
+            .expect("read-only access must not follow a database symlink");
+        let write_error = Store::open(&paths)
+            .err()
+            .expect("writable access must not follow a database symlink");
+
+        assert_eq!(read_error.code, "storage.failure");
+        assert!(read_error
+            .message
+            .to_ascii_lowercase()
+            .contains("symbolic link"));
+        assert_eq!(write_error.code, "storage.failure");
+        assert_eq!(write_error.message, read_error.message);
+        assert_eq!(fs::read(&foreign_target).unwrap(), target_before);
+        assert!(fs::symlink_metadata(&paths.db_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn writable_preflight_observes_future_schema_in_uncheckpointed_wal() {
+        let paths = temp_profile_paths("future-schema-in-wal");
+        drop(Store::open(&paths).unwrap());
+
+        let writer = Connection::open(&paths.db_path).unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        writer
+            .execute(
+                "UPDATE profile_meta SET value = 'qgh.db.v2' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        let wal_path = PathBuf::from(format!("{}-wal", paths.db_path.display()));
+        assert!(
+            fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 0),
+            "fixture must keep the future marker in WAL"
+        );
+        let sidecars_before = sqlite_file_inventory(&paths.db_path);
+
+        let error = Store::open(&paths)
+            .err()
+            .expect("preflight must read the current WAL-backed schema marker");
+
+        assert_eq!(error.code, "storage.failure");
+        assert_eq!(error.details["reason"], "unsupported_schema");
+        assert_eq!(error.details["actual_schema_version"], "qgh.db.v2");
+        assert_eq!(sqlite_file_inventory(&paths.db_path), sidecars_before);
+        drop(writer);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn unsupported_schema_error_does_not_echo_unrecognized_metadata() {
+        let paths = temp_profile_paths("unrecognized-schema-redaction");
+        drop(Store::open(&paths).unwrap());
+        let secret_marker = "not-a-schema-private-marker";
+        let database = Connection::open(&paths.db_path).unwrap();
+        database
+            .execute(
+                "UPDATE profile_meta SET value = ?1 WHERE key = 'schema_version'",
+                params![secret_marker],
+            )
+            .unwrap();
+        drop(database);
+
+        let error = Store::open_for_read(&paths)
+            .err()
+            .expect("unrecognized schema metadata must be rejected");
+
+        assert_eq!(error.code, "storage.failure");
+        assert_eq!(error.details["reason"], "unsupported_schema");
+        assert_eq!(error.details["actual_schema_version"], "unrecognized");
+        assert!(!format!("{error:?}").contains(secret_marker));
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn sync_planning_snapshot_is_independent_of_cursor_cardinality() {
+        let paths = temp_profile_paths("schedule-planning-snapshot");
+        let store = Store::open(&paths).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "WITH RECURSIVE counter(value) AS (
+                    VALUES(1)
+                    UNION ALL
+                    SELECT value + 1 FROM counter WHERE value < 5000
+                )
+                INSERT INTO sync_cursors (endpoint, cursor, etag)
+                SELECT printf('endpoint-%05d', value),
+                       printf('cursor-%05d', value),
+                       printf('etag-%05d', value)
+                FROM counter;",
+            )
+            .unwrap();
+
+        let planning = store.sync_planning_snapshot().unwrap();
+        assert_eq!(planning.last_sync_at, None);
+        assert!(planning.backoff.is_none());
+        let cursor_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM sync_cursors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cursor_count, 5000);
+
+        drop(store);
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn existing_read_open_does_not_initialize_a_missing_profile() {
+        let paths = temp_profile_paths("missing-existing-read-open");
+
+        assert!(Store::open_existing_for_read(&paths).unwrap().is_none());
+        assert!(!paths.profile_dir.exists());
+        assert!(!paths.db_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_open_tightens_existing_database_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let paths = temp_profile_paths("database-permissions");
+        fs::create_dir_all(&paths.profile_dir).unwrap();
+        fs::write(&paths.db_path, []).unwrap();
+        let mut permissions = fs::metadata(&paths.db_path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(&paths.db_path, permissions).unwrap();
+
+        drop(Store::open(&paths).unwrap());
+
+        assert_eq!(
+            fs::metadata(&paths.db_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn future_store_rejection_precedes_permission_and_journal_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let paths = temp_profile_paths("future-store-no-persistent-mutation");
+        fs::create_dir_all(&paths.profile_dir).unwrap();
+        let future = Connection::open(&paths.db_path).unwrap();
+        future
+            .execute_batch(
+                "CREATE TABLE profile_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO profile_meta (key, value)
+                VALUES ('schema_version', 'qgh.db.v2');
+                PRAGMA journal_mode = DELETE;",
+            )
+            .unwrap();
+        drop(future);
+        let mut permissions = fs::metadata(&paths.db_path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(&paths.db_path, permissions).unwrap();
+
+        let error = Store::open(&paths)
+            .err()
+            .expect("future schema must fail before persistent setup");
+
+        assert_eq!(error.details["reason"], "unsupported_schema");
+        assert_eq!(
+            fs::metadata(&paths.db_path).unwrap().permissions().mode() & 0o777,
+            0o666
+        );
+        let unchanged = Connection::open(&paths.db_path).unwrap();
+        let journal_mode: String = unchanged
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "delete");
+        drop(unchanged);
+        assert!(!paths.cache_dir.exists());
+        assert!(!paths.log_dir.exists());
 
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
@@ -19415,6 +20094,17 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, "publication.source_snapshot_changed");
+        assert_eq!(store.status().unwrap().dirty_task_count, 1);
+        let pending_task: (String, String) = store
+            .conn
+            .query_row(
+                "SELECT source_id, task_type FROM index_tasks
+                 WHERE completed_at IS NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending_task, (source_id.to_string(), "upsert".to_string()));
         let active = store.active_retrieval_publication().unwrap().unwrap();
         assert_eq!(active.publication_id, first_publication);
         assert_eq!(active.tantivy_generation, first_generation);
@@ -19423,6 +20113,318 @@ mod tests {
             .unwrap_err();
         assert_eq!(query_error.code, "publication.source_snapshot_changed");
 
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn active_source_inventory_summary_matches_materialized_mixed_sources() {
+        let paths = temp_profile_paths("streamed-source-inventory");
+        let mut store = Store::open(&paths).unwrap();
+        let issue_id = "qgh://github.com/issue/I_STREAMED_INVENTORY";
+        let comment_id = "qgh://github.com/issue-comment/IC_STREAMED_INVENTORY";
+        let mut issue = test_issue(issue_id, "owner/repo", "streamed-inventory");
+        issue.title = "동기화 안정성".to_string();
+        issue.body = "CJK 본문과 ASCII body".to_string();
+        issue.labels = vec!["버그".to_string(), "ready-for-agent".to_string()];
+        issue.author = None;
+        let mut comment = test_comment(comment_id, issue_id, "owner/repo", "streamed-inventory");
+        comment.body = "후속 comment".to_string();
+        comment.parent_issue_title = issue.title.clone();
+        store
+            .upsert_sources_for_run(
+                "sync-streamed-source-inventory",
+                &[issue],
+                &[comment],
+                0,
+                &[],
+            )
+            .unwrap();
+
+        let materialized = store.active_index_sources().unwrap();
+        let streamed = store.active_source_inventory_summary().unwrap();
+
+        assert_eq!(streamed.count, materialized.len());
+        assert_eq!(
+            streamed.hash,
+            crate::index::source_inventory_digest(&materialized)
+        );
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO source_entities
+                    (source_id, entity_type, host, repo, node_id, github_id,
+                     lifecycle_state, created_at, updated_at, last_seen_at)
+                 VALUES (?1, 'unsupported', 'github.com', 'owner/repo',
+                         'ROGUE_STREAMED_INVENTORY', 999, 'active', ?2, ?2, ?2)",
+                params![
+                    "qgh://github.com/unsupported/ROGUE_STREAMED_INVENTORY",
+                    "2026-07-15T03:04:05Z"
+                ],
+            )
+            .unwrap();
+        let error = store.active_source_inventory_summary().unwrap_err();
+        assert_eq!(error.code, "publication.source_inventory_mismatch");
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn publication_failure_preserves_index_work_and_success_consumes_the_queue() {
+        let paths = temp_profile_paths("index-task-publication-consumption");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_INDEX_TASK_CONSUMPTION";
+        store
+            .upsert_sources_for_run(
+                "sync-index-task-consumption",
+                &[test_issue(
+                    source_id,
+                    "owner/repo",
+                    "index-task-consumption",
+                )],
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-index-task-consumption")
+            .unwrap();
+        assert_eq!(store.status().unwrap().dirty_task_count, 1);
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 1)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .conn
+            .execute(
+                "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
+                 VALUES ('legacy-completed-source', 'upsert', ?1, ?1)",
+                params!["2026-01-01T00:00:00Z"],
+            )
+            .unwrap();
+        store.fail_next_retrieval_publication_activation(QghError::new(
+            "publication.test_activation_failed",
+            "Fixture activation failed.",
+            6,
+        ));
+
+        let error = store
+            .activate_retrieval_publication("sync-index-task-consumption", generation, None, None)
+            .unwrap_err();
+
+        assert_eq!(error.code, "publication.test_activation_failed");
+        assert_eq!(store.status().unwrap().dirty_task_count, 1);
+        let retained_after_failure: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM index_tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained_after_failure, 2);
+
+        store
+            .activate_retrieval_publication("sync-index-task-consumption", generation, None, None)
+            .unwrap();
+
+        assert_eq!(store.status().unwrap().dirty_task_count, 0);
+        let retained_task_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM index_tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained_task_count, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn unchanged_source_replay_does_not_enqueue_index_work() {
+        let paths = temp_profile_paths("unchanged-index-task-replay");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_UNCHANGED_INDEX_TASK";
+        let comment_id = "qgh://github.com/issue-comment/IC_UNCHANGED_INDEX_TASK";
+        let issue = test_issue(source_id, "owner/repo", "unchanged-index-task");
+        let comment = test_comment(comment_id, source_id, "owner/repo", "unchanged-index-task");
+        store
+            .upsert_sources_for_run(
+                "sync-unchanged-index-task-initial",
+                std::slice::from_ref(&issue),
+                std::slice::from_ref(&comment),
+                0,
+                &[],
+            )
+            .unwrap();
+        store
+            .mark_sync_run_completed("sync-unchanged-index-task-initial")
+            .unwrap();
+        let (generation, _) = store
+            .reserve_index_generation(&paths.index_root, 2)
+            .unwrap();
+        rebuild_reserved_generation(&store, &paths, generation);
+        store
+            .activate_retrieval_publication(
+                "sync-unchanged-index-task-initial",
+                generation,
+                None,
+                None,
+            )
+            .unwrap();
+
+        store
+            .upsert_sources_for_run(
+                "sync-unchanged-index-task-replay",
+                std::slice::from_ref(&issue),
+                std::slice::from_ref(&comment),
+                0,
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(store.status().unwrap().dirty_task_count, 0);
+        let total_task_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM index_tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total_task_count, 0);
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn repeated_source_edits_coalesce_to_one_pending_index_task() {
+        let paths = temp_profile_paths("coalesced-index-task-edits");
+        let mut store = Store::open(&paths).unwrap();
+        let source_id = "qgh://github.com/issue/I_COALESCED_INDEX_TASK";
+        let mut issue = test_issue(source_id, "owner/repo", "coalesced-v1");
+
+        for revision in 1..=3 {
+            issue.title = format!("Coalesced title v{revision}");
+            issue.body = format!("Coalesced body v{revision}");
+            issue.body_hash = format!("coalesced-body-hash-v{revision}");
+            issue.updated_at = format!("2026-01-0{}T00:00:00Z", revision + 1);
+            issue.indexed_at = format!("2026-01-0{}T00:00:01Z", revision + 1);
+            store
+                .upsert_sources_for_run(
+                    &format!("sync-coalesced-index-task-v{revision}"),
+                    std::slice::from_ref(&issue),
+                    &[],
+                    0,
+                    &[],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.status().unwrap().dirty_task_count, 1);
+        let task: (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT count(*), min(task_type) FROM index_tasks
+                 WHERE source_id = ?1 AND completed_at IS NULL",
+                params![source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(task, (1, "upsert".to_string()));
+
+        store
+            .tombstone_source(source_id, "fixture deletion")
+            .unwrap();
+        let delete_task: (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT count(*), min(task_type) FROM index_tasks
+                 WHERE source_id = ?1 AND completed_at IS NULL",
+                params![source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(delete_task, (1, "delete".to_string()));
+
+        issue.title = "Coalesced title resurrected".to_string();
+        issue.body = "Coalesced body resurrected".to_string();
+        issue.body_hash = "coalesced-body-hash-resurrected".to_string();
+        issue.updated_at = "2026-01-05T00:00:00Z".to_string();
+        issue.indexed_at = "2026-01-05T00:00:01Z".to_string();
+        store
+            .upsert_sources_for_run(
+                "sync-coalesced-index-task-resurrected",
+                std::slice::from_ref(&issue),
+                &[],
+                0,
+                &[],
+            )
+            .unwrap();
+        let resurrected_task: (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT count(*), min(task_type) FROM index_tasks
+                 WHERE source_id = ?1 AND completed_at IS NULL",
+                params![source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(resurrected_task, (1, "upsert".to_string()));
+
+        let _ = fs::remove_dir_all(paths.profile_dir);
+    }
+
+    #[test]
+    fn pending_index_task_coalescing_uses_a_source_lookup_index() {
+        let paths = temp_profile_paths("index-task-pending-lookup-index");
+        let store = Store::open(&paths).unwrap();
+
+        let index_sql: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'idx_index_tasks_pending_source'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_sql.contains("WHERE completed_at IS NULL"));
+
+        let mut plan = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 DELETE FROM index_tasks
+                 WHERE source_id = ?1 AND completed_at IS NULL",
+            )
+            .unwrap();
+        let details = plan
+            .query_map(params!["qgh://github.com/issue/I_PLAN"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_index_tasks_pending_source")),
+            "unexpected query plan: {details:?}"
+        );
+
+        drop(plan);
+        store
+            .conn
+            .execute("DROP INDEX idx_index_tasks_pending_source", [])
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(&paths).unwrap();
+        let restored: bool = reopened
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_schema
+                     WHERE type = 'index' AND name = 'idx_index_tasks_pending_source'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(restored);
+
+        drop(reopened);
         let _ = fs::remove_dir_all(paths.profile_dir);
     }
 
@@ -22554,7 +23556,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(dirty_comment_tasks_after, dirty_comment_tasks_before + 1);
+        assert_eq!(dirty_comment_tasks_before, 1);
+        assert_eq!(dirty_comment_tasks_after, 1);
         let error = store
             .validate_embedding_generation(generation_id)
             .unwrap_err();
@@ -22952,5 +23955,18 @@ mod tests {
             cache_dir,
             profile_dir,
         }
+    }
+
+    fn sqlite_file_inventory(db_path: &Path) -> Vec<String> {
+        let file_name = db_path.file_name().unwrap().to_string_lossy();
+        let mut inventory = fs::read_dir(db_path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                name.starts_with(file_name.as_ref()).then_some(name)
+            })
+            .collect::<Vec<_>>();
+        inventory.sort();
+        inventory
     }
 }

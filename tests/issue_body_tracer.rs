@@ -342,6 +342,78 @@ fn sync_query_get_status_round_trips_issue_body_from_authoritative_store() {
 }
 
 #[test]
+fn status_and_sync_fail_closed_on_a_future_store_schema_before_network_access() {
+    let fixture = TestFixture::new("future-store-schema");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let db_path = fixture.data_home.join("qgh/profiles/work/qgh.sqlite3");
+    let database = rusqlite::Connection::open(&db_path).unwrap();
+    database
+        .execute_batch(
+            "UPDATE profile_meta
+             SET value = 'qgh.db.v2'
+             WHERE key = 'schema_version';
+             CREATE TABLE future_schema_sentinel (
+                 id INTEGER PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+             INSERT INTO future_schema_sentinel (id, value)
+             VALUES (1, 'must-survive');
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    drop(database);
+    let database_before = fs::read(&db_path).unwrap();
+    let requests_before = server.request_count();
+
+    for output in [
+        fixture.qgh(["status", "--json"]),
+        fixture.qgh(["sync", "--json"]),
+    ] {
+        assert_eq!(output.status.code(), Some(6));
+        let body = stdout_json(&output);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "storage.failure");
+        assert_eq!(body["error"]["details"]["reason"], "unsupported_schema");
+        assert_eq!(
+            body["error"]["details"]["expected_schema_version"],
+            "qgh.db.v1"
+        );
+        assert_eq!(
+            body["error"]["details"]["actual_schema_version"],
+            "qgh.db.v2"
+        );
+    }
+
+    assert_eq!(
+        server.request_count(),
+        requests_before,
+        "unsupported stores must fail before GitHub access"
+    );
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        database_before,
+        "read and write adapters must leave the rejected database byte-identical"
+    );
+    let unchanged = rusqlite::Connection::open(&db_path).unwrap();
+    let marker: (String, String) = unchanged
+        .query_row(
+            "SELECT
+                (SELECT value FROM profile_meta WHERE key = 'schema_version'),
+                (SELECT value FROM future_schema_sentinel WHERE id = 1)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        marker,
+        ("qgh.db.v2".to_string(), "must-survive".to_string())
+    );
+}
+
+#[test]
 fn malformed_tantivy_query_is_content_free_across_cli_and_mcp_errors() {
     let fixture = TestFixture::new("malformed-tantivy-query-content-free");
     let server = FakeGitHub::start(issue_payload_with_pr());
@@ -2105,6 +2177,7 @@ fn init_repo_writes_repo_policy_from_cli_repo_at_current_worktree_root() {
     let init_json = stdout_json(&init);
     assert_eq!(init_json["data"]["repo"], "owner/repo");
     assert_eq!(init_json["data"]["repo_source"], "cli");
+    assert_eq!(init_json["meta"]["repo_source"], "cli");
     assert_eq!(init_json["data"]["overwritten"], false);
     assert_eq!(
         init_json["data"]["profile_validation"]["status"],
@@ -2198,6 +2271,7 @@ fn init_yes_bootstraps_profile_config_and_repo_policy_without_secret_or_store_pa
     assert_eq!(init_json["data"]["profile_id"], "work");
     assert_eq!(init_json["data"]["profile_action"], "created");
     assert_eq!(init_json["data"]["repo"], "owner/repo");
+    assert_eq!(init_json["meta"]["repo_source"], "cli");
     assert_eq!(init_json["data"]["repo_allowlist_action"], "added");
     assert_eq!(init_json["data"]["repo_policy_action"], "created");
     assert_eq!(init_json["data"]["token_source"]["kind"], "env");
@@ -2238,6 +2312,39 @@ fn init_yes_bootstraps_profile_config_and_repo_policy_without_secret_or_store_pa
         );
     }
 
+    let config_dir = fixture.config_home.join("qgh");
+    let config_lock = config_dir.join("config.toml.lock");
+    assert!(fs::symlink_metadata(&config_lock)
+        .unwrap()
+        .file_type()
+        .is_file());
+    assert!(fs::read(&config_lock).unwrap().is_empty());
+    let staging_files = fs::read_dir(&config_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect::<Vec<_>>();
+    assert!(staging_files.is_empty(), "staging files: {staging_files:?}");
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(config_dir.join("config.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&config_lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
     let policy = fs::read_to_string(fixture.root.join(".qgh.toml")).unwrap();
     assert!(policy.contains(r#"github = "owner/repo""#));
     assert!(!policy.contains("QGH_TEST_TOKEN"));
@@ -2251,6 +2358,221 @@ fn init_yes_bootstraps_profile_config_and_repo_policy_without_secret_or_store_pa
         status_json["data"]["resolution"]["effective_repo_scope"],
         "owner/repo"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_rejects_symlinked_profile_config_without_mutating_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("init-symlinked-profile-config");
+    fixture.write_config("https://api.github.com");
+    let config_path = fixture.config_home.join("qgh/config.toml");
+    let target_path = fixture.root.join("managed-config.toml");
+    fs::rename(&config_path, &target_path).unwrap();
+    symlink(&target_path, &config_path).unwrap();
+    let original_target = fs::read(&target_path).unwrap();
+    let worktree = fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &worktree,
+        [
+            "--profile",
+            "fresh",
+            "init",
+            "--yes",
+            "--repo",
+            "other/repo",
+            "--host",
+            "github.com",
+            "--api-base-url",
+            "https://api.github.com",
+            "--web-base-url",
+            "https://github.com",
+            "--token-source",
+            "github_cli",
+            "--json",
+        ],
+    );
+
+    assert_eq!(init.status.code(), Some(6));
+    assert_eq!(stdout_json(&init)["error"]["code"], "storage.failure");
+    assert!(fs::symlink_metadata(&config_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read(&target_path).unwrap(), original_target);
+    assert!(!worktree.join(".qgh.toml").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn init_rejects_symlinked_repo_policy_without_mutating_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("init-symlinked-repo-policy");
+    let target_path = fixture.root.join("managed-policy.toml");
+    fs::write(
+        &target_path,
+        "schema_version = \"qgh.repo.v1\"\n\n[repo]\ngithub = \"owner/original\"\n",
+    )
+    .unwrap();
+    let original_target = fs::read(&target_path).unwrap();
+    symlink(&target_path, fixture.root.join(".qgh.toml")).unwrap();
+    let worktree = fixture.init_git_worktree_with_origin("https://github.com/owner/new.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &worktree,
+        ["--profile", "work", "init", "--yes", "--force", "--json"],
+    );
+
+    assert_eq!(init.status.code(), Some(6));
+    assert_eq!(stdout_json(&init)["error"]["code"], "storage.failure");
+    assert_eq!(fs::read(&target_path).unwrap(), original_target);
+    assert!(fs::symlink_metadata(fixture.root.join(".qgh.toml"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(!fixture.config_home.join("qgh/config.toml").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn init_repo_rejects_symlinked_policy_without_mutating_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("init-repo-symlinked-policy");
+    let target_path = fixture.root.join("managed-policy.toml");
+    fs::write(
+        &target_path,
+        "schema_version = \"qgh.repo.v1\"\n\n[repo]\ngithub = \"owner/original\"\n",
+    )
+    .unwrap();
+    let original_target = fs::read(&target_path).unwrap();
+    symlink(&target_path, fixture.root.join(".qgh.toml")).unwrap();
+    let worktree = fixture.init_git_worktree();
+
+    let init = fixture.qgh_without_profile_in(
+        &worktree,
+        ["init", "repo", "--repo", "owner/new", "--force", "--json"],
+    );
+
+    assert_eq!(init.status.code(), Some(6));
+    assert_eq!(stdout_json(&init)["error"]["code"], "storage.failure");
+    assert_eq!(fs::read(&target_path).unwrap(), original_target);
+    assert!(fs::symlink_metadata(fixture.root.join(".qgh.toml"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn init_validation_failure_preserves_existing_profile_config_bytes() {
+    let fixture = TestFixture::new("init-invalid-existing-profile-preserved");
+    let config_path = fixture.config_home.join("qgh/config.toml");
+    fs::write(
+        &config_path,
+        r#"schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+max_in_flight_requests = 17
+
+[profiles.work.token_source]
+type = "github_cli"
+"#,
+    )
+    .unwrap();
+    let original = fs::read(&config_path).unwrap();
+    let worktree = fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &worktree,
+        [
+            "--profile",
+            "work",
+            "init",
+            "--yes",
+            "--repo",
+            "other/repo",
+            "--host",
+            "github.com",
+            "--api-base-url",
+            "https://api.github.com",
+            "--web-base-url",
+            "https://github.com",
+            "--token-source",
+            "github_cli",
+            "--json",
+        ],
+    );
+
+    assert_eq!(init.status.code(), Some(2));
+    assert_eq!(stdout_json(&init)["error"]["code"], "config.invalid");
+    assert_eq!(fs::read(&config_path).unwrap(), original);
+    assert!(!worktree.join(".qgh.toml").exists());
+}
+
+#[test]
+fn init_rejects_an_invalid_untouched_profile_before_publishing_config() {
+    let fixture = TestFixture::new("init-invalid-untouched-profile-preserved");
+    let config_path = fixture.config_home.join("qgh/config.toml");
+    fs::write(
+        &config_path,
+        r#"schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.work.token_source]
+type = "github_cli"
+
+[profiles.broken]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/existing"]
+max_in_flight_requests = 17
+
+[profiles.broken.token_source]
+type = "github_cli"
+"#,
+    )
+    .unwrap();
+    let original = fs::read(&config_path).unwrap();
+    let worktree = fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &worktree,
+        [
+            "--profile",
+            "work",
+            "init",
+            "--yes",
+            "--repo",
+            "other/repo",
+            "--host",
+            "github.com",
+            "--api-base-url",
+            "https://api.github.com",
+            "--web-base-url",
+            "https://github.com",
+            "--token-source",
+            "github_cli",
+            "--json",
+        ],
+    );
+
+    assert_eq!(init.status.code(), Some(2));
+    assert_eq!(stdout_json(&init)["error"]["code"], "config.invalid");
+    assert_eq!(fs::read(&config_path).unwrap(), original);
+    assert!(!worktree.join(".qgh.toml").exists());
 }
 
 #[test]
@@ -2321,6 +2643,400 @@ fn init_yes_applies_inferred_preset_without_preview_or_required_flags() {
     assert_eq!(init_json["data"]["repo"], "owner/repo");
     assert_eq!(init_json["data"]["token_source"]["kind"], "github_cli");
     assert_eq!(init_json["data"]["repo_policy_action"], "created");
+}
+
+#[test]
+fn init_yes_auto_reuses_single_same_host_profile_and_reports_actual_id() {
+    let fixture = TestFixture::new("init-yes-auto-host-match");
+    fixture.write_config_with_host("github.com", "https://api.github.com");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/other.git");
+
+    let init = fixture.qgh_without_profile_in(&nested_worktree_dir, ["init", "--yes", "--json"]);
+
+    assert_success(&init);
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["data"]["profile_id"], "work");
+    assert_eq!(init_json["meta"]["profile_id"], "work");
+    assert_eq!(init_json["meta"]["profile_source"], "cli");
+    assert_eq!(init_json["data"]["profile_action"], "updated");
+    assert_eq!(init_json["data"]["repo_allowlist_action"], "added");
+    assert_eq!(init_json["data"]["token_source"]["kind"], "env");
+    let config = fs::read_to_string(fixture.config_home.join("qgh/config.toml")).unwrap();
+    assert!(config.contains("[profiles.work]"));
+    assert!(config.contains(r#""owner/repo""#));
+    assert!(config.contains(r#""owner/other""#));
+    assert!(!config.contains("[profiles.github]"));
+}
+
+#[test]
+fn init_yes_normalizes_mixed_case_host_identity() {
+    let fixture = TestFixture::new("init-yes-normalized-host");
+    let nested_worktree_dir = fixture.init_git_worktree();
+
+    let init = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        [
+            "init",
+            "--yes",
+            "--repo",
+            "owner/repo",
+            "--host",
+            "GitHub.com",
+            "--json",
+        ],
+    );
+
+    assert_success(&init);
+    let init_json = stdout_json(&init);
+    assert_eq!(init_json["data"]["profile_id"], "github");
+    assert_eq!(init_json["meta"]["profile_source"], "cli");
+    let config = fs::read_to_string(fixture.config_home.join("qgh/config.toml")).unwrap();
+    assert!(config.contains(r#"host = "github.com""#));
+    assert!(config.contains(r#"api_base_url = "https://api.github.com""#));
+    assert!(!config.contains("GitHub.com"));
+}
+
+#[test]
+fn init_yes_auto_rejects_ambiguous_repo_matches_without_writes() {
+    let fixture = TestFixture::new("init-yes-auto-ambiguous-repo");
+    let config_path = fixture.config_home.join("qgh/config.toml");
+    fs::write(
+        &config_path,
+        r#"schema_version = "qgh.config.v1"
+
+[profiles.github]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.github.token_source]
+type = "github_cli"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#,
+    )
+    .unwrap();
+    let original = fs::read(&config_path).unwrap();
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(&nested_worktree_dir, ["init", "--yes", "--json"]);
+
+    assert_eq!(init.status.code(), Some(2));
+    let error = stdout_json(&init);
+    assert_eq!(error["error"]["code"], "config.ambiguous_profile");
+    assert_eq!(error["error"]["details"]["match_basis"], "repo");
+    assert_eq!(
+        error["error"]["details"]["matching_profile_ids"],
+        json!(["github", "work"])
+    );
+    assert_eq!(fs::read(config_path).unwrap(), original);
+    assert!(!fixture.root.join(".qgh.toml").exists());
+}
+
+#[test]
+fn init_yes_auto_rejects_ambiguous_host_matches_without_writes() {
+    let fixture = TestFixture::new("init-yes-auto-ambiguous-host");
+    let config_path = fixture.config_home.join("qgh/config.toml");
+    fs::write(
+        &config_path,
+        r#"schema_version = "qgh.config.v1"
+
+[profiles.github]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/one"]
+
+[profiles.github.token_source]
+type = "github_cli"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/two"]
+
+[profiles.work.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#,
+    )
+    .unwrap();
+    let original = fs::read(&config_path).unwrap();
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(&nested_worktree_dir, ["init", "--yes", "--json"]);
+
+    assert_eq!(init.status.code(), Some(2));
+    let error = stdout_json(&init);
+    assert_eq!(error["error"]["code"], "config.ambiguous_profile");
+    assert_eq!(error["error"]["details"]["match_basis"], "host");
+    assert_eq!(fs::read(config_path).unwrap(), original);
+    assert!(!fixture.root.join(".qgh.toml").exists());
+}
+
+#[test]
+fn init_yes_auto_validates_snapshot_before_reporting_ambiguity() {
+    let fixture = TestFixture::new("init-yes-auto-invalid-before-ambiguity");
+    let config_path = fixture.config_home.join("qgh/config.toml");
+    fs::write(
+        &config_path,
+        r#"schema_version = "qgh.config.v1"
+
+[profiles.work]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/one"]
+
+[profiles.work.token_source]
+type = "github_cli"
+
+[profiles."PRIVATE_INVALID!"]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/two"]
+
+[profiles."PRIVATE_INVALID!".token_source]
+type = "github_cli"
+"#,
+    )
+    .unwrap();
+    let original = fs::read(&config_path).unwrap();
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(&nested_worktree_dir, ["init", "--yes", "--json"]);
+
+    assert_eq!(init.status.code(), Some(2));
+    assert_eq!(stdout_json(&init)["error"]["code"], "config.invalid");
+    assert!(!stdout_text(&init).contains("PRIVATE_INVALID"));
+    assert_eq!(fs::read(config_path).unwrap(), original);
+    assert!(!fixture.root.join(".qgh.toml").exists());
+}
+
+#[test]
+fn interactive_init_validates_snapshot_before_previewing_profile_paths() {
+    let fixture = TestFixture::new("init-interactive-invalid-before-preview");
+    let config_path = fixture.config_home.join("qgh/config.toml");
+    fs::write(
+        &config_path,
+        r#"schema_version = "qgh.config.v1"
+
+[profiles."PRIVATE_INVALID!"]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/repo"]
+
+[profiles."PRIVATE_INVALID!".token_source]
+type = "github_cli"
+"#,
+    )
+    .unwrap();
+    let original = fs::read(&config_path).unwrap();
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init =
+        fixture.qgh_without_profile_in_with_stdin(&nested_worktree_dir, ["init", "--json"], "");
+
+    assert_eq!(init.status.code(), Some(2));
+    assert_eq!(stdout_json(&init)["error"]["code"], "config.invalid");
+    assert!(!stderr_text(&init).contains("PRIVATE_INVALID"));
+    assert!(!stdout_text(&init).contains("PRIVATE_INVALID"));
+    assert_eq!(fs::read(config_path).unwrap(), original);
+    assert!(!fixture.root.join(".qgh.toml").exists());
+}
+
+#[test]
+fn init_yes_auto_reuses_existing_inferred_endpoints_but_rejects_explicit_conflict() {
+    let fixture = TestFixture::new("init-yes-auto-existing-endpoints");
+    fixture.write_config("http://127.0.0.1:1");
+    let config_path = fixture.config_home.join("qgh/config.toml");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/other.git");
+
+    let inferred =
+        fixture.qgh_without_profile_in(&nested_worktree_dir, ["init", "--yes", "--json"]);
+    assert_success(&inferred);
+    let inferred_json = stdout_json(&inferred);
+    assert_eq!(inferred_json["data"]["profile_id"], "work");
+    assert_eq!(inferred_json["data"]["profile_action"], "updated");
+    let after_inferred = fs::read(&config_path).unwrap();
+    assert!(String::from_utf8_lossy(&after_inferred).contains("http://127.0.0.1:1"));
+
+    let explicit = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        [
+            "init",
+            "--yes",
+            "--repo",
+            "owner/third",
+            "--api-base-url",
+            "https://api.github.com",
+            "--force",
+            "--json",
+        ],
+    );
+    assert_eq!(explicit.status.code(), Some(2));
+    assert_eq!(stdout_json(&explicit)["error"]["code"], "config.invalid");
+    assert_eq!(fs::read(config_path).unwrap(), after_inferred);
+}
+
+#[test]
+fn interactive_customize_preserves_existing_endpoint_defaults() {
+    let fixture = TestFixture::new("init-custom-existing-endpoints");
+    fixture.write_config("http://127.0.0.1:1");
+    let config_path = fixture.config_home.join("qgh/config.toml");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/other.git");
+
+    let init = fixture.qgh_without_profile_in_with_stdin(
+        &nested_worktree_dir,
+        ["--profile", "work", "init", "--json"],
+        "n\n\n\n\n\n\n",
+    );
+
+    assert_success(&init);
+    assert_eq!(stdout_json(&init)["data"]["profile_id"], "work");
+    assert!(stderr_text(&init).contains("token source: env"));
+    assert!(!stderr_text(&init).contains("token source (github_cli/env)"));
+    let config = fs::read_to_string(config_path).unwrap();
+    assert!(config.contains(r#"api_base_url = "http://127.0.0.1:1""#));
+    assert!(config.contains(r#""owner/other""#));
+}
+
+#[test]
+fn init_uses_defaults_for_an_explicit_host_instead_of_mismatched_origin_endpoints() {
+    let fixture = TestFixture::new("init-explicit-host-endpoints");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        ["init", "--yes", "--host", "ghe.example", "--json"],
+    );
+
+    assert_success(&init);
+    let config = fs::read_to_string(fixture.config_home.join("qgh/config.toml")).unwrap();
+    assert!(config.contains(r#"host = "ghe.example""#));
+    assert!(config.contains(r#"api_base_url = "https://ghe.example/api/v3""#));
+    assert!(config.contains(r#"web_base_url = "https://ghe.example""#));
+    assert!(!config.contains("api.github.com"));
+}
+
+#[test]
+fn init_normalizes_mixed_case_github_origin_and_reports_git_remote_provenance() {
+    let fixture = TestFixture::new("init-mixed-case-origin");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://GitHub.COM/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in(&nested_worktree_dir, ["init", "--yes", "--json"]);
+
+    assert_success(&init);
+    let json = stdout_json(&init);
+    assert_eq!(json["data"]["profile_id"], "github");
+    assert_eq!(json["meta"]["repo_source"], "git_remote");
+    assert!(json["data"]["repo_policy_path"].is_string());
+    assert_eq!(json["meta"]["repo_policy_path"], Value::Null);
+    let config = fs::read_to_string(fixture.config_home.join("qgh/config.toml")).unwrap();
+    assert!(config.contains(r#"host = "github.com""#));
+    assert!(config.contains(r#"api_base_url = "https://api.github.com""#));
+}
+
+#[test]
+fn top_level_init_honors_env_profile_and_cli_precedence() {
+    let fixture = TestFixture::new("init-profile-env-precedence");
+    fs::write(
+        fixture.config_home.join("qgh/config.toml"),
+        r#"schema_version = "qgh.config.v1"
+
+[profiles.env]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/one"]
+
+[profiles.env.token_source]
+type = "github_cli"
+
+[profiles.cli]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/two"]
+
+[profiles.cli.token_source]
+type = "github_cli"
+"#,
+    )
+    .unwrap();
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/env-target.git");
+
+    let mut env_command = fixture.base_command();
+    let env_init = env_command
+        .env("QGH_PROFILE", "env")
+        .current_dir(&nested_worktree_dir)
+        .args(["init", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&env_init);
+    let env_json = stdout_json(&env_init);
+    assert_eq!(env_json["data"]["profile_id"], "env");
+    assert_eq!(env_json["meta"]["profile_source"], "env");
+
+    let mut cli_command = fixture.base_command();
+    let cli_init = cli_command
+        .env("QGH_PROFILE", "env")
+        .current_dir(&nested_worktree_dir)
+        .args([
+            "--profile",
+            "cli",
+            "init",
+            "--yes",
+            "--repo",
+            "owner/cli-target",
+            "--force",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&cli_init);
+    let cli_json = stdout_json(&cli_init);
+    assert_eq!(cli_json["data"]["profile_id"], "cli");
+    assert_eq!(cli_json["meta"]["profile_source"], "cli");
+}
+
+#[test]
+fn interactive_customize_keeps_explicit_profile_without_reprompting() {
+    let fixture = TestFixture::new("init-interactive-fixed-profile");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init = fixture.qgh_without_profile_in_with_stdin(
+        &nested_worktree_dir,
+        ["--profile", "fixed", "init", "--json"],
+        "n\n\n\n\n\nn\n",
+    );
+
+    assert_success(&init);
+    assert_eq!(stdout_json(&init)["data"]["profile_id"], "fixed");
+    assert_eq!(stderr_text(&init).matches("profile id").count(), 1);
 }
 
 #[test]
@@ -2796,9 +3512,11 @@ fn init_yes_rejects_explicit_host_userinfo_without_writing_config() {
 }
 
 #[test]
-fn init_yes_reports_existing_profile_token_source_when_not_changed() {
-    let fixture = TestFixture::new("init-existing-token-source");
+fn init_yes_rejects_conflicting_token_source_for_existing_profile() {
+    let fixture = TestFixture::new("init-existing-token-source-conflict");
     fixture.write_config("https://api.github.com");
+    let config_path = fixture.config_home.join("qgh/config.toml");
+    let original = fs::read(&config_path).unwrap();
     let nested_worktree_dir =
         fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
 
@@ -2822,14 +3540,46 @@ fn init_yes_reports_existing_profile_token_source_when_not_changed() {
             "--json",
         ],
     );
-    assert_success(&init);
-    let init_json = stdout_json(&init);
-    assert_eq!(init_json["data"]["profile_action"], "updated");
-    assert_eq!(init_json["data"]["token_source"]["kind"], "env");
+    assert_eq!(init.status.code(), Some(2));
+    assert_eq!(stdout_json(&init)["error"]["code"], "config.invalid");
+    assert_eq!(fs::read(config_path).unwrap(), original);
+    assert!(!fixture.root.join(".qgh.toml").exists());
+}
 
-    let config_text = fs::read_to_string(fixture.config_home.join("qgh/config.toml")).unwrap();
-    assert!(config_text.contains(r#"type = "env""#));
-    assert!(!config_text.contains(r#"type = "github_cli""#));
+#[test]
+fn init_yes_auto_rejects_conflicting_token_source_after_locked_selection() {
+    let fixture = TestFixture::new("init-auto-token-source-conflict");
+    fixture.write_config("https://api.github.com");
+    let config_path = fixture.config_home.join("qgh/config.toml");
+    let original = fs::read(&config_path).unwrap();
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/other.git");
+
+    let init = fixture.qgh_without_profile_in(
+        &nested_worktree_dir,
+        ["init", "--yes", "--token-source", "github_cli", "--json"],
+    );
+
+    assert_eq!(init.status.code(), Some(2));
+    assert_eq!(stdout_json(&init)["error"]["code"], "config.invalid");
+    assert_eq!(fs::read(config_path).unwrap(), original);
+    assert!(!fixture.root.join(".qgh.toml").exists());
+}
+
+#[test]
+fn interactive_preview_reports_existing_profile_token_source() {
+    let fixture = TestFixture::new("init-existing-token-source-preview");
+    fixture.write_config("https://api.github.com");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let init =
+        fixture.qgh_without_profile_in_with_stdin(&nested_worktree_dir, ["init", "--json"], "\n");
+
+    assert_success(&init);
+    assert!(stderr_text(&init).contains("token source: env (QGH_TEST_TOKEN)"));
+    assert!(!stderr_text(&init).contains("token source: github_cli"));
+    assert_eq!(stdout_json(&init)["data"]["token_source"]["kind"], "env");
 }
 
 #[test]
@@ -2895,6 +3645,7 @@ fn init_infers_repo_from_github_origin_remote_without_profile_resolution() {
         let init_json = stdout_json(&init);
         assert_eq!(init_json["data"]["repo"], "owner/repo");
         assert_eq!(init_json["data"]["repo_source"], "git_remote");
+        assert_eq!(init_json["meta"]["repo_source"], "git_remote");
         assert_eq!(
             init_json["data"]["profile_validation"]["status"],
             "not_checked"
@@ -2993,6 +3744,24 @@ fn init_refuses_existing_policy_unless_force_overwrites() {
     assert!(fs::read_to_string(fixture.root.join(".qgh.toml"))
         .unwrap()
         .contains(r#"github = "other/repo""#));
+}
+
+#[test]
+fn init_repo_force_atomically_replaces_invalid_regular_policy() {
+    let fixture = TestFixture::new("init-force-invalid-policy");
+    let nested = fixture.init_git_worktree();
+    fs::write(fixture.root.join(".qgh.toml"), "not valid toml = [").unwrap();
+
+    let forced = fixture.qgh_without_profile_in(
+        &nested,
+        ["init", "repo", "--repo", "owner/repo", "--force", "--json"],
+    );
+
+    assert_success(&forced);
+    assert_eq!(stdout_json(&forced)["data"]["overwritten"], true);
+    assert!(fs::read_to_string(fixture.root.join(".qgh.toml"))
+        .unwrap()
+        .contains(r#"github = "owner/repo""#));
 }
 
 #[test]
@@ -9496,6 +10265,24 @@ fn profile_resolution_uses_cli_then_env_then_repo_scope_single_match() {
     let get_json = stdout_json(&get);
     assert_eq!(get_json["data"]["profile_id"], "work");
     assert_eq!(get_json["meta"]["profile_source"], "single_match");
+}
+
+#[test]
+fn profile_resolution_treats_host_case_as_one_identity() {
+    let fixture = TestFixture::new("profile-resolution-host-case");
+    fixture.write_config_with_host("GitHub.COM", "http://127.0.0.1:1");
+    let nested_worktree_dir =
+        fixture.init_git_worktree_with_origin("https://github.com/owner/repo.git");
+
+    let status = fixture.qgh_without_profile_in(&nested_worktree_dir, ["status", "--json"]);
+    assert_success(&status);
+    let json = stdout_json(&status);
+    assert_eq!(json["data"]["profile_id"], "work");
+    assert_eq!(json["meta"]["profile_source"], "single_match");
+
+    let explicit = fixture.qgh_in_profile(&nested_worktree_dir, "work", ["status", "--json"]);
+    assert_success(&explicit);
+    assert_eq!(stdout_json(&explicit)["meta"]["profile_source"], "cli");
 }
 
 #[test]

@@ -1,3 +1,4 @@
+use crate::config_mutation::ConfigMutation;
 use crate::embedding::{
     default_prepared_model_store, is_builtin_preset_id, parse_hf_model_reference,
     FastembedProviderOptions, PoolingKind, PreparedModelStore, QuantizationKind,
@@ -6,7 +7,7 @@ use crate::embedding::{
 use crate::error::QghError;
 use crate::freshness::{parse_duration_seconds, DEFAULT_QUERY_MAX_AGE_SECONDS};
 use crate::local_models::QWEN_EMBEDDING_PRESET_ID;
-use crate::paths::{config_file_path, ensure_private_dir, set_private_file, ProfilePaths};
+use crate::paths::{config_file_path, ProfilePaths};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -221,7 +222,7 @@ pub enum EmbeddingTokenSource {
     Unsupported,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TokenSource {
     GithubCli,
@@ -401,17 +402,44 @@ pub fn load_profile(profile_id: &str) -> Result<Profile, QghError> {
     )
 }
 
+pub(crate) fn load_profile_optional(profile_id: &str) -> Result<Option<Profile>, QghError> {
+    validate_profile_id(profile_id)?;
+    let Some(config) = load_config_file_optional()? else {
+        return Ok(None);
+    };
+    let Some(raw) = config.profiles.get(profile_id) else {
+        return Ok(None);
+    };
+    profile_from_raw(
+        profile_id,
+        raw,
+        config.embedding.as_ref().map(embedding_config_from_raw),
+        config.reranker.as_ref().map(reranker_config_from_raw),
+    )
+    .map(Some)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ProfileBootstrapTarget {
+    Exact(String),
+    Auto,
+}
+
 pub struct ProfileBootstrapInput {
-    pub profile_id: String,
+    pub(crate) target: ProfileBootstrapTarget,
     pub host: String,
     pub api_base_url: String,
     pub web_base_url: String,
+    pub api_base_url_explicit: bool,
+    pub web_base_url_explicit: bool,
+    pub token_source_explicit: bool,
     pub repo: String,
     pub token_source: TokenSource,
 }
 
 pub struct ProfileBootstrapOutcome {
     pub config_path: PathBuf,
+    pub profile_id: String,
     pub profile_action: &'static str,
     pub repo_allowlist_action: &'static str,
     pub token_source_kind: &'static str,
@@ -422,7 +450,23 @@ pub struct ProfileBootstrapOutcome {
 pub fn bootstrap_profile_repo(
     input: ProfileBootstrapInput,
 ) -> Result<ProfileBootstrapOutcome, QghError> {
-    validate_profile_id(&input.profile_id)?;
+    validate_profile_bootstrap_input(&input)?;
+    bootstrap_profile_repo_at_validated(input, config_file_path()?)
+}
+
+#[cfg(test)]
+fn bootstrap_profile_repo_at(
+    input: ProfileBootstrapInput,
+    config_path: PathBuf,
+) -> Result<ProfileBootstrapOutcome, QghError> {
+    validate_profile_bootstrap_input(&input)?;
+    bootstrap_profile_repo_at_validated(input, config_path)
+}
+
+fn validate_profile_bootstrap_input(input: &ProfileBootstrapInput) -> Result<(), QghError> {
+    if let ProfileBootstrapTarget::Exact(profile_id) = &input.target {
+        validate_profile_id(profile_id)?;
+    }
     parse_repo(&input.repo).map_err(|_| {
         QghError::validation(
             "validation.invalid_repo",
@@ -430,49 +474,107 @@ pub fn bootstrap_profile_repo(
         )
     })?;
     validate_profile_endpoints(&input.host, &input.api_base_url, &input.web_base_url)?;
-    validate_token_source(&input.token_source)?;
+    validate_token_source(&input.token_source)
+}
 
-    let config_path = config_file_path()?;
-    let existing_config = load_config_file_optional()?;
+fn bootstrap_profile_repo_at_validated(
+    input: ProfileBootstrapInput,
+    config_path: PathBuf,
+) -> Result<ProfileBootstrapOutcome, QghError> {
+    let mutation = ConfigMutation::begin(config_path.clone())?;
+    bootstrap_profile_repo_with_mutation(input, config_path, mutation)
+}
+
+#[cfg(test)]
+fn bootstrap_profile_repo_at_with_before_lock_hook(
+    input: ProfileBootstrapInput,
+    config_path: PathBuf,
+    before_lock: impl FnOnce(),
+) -> Result<ProfileBootstrapOutcome, QghError> {
+    validate_profile_bootstrap_input(&input)?;
+    let mutation = ConfigMutation::begin_with_before_lock_hook(config_path.clone(), before_lock)?;
+    bootstrap_profile_repo_with_mutation(input, config_path, mutation)
+}
+
+fn bootstrap_profile_repo_with_mutation(
+    input: ProfileBootstrapInput,
+    config_path: PathBuf,
+    mutation: ConfigMutation,
+) -> Result<ProfileBootstrapOutcome, QghError> {
+    let ProfileBootstrapInput {
+        target,
+        host,
+        api_base_url,
+        web_base_url,
+        api_base_url_explicit,
+        web_base_url_explicit,
+        token_source_explicit,
+        repo,
+        token_source,
+    } = input;
+    let host = host.to_ascii_lowercase();
+
+    let existing_config = mutation
+        .read_optional()?
+        .map(|bytes| parse_config_file_bytes(&config_path, bytes))
+        .transpose()?;
     let creates_config = existing_config.is_none();
     let mut config = config_for_bootstrap(existing_config);
+    validate_config_for_publication(&config)?;
+    let profile_id = match target {
+        ProfileBootstrapTarget::Exact(profile_id) => profile_id,
+        ProfileBootstrapTarget::Auto => {
+            select_auto_profile_id_from(&config.profiles, &repo, &host)?
+        }
+    };
+    validate_profile_id(&profile_id)?;
     let default_model_install = creates_config
         .then(|| config.embedding.as_ref()?.model.clone())
         .flatten();
     let duplicate_profile_ids =
-        profiles_allowlisting_repo(&config.profiles, &input.repo, Some(&input.profile_id));
+        profiles_allowlisting_repo(&config.profiles, &repo, Some(&profile_id));
     let profile_action;
     let repo_allowlist_action;
     let effective_token_source_kind;
-    match config.profiles.get_mut(&input.profile_id) {
+    match config.profiles.get_mut(&profile_id) {
         Some(profile) => {
-            if profile.host != input.host
-                || profile.api_base_url.trim_end_matches('/') != input.api_base_url
-                || profile.web_base_url.trim_end_matches('/') != input.web_base_url
-            {
+            let api_conflicts = api_base_url_explicit
+                && profile.api_base_url.trim_end_matches('/') != api_base_url.trim_end_matches('/');
+            let web_conflicts = web_base_url_explicit
+                && profile.web_base_url.trim_end_matches('/') != web_base_url.trim_end_matches('/');
+            if !profile.host.eq_ignore_ascii_case(&host) || api_conflicts || web_conflicts {
                 return Err(QghError::config(format!(
                     "Profile `{}` already exists with different host or base URLs.",
-                    input.profile_id
+                    profile_id
+                )));
+            }
+            if token_source_explicit && profile.token_source != token_source {
+                return Err(QghError::config(format!(
+                    "Profile `{profile_id}` already exists with a different token source."
                 )));
             }
             profile_action = "updated";
-            if profile.repos.iter().any(|repo| repo == &input.repo) {
+            if profile
+                .repos
+                .iter()
+                .any(|allowed_repo| allowed_repo == &repo)
+            {
                 repo_allowlist_action = "already_present";
             } else {
-                profile.repos.push(input.repo.clone());
+                profile.repos.push(repo.clone());
                 repo_allowlist_action = "added";
             }
             effective_token_source_kind = token_source_kind(&profile.token_source);
         }
         None => {
-            effective_token_source_kind = token_source_kind(&input.token_source);
+            effective_token_source_kind = token_source_kind(&token_source);
             config.profiles.insert(
-                input.profile_id.clone(),
+                profile_id.clone(),
                 RawProfile {
-                    host: input.host,
-                    api_base_url: input.api_base_url.trim_end_matches('/').to_string(),
-                    web_base_url: input.web_base_url.trim_end_matches('/').to_string(),
-                    repos: vec![input.repo.clone()],
+                    host,
+                    api_base_url: api_base_url.trim_end_matches('/').to_string(),
+                    web_base_url: web_base_url.trim_end_matches('/').to_string(),
+                    repos: vec![repo.clone()],
                     query_max_age: None,
                     query_stale_behavior: None,
                     active_issue_max_age: None,
@@ -483,7 +585,7 @@ pub fn bootstrap_profile_repo(
                     sync_max_age: None,
                     comments_mode: None,
                     comment_parent_resolution_budget: None,
-                    token_source: input.token_source.clone(),
+                    token_source: token_source.clone(),
                 },
             );
             profile_action = "created";
@@ -491,21 +593,14 @@ pub fn bootstrap_profile_repo(
         }
     }
 
-    if config.schema_version != "qgh.config.v1" {
-        return Err(QghError::config("Unsupported config schema_version."));
-    }
-    let Some(parent) = config_path.parent() else {
-        return Err(QghError::config("Config path has no parent directory."));
-    };
-    ensure_private_dir(parent)?;
+    validate_config_for_publication(&config)?;
     let text = toml::to_string_pretty(&config)
         .map_err(|error| QghError::config(format!("Failed to serialize config: {error}")))?;
-    fs::write(&config_path, text)?;
-    set_private_file(&config_path)?;
-    load_profile(&input.profile_id)?;
+    mutation.commit(text.as_bytes())?;
 
     Ok(ProfileBootstrapOutcome {
         config_path,
+        profile_id,
         profile_action,
         repo_allowlist_action,
         token_source_kind: effective_token_source_kind,
@@ -547,7 +642,7 @@ pub fn single_matching_profile_id(
     let mut matches = Vec::new();
     for (profile_id, raw) in &config.profiles {
         validate_profile_id(profile_id)?;
-        if host_scope.is_some_and(|host| raw.host != host) {
+        if host_scope.is_some_and(|host| !raw.host.eq_ignore_ascii_case(host)) {
             continue;
         }
         if raw
@@ -570,9 +665,13 @@ pub fn single_matching_profile_id(
 }
 
 pub fn suggest_init_profile_id(repo: &str, host: &str) -> Result<String, QghError> {
-    let profiles = load_config_file_optional()?
-        .map(|config| config.profiles)
-        .unwrap_or_default();
+    let profiles = match load_config_file_optional()? {
+        Some(config) => {
+            validate_config_for_publication(&config)?;
+            config.profiles
+        }
+        None => BTreeMap::new(),
+    };
     Ok(suggest_profile_id_from(&profiles, repo, host))
 }
 
@@ -581,20 +680,83 @@ fn suggest_profile_id_from(
     repo: &str,
     host: &str,
 ) -> String {
+    if let Some((profile_id, _)) = profiles.iter().find(|(_, raw)| {
+        raw.host.eq_ignore_ascii_case(host) && raw.repos.iter().any(|allowed| allowed == repo)
+    }) {
+        return profile_id.clone();
+    }
     if let Some((profile_id, _)) = profiles
         .iter()
-        .find(|(_, raw)| raw.host == host && raw.repos.iter().any(|allowed| allowed == repo))
+        .find(|(_, raw)| raw.host.eq_ignore_ascii_case(host))
     {
         return profile_id.clone();
     }
-    if let Some((profile_id, _)) = profiles.iter().find(|(_, raw)| raw.host == host) {
-        return profile_id.clone();
+    derive_available_profile_id(profiles, host)
+}
+
+fn select_auto_profile_id_from(
+    profiles: &BTreeMap<String, RawProfile>,
+    repo: &str,
+    host: &str,
+) -> Result<String, QghError> {
+    let repo_matches = profiles
+        .iter()
+        .filter(|(_, raw)| {
+            raw.host.eq_ignore_ascii_case(host) && raw.repos.iter().any(|allowed| allowed == repo)
+        })
+        .map(|(profile_id, _)| profile_id.clone())
+        .collect::<Vec<_>>();
+    match repo_matches.as_slice() {
+        [profile_id] => return Ok(profile_id.clone()),
+        [] => {}
+        _ => {
+            return Err(QghError::ambiguous_init_profile(
+                repo,
+                host,
+                "repo",
+                repo_matches,
+            ));
+        }
     }
-    let candidate = derive_profile_id_from_host(host);
-    match profiles.get(&candidate) {
-        Some(existing) if existing.host != host => sanitize_profile_id(host),
-        _ => candidate,
+
+    let host_matches = profiles
+        .iter()
+        .filter(|(_, raw)| raw.host.eq_ignore_ascii_case(host))
+        .map(|(profile_id, _)| profile_id.clone())
+        .collect::<Vec<_>>();
+    match host_matches.as_slice() {
+        [profile_id] => Ok(profile_id.clone()),
+        [] => Ok(derive_available_profile_id(profiles, host)),
+        _ => Err(QghError::ambiguous_init_profile(
+            repo,
+            host,
+            "host",
+            host_matches,
+        )),
     }
+}
+
+fn derive_available_profile_id(profiles: &BTreeMap<String, RawProfile>, host: &str) -> String {
+    let derived = derive_profile_id_from_host(host);
+    if !profiles.contains_key(&derived) {
+        return derived;
+    }
+
+    let host_id = sanitize_profile_id(host);
+    if !profiles.contains_key(&host_id) {
+        return host_id;
+    }
+
+    for number in 2_u64.. {
+        let suffix = format!("-{number}");
+        let stem_len = 64 - suffix.len();
+        let mut candidate = host_id[..host_id.len().min(stem_len)].to_string();
+        candidate.push_str(&suffix);
+        if !profiles.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("profile id suffix space is finite only in theory")
 }
 
 fn derive_profile_id_from_host(host: &str) -> String {
@@ -661,14 +823,33 @@ fn load_config_file() -> Result<ConfigFile, QghError> {
             config_file.display()
         ))
     })?;
-    let config: ConfigFile = toml::from_str(&text).map_err(|error| {
+    parse_config_file_text(&text)
+}
+
+fn parse_config_file_bytes(path: &Path, bytes: Vec<u8>) -> Result<ConfigFile, QghError> {
+    let text = String::from_utf8(bytes).map_err(|_| {
+        QghError::config(format!(
+            "Failed to read config at {}: config is not valid UTF-8.",
+            path.display()
+        ))
+    })?;
+    parse_config_file_text(&text)
+}
+
+fn parse_config_file_text(text: &str) -> Result<ConfigFile, QghError> {
+    let config: ConfigFile = toml::from_str(text).map_err(|error| {
         QghError::config(redacted_toml_error(
             "Invalid config TOML",
-            &text,
+            text,
             error.span(),
             redacted_toml_reason(error.message()),
         ))
     })?;
+    validate_config_file_values(&config)?;
+    Ok(config)
+}
+
+fn validate_config_file_values(config: &ConfigFile) -> Result<(), QghError> {
     if config.schema_version != "qgh.config.v1" {
         return Err(QghError::config("Unsupported config schema_version."));
     }
@@ -678,9 +859,20 @@ fn load_config_file() -> Result<ConfigFile, QghError> {
     if let Some(reranker) = &config.reranker {
         parse_reranker_config(reranker)?;
     }
-    validate_config_profile_endpoints(&config)?;
-    validate_config_token_sources(&config)?;
-    Ok(config)
+    validate_config_profile_endpoints(config)?;
+    validate_config_token_sources(config)?;
+    Ok(())
+}
+
+fn validate_config_for_publication(config: &ConfigFile) -> Result<(), QghError> {
+    validate_config_file_values(config)?;
+    let embedding = config.embedding.as_ref().map(embedding_config_from_raw);
+    let reranker = config.reranker.as_ref().map(reranker_config_from_raw);
+    for (profile_id, raw_profile) in &config.profiles {
+        validate_profile_id(profile_id)?;
+        profile_from_raw(profile_id, raw_profile, embedding.clone(), reranker.clone())?;
+    }
+    Ok(())
 }
 
 fn load_config_file_optional() -> Result<Option<ConfigFile>, QghError> {
@@ -858,6 +1050,7 @@ fn parse_github_remote(remote: &str) -> Result<GitRemote, QghError> {
     if host.is_empty() {
         return Err(unsupported_git_remote(remote));
     }
+    let host = host.to_ascii_lowercase();
     let repo = repo.trim_end_matches(".git");
     let parsed = parse_repo(repo).map_err(|_| unsupported_git_remote(remote))?;
     let repo = parsed.full_name();
@@ -868,7 +1061,7 @@ fn parse_github_remote(remote: &str) -> Result<GitRemote, QghError> {
         format!("https://{host}/api/v3")
     };
     Ok(GitRemote {
-        host: host.to_string(),
+        host,
         api_base_url,
         web_base_url,
         repo,
@@ -896,16 +1089,22 @@ fn sanitized_remote_for_error(remote: &str) -> String {
 }
 
 pub(crate) fn load_repo_policy_at(path: &Path) -> Result<RepoPolicy, QghError> {
-    let text = fs::read_to_string(path).map_err(|error| {
+    let bytes = fs::read(path).map_err(|error| {
         QghError::invalid_repo_policy(format!(
             "Failed to read repo policy at {}: {error}",
             path.display()
         ))
     })?;
-    let policy: RepoPolicyFile = toml::from_str(&text).map_err(|error| {
+    parse_repo_policy_bytes(path, &bytes)
+}
+
+pub(crate) fn parse_repo_policy_bytes(path: &Path, bytes: &[u8]) -> Result<RepoPolicy, QghError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| QghError::invalid_repo_policy("Repo policy must be valid UTF-8 text."))?;
+    let policy: RepoPolicyFile = toml::from_str(text).map_err(|error| {
         QghError::invalid_repo_policy(redacted_toml_error(
             "Invalid repo policy TOML",
-            &text,
+            text,
             error.span(),
             redacted_toml_reason(error.message()),
         ))
@@ -1915,6 +2114,179 @@ mod tests {
             suggest_profile_id_from(&profiles, "owner/repo", "oss.navercorp.com"),
             "oss.navercorp.com"
         );
+    }
+
+    #[test]
+    fn auto_profile_selection_rejects_multiple_repo_matches() {
+        let profiles = profiles(&[
+            ("github", raw_profile("github.com", &["owner/repo"])),
+            ("work", raw_profile("github.com", &["owner/repo"])),
+        ]);
+
+        let error = select_auto_profile_id_from(&profiles, "owner/repo", "github.com").unwrap_err();
+
+        assert_eq!(error.code, "config.ambiguous_profile");
+        assert_eq!(error.details["match_basis"], "repo");
+        assert_eq!(
+            error.details["matching_profile_ids"],
+            serde_json::json!(["github", "work"])
+        );
+    }
+
+    #[test]
+    fn auto_profile_selection_rejects_multiple_same_host_matches() {
+        let profiles = profiles(&[
+            ("github", raw_profile("github.com", &["owner/one"])),
+            ("work", raw_profile("github.com", &["owner/two"])),
+        ]);
+
+        let error = select_auto_profile_id_from(&profiles, "owner/repo", "github.com").unwrap_err();
+
+        assert_eq!(error.code, "config.ambiguous_profile");
+        assert_eq!(error.details["match_basis"], "host");
+        assert_eq!(
+            error.details["matching_profile_ids"],
+            serde_json::json!(["github", "work"])
+        );
+    }
+
+    #[test]
+    fn auto_profile_selection_derives_collision_safe_id() {
+        let profiles = profiles(&[
+            ("oss", raw_profile("oss.other.example", &["owner/one"])),
+            (
+                "oss.navercorp.com",
+                raw_profile("legacy.example", &["owner/two"]),
+            ),
+        ]);
+
+        assert_eq!(
+            select_auto_profile_id_from(&profiles, "owner/repo", "oss.navercorp.com").unwrap(),
+            "oss.navercorp.com-2"
+        );
+    }
+
+    #[test]
+    fn auto_profile_selection_treats_host_case_as_one_identity() {
+        let profiles = profiles(&[("github", raw_profile("github.com", &["owner/existing"]))]);
+
+        assert_eq!(
+            select_auto_profile_id_from(&profiles, "owner/repo", "GitHub.com").unwrap(),
+            "github"
+        );
+    }
+
+    #[test]
+    fn auto_bootstrap_resolves_profile_from_mutation_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "qgh-auto-bootstrap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        let input = ProfileBootstrapInput {
+            target: ProfileBootstrapTarget::Auto,
+            host: "github.com".to_string(),
+            api_base_url: "https://api.github.com".to_string(),
+            web_base_url: "https://github.com".to_string(),
+            api_base_url_explicit: false,
+            web_base_url_explicit: false,
+            token_source_explicit: false,
+            repo: "owner/repo".to_string(),
+            token_source: TokenSource::GithubCli,
+        };
+        fs::write(
+            &config_path,
+            r#"schema_version = "qgh.config.v1"
+
+[profiles.preferred]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/existing"]
+
+[profiles.preferred.token_source]
+type = "env"
+env = "QGH_TEST_TOKEN"
+"#,
+        )
+        .unwrap();
+
+        let outcome = bootstrap_profile_repo_at(input, config_path.clone()).unwrap();
+
+        assert_eq!(outcome.profile_id, "preferred");
+        assert_eq!(outcome.token_source_kind, "env");
+        let published = fs::read_to_string(config_path).unwrap();
+        assert!(published.contains("[profiles.preferred]"));
+        assert!(published.contains(r#""owner/existing""#));
+        assert!(published.contains(r#""owner/repo""#));
+        assert!(!published.contains("[profiles.github]"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn auto_bootstrap_waiter_selects_snapshot_published_by_lock_owner() {
+        let root = std::env::temp_dir().join(format!(
+            "qgh-auto-bootstrap-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        let writer = ConfigMutation::begin(config_path.clone()).unwrap();
+        let input = ProfileBootstrapInput {
+            target: ProfileBootstrapTarget::Auto,
+            host: "github.com".to_string(),
+            api_base_url: "https://api.github.com".to_string(),
+            web_base_url: "https://github.com".to_string(),
+            api_base_url_explicit: false,
+            web_base_url_explicit: false,
+            token_source_explicit: false,
+            repo: "owner/repo".to_string(),
+            token_source: TokenSource::GithubCli,
+        };
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let waiter_path = config_path.clone();
+        let waiter = std::thread::spawn(move || {
+            bootstrap_profile_repo_at_with_before_lock_hook(input, waiter_path, || {
+                ready_tx.send(()).unwrap();
+            })
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("auto bootstrap waiter must reach the config lease");
+
+        writer
+            .commit(
+                br#"schema_version = "qgh.config.v1"
+
+[profiles.preferred]
+host = "github.com"
+api_base_url = "https://api.github.com"
+web_base_url = "https://github.com"
+repos = ["owner/existing"]
+
+[profiles.preferred.token_source]
+type = "github_cli"
+"#,
+            )
+            .unwrap();
+        drop(writer);
+
+        let outcome = waiter.join().unwrap().unwrap();
+        assert_eq!(outcome.profile_id, "preferred");
+        let published = fs::read_to_string(config_path).unwrap();
+        assert!(published.contains("[profiles.preferred]"));
+        assert!(published.contains(r#""owner/repo""#));
+        assert!(!published.contains("[profiles.github]"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

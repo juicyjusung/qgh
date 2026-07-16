@@ -17,6 +17,30 @@ const SOURCE_INVENTORY_COMMIT_PREFIX: &str = "qgh.source_inventory.v1:";
 const INDEX_BUILD_MARKER_FILE: &str = ".qgh-build-owner-v1";
 const INDEX_BUILD_MARKER_SEAL_TEMP: &str = ".qgh-build-owner-v1.sealing";
 
+#[cfg(test)]
+thread_local! {
+    static PUBLICATION_DIRECTORY_SYNC_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static PUBLICATION_DIRECTORY_SYNC_PATHS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_publication_directory_sync_after(successful_syncs: usize) {
+    PUBLICATION_DIRECTORY_SYNC_FAILURE_AFTER.set(Some(successful_syncs));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_publication_directory_sync_paths() {
+    PUBLICATION_DIRECTORY_SYNC_FAILURE_AFTER.set(None);
+    PUBLICATION_DIRECTORY_SYNC_PATHS.with(|paths| paths.borrow_mut().clear());
+}
+
+#[cfg(test)]
+fn publication_directory_sync_paths() -> Vec<PathBuf> {
+    PUBLICATION_DIRECTORY_SYNC_PATHS.with(|paths| paths.borrow().clone())
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub source_id: String,
@@ -197,9 +221,7 @@ fn rebuild_in_shadow(
     if generation_path.exists() {
         return Err(index_build_collision_error());
     }
-    rename_without_replacement(shadow_path, generation_path)?;
-    set_private_dir(generation_path)?;
-    Ok(())
+    durably_publish_generation(shadow_path, generation_path)
 }
 
 fn seal_owned_generation_directory(
@@ -506,6 +528,56 @@ fn index_build_collision_error() -> QghError {
     )
 }
 
+/// Makes the renamed generation visible only after every directory entry
+/// needed to reach it has crossed a durability barrier. Callers may activate
+/// the corresponding SQLite publication only after this returns successfully.
+fn durably_publish_generation(shadow_path: &Path, generation_path: &Path) -> Result<(), QghError> {
+    rename_without_replacement(shadow_path, generation_path)?;
+    set_private_dir(generation_path)?;
+    sync_index_publication_directory(generation_path)?;
+    let index_root = generation_path
+        .parent()
+        .ok_or_else(index_build_collision_error)?;
+    sync_index_publication_directory(index_root)?;
+    let profile_dir = index_root
+        .parent()
+        .ok_or_else(index_build_collision_error)?;
+    sync_index_publication_directory(profile_dir)
+}
+
+fn sync_index_publication_directory(path: &Path) -> Result<(), QghError> {
+    #[cfg(test)]
+    {
+        PUBLICATION_DIRECTORY_SYNC_PATHS.with(|paths| paths.borrow_mut().push(path.to_path_buf()));
+        let fail =
+            PUBLICATION_DIRECTORY_SYNC_FAILURE_AFTER.with(|remaining| match remaining.get() {
+                Some(0) => {
+                    remaining.set(None);
+                    true
+                }
+                Some(value) => {
+                    remaining.set(Some(value - 1));
+                    false
+                }
+                None => false,
+            });
+        if fail {
+            return Err(index_build_collision_error());
+        }
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        fs::File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| index_build_collision_error())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = path;
+        Err(index_build_collision_error())
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn rename_without_replacement(from: &Path, to: &Path) -> Result<(), QghError> {
     use std::ffi::CString;
@@ -568,34 +640,63 @@ pub(crate) fn rename_without_replacement(from: &Path, to: &Path) -> Result<(), Q
     fs::rename(from, to).map_err(|_| index_build_collision_error())
 }
 
-pub(crate) fn source_inventory_digest(sources: &[IndexSource]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"qgh.source_inventory.v1");
-    hasher.update((sources.len() as u64).to_le_bytes());
-    for source in sources {
-        hash_text(&mut hasher, &source.source_id);
-        hash_text(&mut hasher, &source.entity_type);
-        hash_text(&mut hasher, &source.repo);
-        hasher.update(source.issue_number.to_le_bytes());
-        hash_text(&mut hasher, &source.state);
-        hasher.update((source.labels.len() as u64).to_le_bytes());
+pub(crate) struct SourceInventoryAccumulator {
+    hasher: Sha256,
+    expected_count: usize,
+    observed_count: usize,
+}
+
+impl SourceInventoryAccumulator {
+    pub(crate) fn new(expected_count: usize) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"qgh.source_inventory.v1");
+        hasher.update((expected_count as u64).to_le_bytes());
+        Self {
+            hasher,
+            expected_count,
+            observed_count: 0,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, source: &IndexSource) {
+        hash_text(&mut self.hasher, &source.source_id);
+        hash_text(&mut self.hasher, &source.entity_type);
+        hash_text(&mut self.hasher, &source.repo);
+        self.hasher.update(source.issue_number.to_le_bytes());
+        hash_text(&mut self.hasher, &source.state);
+        self.hasher
+            .update((source.labels.len() as u64).to_le_bytes());
         for label in &source.labels {
-            hash_text(&mut hasher, label);
+            hash_text(&mut self.hasher, label);
         }
         match &source.author {
             Some(author) => {
-                hasher.update([1]);
-                hash_text(&mut hasher, author);
+                self.hasher.update([1]);
+                hash_text(&mut self.hasher, author);
             }
-            None => hasher.update([0]),
+            None => self.hasher.update([0]),
         }
-        hash_text(&mut hasher, &source.title);
-        hash_text(&mut hasher, &source.body);
-        hash_text(&mut hasher, &source.parent_issue_title);
-        hash_text(&mut hasher, &source.github_updated_at);
-        hash_text(&mut hasher, &source.indexed_at);
+        hash_text(&mut self.hasher, &source.title);
+        hash_text(&mut self.hasher, &source.body);
+        hash_text(&mut self.hasher, &source.parent_issue_title);
+        hash_text(&mut self.hasher, &source.github_updated_at);
+        hash_text(&mut self.hasher, &source.indexed_at);
+        self.observed_count = self.observed_count.saturating_add(1);
     }
-    digest_hex(hasher)
+
+    pub(crate) fn finish(self) -> Option<String> {
+        (self.observed_count == self.expected_count).then(|| digest_hex(self.hasher))
+    }
+}
+
+pub(crate) fn source_inventory_digest(sources: &[IndexSource]) -> String {
+    let mut accumulator = SourceInventoryAccumulator::new(sources.len());
+    for source in sources {
+        accumulator.observe(source);
+    }
+    accumulator
+        .finish()
+        .expect("a slice iterator must match its declared source count")
 }
 
 pub(crate) fn committed_source_inventory_digest(index: &Index) -> Result<Option<String>, QghError> {
@@ -1032,6 +1133,68 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn source_inventory_v1_digest_is_stable_for_mixed_sources() {
+        let sources = mixed_inventory_sources();
+
+        assert_eq!(
+            source_inventory_digest(&sources),
+            "961e8fa7a13c289b76bd13c3e1c29d66a4b0754180b8e705cf3130f86b429693"
+        );
+    }
+
+    #[test]
+    fn source_inventory_accumulator_matches_materialized_digest_and_checks_count() {
+        let sources = mixed_inventory_sources();
+        let mut accumulator = SourceInventoryAccumulator::new(sources.len());
+        for source in &sources {
+            accumulator.observe(source);
+        }
+        assert_eq!(
+            accumulator.finish().as_deref(),
+            Some(source_inventory_digest(&sources).as_str())
+        );
+
+        let mut incomplete = SourceInventoryAccumulator::new(sources.len() + 1);
+        for source in &sources {
+            incomplete.observe(source);
+        }
+        assert_eq!(incomplete.finish(), None);
+    }
+
+    fn mixed_inventory_sources() -> Vec<IndexSource> {
+        vec![
+            IndexSource {
+                source_id: "qgh://github.com/issue/ISSUE_NODE".to_string(),
+                entity_type: "issue".to_string(),
+                repo: "owner/repo".to_string(),
+                issue_number: 47,
+                state: "open".to_string(),
+                labels: vec!["버그".to_string(), "ready-for-agent".to_string()],
+                author: None,
+                title: "동기화 안정성".to_string(),
+                body: "CJK 본문과 ASCII body".to_string(),
+                parent_issue_title: String::new(),
+                github_updated_at: "2026-07-15T01:02:03Z".to_string(),
+                indexed_at: "2026-07-15T01:02:04Z".to_string(),
+            },
+            IndexSource {
+                source_id: "qgh://github.com/issue-comment/COMMENT_NODE".to_string(),
+                entity_type: "issue_comment".to_string(),
+                repo: "owner/repo".to_string(),
+                issue_number: 47,
+                state: String::new(),
+                labels: Vec::new(),
+                author: Some("alice".to_string()),
+                title: String::new(),
+                body: "후속 comment".to_string(),
+                parent_issue_title: "동기화 안정성".to_string(),
+                github_updated_at: "2026-07-15T02:03:04Z".to_string(),
+                indexed_at: "2026-07-15T02:03:05Z".to_string(),
+            },
+        ]
+    }
+
+    #[test]
     fn search_rejects_missing_artifact_instead_of_returning_empty_results() {
         let index_root = temp_index_root("missing-search-artifact");
         let missing = index_root.join("generation-1");
@@ -1121,6 +1284,32 @@ mod tests {
         assert!(sentinel.exists());
         assert!(!index_root.join("shadow-2").exists());
         let _ = fs::remove_dir_all(index_root);
+    }
+
+    #[test]
+    fn generation_publication_waits_for_every_directory_durability_barrier() {
+        for failed_at in 0..=2 {
+            let index_root =
+                temp_index_root(&format!("generation-publication-durability-{failed_at}"));
+            let generation_path = index_root.join("generation-3");
+            let profile_dir = index_root.parent().unwrap().to_path_buf();
+            let expected_paths = [generation_path.clone(), index_root.clone(), profile_dir];
+            reset_publication_directory_sync_paths();
+            fail_publication_directory_sync_after(failed_at);
+
+            let error = rebuild(&index_root, 3, &[]).unwrap_err();
+
+            assert_eq!(error.code, "publication.tantivy_artifact_not_ready");
+            assert_eq!(
+                publication_directory_sync_paths(),
+                expected_paths[..=failed_at]
+            );
+            assert!(generation_path.is_dir());
+            assert!(!index_root.join("shadow-3").exists());
+
+            reset_publication_directory_sync_paths();
+            let _ = fs::remove_dir_all(index_root);
+        }
     }
 
     #[test]

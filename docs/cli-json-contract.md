@@ -255,15 +255,22 @@ source for agents, scripts, MCP parity checks, and release schema validation.
 
 Top-level `init` is the first-run wizard. It reads the current git worktree
 `origin` remote, builds a preset from GitHub.com or GHES host defaults,
-default profile id `work`, token source `github_cli`, XDG config/profile DB
-paths, and the default-on `.qgh.toml` repo policy path. Interactive `qgh init`
-prints that preview before writing. Enter/`Y` applies the preset; `n` enters
-the customize prompts; EOF cancels with `validation.init_cancelled` and no files
-changed. It stores token source references only, never literal token values.
+a profile id suggested from the current config (`github` for a fresh GitHub.com
+setup, otherwise a collision-safe host-derived id), token source `github_cli`,
+XDG config/profile DB paths, and the default-on `.qgh.toml` repo policy path.
+Interactive `qgh init` prints that preview before writing. Enter/`Y` fixes and
+applies the displayed profile id; `n` enters the customize prompts; EOF cancels
+with `validation.init_cancelled` and no files changed. It stores token source
+references only, never literal token values.
 
 `init repo` creates or overwrites only the current git worktree root `.qgh.toml`
 repo policy. It never creates profile config, token source config, profile store
-paths, arbitrary DB paths, or user-local absolute paths.
+paths, arbitrary DB paths, or user-local absolute paths. Both init forms reject
+a final policy symlink/non-regular entry. Create uses no-replace publication;
+force overwrite uses a synchronized same-directory staging file and atomic
+replace. A plan is revalidated at apply time, so a concurrent policy for a
+different repo is never overwritten without `--force`, and output reports the
+action actually applied.
 
 Top-level `init --json` returns:
 
@@ -278,8 +285,26 @@ Top-level `init --json` returns:
 - `next_steps`: short command suggestions.
 
 `init --yes` and `init -y` are the non-interactive automation paths. They apply
-the inferred preset without preview or prompts. Missing required values fail
-with structured validation errors instead of falling back to prompts.
+the inferred preset without preview or prompts. Explicit `--profile`, then
+`QGH_PROFILE`, remains fixed. Without either, profile selection runs once from
+the latest config snapshot under the mutation lock: one repo-and-host match
+wins, otherwise one same-host profile wins, otherwise qgh creates a
+collision-safe host-derived id. Multiple candidates at the applicable tier
+fail with `config.ambiguous_profile` and require `--profile`. Its extensible
+error details add `host` and `match_basis` for this init-specific decision
+without changing the closed `qgh.v2` error-code enum. When an existing profile
+is reused, its stored token source remains authoritative and is reported in
+preview/output; customization omits the inapplicable token-source prompt, and
+an explicit conflicting token source fails. Inferred endpoint defaults likewise
+preserve an existing profile's validated endpoints; an explicit conflicting
+endpoint fails. Git remote endpoints are inferred only when its normalized host
+matches the selected host. Interactive customization shows existing profile
+endpoints as defaults and treats an unchanged default as inferred.
+`meta.repo_source` reports whether the repo came from `cli` or `git_remote`.
+Missing required values fail with structured validation errors instead of
+falling back to prompts. The created/confirmed policy path is returned in
+`data.repo_policy_path`; `meta.repo_policy_path` remains `null` because the
+policy is an output, not the source of effective scope.
 
 `init repo --json` returns:
 

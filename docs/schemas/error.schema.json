@@ -135,6 +135,7 @@
         "config.invalid",
         "config.no_matching_profile",
         "config.ambiguous_profile",
+        "config.busy",
         "config.invalid_repo_policy",
         "config.no_git_worktree",
         "config.git_remote_unavailable",
