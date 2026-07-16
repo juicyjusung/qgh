@@ -104,7 +104,7 @@ evaluation, and safe BM25 fallback.
 | LaunchAgent and systemd user timer lifecycle | `schedule start/status/stop` is idempotent and CLI-only; private macOS LaunchAgent and Linux systemd user artifacts use direct argv, catch-up/jitter, no overlap, rollback, `github_cli` credentials, no GitHub lifecycle egress, and no cron fallback. CI runs `cargo test --lib schedule_lifecycle` and `cargo test --test issue_body_tracer schedule_` on Ubuntu and macOS. The `schedule-manager-gate` workflow then runs `scripts/verify-schedule-manager.sh` against real dedicated user managers, followed by the physical resume observation in `docs/scheduling.md`. |
 | search eval result | `docs/search-quality-eval.md` keeps the synthetic contract gate; `docs/search-quality-live-model-eval.md` records the public 80-query multilingual live run, resource diagnostics, and the Qwen/`lexical_guard_v1` decision. |
 | one-command install | `brew install juicyjusung/tap/qgh` installs a self-contained `qgh` binary that can run `qgh --version`, `qgh help`, `qgh init`, and local diagnostic commands. |
-| cargo-dist release automation | `cargo dist plan` and `cargo dist build` pass for macOS Apple Silicon and Linux x86_64 release targets. |
+| cargo-dist release automation | `dist plan` and `dist build` pass for macOS Apple Silicon and Linux x86_64 release targets. |
 | Homebrew formula smoke | `.github/workflows/homebrew-smoke.yml` checks the generated formula for versioned GitHub Release artifact URLs and Homebrew `sha256` values, then runs the installed `qgh` binary with `qgh --version` and `qgh help`. |
 | release integrity | Release artifacts include checksums and Homebrew `sha256`; separate `cosign`/`minisign` signing is not required for this release gate. |
 
