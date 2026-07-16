@@ -62,6 +62,14 @@ is visible, but crash durability was not confirmed. This instance is retryable:
 verify the visible config and rerun `qgh init`; every successful publication
 re-synchronizes the canonical config-directory ancestry.
 
+Repo-policy mutation in either init form also returns `storage.failure` before
+following a final `.qgh.toml` symlink or accepting a non-regular entry. Create
+is no-replace and forced replacement is staged and atomic. If the final parent
+directory sync fails after publication, details contain
+`reason: "repo_policy_directory_sync_failed"` and
+`publication_state: "visible_durability_unconfirmed"`; verify the visible
+policy and rerun init.
+
 `schedule` validation and lifecycle may additionally return:
 
 - `validation.duplicate_profile`: an explicit schedule list repeated a profile.
@@ -206,6 +214,11 @@ the index before retrying that filter.
 
 `init` may additionally return:
 
+- `config.ambiguous_profile`: promptless `qgh init --yes` may use this existing
+  code when it finds multiple repo-and-host matches, or no repo match and
+  multiple same-host profiles. Its content-free details add `host` and
+  `match_basis` alongside sorted `matching_profile_ids`; rerun with explicit
+  `--profile <profile-id>`.
 - `config.no_git_worktree`: `qgh init` was run outside a git worktree.
 - `config.git_remote_unavailable`: no usable `origin` remote was configured and `--repo` was omitted.
 - `config.unsupported_git_remote`: `origin` was malformed or not a supported GitHub remote URL.

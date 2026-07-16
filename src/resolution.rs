@@ -69,7 +69,7 @@ fn validate_profile_allows_scope(
         && repo_scope
             .host
             .as_deref()
-            .is_none_or(|host| profile.host == host)
+            .is_none_or(|host| profile.host.eq_ignore_ascii_case(host))
     {
         return Ok(());
     }

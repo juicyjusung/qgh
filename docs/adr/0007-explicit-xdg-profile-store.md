@@ -19,6 +19,13 @@ lasts five seconds returns retryable `config.busy`; qgh never deletes the
 stable lock file to recover a lease because the OS releases the lease when the
 writer exits.
 
+For promptless top-level `qgh init --yes` without explicit `--profile` or
+`QGH_PROFILE`, the same lease also covers automatic profile selection. qgh
+chooses from the config snapshot read under the lease and uses that selected id
+for duplicate checks, mutation, and output. Explicit CLI ids and ids confirmed
+by the interactive preview/custom flow remain fixed. Multiple eligible repo or
+host matches fail closed with `config.ambiguous_profile`.
+
 After validating the complete candidate config, qgh writes a same-directory
 `0600` staging file, synchronizes it, atomically renames it over `config.toml`,
 and synchronizes the canonical config-directory ancestry through the filesystem
@@ -36,7 +43,12 @@ file as config or publishes it implicitly.
 This transaction does not claim cross-file atomicity with a worktree
 `.qgh.toml`. Top-level `qgh init` validates the planned repo-policy action
 before mutating the profile config, then publishes each file independently; a
-later repo-policy filesystem failure is reported for explicit recovery.
+later repo-policy filesystem failure is reported for explicit recovery. The
+policy publisher nevertheless revalidates its expected state at apply time.
+Absent-policy creation is no-replace, while forced replacement uses a
+synchronized same-directory staging file and atomic rename. A final policy
+symlink or non-regular entry fails closed, and a concurrent different-repo
+policy is never overwritten without `--force`.
 
 The derived Profile Store database entry must be a regular file. qgh does not
 follow a symbolic link at the final `qgh.sqlite3` path for either reads or

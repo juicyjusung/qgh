@@ -22,6 +22,7 @@ mod paths;
 #[cfg(feature = "fastembed-provider")]
 mod qwen;
 mod rate_budget;
+mod repo_policy_mutation;
 mod resolution;
 mod schedule;
 mod schedule_lifecycle;

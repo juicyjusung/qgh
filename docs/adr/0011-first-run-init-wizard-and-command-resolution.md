@@ -1,11 +1,38 @@
 # First-Run Init Wizard and Command Resolution
 
 Top-level `qgh init` is the first-run bootstrap command. It reads the current
-git worktree `origin` remote, previews GitHub.com or GHES host defaults, default
-profile id `work`, `github_cli` token source, XDG config/profile DB paths, and
-the default-on `.qgh.toml` repo policy path before writing. Enter or `Y` applies
-that preset, `n` enters customize prompts, and EOF cancels before writes. `qgh
-init --yes` and `qgh init -y` apply the same preset without preview or prompts.
+git worktree `origin` remote and previews GitHub.com or GHES host defaults, a
+profile id suggested from the current config (`github` for a fresh GitHub.com
+setup, otherwise a collision-safe host-derived id), `github_cli` token source,
+XDG config/profile DB paths, and the default-on `.qgh.toml` repo policy path.
+Enter or `Y` fixes the displayed profile id and applies that preset; `n` enters
+customize prompts, and EOF cancels before writes.
+
+Promptless `qgh init --yes` and `qgh init -y` fix explicit `--profile`, then
+`QGH_PROFILE`, as the selected id. Without either, they defer profile selection
+until after acquiring the profile-config mutation lease and reading its latest
+snapshot. Automatic selection reuses exactly one repo-and-host match, otherwise
+exactly one same-host profile, otherwise creates a collision-safe host-derived
+id. Multiple candidates at either matching tier fail with
+`config.ambiguous_profile` and require `--profile`; qgh never chooses the
+first map entry. Reusing an existing profile preserves its configured token
+source and endpoints unless an endpoint was explicitly overridden. Interactive
+preview/customization displays the stored token source and does not offer a
+token-source prompt for an existing profile; an explicitly conflicting token
+source fails before mutation. Host identity is normalized to lowercase at Git
+remote and init-input boundaries.
+Origin endpoints are reused only when the normalized origin host matches the
+selected host; otherwise qgh derives endpoints from the selected host.
+Interactive customization uses an existing selected profile's endpoints as
+defaults and treats only a supplied flag or changed prompt value as an
+override. The selected id is the single source for config mutation and success
+output. Explicit environment selection reports `meta.profile_source: env`; all
+other init selection remains `cli` to preserve the released closed `qgh.v2`
+provenance enum. `meta.repo_source` independently reports `cli` or `git_remote`
+according to the actual repo input. The resulting policy path belongs in init
+`data`; `meta.repo_policy_path` remains `null` because no policy supplied the
+input scope.
+
 `qgh init repo` remains repo-policy-only for projects that want tracked policy
 without personal profile mutation.
 

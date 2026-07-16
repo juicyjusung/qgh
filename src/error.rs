@@ -64,6 +64,26 @@ impl QghError {
         .with_hint("Run qgh with --profile <profile-id>.")
     }
 
+    pub fn ambiguous_init_profile(
+        repo: &str,
+        host: &str,
+        match_basis: &str,
+        matching_profile_ids: Vec<String>,
+    ) -> Self {
+        Self::new(
+            "config.ambiguous_profile",
+            "Multiple configured profiles are eligible for automatic init selection.",
+            2,
+        )
+        .with_details(json!({
+            "repo": repo,
+            "host": host,
+            "match_basis": match_basis,
+            "matching_profile_ids": matching_profile_ids
+        }))
+        .with_hint("Run qgh init with --profile <profile-id>.")
+    }
+
     pub fn config(message: impl Into<String>) -> Self {
         Self::new("config.invalid", message, 2)
     }

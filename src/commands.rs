@@ -7,10 +7,10 @@ use crate::cli::{
 };
 use crate::config::{
     bootstrap_profile_repo, current_git_worktree_root, discover_repo_policy,
-    git_remote_defaults_for_root, load_profile, load_repo_policy_at, parse_repo, resolve_token,
+    git_remote_defaults_for_root, load_profile, load_profile_optional, parse_repo, resolve_token,
     resolve_token_with_mode, suggest_init_profile_id, CommentsMode, EmbeddingConfig,
-    EmbeddingProviderKind, GitRemote, Profile, ProfileBootstrapInput, RepoPolicy, RepoRef,
-    TokenResolutionMode, TokenSource,
+    EmbeddingProviderKind, GitRemote, Profile, ProfileBootstrapInput, ProfileBootstrapTarget,
+    RepoPolicy, RepoRef, TokenResolutionMode, TokenSource,
 };
 use crate::context::{prepare_embedding_input, EmbeddingSourceContext};
 use crate::coverage;
@@ -57,6 +57,7 @@ use crate::qwen::{
     QWEN_RERANK_DEPTH, QWEN_RERANK_MAX_LENGTH,
 };
 use crate::rate_budget;
+use crate::repo_policy_mutation::RepoPolicyMutationPlan;
 use crate::resolution::ResolvedRepoScope;
 use crate::store::{
     PendingPurgeView, PurgeTarget, PurgeTrigger, RetrievalBuildSnapshot, RetrievalPublicationView,
@@ -68,7 +69,6 @@ use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 #[cfg(feature = "fastembed-provider")]
@@ -4056,29 +4056,11 @@ pub fn init_repo_policy(
         };
 
     let path = root.join(".qgh.toml");
-    let overwritten = path.exists();
-    if overwritten && !args.force {
-        return Err(QghError::validation(
-            "config.repo_policy_exists",
-            "Repo policy already exists.",
-        )
-        .with_details(json!({ "path": path.to_string_lossy() }))
-        .with_hint("Use --force to overwrite the existing .qgh.toml."));
-    }
+    let policy_plan = RepoPolicyMutationPlan::prepare(&path, &repo, true, args.force, false)?;
+    let policy_text = repo_policy_toml(&repo);
+    let policy_action = policy_plan.commit(policy_text.as_bytes())?;
+    let overwritten = policy_action == "overwritten";
 
-    fs::write(&path, repo_policy_toml(&repo)).map_err(|error| {
-        QghError::storage(format!(
-            "Failed to write repo policy at {}: {error}",
-            path.display()
-        ))
-    })?;
-    load_repo_policy_at(&path)?;
-
-    let meta_repo_source = if repo_source == "cli" {
-        Some("cli")
-    } else {
-        None
-    };
     Ok(InitCommandOutcome {
         data: json!({
             "path": path.to_string_lossy(),
@@ -4092,7 +4074,7 @@ pub fn init_repo_policy(
             "profile_id": meta_profile_id,
             "profile_source": meta_profile_source,
             "repo": repo,
-            "repo_source": meta_repo_source,
+            "repo_source": repo_source,
             "repo_policy_path": Value::Null
         }),
     })
@@ -4104,74 +4086,72 @@ fn init_custom_interactive(
     profile_arg: Option<&str>,
     args: &InitArgs,
 ) -> Result<InitCommandOutcome, QghError> {
-    let repo = match args.repo.as_deref() {
+    let (repo, repo_source) = match args.repo.as_deref() {
         Some(repo) => {
             parse_repo(repo).map_err(|_| invalid_repo_input())?;
-            repo.to_string()
+            (repo.to_string(), "cli")
         }
-        None => remote
-            .map(|remote| remote.repo.clone())
-            .ok_or_else(|| missing_init_value("--repo"))?,
+        None => (
+            remote
+                .map(|remote| remote.repo.clone())
+                .ok_or_else(|| missing_init_value("--repo"))?,
+            "git_remote",
+        ),
     };
     let host_default = args
         .host
         .clone()
         .or_else(|| remote.map(|remote| remote.host.clone()))
-        .ok_or_else(|| missing_init_value("--host"))?;
-    let profile_default = match profile_arg {
-        Some(profile_id) => profile_id.to_string(),
-        None => suggest_init_profile_id(&repo, &host_default)?,
+        .ok_or_else(|| missing_init_value("--host"))?
+        .to_ascii_lowercase();
+    let explicit_profile = explicit_profile_for_init(profile_arg);
+    let (profile_id, profile_source) = match explicit_profile {
+        Some((profile_id, profile_source)) => (profile_id, profile_source),
+        None => {
+            let profile_default = suggest_init_profile_id(&repo, &host_default)?;
+            (prompt_line("profile id", &profile_default)?, "cli")
+        }
     };
-    let profile_id = prompt_line("profile id", &profile_default)?;
-    let host = prompt_line("host", &host_default)?;
+    let host = prompt_line("host", &host_default)?.to_ascii_lowercase();
+    let existing_profile = load_profile_optional(&profile_id)?;
+    let existing_profile = existing_profile
+        .as_ref()
+        .filter(|profile| profile.host.eq_ignore_ascii_case(&host));
+    let matching_remote = remote.filter(|remote| remote.host.eq_ignore_ascii_case(&host));
     let api_default = args
         .api_base_url
         .clone()
-        .or_else(|| remote.map(|remote| remote.api_base_url.clone()))
+        .or_else(|| existing_profile.map(|profile| profile.api_base_url.clone()))
+        .or_else(|| matching_remote.map(|remote| remote.api_base_url.clone()))
         .unwrap_or_else(|| default_api_base_url(&host));
-    let api_base_url = prompt_line(
-        "api base url",
-        args.api_base_url.as_deref().unwrap_or(&api_default),
-    )?;
+    let api_base_url = prompt_line("api base url", &api_default)?;
+    let api_base_url_explicit =
+        args.api_base_url.is_some() || !same_init_endpoint(&api_base_url, &api_default);
     let web_default = args
         .web_base_url
         .clone()
-        .or_else(|| remote.map(|remote| remote.web_base_url.clone()))
+        .or_else(|| existing_profile.map(|profile| profile.web_base_url.clone()))
+        .or_else(|| matching_remote.map(|remote| remote.web_base_url.clone()))
         .unwrap_or_else(|| default_web_base_url(&host));
-    let web_base_url = prompt_line(
-        "web base url",
-        args.web_base_url.as_deref().unwrap_or(&web_default),
-    )?;
-    let token_source_name = match args.token_source {
-        Some(InitTokenSourceArg::GithubCli) => "github_cli".to_string(),
-        Some(InitTokenSourceArg::Env) => "env".to_string(),
-        None => prompt_line("token source (github_cli/env)", "github_cli")?,
-    };
-    let token_source = match token_source_name.as_str() {
-        "github_cli" => TokenSource::GithubCli,
-        "env" => {
-            let env = match args.token_env.as_deref() {
-                Some(env) => env.to_string(),
-                None => prompt_line("token env var", "GITHUB_TOKEN")?,
-            };
-            TokenSource::Env { env }
-        }
-        _ => {
-            return Err(QghError::validation(
-                "validation.invalid_token_source",
-                "Token source must be `github_cli` or `env`.",
-            ));
-        }
-    };
+    let web_base_url = prompt_line("web base url", &web_default)?;
+    let web_base_url_explicit =
+        args.web_base_url.is_some() || !same_init_endpoint(&web_base_url, &web_default);
+    let (token_source, token_source_explicit) =
+        init_token_source_for_profile(args, existing_profile, true)?;
     let write_repo_policy = prompt_bool("create .qgh.toml", true)?;
     finish_profile_init(
         root,
         ProfileInitPlan {
-            profile_id,
+            profile_target: ProfileBootstrapTarget::Exact(profile_id),
+            profile_source,
             repo,
+            repo_source,
             host,
             api_base_url,
             web_base_url,
+            api_base_url_explicit,
+            web_base_url_explicit,
+            token_source_explicit,
             token_source,
             write_repo_policy,
             force_repo_policy: args.force,
@@ -4180,17 +4160,20 @@ fn init_custom_interactive(
 }
 
 struct InitPreset {
-    profile_id: String,
+    profile_target: ProfileBootstrapTarget,
+    profile_source: &'static str,
     repo: String,
+    repo_source: &'static str,
     host: String,
     api_base_url: String,
     web_base_url: String,
+    api_base_url_explicit: bool,
+    web_base_url_explicit: bool,
+    token_source_explicit: bool,
     token_source: TokenSource,
     write_repo_policy: bool,
     force_repo_policy: bool,
-    config_path: PathBuf,
     repo_policy_path: PathBuf,
-    db_path: PathBuf,
 }
 
 fn init_preset(
@@ -4199,48 +4182,66 @@ fn init_preset(
     root: &std::path::Path,
     remote: Option<&GitRemote>,
 ) -> Result<InitPreset, QghError> {
-    let repo = match args.repo.as_deref() {
+    let (repo, repo_source) = match args.repo.as_deref() {
         Some(repo) => {
             parse_repo(repo).map_err(|_| invalid_repo_input())?;
-            repo.to_string()
+            (repo.to_string(), "cli")
         }
-        None => remote
-            .map(|remote| remote.repo.clone())
-            .ok_or_else(|| missing_init_value("--repo"))?,
+        None => (
+            remote
+                .map(|remote| remote.repo.clone())
+                .ok_or_else(|| missing_init_value("--repo"))?,
+            "git_remote",
+        ),
     };
     let host = args
         .host
         .clone()
         .or_else(|| remote.map(|remote| remote.host.clone()))
-        .ok_or_else(|| missing_init_value("--host"))?;
-    let profile_id = match profile_arg {
-        Some(profile_id) => profile_id.to_string(),
-        None => suggest_init_profile_id(&repo, &host)?,
+        .ok_or_else(|| missing_init_value("--host"))?
+        .to_ascii_lowercase();
+    let (profile_target, profile_source) = match explicit_profile_for_init(profile_arg) {
+        Some((profile_id, profile_source)) => {
+            (ProfileBootstrapTarget::Exact(profile_id), profile_source)
+        }
+        None if args.yes => (ProfileBootstrapTarget::Auto, "cli"),
+        None => (
+            ProfileBootstrapTarget::Exact(suggest_init_profile_id(&repo, &host)?),
+            "cli",
+        ),
     };
+    let matching_remote = remote.filter(|remote| remote.host.eq_ignore_ascii_case(&host));
     let api_base_url = args
         .api_base_url
         .clone()
-        .or_else(|| remote.map(|remote| remote.api_base_url.clone()))
+        .or_else(|| matching_remote.map(|remote| remote.api_base_url.clone()))
         .unwrap_or_else(|| default_api_base_url(&host));
     let web_base_url = args
         .web_base_url
         .clone()
-        .or_else(|| remote.map(|remote| remote.web_base_url.clone()))
+        .or_else(|| matching_remote.map(|remote| remote.web_base_url.clone()))
         .unwrap_or_else(|| default_web_base_url(&host));
-    let token_source = init_token_source_or_default(args)?;
-    let paths = ProfilePaths::resolve(&profile_id)?;
+    let existing_profile = match &profile_target {
+        ProfileBootstrapTarget::Exact(profile_id) => load_profile_optional(profile_id)?,
+        ProfileBootstrapTarget::Auto => None,
+    };
+    let (token_source, token_source_explicit) =
+        init_token_source_for_profile(args, existing_profile.as_ref(), false)?;
     Ok(InitPreset {
-        profile_id,
+        profile_target,
+        profile_source,
         repo,
+        repo_source,
         host,
         api_base_url,
         web_base_url,
+        api_base_url_explicit: args.api_base_url.is_some(),
+        web_base_url_explicit: args.web_base_url.is_some(),
+        token_source_explicit,
         token_source,
         write_repo_policy: true,
         force_repo_policy: args.force,
-        config_path: paths.config_file,
         repo_policy_path: root.join(".qgh.toml"),
-        db_path: paths.db_path,
     })
 }
 
@@ -4251,11 +4252,16 @@ fn finish_init_preset(
     finish_profile_init(
         root,
         ProfileInitPlan {
-            profile_id: preset.profile_id,
+            profile_target: preset.profile_target,
+            profile_source: preset.profile_source,
             repo: preset.repo,
+            repo_source: preset.repo_source,
             host: preset.host,
             api_base_url: preset.api_base_url,
             web_base_url: preset.web_base_url,
+            api_base_url_explicit: preset.api_base_url_explicit,
+            web_base_url_explicit: preset.web_base_url_explicit,
+            token_source_explicit: preset.token_source_explicit,
             token_source: preset.token_source,
             write_repo_policy: preset.write_repo_policy,
             force_repo_policy: preset.force_repo_policy,
@@ -4264,33 +4270,44 @@ fn finish_init_preset(
 }
 
 fn write_init_preset_preview(preset: &InitPreset) -> Result<(), QghError> {
+    let ProfileBootstrapTarget::Exact(profile_id) = &preset.profile_target else {
+        return Err(QghError::config(
+            "Automatic profile selection cannot be previewed before the config lock is acquired.",
+        ));
+    };
+    let paths = ProfilePaths::resolve(profile_id)?;
     let mut stderr = io::stderr();
     writeln!(stderr, "Detected qgh init defaults:")?;
     writeln!(stderr, "  repo: {}", preset.repo)?;
     writeln!(stderr, "  host: {}", preset.host)?;
-    writeln!(stderr, "  profile id: {}", preset.profile_id)?;
+    writeln!(stderr, "  profile id: {profile_id}")?;
     writeln!(
         stderr,
         "  token source: {}",
         token_source_display(&preset.token_source)
     )?;
-    writeln!(stderr, "  config path: {}", preset.config_path.display())?;
+    writeln!(stderr, "  config path: {}", paths.config_file.display())?;
     writeln!(stderr, "  repo policy: create")?;
     writeln!(
         stderr,
         "  repo policy path: {}",
         preset.repo_policy_path.display()
     )?;
-    writeln!(stderr, "  db path: {}", preset.db_path.display())?;
+    writeln!(stderr, "  db path: {}", paths.db_path.display())?;
     Ok(())
 }
 
 struct ProfileInitPlan {
-    profile_id: String,
+    profile_target: ProfileBootstrapTarget,
+    profile_source: &'static str,
     repo: String,
+    repo_source: &'static str,
     host: String,
     api_base_url: String,
     web_base_url: String,
+    api_base_url_explicit: bool,
+    web_base_url_explicit: bool,
+    token_source_explicit: bool,
     token_source: TokenSource,
     write_repo_policy: bool,
     force_repo_policy: bool,
@@ -4301,25 +4318,30 @@ fn finish_profile_init(
     plan: ProfileInitPlan,
 ) -> Result<InitCommandOutcome, QghError> {
     let policy_path = root.join(".qgh.toml");
-    let repo_policy_action = plan_repo_policy_action(
+    let repo_policy_plan = RepoPolicyMutationPlan::prepare(
         &policy_path,
         &plan.repo,
         plan.write_repo_policy,
         plan.force_repo_policy,
+        true,
     )?;
 
     let bootstrap = bootstrap_profile_repo(ProfileBootstrapInput {
-        profile_id: plan.profile_id.clone(),
+        target: plan.profile_target,
         host: plan.host,
         api_base_url: plan.api_base_url,
         web_base_url: plan.web_base_url,
+        api_base_url_explicit: plan.api_base_url_explicit,
+        web_base_url_explicit: plan.web_base_url_explicit,
+        token_source_explicit: plan.token_source_explicit,
         repo: plan.repo.clone(),
         token_source: plan.token_source,
     })?;
 
-    apply_repo_policy_action(&policy_path, &plan.repo, repo_policy_action)?;
+    let policy_text = repo_policy_toml(&plan.repo);
+    let repo_policy_action = repo_policy_plan.commit(policy_text.as_bytes())?;
 
-    let profile_id = plan.profile_id;
+    let profile_id = bootstrap.profile_id.clone();
     let repo = plan.repo;
     let repo_policy_path = if plan.write_repo_policy {
         Value::String(policy_path.to_string_lossy().to_string())
@@ -4361,62 +4383,12 @@ fn finish_profile_init(
         warnings,
         meta: json!({
             "profile_id": profile_id,
-            "profile_source": "cli",
+            "profile_source": plan.profile_source,
             "repo": repo,
-            "repo_source": "cli",
-            "repo_policy_path": repo_policy_path
+            "repo_source": plan.repo_source,
+            "repo_policy_path": Value::Null
         }),
     })
-}
-
-fn plan_repo_policy_action(
-    policy_path: &std::path::Path,
-    requested_repo: &str,
-    write_repo_policy: bool,
-    force_repo_policy: bool,
-) -> Result<&'static str, QghError> {
-    if !write_repo_policy {
-        return Ok("skipped");
-    }
-    if !policy_path.exists() {
-        return Ok("created");
-    }
-    if force_repo_policy {
-        return Ok("overwritten");
-    }
-    let existing_policy = load_repo_policy_at(policy_path)?;
-    let existing_repo = existing_policy.repo.full_name();
-    if existing_repo == requested_repo {
-        return Ok("already_exists");
-    }
-    Err(QghError::validation(
-        "config.repo_policy_exists",
-        "Repo policy already exists for a different repo.",
-    )
-    .with_details(json!({
-        "path": policy_path.to_string_lossy(),
-        "existing_repo": existing_repo,
-        "requested_repo": requested_repo
-    }))
-    .with_hint("Use --force to overwrite the existing .qgh.toml."))
-}
-
-fn apply_repo_policy_action(
-    policy_path: &std::path::Path,
-    repo: &str,
-    action: &'static str,
-) -> Result<(), QghError> {
-    if !matches!(action, "created" | "overwritten") {
-        return Ok(());
-    }
-    fs::write(policy_path, repo_policy_toml(repo)).map_err(|error| {
-        QghError::storage(format!(
-            "Failed to write repo policy at {}: {error}",
-            policy_path.display()
-        ))
-    })?;
-    load_repo_policy_at(policy_path)?;
-    Ok(())
 }
 
 fn prompt_line(label: &str, default: &str) -> Result<String, QghError> {
@@ -4714,6 +4686,87 @@ fn explicit_profile_for_init(profile_arg: Option<&str>) -> Option<(String, &'sta
         .map(|profile_id| (profile_id, "env"))
 }
 
+fn init_token_source_for_profile(
+    args: &InitArgs,
+    existing_profile: Option<&Profile>,
+    prompt_for_new_profile: bool,
+) -> Result<(TokenSource, bool), QghError> {
+    let Some(profile) = existing_profile else {
+        let token_source = if prompt_for_new_profile {
+            prompt_init_token_source(args)?
+        } else {
+            init_token_source_or_default(args)?
+        };
+        return Ok((token_source, args.token_source.is_some()));
+    };
+
+    let explicit = args.token_source.is_some() || args.token_env.is_some();
+    let requested = match args.token_source {
+        None if args.token_env.is_some() => return Err(missing_init_value("--token-source")),
+        None => profile.token_source.clone(),
+        Some(InitTokenSourceArg::GithubCli) => {
+            if args.token_env.is_some() {
+                return Err(QghError::validation(
+                    "validation.invalid_token_source",
+                    "--token-env can only be used with --token-source env.",
+                ));
+            }
+            TokenSource::GithubCli
+        }
+        Some(InitTokenSourceArg::Env) => match args.token_env.as_deref() {
+            Some(env) => TokenSource::Env {
+                env: env.to_string(),
+            },
+            None => match &profile.token_source {
+                TokenSource::Env { env } => TokenSource::Env { env: env.clone() },
+                _ => {
+                    return Err(QghError::config(format!(
+                        "Profile `{}` already exists with a different token source.",
+                        profile.id
+                    )));
+                }
+            },
+        },
+    };
+    if requested != profile.token_source {
+        return Err(QghError::config(format!(
+            "Profile `{}` already exists with a different token source.",
+            profile.id
+        )));
+    }
+    Ok((profile.token_source.clone(), explicit))
+}
+
+fn prompt_init_token_source(args: &InitArgs) -> Result<TokenSource, QghError> {
+    let token_source_name = match args.token_source {
+        Some(InitTokenSourceArg::GithubCli) => "github_cli".to_string(),
+        Some(InitTokenSourceArg::Env) => "env".to_string(),
+        None => prompt_line("token source (github_cli/env)", "github_cli")?,
+    };
+    match token_source_name.as_str() {
+        "github_cli" => {
+            if args.token_env.is_some() {
+                return Err(QghError::validation(
+                    "validation.invalid_token_source",
+                    "--token-env can only be used with --token-source env.",
+                ));
+            }
+            Ok(TokenSource::GithubCli)
+        }
+        "env" => {
+            let env = match args.token_env.as_deref() {
+                Some(env) => env.to_string(),
+                None => prompt_line("token env var", "GITHUB_TOKEN")?,
+            };
+            Ok(TokenSource::Env { env })
+        }
+        _ => Err(QghError::validation(
+            "validation.invalid_token_source",
+            "Token source must be `github_cli` or `env`.",
+        )),
+    }
+}
+
 fn init_token_source_or_default(args: &InitArgs) -> Result<TokenSource, QghError> {
     match args.token_source {
         Some(InitTokenSourceArg::GithubCli) => {
@@ -4771,6 +4824,10 @@ fn default_api_base_url(host: &str) -> String {
 
 fn default_web_base_url(host: &str) -> String {
     format!("https://{host}")
+}
+
+fn same_init_endpoint(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/') == right.trim_end_matches('/')
 }
 
 fn missing_init_value(flag: &str) -> QghError {
@@ -7465,6 +7522,32 @@ fn lexical_evidence(
 mod tests {
     use super::*;
     use crate::model::{IssueRecord, SourceVersionView};
+
+    #[test]
+    fn repo_policy_apply_rejects_a_stale_created_plan() {
+        let root = std::env::temp_dir().join(format!(
+            "qgh-repo-policy-cas-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(".qgh.toml");
+        let plan =
+            RepoPolicyMutationPlan::prepare(&path, "owner/requested", true, false, true).unwrap();
+        fs::write(&path, repo_policy_toml("owner/concurrent")).unwrap();
+
+        let candidate = repo_policy_toml("owner/requested");
+        let error = plan.commit(candidate.as_bytes()).unwrap_err();
+
+        assert_eq!(error.code, "config.repo_policy_exists");
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains(r#"github = "owner/concurrent""#));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn sync_retry_action_preserves_the_interrupted_operation() {

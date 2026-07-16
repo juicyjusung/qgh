@@ -49,8 +49,16 @@
       "secret_name": "HOMEBREW_TAP_TOKEN",
       "scope": "contents write on juicyjusung/homebrew-tap only"
     },
-    "init_behavior": "top-level init previews inferred profile/repo defaults before writing; Enter/Y accepts, n customizes, EOF cancels without writes; init --yes and init -y apply the preset non-interactively; init repo is repo-policy-only",
+    "init_behavior": "top-level init previews inferred profile/repo defaults before writing; Enter/Y fixes the displayed profile, n customizes, EOF cancels without writes; init --yes and init -y apply non-interactively; init repo is repo-policy-only",
     "init_yes_aliases": ["--yes", "-y"],
+    "init_profile_selection": {
+      "explicit_precedence": ["cli", "env"],
+      "interactive_confirmation": "fixed",
+      "promptless_auto": "latest locked config snapshot; single repo-and-host match, then single same-host match, then collision-safe host-derived id",
+      "auto_profile_source": "cli",
+      "ambiguity_error": "config.ambiguous_profile"
+    },
+    "repo_policy_publication": "preflight plus apply-time CAS; no-replace create; staged atomic force replace; final symlink and non-regular entries fail closed",
     "get_batch": {
       "max_source_ids": 20,
       "single_source_output": "backward compatible {profile_id, source}",

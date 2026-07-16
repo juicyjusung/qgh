@@ -26,6 +26,14 @@ impl ConfigMutation {
         Self::begin_with_open_hook(config_path, timeout, || {})
     }
 
+    #[cfg(test)]
+    pub(crate) fn begin_with_before_lock_hook(
+        config_path: PathBuf,
+        after_lock_open: impl FnOnce(),
+    ) -> Result<Self, QghError> {
+        Self::begin_with_open_hook(config_path, CONFIG_MUTATION_LOCK_TIMEOUT, after_lock_open)
+    }
+
     fn begin_with_open_hook(
         config_path: PathBuf,
         timeout: Duration,
@@ -289,7 +297,7 @@ fn validate_open_regular_file(path: &Path, file: &File) -> Result<(), QghError> 
 }
 
 #[cfg(target_os = "macos")]
-fn platform_private_file_open_flags() -> std::os::raw::c_int {
+pub(crate) fn platform_private_file_open_flags() -> std::os::raw::c_int {
     const O_NONBLOCK: std::os::raw::c_int = 0x0000_0004;
     const O_NOFOLLOW: std::os::raw::c_int = 0x0000_0100;
     const O_CLOEXEC: std::os::raw::c_int = 0x0100_0000;
@@ -297,7 +305,7 @@ fn platform_private_file_open_flags() -> std::os::raw::c_int {
 }
 
 #[cfg(target_os = "linux")]
-fn platform_private_file_open_flags() -> std::os::raw::c_int {
+pub(crate) fn platform_private_file_open_flags() -> std::os::raw::c_int {
     const O_NONBLOCK: std::os::raw::c_int = 0o4000;
     const O_NOFOLLOW: std::os::raw::c_int = 0o400000;
     const O_CLOEXEC: std::os::raw::c_int = 0o2000000;
@@ -353,12 +361,12 @@ fn tighten_private_file(_file: &File) -> Result<(), QghError> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn sync_directory(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn sync_directory(_path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

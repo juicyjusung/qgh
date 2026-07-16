@@ -17,7 +17,17 @@ This release artifact is for the qgh MVP contract. It does not define new produc
   defaults before write; Enter/`Y` accepts, `n` customizes, EOF cancels with
   `validation.init_cancelled` and no files changed.
 - `qgh init --yes` and `qgh init -y` apply the inferred preset without preview
-  or prompts.
+  or prompts; without explicit `--profile`/`QGH_PROFILE`, selection happens
+  from the latest config snapshot under its mutation lock and ambiguous
+  candidates fail closed.
+- Init lowercases host identity, never combines a selected host with endpoints
+  from a different origin host, preserves unchanged existing endpoint defaults,
+  and reports the actual CLI/Git-remote repo provenance.
+- Existing-profile init previews the stored token source, omits a misleading
+  customization prompt, and rejects explicit credential-source conflicts.
+- Init repo-policy publication revalidates at apply time, creates without
+  replacement, atomically replaces only with `--force`, and rejects final
+  symlink/non-regular entries.
 - `qgh get <source_id>... --json` supports up to 20 source ids; single-source
   output stays backward compatible, batch output uses input-ordered item
   success/error entries, and lifecycle checks run only with
