@@ -358,6 +358,51 @@ fn repo_policy_exists_error(path: &Path, existing_repo: &str, requested_repo: &s
 mod tests {
     use super::*;
 
+    fn repo_policy_toml(repo: &str) -> String {
+        format!(
+            r#"schema_version = "qgh.repo.v1"
+
+[repo]
+github = "{repo}"
+
+[defaults]
+scope = "repo"
+state = "all"
+source_types = ["issue", "issue_comment"]
+labels = []
+
+[query]
+limit = 10
+"#
+        )
+    }
+
+    #[test]
+    fn repo_policy_apply_rejects_a_stale_created_plan() {
+        let root = std::env::temp_dir().join(format!(
+            "qgh-repo-policy-cas-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(".qgh.toml");
+        let plan =
+            RepoPolicyMutationPlan::prepare(&path, "owner/requested", true, false, true).unwrap();
+        fs::write(&path, repo_policy_toml("owner/concurrent")).unwrap();
+
+        let candidate = repo_policy_toml("owner/requested");
+        let error = plan.commit(candidate.as_bytes()).unwrap_err();
+
+        assert_eq!(error.code, "config.repo_policy_exists");
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains(r#"github = "owner/concurrent""#));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn forced_publication_reports_created_when_the_expected_entry_disappeared() {
         let root = std::env::temp_dir().join(format!(

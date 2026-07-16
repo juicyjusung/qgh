@@ -1,6 +1,7 @@
 use crate::cli::Cli;
 use crate::commands;
 use crate::error::QghError;
+use crate::init;
 use crate::mcp;
 use crate::output::{
     print_error, print_human_success, print_human_warnings, print_success, SuccessOutputKind,
@@ -87,7 +88,7 @@ async fn run(cli: Cli) -> Result<CommandOutcome, QghError> {
     let json_mode = cli.wants_json();
     let decorate_human = !cli.wants_quiet();
     if let crate::cli::Command::Init(args) = &cli.command {
-        let outcome = commands::init(cli.profile.as_deref(), args)?;
+        let outcome = init::run(cli.profile.as_deref(), args)?;
         return Ok(CommandOutcome {
             output_kind: SuccessOutputKind::Init,
             json_mode,

@@ -13,6 +13,7 @@ mod freshness;
 mod fusion;
 mod github;
 mod index;
+mod init;
 mod lease;
 mod local_models;
 mod mcp;
