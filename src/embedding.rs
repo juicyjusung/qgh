@@ -65,9 +65,10 @@ pub const EMBEDDING_FINGERPRINT_SCHEMA_VERSION: &str = "qgh.embedding_fingerprin
 pub const MODEL_MANIFEST_SCHEMA_VERSION: &str = "qgh.model_manifest.v1";
 const MAX_PREPARED_ALIAS_BYTES: u64 = 64 * 1024;
 const MAX_MODEL_MANIFEST_BYTES: u64 = 1024 * 1024;
-// v2: chunks slice the tokenizer's canonical (normalized) text instead of
-// the raw source body, so v1 chunk bodies and embeddings are not comparable.
-pub const CHUNKER_VERSION: &str = "qgh.chunker.v2";
+// v3: token budgets still use canonical tokenizer text, while Markdown
+// structure is projected from the original source text. Existing v2 chunks
+// and embeddings are not comparable with the restored source boundaries.
+pub const CHUNKER_VERSION: &str = "qgh.chunker.v3";
 pub const SOURCE_SCHEMA_VERSION: &str = "qgh.source_schema.v1";
 pub const LOCAL_MODEL_REVISION: &str = "local_path";
 const MODULES_FILE: &str = "modules.json";

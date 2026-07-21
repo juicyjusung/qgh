@@ -1,10 +1,12 @@
 #![cfg(feature = "vector-search")]
 
-use qgh::chunking::{CHUNKER_FINGERPRINT, CHUNKER_VERSION};
+use qgh::chunking::{
+    chunk_markdown_with_config, ChunkerConfig, MarkdownChunk, CHUNKER_FINGERPRINT, CHUNKER_VERSION,
+};
 use qgh::context::{prepare_embedding_input, EmbeddingSourceContext};
 use qgh::embedding::{
-    EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_HF_MODEL_REVISION,
-    DEFAULT_QUERY_PREFIX,
+    EmbeddingFingerprintSeed, EmbeddingProviderError, EmbeddingTokenizer, PoolingKind, TokenSpan,
+    TokenizedText, DEFAULT_HF_MODEL_ID, DEFAULT_HF_MODEL_REVISION, DEFAULT_QUERY_PREFIX,
 };
 use qgh::search_eval::{search_with_metadata_boost_v1_for_eval, SearchFilters};
 use rusqlite::{params, Connection};
@@ -21,6 +23,10 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tantivy::collector::TopDocs;
+use tantivy::query::QueryParser;
+use tantivy::schema::{Schema, Value as TantivyValue, STORED, STRING, TEXT};
+use tantivy::{Index, TantivyDocument};
 
 const LABELER: &str = "qgh synthetic fixture maintainer";
 const LABELING_RULE: &str =
@@ -79,6 +85,7 @@ const MODEL_AB_CANDIDATES: [EvalModelCandidate; 3] = [
 
 #[test]
 fn curated_search_quality_eval_gate_passes() {
+    assert_source_markdown_chunk_quality_improves_over_canonical_baseline();
     let fixture = EvalFixture::new("search-quality-eval");
     let server = EvalFakeGitHub::start();
     fixture.write_config(&server.base_url);
@@ -228,6 +235,125 @@ fn curated_search_quality_eval_gate_passes() {
     ] {
         assert!(docs.contains(required), "missing docs phrase: {required}");
     }
+}
+
+fn assert_source_markdown_chunk_quality_improves_over_canonical_baseline() {
+    struct WhitespaceTokenizer;
+
+    impl EmbeddingTokenizer for WhitespaceTokenizer {
+        fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError> {
+            Ok(text
+                .split_whitespace()
+                .scan(0, |cursor, token| {
+                    let relative = text[*cursor..].find(token)?;
+                    let start = *cursor + relative;
+                    let end = start + token.len();
+                    *cursor = end;
+                    Some(TokenSpan { start, end })
+                })
+                .collect())
+        }
+    }
+
+    struct NewlineCollapsingTokenizer;
+
+    impl EmbeddingTokenizer for NewlineCollapsingTokenizer {
+        fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError> {
+            Ok(self.tokenize_canonical(text)?.spans)
+        }
+
+        fn tokenize_canonical(&self, text: &str) -> Result<TokenizedText, EmbeddingProviderError> {
+            let canonical = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let spans = WhitespaceTokenizer.tokenize(&canonical)?;
+            let mut cursor = 0;
+            let original_spans = spans
+                .iter()
+                .map(|span| {
+                    let token = &canonical[span.start..span.end];
+                    let relative = text[cursor..].find(token)?;
+                    let start = cursor + relative;
+                    let end = start + token.len();
+                    cursor = end;
+                    Some(TokenSpan { start, end })
+                })
+                .collect::<Option<Vec<_>>>()
+                .expect("fixture canonical tokens map to source text");
+            Ok(TokenizedText {
+                text: canonical,
+                spans,
+                original_text: text.to_string(),
+                original_spans,
+            })
+        }
+    }
+
+    fn top1_section_recall(chunks: &[MarkdownChunk]) -> f64 {
+        const GOLD_SECTION: &str = "pagination cursor duplicate etag recovery";
+        const QUERY: &str = "pagination cursor duplicate etag recovery";
+
+        let mut schema = Schema::builder();
+        let section_id = schema.add_text_field("section_id", STRING | STORED);
+        let body = schema.add_text_field("body", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer(15_000_000).unwrap();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut document = TantivyDocument::default();
+            let candidate_id = format!("candidate-{index}");
+            let section = if chunk.body == GOLD_SECTION {
+                "gold"
+            } else {
+                &candidate_id
+            };
+            document.add_text(section_id, section);
+            document.add_text(body, &chunk.body);
+            writer.add_document(document).unwrap();
+        }
+        let mut distractor = TantivyDocument::default();
+        distractor.add_text(section_id, "distractor");
+        distractor.add_text(body, "pagination cursor duplicate etag workaround");
+        writer.add_document(distractor).unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let query = QueryParser::for_index(&index, vec![body])
+            .parse_query(QUERY)
+            .unwrap();
+        let (_, address) = searcher
+            .search(&query, &TopDocs::with_limit(1))
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("quality fixture has a top result");
+        let document = searcher.doc::<TantivyDocument>(address).unwrap();
+        f64::from(
+            document
+                .get_first(section_id)
+                .and_then(|value| value.as_str())
+                == Some("gold"),
+        )
+    }
+
+    let source = "# Guide\n\npagination cursor duplicate etag recovery\n\n```rust\nlet key = value\n```\n\ntail01 tail02 tail03";
+    let canonical = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    let config = ChunkerConfig {
+        target_tokens: 3,
+        overlap_tokens: 0,
+        boundary_search_tokens: 2,
+    };
+    let canonical_baseline =
+        chunk_markdown_with_config(&canonical, &WhitespaceTokenizer, config).unwrap();
+    let restored = chunk_markdown_with_config(source, &NewlineCollapsingTokenizer, config).unwrap();
+
+    let canonical_top1 = top1_section_recall(&canonical_baseline);
+    let restored_top1 = top1_section_recall(&restored);
+    assert_eq!(canonical_top1, 0.0, "canonical-only top-1 section recall");
+    assert_eq!(restored_top1, 1.0, "restored top-1 section recall");
+    assert!(
+        restored_top1 > canonical_top1,
+        "source-boundary chunking must improve indexed retrieval over canonical-only chunking"
+    );
 }
 
 fn assert_fixed_metadata_profile_eval_seam(fixture: &EvalFixture) {
