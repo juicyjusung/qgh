@@ -23,7 +23,7 @@ Load related skills only when the request crosses into their domain:
 | Unclear issue, open D2, or pre-implementation design sharpening | `issue-grill-with-docs` |
 | Starting actual implementation | `implement` |
 | Incoming raw bug/request triage | `triage` |
-| Splitting oversized scope into vertical slices | `to-issues` |
+| Splitting oversized scope into vertical slices | `to-tickets` |
 | Unsure which qgh flow applies | `ask-matt` |
 
 ## L2 Implementation Lane (autonomous dispatch)

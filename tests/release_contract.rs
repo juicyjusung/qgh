@@ -3525,6 +3525,23 @@ fn public_agent_skills_are_discoverable_safe_and_evaluated() {
 }
 
 #[test]
+fn maintainer_skill_routes_use_current_dependency_names() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let orchestrator =
+        fs::read_to_string(root.join(".agents/skills/orchestrating-qgh-worktrees/SKILL.md"))
+            .expect("qgh worktree orchestrator skill must exist");
+
+    assert!(
+        orchestrator.contains("| Splitting oversized scope into vertical slices | `to-tickets` |"),
+        "qgh worktree orchestrator must route ticket splitting to the current global skill name"
+    );
+    assert!(
+        !orchestrator.contains("`to-issues`"),
+        "qgh worktree orchestrator must not route to the removed to-issues skill"
+    );
+}
+
+#[test]
 fn cli_help_teaches_workflow_and_side_effect_boundaries() {
     let top_level = stdout_text(&qgh(&["--help"]));
     for workflow_step in [

@@ -22,7 +22,7 @@ Create:
 - `.agents/skills/issue-grill-with-docs/SKILL.md`
 - `.agents/skills/issue-grill-with-docs/evals/evals.json`
 
-Keep the skill in `.agents/skills` because the repo's Matt Pocock engineering skills live there, and this skill wraps `grill-with-docs` / `domain-modeling`.
+Keep the qgh-specific wrapper in `.agents/skills`. It uses the globally installed `grill-with-docs` and `domain-modeling` dependencies instead of vendoring those Matt Pocock engineering skills into this repo.
 
 ## Triggering
 
