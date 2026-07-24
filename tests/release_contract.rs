@@ -899,6 +899,10 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         vec!["./homebrew-smoke"]
     );
     assert_eq!(
+        toml_array_strings(&dist_workspace["dist"]["host-jobs"]),
+        vec!["./homebrew-prepublish-smoke"]
+    );
+    assert_eq!(
         dist_workspace["dist"]["github-attestations"].as_bool(),
         Some(true)
     );
@@ -919,6 +923,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
         "token: ${{ secrets.HOMEBREW_TAP_TOKEN }}",
         "Formula/${filename} unchanged",
         "actions/attest@v4",
+        "custom-homebrew-prepublish-smoke",
+        "uses: ./.github/workflows/homebrew-prepublish-smoke.yml",
         "publish-homebrew-formula",
         "custom-homebrew-smoke",
         "uses: ./.github/workflows/homebrew-smoke.yml",
@@ -928,6 +934,69 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "missing release workflow phrase: {required}"
         );
     }
+
+    let prepublish_smoke_workflow =
+        fs::read_to_string(root.join(".github/workflows/homebrew-prepublish-smoke.yml")).unwrap();
+    for required in [
+        "workflow_call:",
+        "HOMEBREW_NO_AUTO_UPDATE: \"1\"",
+        "HOMEBREW_NO_ANALYTICS: \"1\"",
+        "pattern: artifacts-*",
+        "qgh-aarch64-apple-darwin.tar",
+        "Formula/qgh.rb",
+        "expected exactly one generated qgh.rb",
+        "expected exactly one Apple Silicon archive",
+        "if [ \"$formula_count\" -ne 1 ]",
+        "if [ \"$archive_count\" -ne 1 ]",
+        "file://",
+        "sha256",
+        "brew install juicyjusung/tap/qgh",
+        "qgh --version",
+        "qgh help",
+    ] {
+        assert!(
+            prepublish_smoke_workflow.contains(required),
+            "missing pre-publish Homebrew smoke workflow phrase: {required}"
+        );
+    }
+    assert!(
+        !prepublish_smoke_workflow.contains("-print -quit"),
+        "pre-publish smoke must reject duplicate artifacts instead of choosing the first match"
+    );
+    let host_job = release_workflow
+        .split_once("\n  host:")
+        .expect("host job must exist")
+        .1
+        .split_once("\n  custom-homebrew-prepublish-smoke:")
+        .expect("pre-publish Homebrew smoke job must exist")
+        .0;
+    assert!(
+        host_job.contains("      - custom-homebrew-prepublish-smoke"),
+        "hosting must depend on the blocking pre-publish Homebrew smoke"
+    );
+    assert!(
+        host_job.contains("needs.custom-homebrew-prepublish-smoke.result == 'success'"),
+        "the host job uses always(), so it must explicitly require a successful pre-publish smoke"
+    );
+    let publish_job = release_workflow
+        .split_once("\n  publish-homebrew-formula:")
+        .expect("Homebrew publish job must exist")
+        .1
+        .split_once("\n  announce:")
+        .expect("announce job must exist")
+        .0;
+    assert!(
+        publish_job.contains("      - custom-homebrew-prepublish-smoke"),
+        "formula publication must depend on the blocking pre-publish Homebrew smoke"
+    );
+    let postpublish_job = release_workflow
+        .split_once("\n  custom-homebrew-smoke:")
+        .expect("post-publish Homebrew smoke job must exist")
+        .1;
+    assert!(
+        postpublish_job.contains("      - announce"),
+        "official-tap Homebrew smoke must remain a post-publication check"
+    );
 
     let smoke_workflow =
         fs::read_to_string(root.join(".github/workflows/homebrew-smoke.yml")).unwrap();
