@@ -6303,6 +6303,67 @@ impl Store {
         Ok(())
     }
 
+    /// Reuses only a fully validated BM25-only publication for the captured
+    /// source snapshot. An unproven publication returns `None` so the caller
+    /// retains the existing reserve, rebuild, and compare-and-swap path.
+    pub(crate) fn reusable_bm25_generation_for_snapshot(
+        &self,
+        snapshot: &RetrievalBuildSnapshot,
+    ) -> Result<Option<i64>, QghError> {
+        let pending_index_tasks: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM index_tasks WHERE completed_at IS NULL)",
+            [],
+            |row| row.get(0),
+        )?;
+        if self.successor_repair_required()? || pending_index_tasks {
+            return Ok(None);
+        }
+        self.validate_retrieval_build_snapshot(snapshot)?;
+        let Some(expected_publication_id) = snapshot.expected_publication_id else {
+            return Ok(None);
+        };
+        let Some(publication) = self.active_retrieval_publication()? else {
+            return Ok(None);
+        };
+        if publication.publication_id != expected_publication_id
+            || publication.embedding_generation_id.is_some()
+            || publication.source_snapshot_epoch != snapshot.identity.epoch
+        {
+            return Ok(None);
+        }
+        let generation_inventory = self
+            .conn
+            .query_row(
+                "SELECT source_count, source_inventory_hash
+                 FROM index_generations
+                 WHERE generation = ?1",
+                params![publication.tantivy_generation],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        if !generation_inventory.is_some_and(|(source_count, inventory_hash)| {
+            usize::try_from(source_count).ok() == Some(snapshot.sources.len())
+                && inventory_hash.as_deref() == Some(snapshot.source_inventory_hash.as_str())
+        }) {
+            return Ok(None);
+        }
+        if !matches!(self.resolve_active_tantivy_artifact(), Ok(Some(_))) {
+            return Ok(None);
+        }
+        let pointer_matches: bool = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM retrieval_publication_pointer
+                 WHERE id = 1 AND publication_id = ?1
+             )",
+            params![expected_publication_id],
+            |row| row.get(0),
+        )?;
+        if !pointer_matches {
+            return Ok(None);
+        }
+        Ok(Some(publication.tantivy_generation))
+    }
+
     pub fn source_version_hash(&self, source_version_id: i64) -> Result<Option<String>, QghError> {
         self.conn
             .query_row(
@@ -7358,6 +7419,16 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn fail_next_retrieval_publication_activation(&mut self, error: QghError) {
         self.activation_failure = Some(error);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enqueue_test_index_task(&self, source_id: &str) -> Result<(), QghError> {
+        self.conn.execute(
+            "INSERT INTO index_tasks (source_id, task_type, created_at, completed_at)
+             VALUES (?1, 'upsert', ?2, NULL)",
+            params![source_id, now_rfc3339()],
+        )?;
+        Ok(())
     }
 
     pub fn activate_retrieval_publication(
