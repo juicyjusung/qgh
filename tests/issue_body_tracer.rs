@@ -9012,6 +9012,136 @@ fn mcp_rejects_malformed_envelopes_and_method_params() {
 }
 
 #[test]
+fn mcp_tools_call_accepts_opaque_meta_without_relaxing_strict_params() {
+    let fixture = TestFixture::new("mcp-tools-call-meta");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let private_marker = "PRIVATE_MCP_META_MARKER_7d2f";
+    let output = fixture.mcp([
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "qgh-test", "version": "0" }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": { "query": "BM25 issue body tracer" },
+                "_meta": {
+                    "progressToken": "query-progress",
+                    "futureExtension": private_marker
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "get",
+                "arguments": { "source_id": "qgh://github.com/issue/I_kwDOISSUE1" },
+                "_meta": {
+                    "progressToken": 4,
+                    "futureExtension": private_marker
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {},
+                "_meta": {
+                    "progressToken": "status-progress",
+                    "futureExtension": private_marker
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {},
+                "_meta": private_marker
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {},
+                "unexpected": private_marker
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": { "unexpected": private_marker }
+            }
+        }),
+    ]);
+
+    assert_success(&output);
+    assert!(stderr_text(&output).is_empty());
+    let messages = stdout_json_lines(&output);
+    assert_eq!(messages.len(), 8);
+
+    let tools = messages[1]["result"]["tools"].as_array().unwrap();
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["query", "get", "status"]
+    );
+    assert!(tools
+        .iter()
+        .all(|tool| tool["annotations"]["readOnlyHint"] == true));
+
+    for response in &messages[2..5] {
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["isError"], false);
+    }
+    for response in &messages[5..7] {
+        assert_eq!(response["error"]["code"], -32602);
+    }
+    assert_eq!(messages[7]["result"]["isError"], true);
+    assert_eq!(
+        messages[7]["result"]["structuredContent"]["error"]["code"],
+        "validation.mcp"
+    );
+    assert!(!format!("{}{}", stdout_text(&output), stderr_text(&output)).contains(private_marker));
+}
+
+#[test]
 fn mcp_query_get_status_round_trips_issue_and_comment_sources() {
     let fixture = TestFixture::new("mcp-workflow");
     let server = FakeGitHub::start(issue_payload_with_pr());
