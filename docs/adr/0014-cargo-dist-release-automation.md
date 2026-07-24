@@ -4,7 +4,7 @@ qgh will use `cargo-dist` as the release automation path for version-tagged buil
 
 The release gate proves install-time readiness with `qgh --version`, help, `qgh init`, and local/diagnostic commands. The first-use smoke gate is separate: after the user has GitHub authentication and an explicit repo scope, `qgh init -y && qgh sync && qgh query` must work. Repository bootstrap, authentication, and sync remain explicit qgh commands because they touch private GitHub scope and local derivative data.
 
-The day-one release target matrix is macOS Apple Silicon, macOS Intel, and Linux x86_64. Linux ARM64 and Windows packages are later distribution targets unless a user-facing release requirement changes.
+The current official release target matrix is macOS Apple Silicon (`aarch64-apple-darwin`) and Linux x86_64 (`x86_64-unknown-linux-gnu`). macOS Intel is not an official target because `ort` 2.0.0-rc.12 does not provide the Intel-mac prebuilt ONNX Runtime required by the `fastembed-provider` release feature; direct Intel builds are subject to the same dependency constraint. Restore `x86_64-apple-darwin` only after the release dependency set provides a supported Intel-mac runtime and the complete release-contract, build, Homebrew install, and smoke-test gates pass on Intel hardware. Linux ARM64 and Windows packages remain later distribution targets unless a user-facing release requirement changes.
 
 The release integrity gate requires artifact checksums, Homebrew `sha256` verification, and GitHub Artifact Attestations. Separate `cosign` or `minisign` signing is deferred until there is a concrete key-management owner and user need.
 
