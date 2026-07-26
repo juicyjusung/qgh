@@ -310,7 +310,10 @@ fn parse_call(params: Option<&Value>) -> Result<ToolCall, QghError> {
         .ok_or_else(|| validation_error("tools/call params must be an object."))?
         .as_object()
         .ok_or_else(|| validation_error("tools/call params must be an object."))?;
-    reject_unknown(params, &["name", "arguments"])?;
+    reject_unknown(params, &["name", "arguments", "_meta"])?;
+    if params.get("_meta").is_some_and(|meta| !meta.is_object()) {
+        return Err(validation_error("tools/call _meta must be an object."));
+    }
     let name = required_string(params, "name")?;
     let arguments = params
         .get("arguments")
