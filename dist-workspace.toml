@@ -6,6 +6,7 @@ members = ["cargo:."]
 allow-dirty = ["ci"]
 tap = "juicyjusung/homebrew-tap"
 publish-jobs = ["homebrew"]
+host-jobs = ["./homebrew-prepublish-smoke"]
 post-announce-jobs = ["./homebrew-smoke"]
 github-attestations = true
 checksum = "sha256"
