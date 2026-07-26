@@ -1828,6 +1828,20 @@ fn rebuild_bm25_index(
             warnings: vec![incomplete_snapshot_publication_warning()],
         });
     };
+    if profile.embedding.is_none() {
+        if let Some(generation) = store.reusable_bm25_generation_for_snapshot(&snapshot)? {
+            let status = store.status()?;
+            progress.line(format_args!(
+                "qgh sync: reused active BM25 index generation={generation} sources={}",
+                snapshot.sources().len()
+            ));
+            return Ok(IndexRebuildOutcome {
+                generation,
+                dirty_task_count: status.dirty_task_count,
+                warnings,
+            });
+        }
+    }
     let embedding_generation_id = if embedding_prepared {
         match refresh_incremental_chunk_embeddings_for_snapshot(
             store,
@@ -7408,6 +7422,9 @@ mod tests {
             .unwrap()
             .unwrap()
             .publication_id;
+        store
+            .enqueue_test_index_task("qgh://github.com/issue/I_VALID_PREVIOUS_PUBLICATION")
+            .unwrap();
         store.fail_next_retrieval_publication_activation(QghError::new(
             "publication.test_activation_failed",
             "Fixture activation failed.",
@@ -7478,6 +7495,9 @@ mod tests {
         rebuild_bm25_index(&profile, &mut store, &StderrSyncProgress::new(false)).unwrap();
         let previous = store.active_retrieval_publication().unwrap().unwrap();
         let previous_path = store.resolve_active_tantivy_artifact().unwrap().unwrap();
+        store
+            .enqueue_test_index_task("qgh://github.com/issue/I_DURABILITY_FAILURE")
+            .unwrap();
         crate::index::reset_publication_directory_sync_paths();
         crate::index::fail_publication_directory_sync_after(1);
 
