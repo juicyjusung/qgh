@@ -10504,6 +10504,79 @@ fn incremental_sync_records_new_versions_and_uses_since_overlap_and_etag() {
 }
 
 #[test]
+fn unchanged_bm25_sync_reuses_publication_until_source_content_changes() {
+    let fixture = TestFixture::new("bm25-no-change-publication");
+    let server = EditingFakeGitHub::start();
+    fixture.write_config(&server.base_url);
+
+    let first_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&first_sync);
+    let first_sync_json = stdout_json(&first_sync);
+    let first_footprint = fixture.bm25_publication_footprint();
+    let source_id = "qgh://github.com/issue/I_kwDOISSUE1";
+    let first_query =
+        stdout_json(&fixture.qgh(["query", "round-trip through get before citation", "--json"]));
+    let first_get = stdout_json(&fixture.qgh(["get", source_id, "--json"]));
+    assert_query_result_round_trips_to_get_result(
+        &first_query["data"]["results"][0],
+        &first_get["data"]["source"],
+    );
+
+    let second_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&second_sync);
+    let second_sync_json = stdout_json(&second_sync);
+    assert_ne!(
+        second_sync_json["data"]["sync_run_id"], first_sync_json["data"]["sync_run_id"],
+        "no-change sync must still record normal sync freshness metadata"
+    );
+    assert_eq!(second_sync_json["data"]["index"]["dirty_task_count"], 0);
+    assert_eq!(
+        fixture.bm25_publication_footprint(),
+        first_footprint,
+        "a verified BM25-only no-change sync must not publish or retain another generation"
+    );
+    let status = stdout_json(&fixture.qgh(["status", "--json"]));
+    assert_eq!(
+        status["data"]["index"]["active_generation"],
+        first_footprint.active_generation
+    );
+    let second_query =
+        stdout_json(&fixture.qgh(["query", "round-trip through get before citation", "--json"]));
+    let second_get = stdout_json(&fixture.qgh(["get", source_id, "--json"]));
+    assert_query_result_round_trips_to_get_result(
+        &second_query["data"]["results"][0],
+        &second_get["data"]["source"],
+    );
+
+    server.set_mode(TARGET_REFRESH_DIFF);
+    let edited_sync = fixture.qgh(["sync", "--json"]);
+    assert_success(&edited_sync);
+    let edited_footprint = fixture.bm25_publication_footprint();
+    assert_ne!(
+        edited_footprint.active_publication_id,
+        first_footprint.active_publication_id
+    );
+    assert_ne!(
+        edited_footprint.active_generation,
+        first_footprint.active_generation
+    );
+    assert_eq!(
+        edited_footprint.generation_rows,
+        first_footprint.generation_rows + 1
+    );
+    assert_eq!(
+        edited_footprint.generation_directories,
+        first_footprint.generation_directories + 1
+    );
+    assert!(edited_footprint.artifact_bytes > first_footprint.artifact_bytes);
+    let updated_query = stdout_json(&fixture.qgh(["query", "updated issue body", "--json"]));
+    assert_eq!(updated_query["data"]["results"][0]["source_id"], source_id);
+    let old_query =
+        stdout_json(&fixture.qgh(["query", "round-trip through get before citation", "--json"]));
+    assert_eq!(old_query["data"]["results"].as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn completed_sync_publishes_new_lexical_snapshot_when_embedding_refresh_fails() {
     let fixture = TestFixture::new("completed-sync-lexical-embedding-fallback");
     let server = EditingFakeGitHub::start();
@@ -11310,6 +11383,15 @@ struct TestFixture {
     config_home: PathBuf,
     data_home: PathBuf,
     cache_home: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Bm25PublicationFootprint {
+    active_publication_id: i64,
+    active_generation: i64,
+    generation_rows: i64,
+    generation_directories: usize,
+    artifact_bytes: u64,
 }
 
 impl TestFixture {
@@ -12801,6 +12883,46 @@ limit = 10
         .unwrap()
     }
 
+    fn bm25_publication_footprint(&self) -> Bm25PublicationFootprint {
+        let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let (active_publication_id, active_generation, generation_rows): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT pointer.publication_id, publication.tantivy_generation,
+                        (SELECT count(*) FROM index_generations)
+                 FROM retrieval_publication_pointer pointer
+                 JOIN retrieval_publications publication
+                   ON publication.publication_id = pointer.publication_id
+                 WHERE pointer.id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let index_root = self.data_home.join("qgh/profiles/work/tantivy");
+        let generation_paths = fs::read_dir(index_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("generation-"))
+            })
+            .collect::<Vec<_>>();
+        let artifact_bytes = generation_paths
+            .iter()
+            .map(|path| directory_file_bytes(path))
+            .sum();
+        Bm25PublicationFootprint {
+            active_publication_id,
+            active_generation,
+            generation_rows,
+            generation_directories: generation_paths.len(),
+            artifact_bytes,
+        }
+    }
+
     fn seed_open_repair_candidates(&self, source_id: &str, pending_purge: bool) {
         let db_path = self.data_home.join("qgh/profiles/work/qgh.sqlite3");
         let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -13026,6 +13148,20 @@ limit = 10
             .unwrap();
         assert_eq!(changed, 1);
     }
+}
+
+fn directory_file_bytes(directory: &Path) -> u64 {
+    fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .map(|path| {
+            if path.is_dir() {
+                directory_file_bytes(&path)
+            } else {
+                fs::metadata(path).unwrap().len()
+            }
+        })
+        .sum()
 }
 
 #[cfg(feature = "vector-search")]
