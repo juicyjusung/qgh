@@ -28,6 +28,29 @@ jobs:
       - name: test (all features)
         run: cargo test --all-features
 
+  non-rust-contracts:
+    name: non-Rust contracts (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Python contract tests
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python skills/qgh/evals/test_hard_gates.py
+          PYTHONDONTWRITEBYTECODE=1 python tests/support/test_benchmark_qwen_retrieval.py
+          PYTHONDONTWRITEBYTECODE=1 python tests/support/test_build_fresh_blind_model_eval_fixture.py
+      - name: shell syntax
+        run: |
+          bash -n scripts/loop/qgh-loop.sh
+          bash -n scripts/loop/qgh-triage.sh
+          bash -n scripts/verify-schedule-manager.sh
+
   schedule-platform-contract:
     name: schedule adapter contract (${{ matrix.os }})
     strategy:
