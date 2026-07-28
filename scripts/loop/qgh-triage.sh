@@ -14,6 +14,32 @@ TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
+# launchd starts jobs with a minimal PATH, and `zsh -lc` sources .zprofile but
+# not .zshrc — where Homebrew's shellenv usually lives. Every dependency below
+# sits in /opt/homebrew/bin or ~/.local/bin, so without this the run dies at the
+# first `gh` call. Set PATH here rather than in the plist so a manual
+# invocation behaves the same as a scheduled one.
+for dir in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin"; do
+  [ -d "$dir" ] || continue
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *) PATH="$dir:$PATH" ;;
+  esac
+done
+export PATH
+
+# Exit non-zero on a missing dependency. The kill switch below deliberately
+# exits 0, so a dependency failure that also exited 0 was indistinguishable
+# from a paused loop and every scheduled run silently no-opped.
+missing=""
+for cmd in gh git qgh codex timeout; do
+  command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
+done
+if [ -n "$missing" ]; then
+  log "missing required commands:$missing (PATH=$PATH) — exit"
+  exit 78 # EX_CONFIG
+fi
+
 notify() {
   command -v osascript >/dev/null 2>&1 || return 0
   osascript -e "display notification \"$2\" with title \"qgh-triage\" subtitle \"$1\" sound name \"Glass\"" 2>/dev/null || true
