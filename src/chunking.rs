@@ -3,9 +3,9 @@ use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
 
-pub const CHUNKER_VERSION: &str = "markdown-token-v3";
+pub const CHUNKER_VERSION: &str = "markdown-token-v4";
 pub const CHUNKER_FINGERPRINT: &str =
-    "markdown-token-v3:heading-code-fence-forward-progress-overlap";
+    "markdown-token-v4:source-markdown-boundaries-forward-progress-overlap";
 pub const DEFAULT_TARGET_TOKENS: usize = 900;
 pub const DEFAULT_BOUNDARY_SEARCH_TOKENS: usize = 200;
 pub const DEFAULT_OVERLAP_TOKENS: usize = 135;
@@ -160,8 +160,8 @@ fn chunk_markdown_with_config_and_fingerprint(
         return Ok(Vec::new());
     }
 
-    let boundary_token_indexes = markdown_boundary_token_indexes(text, &tokens);
-    let code_fence_token_ranges = code_fence_token_ranges(text, &tokens);
+    let boundary_token_indexes = markdown_boundary_token_indexes(original_text, &original_tokens);
+    let code_fence_token_ranges = code_fence_token_ranges(original_text, &original_tokens);
     let mut chunks = Vec::new();
     let mut token_start = 0;
 
@@ -173,7 +173,6 @@ fn chunk_markdown_with_config_and_fingerprint(
             &code_fence_token_ranges,
             config,
         );
-        let normalized_byte_start = tokens[token_start].start;
         let byte_start = original_tokens[token_start].start;
         let byte_end = original_tokens[token_end - 1].end;
         if byte_start >= byte_end
@@ -195,7 +194,7 @@ fn chunk_markdown_with_config_and_fingerprint(
             body: original_text[byte_start..byte_end].to_string(),
             chunker_version: CHUNKER_VERSION.to_string(),
             chunker_fingerprint: fingerprint.to_string(),
-            heading_path: heading_path(text, normalized_byte_start),
+            heading_path: heading_path(original_text, byte_start),
         });
 
         if token_end == tokens.len() {
@@ -525,6 +524,52 @@ mod tests {
         }
     }
 
+    struct NewlineCollapsingTokenizer;
+
+    impl NewlineCollapsingTokenizer {
+        fn canonicalize(text: &str) -> String {
+            text.split('\n')
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+
+    impl EmbeddingTokenizer for NewlineCollapsingTokenizer {
+        fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError> {
+            Ok(self.tokenize_canonical(text)?.spans)
+        }
+
+        fn tokenize_canonical(&self, text: &str) -> Result<TokenizedText, EmbeddingProviderError> {
+            let canonical = Self::canonicalize(text);
+            let spans = WhitespaceTokenizer.tokenize(&canonical)?;
+            let mut cursor = 0;
+            let original_spans = spans
+                .iter()
+                .map(|span| {
+                    let token = &canonical[span.start..span.end];
+                    let relative = text[cursor..].find(token)?;
+                    let start = cursor + relative;
+                    let end = start + token.len();
+                    cursor = end;
+                    Some(TokenSpan { start, end })
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    EmbeddingProviderError::structured(
+                        "embedding.tokenizer_unmappable_offset",
+                        "fixture tokenizer could not map normalized token to source",
+                    )
+                })?;
+            Ok(TokenizedText {
+                text: canonical,
+                spans,
+                original_text: text.to_string(),
+                original_spans,
+            })
+        }
+    }
+
     #[test]
     fn chunks_korean_english_and_mixed_markdown_on_boundaries_with_overlap_and_size() {
         let text = "# 한국어 English\n\nko01 ko02 ko03 ko04 ko05 ko06 ko07 ko08\n\n## Mixed\n\n한글09 en10 한글11 en12 한글13 en14 한글15 en16\n\n## English\n\nen17 en18 en19 en20 en21 en22 en23 en24";
@@ -694,15 +739,16 @@ mod tests {
 
     #[test]
     fn semantic_chunker_revision_invalidates_existing_generation_identity() {
-        assert_eq!(CHUNKER_VERSION, "markdown-token-v3");
+        assert_eq!(CHUNKER_VERSION, "markdown-token-v4");
         assert_eq!(
             CHUNKER_FINGERPRINT,
-            "markdown-token-v3:heading-code-fence-forward-progress-overlap"
+            "markdown-token-v4:source-markdown-boundaries-forward-progress-overlap"
         );
         assert!(
             chunker_fingerprint_for_tokenizer_identity("fixture-tokenizer")
-                .starts_with("markdown-token-v3:")
+                .starts_with("markdown-token-v4:")
         );
+        assert_eq!(crate::embedding::CHUNKER_VERSION, "qgh.chunker.v3");
     }
 
     #[test]
@@ -725,55 +771,6 @@ mod tests {
         // Simulates an SPM-style normalizer that collapses newline runs into
         // single spaces: spans are only valid against the normalized text,
         // never the raw input — the shape of the fastembed XLM-R tokenizer.
-        struct NewlineCollapsingTokenizer;
-
-        impl NewlineCollapsingTokenizer {
-            fn canonicalize(text: &str) -> String {
-                text.split('\n')
-                    .filter(|segment| !segment.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            }
-        }
-
-        impl EmbeddingTokenizer for NewlineCollapsingTokenizer {
-            fn tokenize(&self, text: &str) -> Result<Vec<TokenSpan>, EmbeddingProviderError> {
-                Ok(self.tokenize_canonical(text)?.spans)
-            }
-
-            fn tokenize_canonical(
-                &self,
-                text: &str,
-            ) -> Result<TokenizedText, EmbeddingProviderError> {
-                let canonical = Self::canonicalize(text);
-                let spans = WhitespaceTokenizer.tokenize(&canonical)?;
-                let mut cursor = 0;
-                let original_spans = spans
-                    .iter()
-                    .map(|span| {
-                        let token = &canonical[span.start..span.end];
-                        let relative = text[cursor..].find(token)?;
-                        let start = cursor + relative;
-                        let end = start + token.len();
-                        cursor = end;
-                        Some(TokenSpan { start, end })
-                    })
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| {
-                        EmbeddingProviderError::structured(
-                            "embedding.tokenizer_unmappable_offset",
-                            "fixture tokenizer could not map normalized token to source",
-                        )
-                    })?;
-                Ok(TokenizedText {
-                    text: canonical,
-                    spans,
-                    original_text: text.to_string(),
-                    original_spans,
-                })
-            }
-        }
-
         let text = "# 한국어 제목\n\n스토리지 리뷰 지적사항 반영 완료 본문입니다\n\n```swift\nlet key = contentKey\n```";
         let config = ChunkerConfig {
             target_tokens: 4,
@@ -789,6 +786,47 @@ mod tests {
         }
         assert!(chunks.iter().any(|chunk| chunk.body.contains("지적사항")));
         assert_eq!(chunks.last().unwrap().byte_end, text.len());
+        for chunk in &chunks {
+            assert_ne!(
+                chunk.body.matches("```").count(),
+                1,
+                "chunk split a source Markdown fence after canonical normalization: {chunk:?}"
+            );
+        }
+        assert!(chunks.iter().any(|chunk| {
+            chunk.body.contains("```swift") && chunk.body.contains("let key = contentKey")
+        }));
+    }
+
+    #[test]
+    fn preserves_source_heading_boundaries_when_canonical_text_collapses_newlines() {
+        let text = "# 한국어 제목\n\nparagraph01 paragraph02 paragraph03 paragraph04 paragraph05";
+        let chunks = chunk_markdown_with_config(
+            text,
+            &NewlineCollapsingTokenizer,
+            ChunkerConfig {
+                target_tokens: 4,
+                overlap_tokens: 0,
+                boundary_search_tokens: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(chunks[0].body, "# 한국어 제목");
+        assert_eq!(chunks[1].heading_path, vec!["한국어 제목"]);
+
+        let paragraphs = "one01 one02 one03\n\ntwo01 two02 two03 two04 two05";
+        let paragraph_chunks = chunk_markdown_with_config(
+            paragraphs,
+            &NewlineCollapsingTokenizer,
+            ChunkerConfig {
+                target_tokens: 4,
+                overlap_tokens: 0,
+                boundary_search_tokens: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(paragraph_chunks[0].body, "one01 one02 one03");
     }
 
     #[test]
