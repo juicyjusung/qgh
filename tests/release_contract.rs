@@ -2967,6 +2967,7 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "headers".to_string(),
             "name".to_string(),
             "ok".to_string(),
+            "orphan_profile_ids".to_string(),
             "path".to_string(),
             "profile_id".to_string(),
             "profile_source".to_string(),
@@ -2987,7 +2988,8 @@ fn release_contract_artifacts_match_cli_help_and_mcp_surface() {
             "rate_limit_headers",
             "purge",
             "repo_policy",
-            "profile_resolution"
+            "profile_resolution",
+            "orphan_profile_stores"
         ])
     );
     assert_eq!(

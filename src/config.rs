@@ -9,7 +9,7 @@ use crate::freshness::{parse_duration_seconds, DEFAULT_QUERY_MAX_AGE_SECONDS};
 use crate::local_models::QWEN_EMBEDDING_PRESET_ID;
 use crate::paths::{config_file_path, ProfilePaths};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -629,6 +629,30 @@ pub struct GitRemote {
     pub api_base_url: String,
     pub web_base_url: String,
     pub repo: String,
+}
+
+/// Profile store directories that no configured profile owns.
+///
+/// Removing a profile from config leaves its snapshot, index, and embeddings on
+/// disk. That is sensitive derived data no config still references, and no
+/// command reported it. Return the ids only: local paths are not a command
+/// output surface. Never deletes anything.
+pub fn orphan_profile_store_ids() -> Result<Vec<String>, QghError> {
+    let configured: BTreeSet<String> = match load_config_file_optional()? {
+        Some(config) => config.profiles.into_keys().collect(),
+        None => BTreeSet::new(),
+    };
+    let Ok(entries) = fs::read_dir(crate::paths::qgh_data_dir()?.join("profiles")) else {
+        return Ok(Vec::new());
+    };
+    let mut orphans: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|id| !configured.contains(id))
+        .collect();
+    orphans.sort();
+    Ok(orphans)
 }
 
 pub fn single_matching_profile_id(
