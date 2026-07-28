@@ -1289,6 +1289,17 @@ fn render_doctor(data: &Value) -> String {
             &mut out,
             format_args!("FAIL {name}: {}", doctor_hint(&name)),
         );
+        // Name the orphaned profiles so the reader can act without --json.
+        // Ids only — local paths are not a command output surface.
+        if name == "orphan_profile_stores" {
+            line(
+                &mut out,
+                format_args!(
+                    "  orphan profiles: {}",
+                    join_array(check.get("orphan_profile_ids"))
+                ),
+            );
+        }
     }
     if failed.is_empty() {
         line(&mut out, format_args!("all checks passed"));
@@ -1421,6 +1432,9 @@ fn doctor_hint(name: &str) -> &'static str {
         "repo_policy" => "update .qgh.toml or the selected profile repo allowlist",
         "profile_resolution" => "pass --profile or adjust profile allowlists",
         "purge" => "run qgh sync to retry pending qgh-managed cleanup",
+        "orphan_profile_stores" => {
+            "local snapshots remain for profiles no longer in config; qgh does not delete them"
+        }
         _ => "inspect the corresponding JSON check details with --json",
     }
 }

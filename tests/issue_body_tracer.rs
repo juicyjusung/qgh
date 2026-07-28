@@ -8575,6 +8575,100 @@ fn doctor_runs_explicit_checks_and_reports_cli_only_scope() {
 }
 
 #[test]
+fn doctor_reports_profile_stores_no_config_profile_owns_without_exposing_paths() {
+    let fixture = TestFixture::new("doctor-orphan-store");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    let orphan_check = |output: &Output| -> Value {
+        let doctor_json = stdout_json(output);
+        doctor_json["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "orphan_profile_stores")
+            .unwrap_or_else(|| panic!("doctor must always report the check: {doctor_json:#}"))
+            .clone()
+    };
+
+    let clean = fixture.qgh(["doctor", "--json"]);
+    assert_success(&clean);
+    let clean_check = orphan_check(&clean);
+    assert_eq!(clean_check["ok"], true);
+    assert_eq!(clean_check["orphan_profile_ids"], json!([]));
+
+    // A profile removed from config leaves its store behind.
+    let stale_store = fixture.data_home.join("qgh").join("profiles").join("stale");
+    fs::create_dir_all(stale_store.join("tantivy")).unwrap();
+    fs::write(stale_store.join("qgh.sqlite3"), b"stale snapshot").unwrap();
+
+    let flagged = fixture.qgh(["doctor", "--json"]);
+    assert_success(&flagged);
+    let flagged_check = orphan_check(&flagged);
+    assert_eq!(flagged_check["ok"], false);
+    assert_eq!(flagged_check["orphan_profile_ids"], json!(["stale"]));
+    assert!(
+        stale_store.exists(),
+        "doctor reports orphan stores and must never delete them"
+    );
+
+    let serialized = String::from_utf8(flagged.stdout.clone()).unwrap();
+    assert!(
+        !serialized.contains(&fixture.data_home.to_string_lossy().to_string()),
+        "orphan reporting must not expose local paths: {serialized}"
+    );
+
+    let human = fixture.qgh(["doctor"]);
+    assert_success(&human);
+    let human = stdout_text(&human);
+    assert!(human.contains("FAIL orphan_profile_stores"));
+    assert!(human.contains("orphan profiles: stale"));
+    assert!(!human.contains(&fixture.data_home.to_string_lossy().to_string()));
+}
+
+/// Reusing a profile id for a different host inherits the previous store,
+/// because `ProfilePaths::resolve` keys only on the id. Pin what that means
+/// today: citations stay correct because each source row carries its own host
+/// (ADR-0002), but the snapshot itself is served with no signal that it came
+/// from the host the profile no longer points at. Whether that should fail
+/// closed is a separate storage-identity decision; this test exists so the
+/// current contract cannot change silently.
+#[test]
+fn reusing_a_profile_id_for_another_host_keeps_source_identity_but_serves_the_old_snapshot() {
+    let fixture = TestFixture::new("profile-id-reuse");
+    let server = FakeGitHub::start(issue_payload_with_pr());
+    fixture.write_config(&server.base_url);
+    assert_success(&fixture.qgh(["sync", "--json"]));
+
+    fixture.write_config_with_host("other.example.com", "https://other.example.com/api/v3");
+
+    let status = fixture.qgh(["status", "--json"]);
+    assert_success(&status);
+    let status_json = stdout_json(&status);
+    assert_eq!(status_json["data"]["github"]["host"], "other.example.com");
+    assert_eq!(
+        status_json["data"]["coverage"]["oldest_synced_updated_at"], "2026-01-02T03:04:05Z",
+        "the redefined profile still reports the previous host's coverage"
+    );
+
+    let query = fixture.qgh(["query", "issue", "--json"]);
+    assert_success(&query);
+    let query_json = stdout_json(&query);
+    let result = &query_json["data"]["results"][0];
+    assert_eq!(
+        result["canonical_url"], "https://github.com/owner/repo/issues/42",
+        "a stored source keeps the host it was synced from; the new profile host must not rewrite it"
+    );
+    assert_eq!(result["source_id"], "qgh://github.com/issue/I_kwDOISSUE1");
+    assert_success(&fixture.qgh([
+        "get",
+        result["get_args"]["source_id"].as_str().unwrap(),
+        "--json",
+    ]));
+}
+
+#[test]
 fn doctor_reports_null_rate_limit_headers_when_token_is_unavailable() {
     let fixture = TestFixture::new("doctor-missing-token");
     fixture.write_config_with_missing_token_profile("http://127.0.0.1:1");
