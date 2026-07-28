@@ -58,7 +58,8 @@
             "rate_limit_headers",
             "purge",
             "repo_policy",
-            "profile_resolution"
+            "profile_resolution",
+            "orphan_profile_stores"
           ]
         },
         "ok": {
@@ -84,6 +85,13 @@
         "allowlist_match_count": {
           "type": ["integer", "null"],
           "minimum": 0
+        },
+        "orphan_profile_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false

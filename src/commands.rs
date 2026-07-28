@@ -3,9 +3,9 @@ use crate::chunking::chunk_markdown_with_fingerprint;
 use crate::chunking::chunker_fingerprint_for_tokenizer_identity;
 use crate::cli::{EmbedArgs, ModelArgs, ModelCommand, QueryArgs, ReconcileMode};
 use crate::config::{
-    discover_repo_policy, load_profile, parse_repo, resolve_token, resolve_token_with_mode,
-    CommentsMode, EmbeddingConfig, EmbeddingProviderKind, Profile, RepoPolicy, RepoRef,
-    TokenResolutionMode,
+    discover_repo_policy, load_profile, orphan_profile_store_ids, parse_repo, resolve_token,
+    resolve_token_with_mode, CommentsMode, EmbeddingConfig, EmbeddingProviderKind, Profile,
+    RepoPolicy, RepoRef, TokenResolutionMode,
 };
 use crate::context::{prepare_embedding_input, EmbeddingSourceContext};
 use crate::coverage;
@@ -6330,6 +6330,7 @@ pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
     let purge_ok = purge["pending_count"].as_u64() == Some(0)
         && purge["retrieval_blocked"].as_bool() == Some(false);
     let permissions_ok = private_paths_ok(&profile.paths);
+    let orphan_profile_store_ids = orphan_profile_store_ids()?;
     let sqlite_ok = status.active_generation >= 0;
     let tantivy_ok = store.resolve_active_tantivy_artifact().is_ok();
     let (github_ok, rate_limit_ok, rate_limit_headers) = match resolve_token(&profile) {
@@ -6370,6 +6371,11 @@ pub async fn doctor(profile_id: &str) -> Result<Value, QghError> {
         json!({
             "name": "purge",
             "ok": purge_ok
+        }),
+        json!({
+            "name": "orphan_profile_stores",
+            "ok": orphan_profile_store_ids.is_empty(),
+            "orphan_profile_ids": orphan_profile_store_ids
         }),
     ]);
     Ok(json!({

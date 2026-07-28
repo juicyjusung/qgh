@@ -193,6 +193,11 @@ includes the same diagnostics and is the explicit command that may run probes.
 Its purge block also states that user-created filesystem backups and snapshots
 outside qgh-managed generation paths are not deleted by qgh. Neither `status`
 nor `doctor` retries or starts a purge. MCP exposes `status`, but not `doctor`.
+`doctor` also always emits an `orphan_profile_stores` check. Removing a profile
+from config leaves its snapshot, index, and embeddings on disk, so the check
+reports `orphan_profile_ids` for every profile store directory no configured
+profile owns. It lists ids only, never local paths, and `doctor` never deletes
+the stores it names.
 CLI-only top-level `init` bootstraps profile config plus repo scope. `init repo`
 creates tracked repo policy only. Neither command is exposed to MCP.
 `schedule` is also CLI-only and is not exposed to MCP.
