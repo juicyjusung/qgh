@@ -1,4 +1,6 @@
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
+#[path = "support/schedule_identity.rs"]
+mod schedule_identity;
 #[cfg(feature = "vector-search")]
 use qgh::embedding::LOCAL_MODEL_REVISION;
 #[cfg(feature = "fastembed-provider")]
@@ -12,6 +14,7 @@ use qgh::embedding::{
     EmbeddingFingerprintSeed, PoolingKind, DEFAULT_HF_MODEL_ID, DEFAULT_HF_MODEL_REVISION,
     DEFAULT_QUERY_PREFIX,
 };
+use schedule_identity::fixed_schedule_identity_is_active;
 use serde_json::{json, Value};
 #[cfg(feature = "fastembed-provider")]
 use sha2::{Digest, Sha256};
@@ -8049,13 +8052,26 @@ fn schedule_status_and_absent_stop_are_local_only_and_idempotent() {
         .args(["schedule", "stop", "--json"])
         .output()
         .unwrap();
-    assert_success(&stopped);
-    let stopped_json = stdout_json(&stopped);
-    assert_eq!(stopped_json["data"]["operation"], "stop");
-    assert_eq!(stopped_json["data"]["action"], "unchanged");
-    assert_eq!(stopped_json["data"]["schedule_state"], "not_installed");
-    assert_eq!(stopped_json["data"]["installed"], false);
-    assert_eq!(stopped_json["data"]["network_access"], false);
+    if fixed_schedule_identity_is_active() {
+        // Not a skip: the host owns the fixed identity, so this asserts the
+        // other documented branch of the same contract.
+        let stopped_json = stdout_json(&stopped);
+        assert_eq!(
+            stopped_json["error"]["code"], "schedule.ownership_ambiguous",
+            "a schedule is installed for this OS user, so absent stop must fail closed: {stopped_json}"
+        );
+        assert_eq!(stopped_json["error"]["exit_code"], 6);
+        assert_eq!(stopped_json["error"]["retryable"], false);
+        assert_eq!(stopped_json["ok"], false);
+    } else {
+        assert_success(&stopped);
+        let stopped_json = stdout_json(&stopped);
+        assert_eq!(stopped_json["data"]["operation"], "stop");
+        assert_eq!(stopped_json["data"]["action"], "unchanged");
+        assert_eq!(stopped_json["data"]["schedule_state"], "not_installed");
+        assert_eq!(stopped_json["data"]["installed"], false);
+        assert_eq!(stopped_json["data"]["network_access"], false);
+    }
 
     let mut human_command = fixture.base_command();
     let human = human_command

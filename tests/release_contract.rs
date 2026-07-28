@@ -7,6 +7,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
+#[path = "support/schedule_identity.rs"]
+mod schedule_identity;
+use schedule_identity::fixed_schedule_identity_is_active;
+
 #[test]
 fn released_error_schema_covers_all_stable_externally_emitted_error_codes() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -247,11 +251,31 @@ fn schedule_lifecycle_schema_validates_real_payload_shapes_with_draft_2020_12() 
         .validate(&status, schema_index)
         .expect("actual absent schedule status payload shape must validate");
 
-    let stop = run_lifecycle("stop");
-    assert_eq!(stop["action"], "unchanged");
-    schemas
-        .validate(&stop, schema_index)
-        .expect("actual absent schedule stop payload shape must validate");
+    // The fixed manager identity is one per OS user and no HOME/XDG override
+    // scopes it, so a host that already owns a qgh schedule cannot produce an
+    // `unchanged` stop payload. Not a skip: assert the other documented branch.
+    // The `unchanged` shape stays covered wherever the user manager is empty.
+    if fixed_schedule_identity_is_active() {
+        let output = Command::new(binary())
+            .args(["schedule", "stop", "--json"])
+            .env("HOME", runtime_root.join("home"))
+            .env("XDG_CONFIG_HOME", runtime_root.join("config"))
+            .env("XDG_DATA_HOME", runtime_root.join("data"))
+            .env("XDG_CACHE_HOME", runtime_root.join("cache"))
+            .output()
+            .unwrap();
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["schema_version"], "qgh.v2");
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], "schedule.ownership_ambiguous");
+        assert_eq!(envelope["error"]["exit_code"], 6);
+    } else {
+        let stop = run_lifecycle("stop");
+        assert_eq!(stop["action"], "unchanged");
+        schemas
+            .validate(&stop, schema_index)
+            .expect("actual absent schedule stop payload shape must validate");
+    }
 
     for (name, invalid) in [
         ("empty profiles", json!({"profile_ids": []})),
